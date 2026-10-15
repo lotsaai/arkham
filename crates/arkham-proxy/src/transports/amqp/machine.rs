@@ -58,6 +58,10 @@ const SMALL_ULONG: u8 = 0x53;
 
 const ULONG: u8 = 0x80;
 
+const SYMBOL8: u8 = 0xa3;
+
+const SYMBOL32: u8 = 0xb3;
+
 const SASL_INIT: u64 = 0x41;
 const SASL_RESPONSE: u64 = 0x43;
 const DETACH: u64 = 0x16;
@@ -147,6 +151,12 @@ enum Classified {
   AbsoluteHead(usize),
   Hold { total: usize, kind: Kind },
   Forward { total: usize },
+}
+
+enum Descriptor {
+  Need(usize),
+  Absent,
+  Code(u64),
 }
 
 impl Amqp {
@@ -355,7 +365,8 @@ impl Amqp {
   }
 
   /// A 1.0 head: size, data offset, type, channel, then the performative's
-  /// descriptor. A symbolic descriptor is forwarded and scanned.
+  /// descriptor. The credential and close names map to their numeric codes.
+  /// Any other symbol is forwarded and scanned.
   fn classify_10(&self, buf: &[u8]) -> Result<Classified, ()> {
     let (Some(total), Some(&doff), Some(&frame_type)) = (be_u32(buf, 0), buf.get(4), buf.get(5)) else {
       return Ok(Classified::AbsoluteHead(HEAD_10));
@@ -380,19 +391,21 @@ impl Amqp {
     let Some(&[constructor, encoding]) = buf.get(data_offset..code_at) else {
       return Ok(Classified::AbsoluteHead(code_at));
     };
-    let code_len = match (constructor, encoding) {
-      (DESCRIBED, SMALL_ULONG) => 1,
-      (DESCRIBED, ULONG) => 8,
-      _ => return Ok(forward),
-    };
-    let code_end = code_at.checked_add(code_len).ok_or(())?;
-    if code_end > total {
+    if constructor != DESCRIBED {
       return Ok(forward);
     }
-    let Some(code_bytes) = buf.get(code_at..code_end) else {
-      return Ok(Classified::AbsoluteHead(code_end));
+    let descriptor = match encoding {
+      SMALL_ULONG => read_ulong(buf, code_at, 1, total),
+      ULONG => read_ulong(buf, code_at, 8, total),
+      SYMBOL8 => read_symbol(buf, code_at, total, false),
+      SYMBOL32 => read_symbol(buf, code_at, total, true),
+      _ => Descriptor::Absent,
     };
-    let code = code_bytes.iter().fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
+    let code = match descriptor {
+      Descriptor::Need(need) => return Ok(Classified::AbsoluteHead(need)),
+      Descriptor::Absent => return Ok(forward),
+      Descriptor::Code(code) => code,
+    };
     let kind = match (frame_type, code) {
       (FRAME_SASL, SASL_INIT) => Kind::SaslInit,
       (FRAME_SASL, SASL_RESPONSE) if self.down.as_ref().is_some_and(|down| down.awaiting_response) => Kind::SaslResponse,
@@ -612,6 +625,58 @@ impl Amqp {
     out.extend_from_slice(head);
     self.held = combined.split_off(emit);
     Ok(())
+  }
+}
+
+fn symbol_code(name: &[u8]) -> Option<u64> {
+  match name {
+    b"amqp:sasl-init:list" => Some(SASL_INIT),
+    b"amqp:sasl-response:list" => Some(SASL_RESPONSE),
+    b"amqp:detach:list" => Some(DETACH),
+    b"amqp:end:list" => Some(END),
+    b"amqp:close:list" => Some(CLOSE),
+    _ => None,
+  }
+}
+
+fn read_ulong(buf: &[u8], at: usize, len: usize, total: usize) -> Descriptor {
+  let Some(end) = at.checked_add(len).filter(|end| *end <= total) else {
+    return Descriptor::Absent;
+  };
+  let Some(bytes) = buf.get(at..end) else {
+    return Descriptor::Need(end);
+  };
+  let code = bytes.iter().fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
+  Descriptor::Code(code)
+}
+
+fn read_symbol(buf: &[u8], at: usize, total: usize, wide: bool) -> Descriptor {
+  let width = if wide { 4 } else { 1 };
+  let Some(len_end) = at.checked_add(width).filter(|end| *end <= total) else {
+    return Descriptor::Absent;
+  };
+  let Some(len_bytes) = buf.get(at..len_end) else {
+    return Descriptor::Need(len_end);
+  };
+  let len = match len_bytes {
+    [len] => usize::from(*len),
+    [a, b, c, d] => {
+      let Ok(len) = usize::try_from(u32::from_be_bytes([*a, *b, *c, *d])) else {
+        return Descriptor::Absent;
+      };
+      len
+    }
+    _ => return Descriptor::Absent,
+  };
+  let Some(end) = len_end.checked_add(len).filter(|end| *end <= total) else {
+    return Descriptor::Absent;
+  };
+  let Some(name) = buf.get(len_end..end) else {
+    return Descriptor::Need(end);
+  };
+  match symbol_code(name) {
+    Some(code) => Descriptor::Code(code),
+    None => Descriptor::Absent,
   }
 }
 

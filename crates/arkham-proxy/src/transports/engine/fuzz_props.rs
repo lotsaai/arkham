@@ -1507,6 +1507,117 @@ fn amqp_transfer_10(payload: &[u8]) -> Vec<u8> {
   amqp_10(0, &body)
 }
 
+fn splice_symbol(body: &[u8], name: &str, wide: bool) -> Vec<u8> {
+  assert!(body.len() >= 3 && body[0] == 0x00 && body[1] == 0x53, "numeric descriptor");
+  let mut out = Vec::with_capacity(body.len().saturating_add(name.len()));
+  out.push(0x00);
+  let bytes = name.as_bytes();
+  if wide {
+    out.push(0xb3);
+    out.extend(u32::try_from(bytes.len()).expect("symbol length").to_be_bytes());
+  } else {
+    out.push(0xa3);
+    out.push(u8::try_from(bytes.len()).expect("symbol8 length"));
+  }
+  out.extend_from_slice(bytes);
+  out.extend_from_slice(&body[3..]);
+  out
+}
+
+fn splice_frame_symbol(frame: &[u8], name: &str, wide: bool) -> Vec<u8> {
+  let body = frame.get(8..).expect("1.0 body");
+  let mut out = frame.get(..8).expect("1.0 head").to_vec();
+  out.extend(splice_symbol(body, name, wide));
+  let size = u32::try_from(out.len()).expect("frame size");
+  out[..4].copy_from_slice(&size.to_be_bytes());
+  out
+}
+
+fn symbolic_open(header: &[u8], frame: &[u8], name: &str, wide: bool) -> Vec<u8> {
+  let mut out = header.to_vec();
+  out.extend(splice_frame_symbol(frame, name, wide));
+  out
+}
+
+fn amqp_symbol_overrun(wide: bool) -> Vec<u8> {
+  let mut body = vec![0x00];
+  if wide {
+    body.push(0xb3);
+    body.extend(50u32.to_be_bytes());
+  } else {
+    body.push(0xa3);
+    body.push(50);
+  }
+  body.extend_from_slice(b"amqp:sasl-init:list");
+  let mut out = AMQP_HEADER_SASL.to_vec();
+  out.extend(amqp_10(1, &body));
+  out
+}
+
+#[test]
+fn amqp_symbolic_descriptors_rewrite_under_every_split() {
+  let swapped = [b"\0svc\0".as_slice(), AMQP_REAL.as_bytes()].concat();
+  for wide in [false, true] {
+    let init = symbolic_open(
+      AMQP_HEADER_SASL,
+      &amqp_sasl_init("PLAIN", Some(amqp_plain(AMQP_FAKE))),
+      "amqp:sasl-init:list",
+      wide,
+    );
+    let (out, closed) = amqp_splits_match(AmqpLeg::DownSwap, &init, &[4, 11]).expect("sasl-init splits");
+    assert!(!closed, "wide={wide} sasl-init closed");
+    assert!(ldap_contains(&out, &swapped), "wide={wide} sasl-init kept the decoy");
+    assert!(!ldap_contains(&out, AMQP_FAKE.as_bytes()), "wide={wide} sasl-init leaked the decoy");
+
+    let mut deferred = symbolic_open(AMQP_HEADER_SASL, &amqp_sasl_init("PLAIN", None), "amqp:sasl-init:list", wide);
+    deferred.extend(splice_frame_symbol(
+      &amqp_sasl_response(amqp_plain(AMQP_FAKE)),
+      "amqp:sasl-response:list",
+      wide,
+    ));
+    let (out, closed) = amqp_splits_match(AmqpLeg::DownSwap, &deferred, &[6, 15]).expect("sasl-response splits");
+    assert!(!closed, "wide={wide} sasl-response closed");
+    assert!(ldap_contains(&out, &swapped), "wide={wide} sasl-response kept the decoy");
+    assert!(
+      !ldap_contains(&out, AMQP_FAKE.as_bytes()),
+      "wide={wide} sasl-response leaked the decoy"
+    );
+
+    for (frame, name) in [
+      (AmqpErrorFrame::Close, "amqp:close:list"),
+      (AmqpErrorFrame::End, "amqp:end:list"),
+      (AmqpErrorFrame::Detach, "amqp:detach:list"),
+    ] {
+      let data = symbolic_open(AMQP_HEADER_10, &amqp_error_10(frame, &format!("bad {AMQP_REAL}")), name, wide);
+      let (out, closed) = amqp_splits_match(AmqpLeg::Up, &data, &[5, 13]).expect("close splits");
+      assert!(!closed, "{name} wide={wide} closed");
+      assert!(
+        ldap_contains(&out, AMQP_FAKE.as_bytes()),
+        "{name} wide={wide} left the real password"
+      );
+      assert!(
+        !ldap_contains(&out, AMQP_REAL.as_bytes()),
+        "{name} wide={wide} leaked the real password"
+      );
+    }
+
+    let unknown = symbolic_open(
+      AMQP_HEADER_SASL,
+      &amqp_sasl_init("PLAIN", Some(amqp_plain(AMQP_FAKE))),
+      "amqp:sasl-mechanisms:list",
+      wide,
+    );
+    let (out, closed) = amqp_splits_match(AmqpLeg::DownSwap, &unknown, &[3, 9]).expect("unknown symbol splits");
+    assert!(!closed, "wide={wide} unknown symbol closed");
+    assert_eq!(out, unknown, "wide={wide} unknown symbol was rewritten");
+
+    let overrun = amqp_symbol_overrun(wide);
+    let (out, closed) = amqp_splits_match(AmqpLeg::DownSwap, &overrun, &[2, 8]).expect("overrun splits");
+    assert!(!closed, "wide={wide} overrun closed");
+    assert_eq!(out, overrun, "wide={wide} overrun was held");
+  }
+}
+
 fn amqp_text() -> impl Strategy<Value = String> {
   proptest::string::string_regex("[b-z]{0,8}").expect("plain text")
 }
