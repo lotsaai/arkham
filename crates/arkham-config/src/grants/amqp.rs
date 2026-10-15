@@ -289,6 +289,9 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
     if tls.root_cert.is_some() {
       return Err(Error::AmqpTrust { label: label.to_string() });
     }
+    if tls.guest_tls_mode == GuestTlsMode::Mtls && !scope.is_downstream_tls {
+      return Err(Error::AmqpCleartextMtls { label: label.to_string() });
+    }
     scope.guest_tls = tls.guest_tls_mode;
   }
   let credential = Credential {

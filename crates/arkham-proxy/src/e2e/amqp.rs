@@ -145,6 +145,104 @@ fn guest_tls(ca: &CertAuthority, sni: bool) -> TlsConnector {
 }
 
 #[tokio::test]
+async fn plaintext_guest_with_mtls_does_not_get_the_real_password() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let (_bundle_dir, bundle) = ca_bundle(&ca);
+  let fake = format!("amqp://agent:{FAKE}@localhost:{stub_port}");
+  let real = format!("amqps://svc:{VALUE}@localhost:{stub_port}?sslrootcert={}", bundle.display());
+  match mtls_grants(&fake, &real) {
+    Err(err) => {
+      assert!(matches!(err.as_ref(), arkham_config::Error::AmqpCleartextMtls { .. }), "{err}");
+      let text = err.to_string();
+      assert!(!text.contains(FAKE), "{text}");
+      assert!(!text.contains(VALUE), "{text}");
+    }
+    Ok(grants) => {
+      let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
+      let stub_task = tokio::spawn(async move {
+        let (conn, _) = stub.accept().await.unwrap();
+        let mut tls = acceptor.accept(conn).await.unwrap();
+        assert_eq!(read_header(&mut tls).await, HEADER_091);
+        tls.write_all(&start()).await.unwrap();
+        let response = start_ok_response(read_frame(&mut tls).await);
+        assert_eq!(
+          response,
+          plain("agent", FAKE),
+          "plaintext guest received the real password: {response:?}"
+        );
+        tls.write_all(&close("ACCESS_REFUSED")).await.unwrap();
+      });
+      let mut stream = connect_through_proxy(proxy_addr, stub_port).await;
+      stream.write_all(HEADER_091).await.unwrap();
+      let _ = read_frame(&mut stream).await;
+      stream.write_all(&start_ok(plain("agent", FAKE))).await.unwrap();
+      let _ = read_frame(&mut stream).await;
+      drop(stream);
+      tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+      proxy.abort();
+    }
+  }
+}
+
+fn mtls_grants(fake: &str, real: &str) -> Result<Vec<Grant>, Box<arkham_config::Error>> {
+  use std::collections::BTreeMap;
+
+  use arkham_config::config::{AppConfig, HostTlsCfg, IfMissing, ProxyCfg, WorkspaceCfg};
+  use arkham_config::grants::resolve;
+  use secrecy::SecretString;
+
+  let mut tls = BTreeMap::new();
+  tls.insert(
+    "AMQP_URL".to_string(),
+    HostTlsCfg {
+      client_cert: None,
+      client_key: None,
+      root_cert: None,
+      guest_tls_mode: GuestTlsMode::Mtls,
+      guest_cert: None,
+      guest_key: None,
+    },
+  );
+  let mut rules = BTreeMap::new();
+  rules.insert(
+    "broker".to_string(),
+    arkham_config::RuleCfg {
+      env: "AMQP_URL".into(),
+      value: Some(SecretString::from(fake)),
+      real: Some(SecretString::from(real)),
+      fnox_key: None,
+      allow: Vec::new(),
+      pattern: None,
+      oauth2: None,
+      registry: None,
+      if_missing: IfMissing::default(),
+      tls,
+      ssh: BTreeMap::new(),
+    },
+  );
+  let cfg = AppConfig {
+    proxy: ProxyCfg {
+      listen: "127.0.0.1:8080".parse().unwrap(),
+      ca_file: None,
+      root_certs: Vec::new(),
+      handshake_timeout_secs: 10,
+      ssh_host_key: None,
+      ssh_known_hosts: None,
+    },
+    workspace: WorkspaceCfg::default(),
+    rules,
+    plugins: BTreeMap::new(),
+    tools: BTreeMap::new(),
+  };
+  resolve(&cfg).map(|resolved| resolved.grants).map_err(Box::new)
+}
+
+#[tokio::test]
 async fn amqp_cleartext_start_ok_forwards_the_decoy() {
   let fx = mitm_fixture(|port| {
     vec![amqp_grant(

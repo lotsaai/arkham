@@ -1238,6 +1238,34 @@ mod tests {
   }
 
   #[test]
+  fn amqp_mtls_rejects_a_cleartext_fake() {
+    let mut cfg = cfg_with_db(
+      "amqp://agent:arkham_fake_amqp_pass@mq.internal",        // betterleaks:allow
+      "amqps://svc:arkham_real_amqp_pass_01@mq.internal:5671", // betterleaks:allow
+    );
+    let mut tls = BTreeMap::new();
+    tls.insert(
+      "DATABASE_URL".to_string(),
+      crate::config::HostTlsCfg {
+        client_cert: None,
+        client_key: None,
+        root_cert: None,
+        guest_tls_mode: GuestTlsMode::Mtls,
+        guest_cert: None,
+        guest_key: None,
+      },
+    );
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+    let err = resolve(&cfg).expect_err("mtls on a cleartext fake");
+    assert!(matches!(err, crate::Error::AmqpCleartextMtls { .. }), "{err}");
+    let text = err.to_string();
+    assert!(text.contains("amqps://"), "{text}");
+    for secret in ["arkham_fake_amqp_pass", "arkham_real_amqp_pass_01", "agent", "svc"] {
+      assert!(!text.contains(secret), "{text} contains {secret}");
+    }
+  }
+
+  #[test]
   fn rule_table_for_a_redis_rule_keys_by_its_env() {
     let mut cfg = cfg_with_db(
       "rediss://app:fake@db.internal:6379/0", // betterleaks:allow

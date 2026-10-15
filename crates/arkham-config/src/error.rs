@@ -545,6 +545,12 @@ pub enum Error {
     /// Rule label.
     label: String,
   },
+  /// `guest_tls_mode = mtls` on a cleartext `amqp://` fake string.
+  #[error("rule `{label}`: mtls requires an amqps:// fake, because a cleartext guest cannot present a client certificate")]
+  AmqpCleartextMtls {
+    /// Rule label.
+    label: String,
+  },
   /// An ssh rule mixes `ssh://` entries with other schemes.
   #[error("rule `{label}`: ssh entries cannot mix with other schemes in one rule")]
   SshMixedSchemes {
