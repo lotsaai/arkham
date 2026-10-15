@@ -54,8 +54,6 @@ printf "subjectAltName=IP:10.202.0.80,DNS:ldap\nextendedKeyUsage=serverAuth\nkey
 openssl x509 -req -in "$dir/ldap.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
   -CAcreateserial -out "$dir/ldap.crt" -days 2 -extfile "$dir/ldap.ext"
 
-# AMQP TLS: RabbitMQ presents this leaf on 5671. The proxy verifies the
-# name `amqp`; SAN also carries the static address on the server net.
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$dir/amqp.key"
 openssl req -new -key "$dir/amqp.key" -out "$dir/amqp.csr" -subj "/CN=amqp"
 printf "subjectAltName=IP:10.202.0.90,DNS:amqp\nextendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature,keyEncipherment\n" >"$dir/amqp.ext"

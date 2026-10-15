@@ -106,17 +106,10 @@ value = "ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3389"
 env = "LDAP_TLS_URL"
 value = "ldaps://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3636"
 
-# AMQP with a cleartext guest leg. The fake string is what the client
-# dials. The real string in fnox is amqps://, so the upstream leg is TLS
-# and the PLAIN response carries the real user and password. A cleartext
-# real string would forward the decoy. The real password is longer than
-# the decoy: 0-9-1 and 1.0 frames are re-encoded.
 [rules.amqp_plain]
 env = "AMQP_URL"
 value = "amqp://agent:arkham_fake_amqp_pass@amqp:5672"
 
-# AMQPS: TLS from the first byte on both legs. No allow entries; the
-# connection string is the grant.
 [rules.amqp_tls]
 env = "AMQP_TLS_URL"
 value = "amqps://agent:arkham_fake_amqp_pass@amqp:5671"

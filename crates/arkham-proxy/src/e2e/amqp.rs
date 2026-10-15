@@ -1,7 +1,3 @@
-//! AMQP PLAIN through the MITM: a cleartext upstream keeps the decoy,
-//! `amqps` swaps after TLS, a guest without SNI gets the grant host, and an
-//! ungranted destination splices byte for byte.
-
 use super::*;
 use amq_protocol::frame::{AMQPFrame, WriteContext, gen_frame, parse_frame};
 use amq_protocol::protocol::{AMQPClass, connection};
@@ -79,7 +75,6 @@ async fn read_header<S: AsyncRead + Unpin>(conn: &mut S) -> Vec<u8> {
   header
 }
 
-/// One 0-9-1 frame: type, channel, size, payload, frame end.
 async fn read_frame<S: AsyncRead + Unpin>(conn: &mut S) -> AMQPFrame {
   let mut head = [0u8; 7];
   conn.read_exact(&mut head).await.unwrap();
@@ -106,7 +101,6 @@ fn close_text(frame: AMQPFrame) -> String {
   close.reply_text.as_str().to_string()
 }
 
-/// One 1.0 SASL frame with a two-word data offset.
 fn sasl_frame(body: &[u8]) -> Vec<u8> {
   let mut out = u32::try_from(body.len() + 8).unwrap().to_be_bytes().to_vec();
   out.extend([2, 1, 0, 0]);
@@ -114,7 +108,6 @@ fn sasl_frame(body: &[u8]) -> Vec<u8> {
   out
 }
 
-/// One 1.0 frame body, after its fixed header.
 async fn read_frame_10<S: AsyncRead + Unpin>(conn: &mut S) -> Vec<u8> {
   let mut head = [0u8; 8];
   conn.read_exact(&mut head).await.unwrap();
@@ -136,7 +129,6 @@ async fn connect_through_proxy(proxy_addr: SocketAddr, stub_port: u16) -> TcpStr
   stream
 }
 
-/// Bundle file trusting `ca`, kept alive by the returned directory.
 fn ca_bundle(ca: &CertAuthority) -> (tempfile::TempDir, std::path::PathBuf) {
   let dir = tempfile::tempdir().unwrap();
   let bundle = dir.path().join("ca.pem");

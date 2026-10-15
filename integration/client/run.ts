@@ -689,9 +689,6 @@ function amqpWithPassword(raw: string, password: string): string {
   return url.toString();
 }
 
-// 0-9-1 through amqplib: open, declare a server-named queue, publish with a
-// confirm, and read the message back. RabbitMQ refuses the decoy, so a
-// delivered message proves the swap.
 async function amqp091RoundTrip(raw: string): Promise<boolean> {
   const conn = await race("amqp 0-9-1 open", amqplib.connect(raw, { ca: [ca], timeout: ATTEMPT_TIMEOUT_MS }));
   try {
@@ -717,9 +714,6 @@ async function amqp091Refusal(raw: string): Promise<string> {
   }
 }
 
-// 1.0 through rhea: SASL PLAIN, then the broker's open. RabbitMQ answers a
-// refused login with a SASL outcome and never sends open, so an open
-// proves the swap. `vhost:/` names the default vhost.
 function amqp10Open(raw: string, tls: boolean, password: string): Promise<string> {
   const parts = amqpParts(raw);
   return race("amqp 1.0 open", new Promise<string>((resolve) => {
@@ -748,9 +742,6 @@ function amqp10Open(raw: string, tls: boolean, password: string): Promise<string
   }));
 }
 
-// Both real strings are amqps://, so the cleartext guest leg on 5672 still
-// reaches the broker over TLS and is rewritten. The client holds only the
-// decoy user and password; the broker knows only `svc` and the real one.
 async function amqpScenarios(scheme: "amqp" | "amqps", raw: string) {
   const tls = scheme === "amqps";
   const parts = amqpParts(raw);

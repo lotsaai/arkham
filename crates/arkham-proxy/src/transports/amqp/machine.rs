@@ -1,19 +1,3 @@
-//! AMQP wire format: SASL PLAIN rewrite over a streamed frame cursor.
-//!
-//! The 8-byte protocol header picks the framer: 0-9-1 frames (`type
-//! channel size payload 0xCE`) or 1.0 frames (`size doff type channel`).
-//! A frame is stored only when it is the one credential command (0-9-1
-//! `connection.start-ok`, 1.0 `sasl-init` or the `sasl-response` that
-//! carries a deferred initial response) or, upstream, a frame whose text can
-//! echo a password (0-9-1 `connection.close` and `channel.close`, 1.0
-//! `close`, `end`, and `detach`). That frame's own size is the bound. Every
-//! other frame is counted down as it arrives.
-//!
-//! Downstream rewrites only when the upstream writer is TLS, and forwards
-//! every byte unchanged after the credential frame. Upstream always redacts:
-//! a password inside a rewritable text field becomes the decoy, and any other
-//! occurrence closes the leg.
-
 use std::borrow::Cow;
 use std::str::FromStr;
 
@@ -34,86 +18,58 @@ use crate::transports::engine::{
   CredentialPair, Direction, Hit, Location, Rewritten, Wire, find_new_match, needle_prefix_suffix_len, replace_bytes,
 };
 
-/// AMQP 0-9-1 protocol header.
 const HEADER_091: &[u8] = b"AMQP\x00\x00\x09\x01";
 
-/// AMQP 1.0 SASL layer header.
 const HEADER_SASL: &[u8] = b"AMQP\x03\x01\x00\x00";
 
-/// AMQP 1.0 protocol header, after the SASL layer or without one.
 const HEADER_10: &[u8] = b"AMQP\x00\x01\x00\x00";
 
-/// Length of every protocol header.
 const HEADER_LEN: usize = 8;
 
-/// First byte of every protocol header.
 const HEADER_LEAD: u8 = b'A';
 
-/// 0-9-1 frame header: type, channel, payload size.
 const HEAD_091: usize = 7;
 
-/// Class id and method id that open a 0-9-1 method payload.
 const METHOD_IDS_091: usize = 4;
 
-/// Offset of a 0-9-1 method id, after the class id.
 const METHOD_AT_091: usize = HEAD_091 + 2;
 
-/// 0-9-1 frame header plus the class and method ids of a method frame.
 const METHOD_HEAD_091: usize = HEAD_091 + METHOD_IDS_091;
 
-/// 0-9-1 `connection.start-ok` class and method ids.
 const START_OK: (u16, u16) = (10, 11);
 
-/// 0-9-1 `connection.close` class and method ids.
 const CONNECTION_CLOSE: (u16, u16) = (10, 50);
 
-/// 0-9-1 `channel.close` class and method ids.
 const CHANNEL_CLOSE: (u16, u16) = (20, 40);
 
-/// 1.0 fixed frame header: size, data offset, type, channel.
 const HEAD_10: usize = 8;
 
-/// 1.0 AMQP frame type.
 const FRAME_AMQP: u8 = 0;
 
-/// 1.0 SASL frame type.
 const FRAME_SASL: u8 = 1;
 
-/// 1.0 described-type constructor.
 const DESCRIBED: u8 = 0x00;
 
-/// 1.0 `smallulong` descriptor encoding: one code byte.
 const SMALL_ULONG: u8 = 0x53;
 
-/// 1.0 `ulong` descriptor encoding: eight code bytes.
 const ULONG: u8 = 0x80;
 
-/// 1.0 descriptor codes this machine stores a frame for.
 const SASL_INIT: u64 = 0x41;
 const SASL_RESPONSE: u64 = 0x43;
 const DETACH: u64 = 0x16;
 const END: u64 = 0x17;
 const CLOSE: u64 = 0x18;
 
-/// SASL mechanisms an AMQP client names. Only [`SaslMechanism::Plain`]
-/// carries the password in a field this machine rewrites; every other
-/// mechanism passes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SaslMechanism {
-  /// `PLAIN`: `authzid NUL user NUL password`.
   Plain,
-  /// `AMQPLAIN`: a field-table credential.
   Amqplain,
-  /// `EXTERNAL`: the transport authenticates.
   External,
-  /// `ANONYMOUS`: no credential.
   Anonymous,
-  /// `RABBIT-CR-DEMO`: a challenge-response demo.
   RabbitCrDemo,
 }
 
 impl SaslMechanism {
-  /// Whether a response under this mechanism is rewritten.
   pub(crate) fn swaps(self) -> bool {
     matches!(self, Self::Plain)
   }
@@ -122,8 +78,6 @@ impl SaslMechanism {
 impl FromStr for SaslMechanism {
   type Err = ();
 
-  /// Parse a mechanism name with `amq-protocol`'s own list. A name it does
-  /// not know is `Err` and passes through.
   fn from_str(name: &str) -> Result<Self, Self::Err> {
     Ok(match SASLMechanism::from_str(name).map_err(|_unknown| ())? {
       SASLMechanism::Plain => Self::Plain,
@@ -135,29 +89,23 @@ impl FromStr for SaslMechanism {
   }
 }
 
-/// One AMQP direction leg.
 pub(crate) struct Amqp {
   down: Option<Down>,
-  /// Upstream needle: the real password, replaced by the decoy.
   up: Option<CredentialPair>,
   framer: Framer,
   phase: Phase,
-  /// Upstream needle hold-back. A window shorter than the secret, not a frame buffer.
   held: Vec<u8>,
   closed: bool,
 }
 
-/// Downstream rewrite facts. Present only when the swap is on.
 struct Down {
   fake: Vec<u8>,
   user: Vec<u8>,
   real: Vec<u8>,
   label: String,
-  /// A PLAIN `sasl-init` came without its initial response.
   awaiting_response: bool,
 }
 
-/// Which frame layout the protocol header selected.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Framer {
   V091,
@@ -168,45 +116,36 @@ enum Framer {
   },
 }
 
-/// Where the cursor is.
 enum Phase {
-  /// Protocol header bytes. At most eight.
   Header(Vec<u8>),
-  /// One frame's header and the bytes that classify it.
   Head(Vec<u8>),
-  /// One whole frame this machine rewrites. `total` is that frame's own size.
   Frame { buf: Vec<u8>, total: usize, kind: Kind },
-  /// `left` bytes of the current frame, forwarded without storing.
   Forward(usize),
-  /// No more framing: every byte passes.
   Opaque,
 }
 
-/// The frame a [`Phase::Frame`] stores.
 #[derive(Clone, Copy)]
 enum Kind {
   StartOk,
   SaslInit,
   SaslResponse,
   Close091,
-  /// 1.0 `close`, `end`, or `detach`, by descriptor code.
-  Error10(u64),
+  CloseEndDetach(u64),
 }
 
-/// What a frame head says about its frame.
+enum InitRewrite {
+  Unchanged,
+  Rewritten(Vec<u8>),
+  AwaitResponse,
+}
+
 enum Classified {
-  /// Absolute head length still required.
-  Need(usize),
-  /// Store the whole frame of `total` bytes.
+  AbsoluteHead(usize),
   Hold { total: usize, kind: Kind },
-  /// Forward the frame of `total` bytes, the head included.
   Forward { total: usize },
 }
 
 impl Amqp {
-  /// Fresh leg. `swap` is downstream only: a PLAIN response is rewritten
-  /// when the upstream writer is already TLS, and a cleartext upstream keeps
-  /// the decoy. Upstream always redacts.
   pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction, swap: bool) -> Self {
     let found = grants.iter().find_map(|grant| {
       let scope = grant.amqp(Some(host), port)?;
@@ -269,7 +208,6 @@ impl Amqp {
     let mut hits = Vec::new();
     while !input.is_empty() {
       let before = input.len();
-      // Every step consumes input; one that does not would drop bytes.
       if self.step(&mut input, &mut out, &mut hits).is_err() || input.len() == before {
         self.closed = true;
         return (Rewritten::Close, hits);
@@ -282,9 +220,6 @@ impl Amqp {
     }
   }
 
-  /// Empty input is end of stream. A partial header or frame closes and
-  /// emits nothing for it. A held needle suffix is flushed; it is shorter
-  /// than the secret, so it is not the secret.
   fn finish(&mut self) -> (Rewritten<'static>, Vec<Hit>) {
     let idle = match &self.phase {
       Phase::Header(buf) | Phase::Head(buf) => buf.is_empty(),
@@ -303,7 +238,6 @@ impl Amqp {
     }
   }
 
-  /// Advance one cursor step over `input`.
   fn step(&mut self, input: &mut &[u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Result<(), ()> {
     match std::mem::replace(&mut self.phase, Phase::Opaque) {
       Phase::Header(buf) => self.drive_header(buf, input, out, hits),
@@ -317,7 +251,6 @@ impl Amqp {
     }
   }
 
-  /// Stop framing and pass the rest of `input` in this same step.
   fn opaque(&mut self, input: &mut &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
     self.phase = Phase::Opaque;
     self.pass(input, out)?;
@@ -358,9 +291,6 @@ impl Amqp {
     Ok(())
   }
 
-  /// Read one frame head until it classifies, then store, or forward and
-  /// count down. During the 1.0 SASL layer a protocol header may stand where
-  /// a frame would.
   fn drive_head(&mut self, mut buf: Vec<u8>, input: &mut &[u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Result<(), ()> {
     if buf.is_empty() && self.framer == (Framer::V10 { sasl: true }) && input.first() == Some(&HEADER_LEAD) {
       if self.down.is_some() {
@@ -370,7 +300,7 @@ impl Amqp {
     }
     loop {
       match self.classify(&buf)? {
-        Classified::Need(need) => {
+        Classified::AbsoluteHead(need) => {
           if need <= buf.len() {
             return Err(());
           }
@@ -398,17 +328,16 @@ impl Amqp {
     }
   }
 
-  /// A 0-9-1 head: type, channel, size, then class and method of a method frame.
   fn classify_091(&self, buf: &[u8]) -> Result<Classified, ()> {
     let Some(size) = be_u32(buf, 3) else {
-      return Ok(Classified::Need(HEAD_091));
+      return Ok(Classified::AbsoluteHead(HEAD_091));
     };
     let total = HEAD_091.checked_add(size).and_then(|len| len.checked_add(1)).ok_or(())?;
     if buf.first() != Some(&FRAME_METHOD) || size < METHOD_IDS_091 {
       return Ok(Classified::Forward { total });
     }
     let (Some(class), Some(method)) = (be_u16(buf, HEAD_091), be_u16(buf, METHOD_AT_091)) else {
-      return Ok(Classified::Need(METHOD_HEAD_091));
+      return Ok(Classified::AbsoluteHead(METHOD_HEAD_091));
     };
     let kind = match (class, method) {
       START_OK if self.down.is_some() => Kind::StartOk,
@@ -422,10 +351,10 @@ impl Amqp {
   /// descriptor. A symbolic descriptor is forwarded and scanned.
   fn classify_10(&self, buf: &[u8]) -> Result<Classified, ()> {
     let (Some(total), Some(&doff), Some(&frame_type)) = (be_u32(buf, 0), buf.get(4), buf.get(5)) else {
-      return Ok(Classified::Need(HEAD_10));
+      return Ok(Classified::AbsoluteHead(HEAD_10));
     };
-    let body_at = usize::from(doff).checked_mul(4).ok_or(())?;
-    if body_at < HEAD_10 || body_at > total {
+    let data_offset = usize::from(doff).checked_mul(4).ok_or(())?;
+    if data_offset < HEAD_10 || data_offset > total {
       return Err(());
     }
     let forward = Classified::Forward { total };
@@ -434,12 +363,12 @@ impl Amqp {
       FRAME_AMQP => self.up.is_some(),
       _ => false,
     };
-    let code_at = body_at.checked_add(2).ok_or(())?;
+    let code_at = data_offset.checked_add(2).ok_or(())?;
     if !wanted || code_at > total {
       return Ok(forward);
     }
-    let Some(&[constructor, encoding]) = buf.get(body_at..code_at) else {
-      return Ok(Classified::Need(code_at));
+    let Some(&[constructor, encoding]) = buf.get(data_offset..code_at) else {
+      return Ok(Classified::AbsoluteHead(code_at));
     };
     let code_len = match (constructor, encoding) {
       (DESCRIBED, SMALL_ULONG) => 1,
@@ -451,19 +380,18 @@ impl Amqp {
       return Ok(forward);
     }
     let Some(code_bytes) = buf.get(code_at..code_end) else {
-      return Ok(Classified::Need(code_end));
+      return Ok(Classified::AbsoluteHead(code_end));
     };
     let code = code_bytes.iter().fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
     let kind = match (frame_type, code) {
       (FRAME_SASL, SASL_INIT) => Kind::SaslInit,
       (FRAME_SASL, SASL_RESPONSE) if self.down.as_ref().is_some_and(|down| down.awaiting_response) => Kind::SaslResponse,
-      (FRAME_AMQP, DETACH | END | CLOSE) => Kind::Error10(code),
+      (FRAME_AMQP, DETACH | END | CLOSE) => Kind::CloseEndDetach(code),
       _ => return Ok(forward),
     };
     Ok(Classified::Hold { total, kind })
   }
 
-  /// Store one frame until it is whole, then rewrite it and move on.
   fn drive_frame(
     &mut self,
     mut buf: Vec<u8>,
@@ -488,9 +416,14 @@ impl Amqp {
         self.phase = Phase::Opaque;
       }
       Kind::SaslInit => {
-        let (rewritten, deferred) = self.sasl_init(&buf, hits)?;
-        self.pass(rewritten.as_deref().unwrap_or(&buf), out)?;
-        self.phase = if deferred { Phase::Head(Vec::new()) } else { Phase::Opaque };
+        let outcome = self.sasl_init(&buf, hits)?;
+        let await_response = matches!(outcome, InitRewrite::AwaitResponse);
+        let frame = match outcome {
+          InitRewrite::Rewritten(frame) => frame,
+          InitRewrite::Unchanged | InitRewrite::AwaitResponse => buf,
+        };
+        self.pass(&frame, out)?;
+        self.phase = if await_response { Phase::Head(Vec::new()) } else { Phase::Opaque };
       }
       Kind::SaslResponse => {
         let rewritten = self.sasl_response(&buf, hits)?;
@@ -502,7 +435,7 @@ impl Amqp {
         self.pass(redacted.as_deref().unwrap_or(&buf), out)?;
         self.phase = self.finish_frame(out);
       }
-      Kind::Error10(code) => {
+      Kind::CloseEndDetach(code) => {
         let redacted = self.error_10(&buf, code, hits)?;
         self.pass(redacted.as_deref().unwrap_or(&buf), out)?;
         self.phase = self.finish_frame(out);
@@ -511,8 +444,6 @@ impl Amqp {
     Ok(())
   }
 
-  /// A 0-9-1 `start-ok` carrying the decoy under PLAIN, re-encoded with the
-  /// real user and password. `None` keeps the original bytes.
   fn start_ok(&self, buf: &[u8], hits: &mut Vec<Hit>) -> Result<Option<Vec<u8>>, ()> {
     let Some(down) = self.down.as_ref() else {
       return Err(());
@@ -538,33 +469,29 @@ impl Amqp {
     Ok(Some(frame))
   }
 
-  /// A 1.0 `sasl-init`. PLAIN with the decoy is re-encoded with the real
-  /// user and password; PLAIN with no initial response defers to the next
-  /// `sasl-response` (`true`).
-  fn sasl_init(&mut self, buf: &[u8], hits: &mut Vec<Hit>) -> Result<(Option<Vec<u8>>, bool), ()> {
+  fn sasl_init(&mut self, buf: &[u8], hits: &mut Vec<Hit>) -> Result<InitRewrite, ()> {
     let mut init: SaslInit = decode_10(buf)?;
     let Some(down) = self.down.as_mut() else {
       return Err(());
     };
     if !SaslMechanism::from_str(init.mechanism.as_str()).is_ok_and(SaslMechanism::swaps) {
-      return Ok((None, false));
+      return Ok(InitRewrite::Unchanged);
     }
     let Some(response) = init.initial_response.as_ref() else {
       down.awaiting_response = true;
-      return Ok((None, true));
+      return Ok(InitRewrite::AwaitResponse);
     };
     let Some(token) = rewrite_plain(response, down) else {
-      return Ok((None, false));
+      return Ok(InitRewrite::Unchanged);
     };
     init.initial_response = Some(Binary::from(token));
     hits.push(Hit {
       label: down.label.clone(),
       location: Location::Body,
     });
-    Ok((Some(encode_10(buf, &init)?), false))
+    Ok(InitRewrite::Rewritten(encode_10(buf, &init)?))
   }
 
-  /// The `sasl-response` that carries a deferred PLAIN initial response.
   fn sasl_response(&self, buf: &[u8], hits: &mut Vec<Hit>) -> Result<Option<Vec<u8>>, ()> {
     let mut response: SaslResponse = decode_10(buf)?;
     let Some(down) = self.down.as_ref() else {
@@ -581,9 +508,6 @@ impl Amqp {
     Ok(Some(encode_10(buf, &response)?))
   }
 
-  /// A 0-9-1 `connection.close` or `channel.close` whose reply-text carries
-  /// the real password, re-encoded with the decoy. A reply-text the decoy
-  /// would push past 255 bytes cannot be encoded and closes.
   fn close_091(&self, buf: &[u8], hits: &mut Vec<Hit>) -> Result<Option<Vec<u8>>, ()> {
     let Some(pair) = self.up.as_ref().filter(|pair| find_new_match(buf, &pair.needle, 0)) else {
       return Ok(None);
@@ -606,9 +530,6 @@ impl Amqp {
     Ok(Some(encode_091(&frame)?))
   }
 
-  /// A 1.0 `close`, `end`, or `detach` whose error description carries the
-  /// real password, re-encoded with the decoy. A password anywhere else in
-  /// the frame stays and closes in the scan.
   fn error_10(&self, buf: &[u8], code: u64, hits: &mut Vec<Hit>) -> Result<Option<Vec<u8>>, ()> {
     let Some(pair) = self.up.as_ref().filter(|pair| find_new_match(buf, &pair.needle, 0)) else {
       return Ok(None);
@@ -638,7 +559,6 @@ impl Amqp {
     Ok(Some(frame))
   }
 
-  /// Stream `left` bytes from `input`. A 0-9-1 frame must end in `0xCE`.
   fn forward_rest(&mut self, left: usize, input: &mut &[u8], out: &mut Vec<u8>) -> Result<Phase, ()> {
     if left == 0 {
       return Ok(self.finish_frame(out));
@@ -654,15 +574,11 @@ impl Amqp {
     Ok(if left == 0 { self.finish_frame(out) } else { Phase::Forward(left) })
   }
 
-  /// The current frame is complete: release the needle suffix, because a
-  /// finished frame cannot grow.
   fn finish_frame(&mut self, out: &mut Vec<u8>) -> Phase {
     out.extend(std::mem::take(&mut self.held));
     Phase::Head(Vec::new())
   }
 
-  /// Downstream copies. Upstream scans with the needle hold-back and closes
-  /// when the real password appears outside a field already rewritten.
   fn pass(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
     let Some(pair) = self.up.as_ref().filter(|pair| !pair.needle.is_empty()) else {
       out.extend_from_slice(data);
@@ -683,7 +599,6 @@ impl Amqp {
   }
 }
 
-/// Move bytes from `input` into `buf` until it holds `want`.
 fn take(buf: &mut Vec<u8>, want: usize, input: &mut &[u8]) {
   let n = want.saturating_sub(buf.len()).min(input.len());
   if let Some((head, rest)) = input.split_at_checked(n) {
@@ -702,9 +617,6 @@ fn be_u32(buf: &[u8], at: usize) -> Option<usize> {
   usize::try_from(u32::from_be_bytes(bytes.try_into().ok()?)).ok()
 }
 
-/// `authzid NUL user NUL password` with the decoy password, rebuilt with the
-/// client's authzid and the upstream user and password. `None` for any
-/// other token.
 fn rewrite_plain(token: &[u8], down: &Down) -> Option<Vec<u8>> {
   let mut parts = token.splitn(3, |byte| *byte == 0);
   let (authzid, _user, password) = (parts.next()?, parts.next()?, parts.next()?);
@@ -715,7 +627,6 @@ fn rewrite_plain(token: &[u8], down: &Down) -> Option<Vec<u8>> {
   Some([authzid, nul, down.user.as_slice(), nul, down.real.as_slice()].concat())
 }
 
-/// One whole 0-9-1 frame through `amq-protocol`.
 fn parse_whole(buf: &[u8]) -> Result<AMQPFrame, ()> {
   match parse_frame(buf) {
     Ok((&[], frame)) => Ok(frame),
@@ -728,22 +639,18 @@ fn encode_091(frame: &AMQPFrame) -> Result<Vec<u8>, ()> {
   Ok(written.into_inner().0)
 }
 
-/// Body offset of a whole 1.0 frame, from its data offset.
-fn body_at(buf: &[u8]) -> Result<usize, ()> {
+fn data_offset(buf: &[u8]) -> Result<usize, ()> {
   let doff = buf.get(4).ok_or(())?;
   usize::from(*doff).checked_mul(4).ok_or(())
 }
 
-/// The performative of one whole 1.0 frame through `serde_amqp`.
 fn decode_10<'de, T: Deserialize<'de>>(buf: &'de [u8]) -> Result<T, ()> {
-  let body = buf.get(body_at(buf)?..).ok_or(())?;
+  let body = buf.get(data_offset(buf)?..).ok_or(())?;
   serde_amqp::from_slice(body).map_err(|_decode| ())
 }
 
-/// `performative` re-encoded into the frame `buf` came from: same data
-/// offset, type, channel, and extended header, new size.
 fn encode_10<T: Serialize>(buf: &[u8], performative: &T) -> Result<Vec<u8>, ()> {
-  let at = body_at(buf)?;
+  let at = data_offset(buf)?;
   let body = serde_amqp::to_vec(performative).map_err(|_encode| ())?;
   let size = u32::try_from(at.checked_add(body.len()).ok_or(())?).map_err(|_wide| ())?;
   let mut frame = Vec::with_capacity(at.saturating_add(body.len()));
@@ -753,8 +660,6 @@ fn encode_10<T: Serialize>(buf: &[u8], performative: &T) -> Result<Vec<u8>, ()> 
   Ok(frame)
 }
 
-/// A shortstr with the real password replaced by the decoy. `Err` when the
-/// result no longer fits a shortstr.
 fn redact_short(text: &ShortString, pair: &CredentialPair) -> Result<ShortString, ()> {
   let Some(bytes) = replace_bytes(text.as_str().as_bytes(), &pair.needle, &pair.replacement) else {
     return Ok(text.clone());
@@ -763,8 +668,6 @@ fn redact_short(text: &ShortString, pair: &CredentialPair) -> Result<ShortString
   ShortString::try_new(text).map_err(|_long| ())
 }
 
-/// Replace the real password inside an error description. `false` when
-/// there was nothing to replace.
 fn redact_error(error: Option<&mut AmqpError>, pair: &CredentialPair) -> bool {
   let Some(description) = error.and_then(|error| error.description.as_mut()) else {
     return false;
@@ -893,7 +796,6 @@ mod tests {
     ))
   }
 
-  /// Feed `bytes` in one chunk, then end of stream. `None` when the leg closed.
   async fn run(wire: &mut Amqp, bytes: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     for chunk in [bytes, &[][..]] {

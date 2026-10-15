@@ -1,7 +1,3 @@
-//! AMQP vertical. The connection string is the grant: the scheme states
-//! each leg's transport (`amqp://` cleartext, `amqps://` TLS from the first
-//! byte), and the rule-to-scope assembly lives here.
-
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -116,7 +112,6 @@ pub enum AmqpUriError {
   CertKeyPair,
 }
 
-/// One parsed `amqp://` or `amqps://` string.
 #[derive(Debug)]
 struct AmqpUri {
   scheme: Scheme,
@@ -128,7 +123,6 @@ struct AmqpUri {
   query: Vec<(String, String)>,
 }
 
-/// Percent-decode one URL component; only invalid UTF-8 fails.
 fn decode(raw: &str, label: &'static str) -> Result<String, AmqpUriError> {
   percent_encoding::percent_decode_str(raw)
     .decode_utf8()
@@ -139,16 +133,6 @@ fn decode(raw: &str, label: &'static str) -> Result<String, AmqpUriError> {
 impl FromStr for AmqpUri {
   type Err = AmqpUriError;
 
-  /// Parse one AMQP connection string. The user and the password are both
-  /// required: a string with no credential maps nothing. An omitted port is
-  /// 5672 for `amqp://` and 5671 for `amqps://`. The vhost is the path with
-  /// one leading slash removed, percent-decoded; no path is `/`.
-  ///
-  /// # Errors
-  ///
-  /// Returns [`AmqpUriError`] when the scheme, host, or userinfo breaks the
-  /// amqp law. The error text names the problem and never the connection
-  /// string.
   fn from_str(entry: &str) -> Result<Self, Self::Err> {
     let scheme = if entry.starts_with("amqps://") {
       Scheme::Amqps
@@ -188,7 +172,6 @@ impl FromStr for AmqpUri {
 }
 
 impl AmqpUri {
-  /// The leg a rule builds from this string.
   fn leg(self) -> AmqpLeg {
     AmqpLeg {
       host: self.host,
@@ -200,7 +183,6 @@ impl AmqpUri {
   }
 }
 
-/// Trust and identity from one `amqps://` string's query.
 struct AmqpTls {
   root_cert: Option<RootCert>,
   client_cert: Option<PathBuf>,
@@ -275,18 +257,11 @@ impl AmqpScope {
     })
   }
 
-  /// Grant-level match for a concrete request: scheme + port + host.
   pub(super) fn matches(scope: &Self, scheme: Scheme, host: &str, port: u16) -> bool {
     matches!(scheme, Scheme::Amqp | Scheme::Amqps) && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
   }
 }
 
-/// Assemble one AMQP grant from its rule.
-///
-/// # Errors
-///
-/// Returns an error when either string fails the amqp law above, or when
-/// a `tls` row tries to state what only the real string may state.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
   let fake = rule
     .value

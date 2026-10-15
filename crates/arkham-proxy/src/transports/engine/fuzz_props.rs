@@ -5,9 +5,9 @@
 //! - **Invariants** (valid framing, adversarial splits): a token split
 //!   across any arrival boundary must recombine and substitute whole;
 //!   fixed-length bodies must not drift; chunked output must re-parse.
-//!   LDAP and AMQP use the same cut loop at 256 cases: one shot, random
-//!   cuts, and one byte at a time must match, the real password must stay
-//!   off the guest-bound leg, and every run ends with the empty EOF flush.
+//!   LDAP uses the same cut loop at 256 cases: one shot, random cuts, and
+//!   one byte at a time must match, the real password must stay off the
+//!   guest-bound leg, and every run ends with the empty EOF flush.
 //! - **Crash resistance** (arbitrary bytes): no input, arrival split, or
 //!   pipelining combination may panic or hang.
 //!
@@ -1303,14 +1303,12 @@ fn ldap_truncated_prefix_closes_on_eof_for_every_cut() {
   assert_eq!(once.out, byte.out);
 }
 
-/// AMQP decoy and real PLAIN passwords. Lengths differ on purpose.
 const AMQP_FAKE: &str = "arkham_fake_amqp_pass"; // betterleaks:allow
 const AMQP_REAL: &str = "arkham_real_amqp_pass_longer_01"; // betterleaks:allow
 const AMQP_HEADER_091: &[u8] = b"AMQP\x00\x00\x09\x01";
 const AMQP_HEADER_SASL: &[u8] = b"AMQP\x03\x01\x00\x00";
 const AMQP_HEADER_10: &[u8] = b"AMQP\x00\x01\x00\x00";
 
-/// One direction the AMQP properties drive. Guest-bound output is [`AmqpLeg::Up`].
 #[derive(Clone, Copy, Debug)]
 enum AmqpLeg {
   DownSwap,
@@ -1340,7 +1338,6 @@ fn amqp_leg(leg: AmqpLeg) -> Amqp {
   }
 }
 
-/// One AMQP run through [`run_split_parts`]: output and whether the leg closed.
 fn run_amqp(leg: AmqpLeg, data: &[u8], cuts: &[usize]) -> (Vec<u8>, bool) {
   let mut sorted = cuts.to_vec();
   sorted.sort_unstable();
@@ -1348,7 +1345,6 @@ fn run_amqp(leg: AmqpLeg, data: &[u8], cuts: &[usize]) -> (Vec<u8>, bool) {
   (out, closed)
 }
 
-/// One shot, `cuts`, and one byte at a time agree on output and on closing.
 fn amqp_splits_match(leg: AmqpLeg, data: &[u8], cuts: &[usize]) -> Result<(Vec<u8>, bool), TestCaseError> {
   let once = run_amqp(leg, data, &[]);
   let split = run_amqp(leg, data, cuts);
@@ -1401,7 +1397,6 @@ fn amqp_close_091(on_channel: bool, text: &str) -> Vec<u8> {
   amqp_091(&amq_protocol::frame::AMQPFrame::Method(u16::from(on_channel), class))
 }
 
-/// One 1.0 frame with a two-word data offset.
 fn amqp_10(frame_type: u8, body: &[u8]) -> Vec<u8> {
   let size = u32::try_from(body.len().saturating_add(8)).expect("1.0 frame size");
   let mut out = size.to_be_bytes().to_vec();
@@ -1434,7 +1429,6 @@ fn amqp_sasl_outcome() -> Vec<u8> {
   amqp_10(1, &serde_amqp::to_vec(&outcome).expect("sasl-outcome"))
 }
 
-/// Which 1.0 performative carries an error description.
 #[derive(Clone, Copy, Debug)]
 enum AmqpErrorFrame {
   Close,
@@ -1462,14 +1456,12 @@ fn amqp_error_10(frame: AmqpErrorFrame, description: &str) -> Vec<u8> {
   amqp_10(0, &body.expect("1.0 error performative"))
 }
 
-/// A 1.0 `transfer` descriptor followed by `payload`: forwarded and scanned.
 fn amqp_transfer_10(payload: &[u8]) -> Vec<u8> {
   let mut body = vec![0x00, 0x53, 0x14];
   body.extend_from_slice(payload);
   amqp_10(0, &body)
 }
 
-/// Text that cannot spell either AMQP password. Both start with `a`.
 fn amqp_text() -> impl Strategy<Value = String> {
   proptest::string::string_regex("[b-z]{0,8}").expect("plain text")
 }
@@ -1482,7 +1474,6 @@ fn amqp_password() -> impl Strategy<Value = &'static str> {
   prop_oneof![Just(AMQP_FAKE), Just("guest-pass")]
 }
 
-/// Guest-to-server streams: a credential frame, then later bytes.
 fn amqp_server_bound() -> impl Strategy<Value = Vec<u8>> {
   prop_oneof![
     (amqp_mechanism(), amqp_password(), amqp_text()).prop_map(|(mechanism, password, text)| {
@@ -1534,7 +1525,6 @@ fn amqp_guest_frame_10() -> impl Strategy<Value = Vec<u8>> {
   ]
 }
 
-/// Server-to-guest streams with no password outside a rewritable field.
 fn amqp_guest_bound() -> impl Strategy<Value = Vec<u8>> {
   prop_oneof![
     proptest::collection::vec(amqp_guest_frame_091(), 1..4).prop_map(|frames| frames.concat()),
@@ -1548,7 +1538,6 @@ fn amqp_guest_bound() -> impl Strategy<Value = Vec<u8>> {
   ]
 }
 
-/// Server-to-guest frames carrying the real password somewhere.
 #[derive(Clone, Debug)]
 enum AmqpSecret {
   Close091 { on_channel: bool, pad: String },
@@ -1568,7 +1557,6 @@ impl AmqpSecret {
     }
   }
 
-  /// A rewritable text field: the decoy goes out instead.
   fn is_redacted(&self) -> bool {
     matches!(self, Self::Close091 { .. } | Self::Error10 { .. })
   }
@@ -1697,8 +1685,6 @@ proptest! {
     let _ = run_ldap(ldap_leg(leg), &data, &[cut.min(data.len())]);
   }
 
-  /// Any cut of one accepted AMQP stream matches one shot. Only a TLS
-  /// upstream sees the real password; a cleartext one gets the bytes as sent.
   #[test]
   fn prop_amqp_split_output_is_identical(
     server_bound in amqp_server_bound(),
@@ -1723,9 +1709,6 @@ proptest! {
     }
   }
 
-  /// The real password stays out of guest-bound AMQP output for every cut.
-  /// A close reply or error description carries the decoy instead; anywhere
-  /// else the leg closes.
   #[test]
   fn prop_amqp_guest_output_hides_the_real_password(
     place in prop_oneof![
@@ -1752,8 +1735,6 @@ proptest! {
     }
   }
 
-  /// A close reply cut at any offset closes on EOF, the same way for every
-  /// arrival split, and never emits the real password.
   #[test]
   fn prop_amqp_truncated_close_reply_closes_alike(
     on_channel in any::<bool>(),
@@ -1769,8 +1750,6 @@ proptest! {
     prop_assert!(!ldap_contains(&out, AMQP_REAL.as_bytes()));
   }
 
-  /// Crash resistance: arbitrary bytes after any protocol header, one cut,
-  /// either leg, then EOF.
   #[test]
   fn prop_amqp_arbitrary_no_panic(
     header in prop_oneof![Just(&[][..]), Just(AMQP_HEADER_091), Just(AMQP_HEADER_SASL), Just(AMQP_HEADER_10)],

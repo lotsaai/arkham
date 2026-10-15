@@ -1,9 +1,3 @@
-//! AMQP vertical: transport halves and the frame machine.
-//!
-//! TLS is the scheme. `amqps://` settles TLS on its leg before any AMQP byte,
-//! and `amqp://` never upgrades. Both sockets then go to [`relay_guarded`]
-//! with no session pump of their own.
-
 pub(crate) mod machine;
 
 use std::sync::Arc;
@@ -30,11 +24,8 @@ use crate::transports::engine::{Amqp, Direction};
 use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
 use rama::tls::client::ClientAuth;
 
-/// First byte of a TLS record carrying a handshake. An `amqps` guest leg
-/// opens with it; a cleartext `amqp` scope never serves it.
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 
-/// AMQP transport. Each connection string states its own leg's transport.
 #[derive(Debug)]
 pub(crate) struct AmqpTransport {
   ca: CertAuthority,
@@ -43,11 +34,6 @@ pub(crate) struct AmqpTransport {
 }
 
 impl AmqpTransport {
-  /// Build both halves over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
   pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
     Ok(Self {
       ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
@@ -60,11 +46,6 @@ impl AmqpTransport {
 impl TlsHalves for AmqpTransport {
   type Scope = AmqpScope;
 
-  /// Accept the guest's TLS, minting the leaf for `name` on first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the handshake fails.
   async fn accept_guest<G>(&self, name: &str, guest: G, guest_tls: GuestTlsMode) -> Result<ServerTlsStream<G>, Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -79,12 +60,6 @@ impl TlsHalves for AmqpTransport {
       .map_err(|err| Error::GuestAmqpTls { source: err })
   }
 
-  /// Handshake the server. Chain and host name are always verified.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the trust anchor cannot be read, when the server
-  /// name is unusable, or when the handshake fails.
   async fn connect_server<S>(&self, scope: &AmqpScope, server_name: &str, server: S) -> Result<ClientTlsStream<S>, Error>
   where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -117,8 +92,6 @@ impl TlsHalves for AmqpTransport {
 impl Transport for AmqpTransport {
   type Scope = AmqpScope;
 
-  /// The `amqp://` / `amqps://` arm. A TLS leg settles first, then both
-  /// sockets relay.
   async fn serve<G>(&self, ServeStream { mut guest, params, scope }: ServeStream<'_, G, AmqpScope>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -173,7 +146,6 @@ impl Transport for AmqpTransport {
   }
 }
 
-/// Guest bytes already read, plus whether that leg opened with TLS.
 struct OpenGuest<G> {
   stream: G,
   head: Vec<u8>,
@@ -181,8 +153,6 @@ struct OpenGuest<G> {
 }
 
 impl AmqpTransport {
-  /// Both legs already know their transport. The password is swapped only
-  /// when the upstream writer is TLS. A cleartext upstream keeps the decoy.
   async fn relay_settled<G, S>(&self, guest: OpenGuest<G>, upstream: S, scope: &AmqpScope, ctx: &PairCtx<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -214,7 +184,6 @@ impl AmqpTransport {
   }
 }
 
-/// Pump one settled pair. `swap` is set only when `server` is already TLS.
 async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>, swap: bool) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
@@ -224,8 +193,6 @@ where
   relay_guarded(guest, server, &mut downstream, &mut upstream, &[], &[]).await
 }
 
-/// Both directions for an AMQP scope. `swap` applies to the downstream leg:
-/// a cleartext upstream must keep the decoy.
 pub(crate) fn amqp_pair(ctx: &PairCtx<'_>, swap: bool) -> (Amqp, Amqp) {
   (
     Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream, swap),

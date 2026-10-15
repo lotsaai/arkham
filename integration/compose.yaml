@@ -351,9 +351,6 @@ services:
         EOF
         su-exec rabbitmq rabbitmq-plugins enable --offline rabbitmq_amqp1_0
         exec docker-entrypoint.sh rabbitmq-server
-    # Healthy only when both listeners answer, the real password
-    # authenticates, and the decoy password does not. These checks run
-    # inside the container, so the proxy cannot rewrite them.
     healthcheck:
       test:
         [
