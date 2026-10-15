@@ -268,6 +268,35 @@ async fn amqps_without_sni_mints_and_swaps_for_the_grant_host() {
 }
 
 #[tokio::test]
+async fn amqps_broker_stalls_tls_and_the_leg_closes_within_budget() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let (_bundle_dir, bundle) = ca_bundle(&ca);
+  let grants = vec![amqp_grant(
+    &format!("amqp://agent:{FAKE}@localhost:{stub_port}"),
+    &format!("amqps://svc:{VALUE}@localhost:{stub_port}?sslrootcert={}", bundle.display()),
+  )];
+  let state = test_state_with_budget(grants, Vec::new(), &ca, 1);
+  let snapshot = state.snapshot();
+  let stall = tokio::spawn(async move {
+    let (_conn, _) = stub.accept().await.unwrap();
+    std::future::pending::<()>().await;
+  });
+  let (guest, client_end) = tokio::io::duplex(8 * 1024);
+  let serve =
+    tokio::spawn(async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await });
+  let joined = tokio::time::timeout(Duration::from_secs(4), serve)
+    .await
+    .expect("broker TLS stall closed the leg within the handshake budget");
+  let err = joined.expect("serve task").expect_err("handshake budget");
+  assert!(matches!(err, crate::Error::AmqpHandshakeTimeout), "{err}");
+  drop(client_end);
+  stall.abort();
+}
+
+#[tokio::test]
 async fn amqp_without_a_grant_splices_byte_identical() {
   let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let stub_port = local_addr(&stub).port();

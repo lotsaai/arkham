@@ -141,6 +141,7 @@ impl Transport for AmqpTransport {
         upstream,
         scope,
         &ctx,
+        budget,
       )
       .await
   }
@@ -153,7 +154,14 @@ struct OpenGuest<G> {
 }
 
 impl AmqpTransport {
-  async fn relay_settled<G, S>(&self, guest: OpenGuest<G>, upstream: S, scope: &AmqpScope, ctx: &PairCtx<'_>) -> Result<(), Error>
+  async fn relay_settled<G, S>(
+    &self,
+    guest: OpenGuest<G>,
+    upstream: S,
+    scope: &AmqpScope,
+    ctx: &PairCtx<'_>,
+    budget: Duration,
+  ) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
@@ -164,23 +172,34 @@ impl AmqpTransport {
     match (tls, scope.is_upstream_tls) {
       (None, false) => relay(Prefixed::new(head, stream), upstream, ctx, swap).await,
       (Some((hello_buf, identity)), false) => {
-        let plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
-          .await?;
+        let plain = within(
+          budget,
+          self.accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls),
+        )
+        .await?;
         relay(plain, upstream, ctx, swap).await
       }
       (None, true) => {
-        let plain = self.connect_server(scope, upstream_name, upstream).await?;
+        let plain = within(budget, self.connect_server(scope, upstream_name, upstream)).await?;
         relay(Prefixed::new(head, stream), plain, ctx, swap).await
       }
       (Some((hello_buf, identity)), true) => {
-        let guest_plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
-          .await?;
-        let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
+        let guest_plain = within(
+          budget,
+          self.accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls),
+        )
+        .await?;
+        let server_plain = within(budget, self.connect_server(scope, upstream_name, upstream)).await?;
         relay(guest_plain, server_plain, ctx, swap).await
       }
     }
+  }
+}
+
+async fn within<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+  match tokio::time::timeout(budget, handshake).await {
+    Ok(result) => result,
+    Err(_elapsed) => Err(Error::AmqpHandshakeTimeout),
   }
 }
 

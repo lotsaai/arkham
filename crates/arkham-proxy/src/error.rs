@@ -349,6 +349,9 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
+  /// An AMQP TLS handshake exceeded the configured budget.
+  #[error("amqp handshake timed out")]
+  AmqpHandshakeTimeout,
   /// An SMTP TLS handshake exceeded the configured budget.
   #[error("smtp handshake timed out")]
   SmtpHandshakeTimeout,
