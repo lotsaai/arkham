@@ -134,14 +134,12 @@ impl FromStr for AmqpUri {
   type Err = AmqpUriError;
 
   fn from_str(entry: &str) -> Result<Self, Self::Err> {
-    let scheme = if entry.starts_with("amqps://") {
-      Scheme::Amqps
-    } else if entry.starts_with("amqp://") {
-      Scheme::Amqp
-    } else {
-      return Err(AmqpUriError::Scheme);
-    };
     let url = Url::parse(entry).map_err(|source| AmqpUriError::Url { source })?;
+    let scheme = match url.scheme() {
+      "amqps" => Scheme::Amqps,
+      "amqp" => Scheme::Amqp,
+      _ => return Err(AmqpUriError::Scheme),
+    };
     let host = url.host().map(|host| host.to_string()).ok_or(AmqpUriError::EmptyHost)?;
     let user = decode(url.username(), "user")?;
     if user.is_empty() {
