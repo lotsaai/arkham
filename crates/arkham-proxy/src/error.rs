@@ -328,6 +328,27 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
+  /// A guest AMQP TLS handshake fails.
+  #[error("guest amqp TLS: {source}")]
+  GuestAmqpTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
+  /// A server AMQP TLS handshake fails.
+  #[error("server amqp TLS: {source}")]
+  ServerAmqpTls {
+    /// Underlying handshake failure.
+    #[source]
+    source: IoError,
+  },
+  /// An AMQP upstream name cannot become a TLS server name.
+  #[error("amqp server name: {source}")]
+  AmqpServerName {
+    /// Underlying name failure.
+    #[source]
+    source: Box<dyn StdError + Send + Sync>,
+  },
   /// An SMTP TLS handshake exceeded the configured budget.
   #[error("smtp handshake timed out")]
   SmtpHandshakeTimeout,

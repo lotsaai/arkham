@@ -6,6 +6,7 @@
 #[cfg(test)]
 mod fuzz_props;
 
+pub(crate) use super::amqp::machine::Amqp;
 pub(crate) use super::http::h2::H2;
 pub(crate) use super::http::machine::Http;
 pub(crate) use super::ldap::machine::Ldap;

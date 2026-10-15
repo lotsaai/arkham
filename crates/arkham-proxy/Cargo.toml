@@ -8,12 +8,14 @@ repository = "https://github.com/casualjim/arkham"
 publish = false
 
 [dependencies]
+amq-protocol = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 arkham-config = { workspace = true }
 arkham-pki = { workspace = true }
 arkham-plugin = { workspace = true }
+fe2o3-amqp-types = { workspace = true }
 httlib-hpack = { workspace = true }
 httparse = { workspace = true }
 pgwire = { workspace = true }
@@ -24,6 +26,7 @@ russh = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 secrecy = { workspace = true }
+serde_amqp = { workspace = true }
 serde_json = { workspace = true }
 smtp-proto = { workspace = true }
 thiserror = { workspace = true }
