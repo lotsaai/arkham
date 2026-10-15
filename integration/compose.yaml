@@ -33,6 +33,8 @@ services:
       ARKHAM_SMTPS_REAL: ${ARKHAM_SMTPS_REAL:?copy integration/.env.example to integration/.env}
       ARKHAM_LDAP_REAL: ${ARKHAM_LDAP_REAL:?copy integration/.env.example to integration/.env}
       ARKHAM_LDAP_TLS_REAL: ${ARKHAM_LDAP_TLS_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_AMQP_REAL: ${ARKHAM_AMQP_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_AMQP_TLS_REAL: ${ARKHAM_AMQP_TLS_REAL:?copy integration/.env.example to integration/.env}
     volumes:
       - ./gen-certs.sh:/srv/gen-certs.sh:ro
       - ./gen-secrets.sh:/srv/gen-secrets.sh:ro
@@ -321,6 +323,56 @@ services:
       certs:
         condition: service_completed_successfully
 
+  # Official RabbitMQ 4.3.6 (Alpine), pinned by its manifest-list digest.
+  # The broker's one user is `svc` with the real password; `default_user`
+  # replaces the image's `guest`. 5672 is cleartext and 5671 is TLS with
+  # the demo-CA leaf. AMQP 1.0 is a core protocol in 4.x, and
+  # `rabbitmq_amqp1_0` is the no-op plugin 4.x keeps so deployment tools
+  # can still enable it. TLS does not ask for a client certificate: the
+  # demo authenticates with passwords. The key is copied and re-owned
+  # because the volume file is root-owned and the broker runs as rabbitmq.
+  amqp:
+    image: rabbitmq:4.3.6-alpine@sha256:60f9d5575c0a96f0df221fa55a9bd82118c0098f006ff08f7c8b797ef7fd0f50
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        cp /certs/amqp.key /tmp/amqp.key && chown rabbitmq:rabbitmq /tmp/amqp.key && chmod 600 /tmp/amqp.key
+        cat > /etc/rabbitmq/conf.d/90-arkham.conf <<'EOF'
+        default_user = svc
+        default_pass = arkham_real_amqp_pass_longer_01
+        listeners.tcp.default = 5672
+        listeners.ssl.default = 5671
+        ssl_options.certfile = /certs/amqp.crt
+        ssl_options.keyfile = /tmp/amqp.key
+        ssl_options.verify = verify_none
+        ssl_options.fail_if_no_peer_cert = false
+        EOF
+        su-exec rabbitmq rabbitmq-plugins enable --offline rabbitmq_amqp1_0
+        exec docker-entrypoint.sh rabbitmq-server
+    # Healthy only when both listeners answer, the real password
+    # authenticates, and the decoy password does not. These checks run
+    # inside the container, so the proxy cannot rewrite them.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "rabbitmq-diagnostics -q check_port_connectivity && rabbitmqctl -q authenticate_user svc arkham_real_amqp_pass_longer_01 >/dev/null && ! rabbitmqctl -q authenticate_user svc arkham_fake_amqp_pass >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 15s
+      retries: 30
+      start_period: 15s
+    volumes:
+      - certs:/certs:ro
+    networks:
+      server:
+        ipv4_address: 10.202.0.90
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
   # Decoy AUTH straight at the mail server, from a network namespace the
   # capture rules do not cover. Not the client: that container is the
   # confined agent and must not hold NET_ADMIN. An empty SMTP_URL skips
@@ -419,6 +471,8 @@ services:
       SMTPS_URL: smtps://agent%40demo.test:arkham_fake_smtp_pass@mail:465 # nosemgrep: deterministic demo decoy, not a credential
       LDAP_URL: ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3389 # nosemgrep: deterministic demo decoy, not a credential
       LDAP_TLS_URL: ldaps://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3636 # nosemgrep: deterministic demo decoy, not a credential
+      AMQP_URL: amqp://agent:arkham_fake_amqp_pass@amqp:5672 # nosemgrep: deterministic demo decoy, not a credential
+      AMQP_TLS_URL: amqps://agent:arkham_fake_amqp_pass@amqp:5671 # nosemgrep: deterministic demo decoy, not a credential
       SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
@@ -441,6 +495,8 @@ services:
       mail:
         condition: service_healthy
       ldap:
+        condition: service_healthy
+      amqp:
         condition: service_healthy
 
 networks:

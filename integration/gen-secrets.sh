@@ -16,6 +16,8 @@ dir=${1:-/arkham-config}
 : "${ARKHAM_SMTPS_REAL:?ARKHAM_SMTPS_REAL not set: copy integration/.env.example to integration/.env and export it}"
 : "${ARKHAM_LDAP_REAL:?ARKHAM_LDAP_REAL not set: copy integration/.env.example to integration/.env and export it}"
 : "${ARKHAM_LDAP_TLS_REAL:?ARKHAM_LDAP_TLS_REAL not set: copy integration/.env.example to integration/.env and export it}"
+: "${ARKHAM_AMQP_REAL:?ARKHAM_AMQP_REAL not set: copy integration/.env.example to integration/.env and export it}"
+: "${ARKHAM_AMQP_TLS_REAL:?ARKHAM_AMQP_TLS_REAL not set: copy integration/.env.example to integration/.env and export it}"
 
 mkdir -p "$dir"
 
@@ -64,6 +66,14 @@ value = "$ARKHAM_LDAP_REAL"
 [secrets.LDAP_TLS_URL]
 provider = "plain"
 value = "$ARKHAM_LDAP_TLS_REAL"
+
+[secrets.AMQP_URL]
+provider = "plain"
+value = "$ARKHAM_AMQP_REAL"
+
+[secrets.AMQP_TLS_URL]
+provider = "plain"
+value = "$ARKHAM_AMQP_TLS_REAL"
 EOF
 chmod -R a+rX "$dir"
 echo "fnox config ready in $dir"

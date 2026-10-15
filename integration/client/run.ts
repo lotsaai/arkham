@@ -8,8 +8,10 @@ import { spawn } from "node:child_process";
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { readFile, writeFile } from "node:fs/promises";
+import amqplib from "amqplib";
 import { RedisClient } from "bun";
 import { Client } from "ldapts";
+import rhea from "rhea";
 
 const FAKE = process.env.ARKHAM_FAKE ?? "";
 const OIDC_FAKE_SECRET = process.env.OIDC_FAKE_SECRET ?? "";
@@ -22,6 +24,9 @@ const SMTPS_URL = process.env.SMTPS_URL ?? "";
 const LDAP_URL = process.env.LDAP_URL ?? "";
 const LDAP_TLS_URL = process.env.LDAP_TLS_URL ?? "";
 const LDAP_REAL = "arkham_real_ldap_pass_01";
+const AMQP_URL = process.env.AMQP_URL ?? "";
+const AMQP_TLS_URL = process.env.AMQP_TLS_URL ?? "";
+const AMQP_REAL = "arkham_real_amqp_pass_longer_01";
 const ATTEMPT_TIMEOUT_MS = 5000;
 const SCENARIO_BUDGET_MS = 20000;
 const TOTAL_BUDGET_MS = 90000;
@@ -666,6 +671,121 @@ if (LDAP_TLS_URL) {
   });
 } else {
   stage("ldaps scenarios skipped: no LDAP_TLS_URL");
+}
+
+function amqpParts(raw: string) {
+  const url = new URL(raw);
+  return {
+    host: url.hostname,
+    port: Number(url.port),
+    user: decodeURIComponent(url.username),
+    password: decodeURIComponent(url.password),
+  };
+}
+
+function amqpWithPassword(raw: string, password: string): string {
+  const url = new URL(raw);
+  url.password = encodeURIComponent(password);
+  return url.toString();
+}
+
+// 0-9-1 through amqplib: open, declare a server-named queue, publish with a
+// confirm, and read the message back. RabbitMQ refuses the decoy, so a
+// delivered message proves the swap.
+async function amqp091RoundTrip(raw: string): Promise<boolean> {
+  const conn = await race("amqp 0-9-1 open", amqplib.connect(raw, { ca: [ca], timeout: ATTEMPT_TIMEOUT_MS }));
+  try {
+    const channel = await race("amqp 0-9-1 channel", conn.createConfirmChannel());
+    const { queue } = await race("amqp 0-9-1 declare", channel.assertQueue("", { exclusive: true }));
+    channel.sendToQueue(queue, Buffer.from("amqp-ok"));
+    await race("amqp 0-9-1 confirm", channel.waitForConfirms());
+    const message = await race("amqp 0-9-1 get", channel.get(queue, { noAck: true }));
+    stage(`amqp 0-9-1 get: ${message === false ? "empty" : message.content.toString()}`);
+    return message !== false && message.content.toString() === "amqp-ok";
+  } finally {
+    await race("amqp 0-9-1 close", conn.close()).catch(() => undefined);
+  }
+}
+
+async function amqp091Refusal(raw: string): Promise<string> {
+  try {
+    const conn = await race("amqp 0-9-1 open", amqplib.connect(raw, { ca: [ca], timeout: ATTEMPT_TIMEOUT_MS }));
+    await race("amqp 0-9-1 close", conn.close()).catch(() => undefined);
+    return "opened";
+  } catch (err) {
+    return String(err);
+  }
+}
+
+// 1.0 through rhea: SASL PLAIN, then the broker's open. RabbitMQ answers a
+// refused login with a SASL outcome and never sends open, so an open
+// proves the swap. `vhost:/` names the default vhost.
+function amqp10Open(raw: string, tls: boolean, password: string): Promise<string> {
+  const parts = amqpParts(raw);
+  return race("amqp 1.0 open", new Promise<string>((resolve) => {
+    const connection = rhea.create_container().connect({
+      host: parts.host,
+      port: parts.port,
+      transport: tls ? "tls" : "tcp",
+      ca: [ca],
+      servername: parts.host,
+      username: parts.user,
+      password,
+      hostname: "vhost:/",
+      reconnect: false,
+    });
+    connection.on("connection_open", () => {
+      connection.close();
+      resolve("open");
+    });
+    connection.on("connection_error", (context) => {
+      const error = context.error as { condition?: string; description?: string } | undefined;
+      resolve(`error ${error?.condition ?? ""} ${error?.description ?? ""}`.trim());
+    });
+    connection.on("disconnected", (context) => {
+      resolve(`disconnected ${String(context.error ?? "")}`.trim());
+    });
+  }));
+}
+
+// Both real strings are amqps://, so the cleartext guest leg on 5672 still
+// reaches the broker over TLS and is rewritten. The client holds only the
+// decoy user and password; the broker knows only `svc` and the real one.
+async function amqpScenarios(scheme: "amqp" | "amqps", raw: string) {
+  const tls = scheme === "amqps";
+  const parts = amqpParts(raw);
+
+  await retry(scheme, `${scheme} 0-9-1 PLAIN swaps the decoy user and password`, () => amqp091RoundTrip(raw));
+
+  await retry(scheme, `${scheme} 1.0 SASL PLAIN swaps the decoy user and password`, async () => {
+    const outcome = await amqp10Open(raw, tls, parts.password);
+    stage(`${scheme} 1.0 outcome: ${outcome}`);
+    return outcome === "open";
+  });
+
+  await retry(scheme, `${scheme} 0-9-1 non-decoy password is not swapped`, async () => {
+    const text = await amqp091Refusal(amqpWithPassword(raw, "not-the-amqp-decoy"));
+    stage(`${scheme} 0-9-1 refusal: ${text}`);
+    return /ACCESS.REFUSED/.test(text) && !text.includes(AMQP_REAL);
+  });
+
+  await retry(scheme, `${scheme} 1.0 non-decoy password is not swapped`, async () => {
+    const outcome = await amqp10Open(raw, tls, "not-the-amqp-decoy");
+    stage(`${scheme} 1.0 refusal: ${outcome}`);
+    return outcome.includes("amqp:unauthorized-access") && !outcome.includes(AMQP_REAL);
+  });
+}
+
+if (AMQP_URL) {
+  await amqpScenarios("amqp", AMQP_URL);
+} else {
+  stage("amqp scenarios skipped: no AMQP_URL");
+}
+
+if (AMQP_TLS_URL) {
+  await amqpScenarios("amqps", AMQP_TLS_URL);
+} else {
+  stage("amqps scenarios skipped: no AMQP_TLS_URL");
 }
 
 const coveredPath = process.env.ARKHAM_COVERED ?? "";

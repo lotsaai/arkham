@@ -19,6 +19,7 @@ Underneath sits a grant-scoped proxy. A workload can also point its proxy settin
 | Redis | RESP `AUTH` and `HELLO` passwords swapped. A TLS leaf is minted for the scope host when the client sends no SNI. |
 | SMTP | `AUTH PLAIN`, `AUTH LOGIN`, `AUTH XOAUTH2`, and `AUTH OAUTHBEARER` credentials swapped once the upstream leg is TLS. A cleartext upstream forwards the decoy. `STARTTLS` upgrades the same sockets; `smtps://` is TLS from the first byte. |
 | LDAP | Simple-bind password swapped. StartTLS and LDAPS mint a leaf for the scope host when the client sends no SNI. |
+| AMQP | SASL `PLAIN` user and password swapped in the 0-9-1 `connection.start-ok` and the 1.0 `sasl-init`, once the upstream leg is TLS. A cleartext upstream forwards the decoy. Other mechanisms pass through. Close and error texts that carry the real password reach the client as the decoy. |
 | Raw TCP | Equal-length byte swap that never reframes; everything else splices untouched. |
 
 ## Install
