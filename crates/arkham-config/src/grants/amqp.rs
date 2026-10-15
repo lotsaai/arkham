@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use secrecy::{ExposeSecret as _, SecretString};
-use url::Url;
+use url::{Host, Url};
 
 use super::{Credential, Grant, GuestTlsMode, RootCert, Scheme};
 use crate::config::RuleCfg;
@@ -140,7 +140,12 @@ impl FromStr for AmqpUri {
       "amqp" => Scheme::Amqp,
       _ => return Err(AmqpUriError::Scheme),
     };
-    let host = url.host().map(|host| host.to_string()).ok_or(AmqpUriError::EmptyHost)?;
+    let host = match url.host() {
+      Some(Host::Domain(domain)) => domain.to_string(),
+      Some(Host::Ipv4(addr)) => addr.to_string(),
+      Some(Host::Ipv6(addr)) => addr.to_string(),
+      None => return Err(AmqpUriError::EmptyHost),
+    };
     let user = decode(url.username(), "user")?;
     if user.is_empty() {
       return Err(AmqpUriError::UserRequired);
@@ -329,6 +334,14 @@ mod tests {
       assert_hides(&real, &err.to_string(), problem);
       assert_hides(&fake, &err.to_string(), problem);
     }
+  }
+
+  #[test]
+  fn amqp_uri_ipv6_host_has_no_brackets() {
+    let uri = "amqps://u:p@[::1]:5671".parse::<super::AmqpUri>().expect("ipv6"); // betterleaks:allow
+    assert_eq!(uri.host, "::1");
+    assert_eq!(uri.port, 5671);
+    assert!(matches!(uri.scheme, super::Scheme::Amqps));
   }
 
   #[test]
