@@ -28,6 +28,10 @@ const HEADER_LEN: usize = 8;
 
 const HEADER_LEAD: u8 = b'A';
 
+/// A credential or close frame is stored only up to this many bytes.
+/// A larger declared size is forwarded and scanned.
+pub(crate) const MAX_CREDENTIAL_FRAME: usize = 16_384;
+
 const HEAD_091: usize = 7;
 
 const METHOD_IDS_091: usize = 4;
@@ -333,6 +337,9 @@ impl Amqp {
       return Ok(Classified::AbsoluteHead(HEAD_091));
     };
     let total = HEAD_091.checked_add(size).and_then(|len| len.checked_add(1)).ok_or(())?;
+    if total > MAX_CREDENTIAL_FRAME {
+      return Ok(Classified::Forward { total });
+    }
     if buf.first() != Some(&FRAME_METHOD) || size < METHOD_IDS_091 {
       return Ok(Classified::Forward { total });
     }
@@ -356,6 +363,9 @@ impl Amqp {
     let data_offset = usize::from(doff).checked_mul(4).ok_or(())?;
     if data_offset < HEAD_10 || data_offset > total {
       return Err(());
+    }
+    if total > MAX_CREDENTIAL_FRAME {
+      return Ok(Classified::Forward { total });
     }
     let forward = Classified::Forward { total };
     let wanted = match frame_type {
@@ -401,6 +411,12 @@ impl Amqp {
     out: &mut Vec<u8>,
     hits: &mut Vec<Hit>,
   ) -> Result<(), ()> {
+    if total > MAX_CREDENTIAL_FRAME {
+      self.pass(&buf, out)?;
+      let left = total.checked_sub(buf.len()).ok_or(())?;
+      self.phase = self.forward_rest(left, input, out)?;
+      return Ok(());
+    }
     take(&mut buf, total, input);
     if buf.len() < total {
       self.phase = Phase::Frame { buf, total, kind };

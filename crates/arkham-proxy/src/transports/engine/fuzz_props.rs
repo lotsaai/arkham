@@ -28,6 +28,7 @@ use secrecy::SecretString;
 
 use crate::transports::smtp::{GuestLeg, MAX_COMMAND, Smtp, acceptance_reply, plain_guest};
 
+use super::super::amqp::machine::MAX_CREDENTIAL_FRAME;
 use super::{Amqp, Direction, Http, Ldap, Raw, Rewritten, Wire};
 use crate::transports::http::h2::{H2, H2_PREFACE};
 
@@ -1397,6 +1398,50 @@ fn amqp_close_091(on_channel: bool, text: &str) -> Vec<u8> {
   amqp_091(&amq_protocol::frame::AMQPFrame::Method(u16::from(on_channel), class))
 }
 
+fn amqp_oversize_method(class: u16, method: u16) -> Vec<u8> {
+  let payload = MAX_CREDENTIAL_FRAME;
+  let mut frame = Vec::with_capacity(payload.saturating_add(8));
+  frame.push(1);
+  frame.extend_from_slice(&0u16.to_be_bytes());
+  frame.extend_from_slice(&u32::try_from(payload).expect("payload").to_be_bytes());
+  frame.extend_from_slice(&class.to_be_bytes());
+  frame.extend_from_slice(&method.to_be_bytes());
+  frame.resize(payload.saturating_add(7), b'b');
+  frame.push(0xCE);
+  frame
+}
+
+fn amqp_oversize_performative(frame_type: u8, code: u8) -> Vec<u8> {
+  let total = MAX_CREDENTIAL_FRAME.saturating_add(8);
+  let mut frame = Vec::with_capacity(total);
+  frame.extend_from_slice(&u32::try_from(total).expect("size").to_be_bytes());
+  frame.extend([2, frame_type, 0, 0]);
+  frame.extend([0x00, 0x53, code]);
+  frame.resize(total, b'b');
+  frame
+}
+
+fn amqp_oversize_clean(leg: AmqpLeg, sasl: bool, on_channel: bool) -> Vec<u8> {
+  match (leg, sasl) {
+    (AmqpLeg::Up, false) => amqp_oversize_method(if on_channel { 20 } else { 10 }, if on_channel { 40 } else { 50 }),
+    (AmqpLeg::Up, true) => {
+      let mut out = AMQP_HEADER_10.to_vec();
+      out.extend(amqp_oversize_performative(0, 0x18));
+      out
+    }
+    (_, false) => {
+      let mut out = AMQP_HEADER_091.to_vec();
+      out.extend(amqp_oversize_method(10, 11));
+      out
+    }
+    (_, true) => {
+      let mut out = AMQP_HEADER_SASL.to_vec();
+      out.extend(amqp_oversize_performative(1, 0x41));
+      out
+    }
+  }
+}
+
 fn amqp_10(frame_type: u8, body: &[u8]) -> Vec<u8> {
   let size = u32::try_from(body.len().saturating_add(8)).expect("1.0 frame size");
   let mut out = size.to_be_bytes().to_vec();
@@ -1748,6 +1793,21 @@ proptest! {
     let (out, closed) = amqp_splits_match(AmqpLeg::Up, prefix, &scaled)?;
     prop_assert!(closed);
     prop_assert!(!ldap_contains(&out, AMQP_REAL.as_bytes()));
+  }
+
+  #[test]
+  fn prop_amqp_oversize_declared_frame_forwards(
+    leg in prop_oneof![Just(AmqpLeg::DownSwap), Just(AmqpLeg::DownClear), Just(AmqpLeg::Up)],
+    sasl in any::<bool>(),
+    on_channel in any::<bool>(),
+    cuts in proptest::collection::vec(any::<usize>(), 0..6),
+  ) {
+    let frame = amqp_oversize_clean(leg, sasl, on_channel);
+    prop_assert!(frame.len() > MAX_CREDENTIAL_FRAME);
+    let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % frame.len()).collect();
+    let (out, closed) = amqp_splits_match(leg, &frame, &scaled)?;
+    prop_assert!(!closed);
+    prop_assert_eq!(&out, &frame);
   }
 
   #[test]
