@@ -2,65 +2,50 @@ use std::borrow::Cow;
 use std::str::FromStr;
 
 use amq_protocol::auth::SASLMechanism;
-use amq_protocol::frame::{AMQPFrame, WriteContext, gen_frame, parse_frame};
+use amq_protocol::frame::parsing::parse_frame_type;
+use amq_protocol::frame::{AMQPFrame, ParserError, ProtocolVersion, WriteContext, gen_frame, parse_frame};
 use amq_protocol::protocol::constants::{FRAME_END, FRAME_METHOD};
 use amq_protocol::protocol::{AMQPClass, channel, connection};
 use amq_protocol::types::ShortString;
+use amq_protocol::types::parsing::{parse_id, parse_long_uint};
 use arkham_config::grants::Grant;
-use fe2o3_amqp_types::definitions::Error as AmqpError;
+use fe2o3_amqp_types::definitions::{Error as AmqpError, MAJOR, MINOR, REVISION};
 use fe2o3_amqp_types::performatives::{Close, Detach, End};
 use fe2o3_amqp_types::primitives::Binary;
 use fe2o3_amqp_types::sasl::{SaslInit, SaslResponse};
 use secrecy::ExposeSecret as _;
+use serde_amqp::descriptor::Descriptor;
 use serde_amqp::serde::{Deserialize, Serialize};
 
 use crate::transports::engine::{
   CredentialPair, Direction, Hit, Location, Rewritten, Wire, find_new_match, needle_prefix_suffix_len, replace_bytes,
 };
 
-const HEADER_091: &[u8] = b"AMQP\x00\x00\x09\x01";
-
-const HEADER_SASL: &[u8] = b"AMQP\x03\x01\x00\x00";
-
-const HEADER_10: &[u8] = b"AMQP\x00\x01\x00\x00";
-
-const HEADER_LEN: usize = 8;
-
-const HEADER_LEAD: u8 = b'A';
+/// Protocol header length. `parse_protocol_header` does not return a partial version.
+const PROTOCOL_HEADER_LEN: usize = 8;
 
 /// A credential or close frame is stored only up to this many bytes.
 /// A larger declared size is forwarded and scanned.
 pub(crate) const MAX_CREDENTIAL_FRAME: usize = 16_384;
 
-const HEAD_091: usize = 7;
+const TYPE_CHANNEL_AND_SIZE: usize = 7;
 
-const METHOD_IDS_091: usize = 4;
+const CLASS_AND_METHOD_IDS: usize = 4;
 
-const METHOD_AT_091: usize = HEAD_091 + 2;
+const FRAME_HEADER_10: usize = 8;
 
-const METHOD_HEAD_091: usize = HEAD_091 + METHOD_IDS_091;
+/// AMQP frame type. Not exported by `fe2o3-amqp-types`.
+const FRAME_AMQP: u8 = 0;
 
+/// SASL frame type. Not exported by `fe2o3-amqp-types`.
+const FRAME_SASL: u8 = 1;
+
+/// Class and method ids. `amq-protocol` embeds these in generated match arms.
 const START_OK: (u16, u16) = (10, 11);
 
 const CONNECTION_CLOSE: (u16, u16) = (10, 50);
 
 const CHANNEL_CLOSE: (u16, u16) = (20, 40);
-
-const HEAD_10: usize = 8;
-
-const FRAME_AMQP: u8 = 0;
-
-const FRAME_SASL: u8 = 1;
-
-const DESCRIBED: u8 = 0x00;
-
-const SMALL_ULONG: u8 = 0x53;
-
-const ULONG: u8 = 0x80;
-
-const SYMBOL8: u8 = 0xa3;
-
-const SYMBOL32: u8 = 0xb3;
 
 const SASL_INIT: u64 = 0x41;
 const SASL_RESPONSE: u64 = 0x43;
@@ -151,12 +136,6 @@ enum Classified {
   AbsoluteHead(usize),
   Hold { total: usize, kind: Kind },
   Forward { total: usize },
-}
-
-enum Descriptor {
-  Need(usize),
-  Absent,
-  Code(u64),
 }
 
 impl Amqp {
@@ -276,26 +255,21 @@ impl Amqp {
   /// a frame instead is 0-9-1. Any header the machine does not frame
   /// forwards the rest of the stream.
   fn drive_header(&mut self, mut buf: Vec<u8>, input: &mut &[u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Result<(), ()> {
-    if buf.is_empty() && input.first().is_some_and(|lead| *lead != HEADER_LEAD) {
+    if buf.is_empty() && input.first().is_some_and(|lead| *lead != protocol_lead()) {
       if self.down.is_some() {
         return self.opaque(input, out);
       }
       self.framer = Framer::V091;
       return self.drive_head(Vec::new(), input, out, hits);
     }
-    take(&mut buf, HEADER_LEN, input);
-    if buf.len() < HEADER_LEN {
+    // `parse_protocol_header` returns Incomplete on a short slice and does not yield a partial version.
+    take(&mut buf, PROTOCOL_HEADER_LEN, input);
+    if buf.len() < PROTOCOL_HEADER_LEN {
       self.phase = Phase::Header(buf);
       return Ok(());
     }
     self.pass(&buf, out)?;
-    let framer = match (self.down.is_some(), buf.as_slice()) {
-      (true, HEADER_091) => Some(Framer::V091),
-      (_, HEADER_SASL) => Some(Framer::V10 { sasl: true }),
-      (false, HEADER_10) => Some(Framer::V10 { sasl: false }),
-      _ => None,
-    };
-    self.phase = match framer {
+    self.phase = match header_framer(self.down.is_some(), &buf) {
       Some(framer) => {
         self.framer = framer;
         Phase::Head(Vec::new())
@@ -306,7 +280,7 @@ impl Amqp {
   }
 
   fn drive_head(&mut self, mut buf: Vec<u8>, input: &mut &[u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Result<(), ()> {
-    if buf.is_empty() && self.framer == (Framer::V10 { sasl: true }) && input.first() == Some(&HEADER_LEAD) {
+    if buf.is_empty() && self.framer == (Framer::V10 { sasl: true }) && input.first() == Some(&protocol_lead()) {
       if self.down.is_some() {
         return self.opaque(input, out);
       }
@@ -343,20 +317,27 @@ impl Amqp {
   }
 
   fn classify_091(&self, buf: &[u8]) -> Result<Classified, ()> {
-    let Some(size) = be_u32(buf, 3) else {
-      return Ok(Classified::AbsoluteHead(HEAD_091));
+    let Some(size) = payload_len_091(buf)? else {
+      return Ok(Classified::AbsoluteHead(TYPE_CHANNEL_AND_SIZE));
     };
-    let total = HEAD_091.checked_add(size).and_then(|len| len.checked_add(1)).ok_or(())?;
+    let total = TYPE_CHANNEL_AND_SIZE
+      .checked_add(size)
+      .and_then(|len| len.checked_add(1))
+      .ok_or(())?;
     if total > MAX_CREDENTIAL_FRAME {
       return Ok(Classified::Forward { total });
     }
-    if buf.first() != Some(&FRAME_METHOD) || size < METHOD_IDS_091 {
+    if buf.first() != Some(&FRAME_METHOD) || size < CLASS_AND_METHOD_IDS {
       return Ok(Classified::Forward { total });
     }
-    let (Some(class), Some(method)) = (be_u16(buf, HEAD_091), be_u16(buf, METHOD_AT_091)) else {
-      return Ok(Classified::AbsoluteHead(METHOD_HEAD_091));
+    let method_head = TYPE_CHANNEL_AND_SIZE + CLASS_AND_METHOD_IDS;
+    let Some(payload) = buf.get(TYPE_CHANNEL_AND_SIZE..) else {
+      return Ok(Classified::AbsoluteHead(method_head));
     };
-    let kind = match (class, method) {
+    let Some((class_id, method_id)) = method_ids(payload)? else {
+      return Ok(Classified::AbsoluteHead(method_head));
+    };
+    let kind = match (class_id, method_id) {
       START_OK if self.down.is_some() => Kind::StartOk,
       CONNECTION_CLOSE | CHANNEL_CLOSE if self.up.is_some() => Kind::Close091,
       _ => return Ok(Classified::Forward { total }),
@@ -364,15 +345,18 @@ impl Amqp {
     Ok(Classified::Hold { total, kind })
   }
 
-  /// A 1.0 head: size, data offset, type, channel, then the performative's
-  /// descriptor. The credential and close names map to their numeric codes.
-  /// Any other symbol is forwarded and scanned.
   fn classify_10(&self, buf: &[u8]) -> Result<Classified, ()> {
-    let (Some(total), Some(&doff), Some(&frame_type)) = (be_u32(buf, 0), buf.get(4), buf.get(5)) else {
-      return Ok(Classified::AbsoluteHead(HEAD_10));
+    let Some((after_size, total)) = frame_len_10(buf)? else {
+      return Ok(Classified::AbsoluteHead(FRAME_HEADER_10));
+    };
+    let Some((&doff, after_doff)) = after_size.split_first() else {
+      return Ok(Classified::AbsoluteHead(FRAME_HEADER_10));
+    };
+    let Some(&frame_type) = after_doff.first() else {
+      return Ok(Classified::AbsoluteHead(FRAME_HEADER_10));
     };
     let data_offset = usize::from(doff).checked_mul(4).ok_or(())?;
-    if data_offset < HEAD_10 || data_offset > total {
+    if data_offset < FRAME_HEADER_10 || data_offset > total {
       return Err(());
     }
     if total > MAX_CREDENTIAL_FRAME {
@@ -384,27 +368,26 @@ impl Amqp {
       FRAME_AMQP => self.up.is_some(),
       _ => false,
     };
-    let code_at = data_offset.checked_add(2).ok_or(())?;
-    if !wanted || code_at > total {
+    if !wanted || data_offset == total {
       return Ok(forward);
     }
-    let Some(&[constructor, encoding]) = buf.get(data_offset..code_at) else {
-      return Ok(Classified::AbsoluteHead(code_at));
-    };
-    if constructor != DESCRIBED {
-      return Ok(forward);
+    if buf.len() < data_offset {
+      return Ok(Classified::AbsoluteHead(data_offset));
     }
-    let descriptor = match encoding {
-      SMALL_ULONG => read_ulong(buf, code_at, 1, total),
-      ULONG => read_ulong(buf, code_at, 8, total),
-      SYMBOL8 => read_symbol(buf, code_at, total, false),
-      SYMBOL32 => read_symbol(buf, code_at, total, true),
-      _ => Descriptor::Absent,
+    let end = buf.len().min(total);
+    let Some(body) = buf.get(data_offset..end) else {
+      return Ok(forward);
     };
-    let code = match descriptor {
-      Descriptor::Need(need) => return Ok(Classified::AbsoluteHead(need)),
-      Descriptor::Absent => return Ok(forward),
-      Descriptor::Code(code) => code,
+    let code = match descriptor_code(body) {
+      DescriptorRead::Code(code) => code,
+      DescriptorRead::Forward => return Ok(forward),
+      DescriptorRead::Need => {
+        let need = buf.len().checked_add(1).ok_or(())?;
+        if need > total {
+          return Ok(forward);
+        }
+        return Ok(Classified::AbsoluteHead(need));
+      }
     };
     let kind = match (frame_type, code) {
       (FRAME_SASL, SASL_INIT) => Kind::SaslInit,
@@ -628,56 +611,132 @@ impl Amqp {
   }
 }
 
-fn symbol_code(name: &[u8]) -> Option<u64> {
-  match name {
-    b"amqp:sasl-init:list" => Some(SASL_INIT),
-    b"amqp:sasl-response:list" => Some(SASL_RESPONSE),
-    b"amqp:detach:list" => Some(DETACH),
-    b"amqp:end:list" => Some(END),
-    b"amqp:close:list" => Some(CLOSE),
-    _ => None,
+enum DescriptorRead {
+  Code(u64),
+  Need,
+  Forward,
+}
+
+fn protocol_lead() -> u8 {
+  amq_protocol::protocol::metadata::NAME.as_bytes().first().copied().unwrap_or(0)
+}
+
+/// SASL header. `parse_protocol_header` accepts only protocol id 0, so id 3 never parses.
+fn sasl_header() -> [u8; PROTOCOL_HEADER_LEN] {
+  let mut bytes = [0u8; PROTOCOL_HEADER_LEN];
+  for (slot, byte) in bytes.iter_mut().zip(amq_protocol::protocol::metadata::NAME.as_bytes()) {
+    *slot = *byte;
   }
+  if let Some(id) = bytes.get_mut(4) {
+    *id = 3;
+  }
+  if let Some(major) = bytes.get_mut(5) {
+    *major = MAJOR;
+  }
+  if let Some(minor) = bytes.get_mut(6) {
+    *minor = MINOR;
+  }
+  if let Some(revision) = bytes.get_mut(7) {
+    *revision = REVISION;
+  }
+  bytes
 }
 
-fn read_ulong(buf: &[u8], at: usize, len: usize, total: usize) -> Descriptor {
-  let Some(end) = at.checked_add(len).filter(|end| *end <= total) else {
-    return Descriptor::Absent;
-  };
-  let Some(bytes) = buf.get(at..end) else {
-    return Descriptor::Need(end);
-  };
-  let code = bytes.iter().fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
-  Descriptor::Code(code)
-}
-
-fn read_symbol(buf: &[u8], at: usize, total: usize, wide: bool) -> Descriptor {
-  let width = if wide { 4 } else { 1 };
-  let Some(len_end) = at.checked_add(width).filter(|end| *end <= total) else {
-    return Descriptor::Absent;
-  };
-  let Some(len_bytes) = buf.get(at..len_end) else {
-    return Descriptor::Need(len_end);
-  };
-  let len = match len_bytes {
-    [len] => usize::from(*len),
-    [a, b, c, d] => {
-      let Ok(len) = usize::try_from(u32::from_be_bytes([*a, *b, *c, *d])) else {
-        return Descriptor::Absent;
-      };
-      len
+fn header_framer(downstream: bool, buf: &[u8]) -> Option<Framer> {
+  if let Ok((rest, AMQPFrame::ProtocolHeader(version))) = parse_frame(buf) {
+    if rest.is_empty() && downstream && version == ProtocolVersion::amqp_0_9_1() {
+      return Some(Framer::V091);
     }
-    _ => return Descriptor::Absent,
-  };
-  let Some(end) = len_end.checked_add(len).filter(|end| *end <= total) else {
-    return Descriptor::Absent;
-  };
-  let Some(name) = buf.get(len_end..end) else {
-    return Descriptor::Need(end);
-  };
-  match symbol_code(name) {
-    Some(code) => Descriptor::Code(code),
-    None => Descriptor::Absent,
+    if rest.is_empty() && !downstream && version.major == MAJOR && version.minor == MINOR && version.revision == REVISION {
+      return Some(Framer::V10 { sasl: false });
+    }
   }
+  if buf == sasl_header().as_slice() {
+    return Some(Framer::V10 { sasl: true });
+  }
+  None
+}
+
+fn payload_len_091(buf: &[u8]) -> Result<Option<usize>, ()> {
+  let after_type = match parse_frame_type(buf) {
+    Ok((rest, _)) => rest,
+    Err(ParserError::Incomplete(_)) => return Ok(None),
+    Err(_) => match buf.get(1..) {
+      Some(rest) => rest,
+      None => return Ok(None),
+    },
+  };
+  let after_channel = match parse_id(after_type) {
+    Ok((rest, _)) => rest,
+    Err(ParserError::Incomplete(_)) => return Ok(None),
+    Err(_) => return Err(()),
+  };
+  long_uint(after_channel)
+}
+
+fn method_ids(payload: &[u8]) -> Result<Option<(u16, u16)>, ()> {
+  let (rest, class_id) = match parse_id(payload) {
+    Ok(parsed) => parsed,
+    Err(ParserError::Incomplete(_)) => return Ok(None),
+    Err(_) => return Err(()),
+  };
+  match parse_id(rest) {
+    Ok((_, method_id)) => Ok(Some((class_id, method_id))),
+    Err(ParserError::Incomplete(_)) => Ok(None),
+    Err(_) => Err(()),
+  }
+}
+
+fn frame_len_10(buf: &[u8]) -> Result<Option<(&[u8], usize)>, ()> {
+  match parse_long_uint(buf) {
+    Ok((rest, size)) => {
+      let total = usize::try_from(size).map_err(|_wide| ())?;
+      Ok(Some((rest, total)))
+    }
+    Err(ParserError::Incomplete(_)) => Ok(None),
+    Err(_) => Err(()),
+  }
+}
+
+fn long_uint(buf: &[u8]) -> Result<Option<usize>, ()> {
+  match parse_long_uint(buf) {
+    Ok((_, value)) => usize::try_from(value).map(Some).map_err(|_wide| ()),
+    Err(ParserError::Incomplete(_)) => Ok(None),
+    Err(_) => Err(()),
+  }
+}
+
+fn descriptor_code(body: &[u8]) -> DescriptorRead {
+  if body.is_empty() {
+    return DescriptorRead::Need;
+  }
+  // `to_vec` of a descriptor starts with the described-type marker.
+  match serde_amqp::from_slice::<Descriptor>(body) {
+    Ok(descriptor) => match code_of(&descriptor) {
+      Some(code) => DescriptorRead::Code(code),
+      None => DescriptorRead::Forward,
+    },
+    Err(err) if descriptor_is_short(&err) => DescriptorRead::Need,
+    Err(_) => DescriptorRead::Forward,
+  }
+}
+
+fn code_of(descriptor: &Descriptor) -> Option<u64> {
+  match descriptor {
+    Descriptor::Code(code) => Some(*code),
+    Descriptor::Name(name) => match name.as_str() {
+      "amqp:sasl-init:list" => Some(SASL_INIT),
+      "amqp:sasl-response:list" => Some(SASL_RESPONSE),
+      "amqp:detach:list" => Some(DETACH),
+      "amqp:end:list" => Some(END),
+      "amqp:close:list" => Some(CLOSE),
+      _ => None,
+    },
+  }
+}
+
+fn descriptor_is_short(err: &serde_amqp::Error) -> bool {
+  matches!(err, serde_amqp::Error::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
 fn take(buf: &mut Vec<u8>, want: usize, input: &mut &[u8]) {
@@ -686,16 +745,6 @@ fn take(buf: &mut Vec<u8>, want: usize, input: &mut &[u8]) {
     buf.extend_from_slice(head);
     *input = rest;
   }
-}
-
-fn be_u16(buf: &[u8], at: usize) -> Option<u16> {
-  let bytes = buf.get(at..at.checked_add(2)?)?;
-  Some(u16::from_be_bytes(bytes.try_into().ok()?))
-}
-
-fn be_u32(buf: &[u8], at: usize) -> Option<usize> {
-  let bytes = buf.get(at..at.checked_add(4)?)?;
-  usize::try_from(u32::from_be_bytes(bytes.try_into().ok()?)).ok()
 }
 
 fn rewrite_plain(token: &[u8], down: &Down) -> Option<Vec<u8>> {
@@ -734,6 +783,7 @@ fn encode_10<T: Serialize>(buf: &[u8], performative: &T) -> Result<Vec<u8>, ()> 
   let at = data_offset(buf)?;
   let body = serde_amqp::to_vec(performative).map_err(|_encode| ())?;
   let size = u32::try_from(at.checked_add(body.len()).ok_or(())?).map_err(|_wide| ())?;
+  // The original doff, type, channel, and extended header stay. No standalone encoder preserves them.
   let mut frame = Vec::with_capacity(at.saturating_add(body.len()));
   frame.extend_from_slice(&size.to_be_bytes());
   frame.extend_from_slice(buf.get(4..at).ok_or(())?);
