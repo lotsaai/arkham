@@ -877,7 +877,158 @@ fn data_offset(buf: &[u8]) -> Result<usize, ()> {
 
 fn decode_10<'de, T: Deserialize<'de>>(buf: &'de [u8]) -> Result<T, ()> {
   let body = buf.get(data_offset(buf)?..).ok_or(())?;
+  consume_value(body, PERFORMATIVE_NESTING)?;
   serde_amqp::from_slice(body).map_err(|_decode| ())
+}
+
+/// Nested described values in the performatives this machine decodes.
+/// Deeper input is rejected before `from_slice`.
+const PERFORMATIVE_NESTING: usize = 8;
+
+fn consume_value(buf: &[u8], nest: usize) -> Result<usize, ()> {
+  if nest == 0 {
+    return Err(());
+  }
+  let (&byte, rest) = buf.split_first().ok_or(())?;
+  let code = serde_amqp::format_code::EncodingCodes::try_from(byte).map_err(|_code| ())?;
+  let used = consume_payload(&code, rest, nest)?;
+  used.checked_add(1).ok_or(())
+}
+
+fn consume_payload(code: &serde_amqp::format_code::EncodingCodes, buf: &[u8], nest: usize) -> Result<usize, ()> {
+  use serde_amqp::format_code::EncodingCodes;
+  match code {
+    EncodingCodes::DescribedType => consume_described(buf, nest),
+    EncodingCodes::Null
+    | EncodingCodes::BooleanTrue
+    | EncodingCodes::BooleanFalse
+    | EncodingCodes::Uint0
+    | EncodingCodes::Ulong0
+    | EncodingCodes::List0 => Ok(0),
+    EncodingCodes::Boolean
+    | EncodingCodes::Ubyte
+    | EncodingCodes::SmallUint
+    | EncodingCodes::SmallUlong
+    | EncodingCodes::Byte
+    | EncodingCodes::SmallInt
+    | EncodingCodes::SmallLong => fixed_payload(buf, 1),
+    EncodingCodes::Ushort | EncodingCodes::Short => fixed_payload(buf, 2),
+    EncodingCodes::Uint | EncodingCodes::Int | EncodingCodes::Float | EncodingCodes::Char | EncodingCodes::Decimal32 => {
+      fixed_payload(buf, 4)
+    }
+    EncodingCodes::Ulong | EncodingCodes::Long | EncodingCodes::Double | EncodingCodes::Timestamp | EncodingCodes::Decimal64 => {
+      fixed_payload(buf, 8)
+    }
+    EncodingCodes::Decimal128 | EncodingCodes::Uuid => fixed_payload(buf, 16),
+    EncodingCodes::Vbin8 | EncodingCodes::Str8 | EncodingCodes::Sym8 => variable_payload(buf, 1),
+    EncodingCodes::Vbin32 | EncodingCodes::Str32 | EncodingCodes::Sym32 => variable_payload(buf, 4),
+    EncodingCodes::List8 | EncodingCodes::Map8 => compound_payload(buf, 1, nest),
+    EncodingCodes::List32 | EncodingCodes::Map32 => compound_payload(buf, 4, nest),
+    EncodingCodes::Array8 => array_payload(buf, 1, nest),
+    EncodingCodes::Array32 => array_payload(buf, 4, nest),
+  }
+}
+
+fn consume_described(buf: &[u8], nest: usize) -> Result<usize, ()> {
+  let nest = nest.checked_sub(1).ok_or(())?;
+  let descriptor = consume_value(buf, nest)?;
+  let after = buf.get(descriptor..).ok_or(())?;
+  let value = consume_value(after, nest)?;
+  descriptor.checked_add(value).ok_or(())
+}
+
+fn fixed_payload(buf: &[u8], width: usize) -> Result<usize, ()> {
+  if buf.len() < width { Err(()) } else { Ok(width) }
+}
+
+fn variable_payload(buf: &[u8], width: usize) -> Result<usize, ()> {
+  let len = read_len(buf, width)?;
+  let after = buf.get(width..).ok_or(())?;
+  if len > after.len() {
+    return Err(());
+  }
+  width.checked_add(len).ok_or(())
+}
+
+fn compound_payload(buf: &[u8], width: usize, nest: usize) -> Result<usize, ()> {
+  let size = read_len(buf, width)?;
+  let after = buf.get(width..).ok_or(())?;
+  if size > after.len() || size < width {
+    return Err(());
+  }
+  let region = after.get(..size).ok_or(())?;
+  let count = read_len(region, width)?;
+  let mut elements = region.get(width..).ok_or(())?;
+  if count > elements.len() {
+    return Err(());
+  }
+  let nest = nest.checked_sub(1).ok_or(())?;
+  for _ in 0..count {
+    let used = consume_value(elements, nest)?;
+    if used == 0 {
+      return Err(());
+    }
+    elements = elements.get(used..).ok_or(())?;
+  }
+  width.checked_add(size).ok_or(())
+}
+
+fn array_payload(buf: &[u8], width: usize, nest: usize) -> Result<usize, ()> {
+  use serde_amqp::format_code::EncodingCodes;
+  let size = read_len(buf, width)?;
+  let after = buf.get(width..).ok_or(())?;
+  if size > after.len() || size < width {
+    return Err(());
+  }
+  let region = after.get(..size).ok_or(())?;
+  let count = read_len(region, width)?;
+  let elements = region.get(width..).ok_or(())?;
+  let Some((&ctor, elements)) = elements.split_first() else {
+    return Err(());
+  };
+  let code = EncodingCodes::try_from(ctor).map_err(|_code| ())?;
+  if matches!(
+    code,
+    EncodingCodes::DescribedType
+      | EncodingCodes::List0
+      | EncodingCodes::List8
+      | EncodingCodes::List32
+      | EncodingCodes::Map8
+      | EncodingCodes::Map32
+      | EncodingCodes::Array8
+      | EncodingCodes::Array32
+  ) {
+    return Err(());
+  }
+  if matches!(
+    code,
+    EncodingCodes::Null
+      | EncodingCodes::BooleanTrue
+      | EncodingCodes::BooleanFalse
+      | EncodingCodes::Uint0
+      | EncodingCodes::Ulong0
+      | EncodingCodes::List0
+  ) {
+    return width.checked_add(size).ok_or(());
+  }
+  let nest = nest.checked_sub(1).ok_or(())?;
+  let mut elements = elements;
+  for _ in 0..count {
+    let used = consume_payload(&code, elements, nest)?;
+    if used == 0 {
+      return Err(());
+    }
+    elements = elements.get(used..).ok_or(())?;
+  }
+  width.checked_add(size).ok_or(())
+}
+
+fn read_len(buf: &[u8], width: usize) -> Result<usize, ()> {
+  if width == 1 {
+    return buf.first().copied().map(usize::from).ok_or(());
+  }
+  let bytes = <[u8; 4]>::try_from(buf.get(..4).ok_or(())?).map_err(|_len| ())?;
+  usize::try_from(u32::from_be_bytes(bytes)).map_err(|_wide| ())
 }
 
 fn encode_10<T: Serialize>(buf: &[u8], performative: &T) -> Result<Vec<u8>, ()> {
@@ -1049,6 +1200,29 @@ mod tests {
     let mut body = vec![0x00, 0xb3];
     body.extend_from_slice(&80_000u32.to_be_bytes());
     assert!(matches!(super::descriptor_code(&body, body.len()), super::DescriptorRead::Forward));
+  }
+
+  #[test]
+  fn symbol32_inside_a_performative_is_not_decoded() {
+    let mut body = vec![0x00, 0x53, 0x41, 0xd0];
+    let size = 4 + 1 + 4 + 1 + 1;
+    body.extend_from_slice(&u32::try_from(size).unwrap().to_be_bytes());
+    body.extend_from_slice(&3u32.to_be_bytes());
+    body.push(0xb3);
+    body.extend_from_slice(&80_000u32.to_be_bytes());
+    body.extend_from_slice(&[0x40, 0x40]);
+    super::consume_value(&body, super::PERFORMATIVE_NESTING).unwrap_err();
+  }
+
+  #[test]
+  fn encoded_sasl_init_fits_in_its_frame() {
+    let body = serde_amqp::to_vec(&SaslInit {
+      mechanism: Symbol::from("PLAIN"),
+      initial_response: Some(Binary::from(plain("agent", FAKE))),
+      hostname: Some("mq".into()),
+    })
+    .unwrap();
+    super::consume_value(&body, super::PERFORMATIVE_NESTING).unwrap();
   }
 
   #[test]
