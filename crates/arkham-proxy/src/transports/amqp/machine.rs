@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 use amq_protocol::auth::SASLMechanism;
 use amq_protocol::frame::parsing::parse_frame_type;
@@ -15,6 +16,8 @@ use fe2o3_amqp_types::primitives::Binary;
 use fe2o3_amqp_types::sasl::{SaslInit, SaslResponse};
 use secrecy::ExposeSecret as _;
 use serde_amqp::descriptor::Descriptor;
+use serde_amqp::primitives::Symbol;
+use serde_amqp::serde::de::DeserializeOwned;
 use serde_amqp::serde::{Deserialize, Serialize};
 
 use crate::transports::engine::{
@@ -40,18 +43,72 @@ const FRAME_AMQP: u8 = 0;
 /// SASL frame type. Not exported by `fe2o3-amqp-types`.
 const FRAME_SASL: u8 = 1;
 
-/// Class and method ids. `amq-protocol` embeds these in generated match arms.
-const START_OK: (u16, u16) = (10, 11);
+fn start_ok_ids() -> (u16, u16) {
+  static IDS: OnceLock<(u16, u16)> = OnceLock::new();
+  *IDS.get_or_init(|| {
+    let method = connection::StartOk::default();
+    (method.get_amqp_class_id(), method.get_amqp_method_id())
+  })
+}
 
-const CONNECTION_CLOSE: (u16, u16) = (10, 50);
+fn connection_close_ids() -> (u16, u16) {
+  static IDS: OnceLock<(u16, u16)> = OnceLock::new();
+  *IDS.get_or_init(|| {
+    let method = connection::Close::default();
+    (method.get_amqp_class_id(), method.get_amqp_method_id())
+  })
+}
 
-const CHANNEL_CLOSE: (u16, u16) = (20, 40);
+fn channel_close_ids() -> (u16, u16) {
+  static IDS: OnceLock<(u16, u16)> = OnceLock::new();
+  *IDS.get_or_init(|| {
+    let method = channel::Close::default();
+    (method.get_amqp_class_id(), method.get_amqp_method_id())
+  })
+}
 
-const SASL_INIT: u64 = 0x41;
-const SASL_RESPONSE: u64 = 0x43;
-const DETACH: u64 = 0x16;
-const END: u64 = 0x17;
-const CLOSE: u64 = 0x18;
+fn sasl_init_code() -> Option<u64> {
+  remembered(&SASL_INIT_CODE, &sample_sasl_init())
+}
+
+fn sasl_response_code() -> Option<u64> {
+  remembered(&SASL_RESPONSE_CODE, &sample_sasl_response())
+}
+
+fn detach_code() -> Option<u64> {
+  remembered(&DETACH_CODE, &sample_detach())
+}
+
+fn end_code() -> Option<u64> {
+  remembered(&END_CODE, &sample_end())
+}
+
+fn close_code() -> Option<u64> {
+  remembered(&CLOSE_CODE, &sample_close())
+}
+
+static SASL_INIT_CODE: OnceLock<u64> = OnceLock::new();
+static SASL_RESPONSE_CODE: OnceLock<u64> = OnceLock::new();
+static DETACH_CODE: OnceLock<u64> = OnceLock::new();
+static END_CODE: OnceLock<u64> = OnceLock::new();
+static CLOSE_CODE: OnceLock<u64> = OnceLock::new();
+
+fn remembered<T: Serialize>(slot: &OnceLock<u64>, sample: &T) -> Option<u64> {
+  if let Some(code) = slot.get() {
+    return Some(*code);
+  }
+  let code = encoded_code(sample)?;
+  let _ = slot.set(code);
+  Some(code)
+}
+
+fn encoded_code<T: Serialize>(sample: &T) -> Option<u64> {
+  let encoded = serde_amqp::to_vec(sample).ok()?;
+  match serde_amqp::from_slice::<Descriptor>(&encoded).ok()? {
+    Descriptor::Code(code) => Some(code),
+    Descriptor::Name(_) => None,
+  }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SaslMechanism {
@@ -337,10 +394,13 @@ impl Amqp {
     let Some((class_id, method_id)) = method_ids(payload)? else {
       return Ok(Classified::AbsoluteHead(method_head));
     };
-    let kind = match (class_id, method_id) {
-      START_OK if self.down.is_some() => Kind::StartOk,
-      CONNECTION_CLOSE | CHANNEL_CLOSE if self.up.is_some() => Kind::Close091,
-      _ => return Ok(Classified::Forward { total }),
+    let pair = (class_id, method_id);
+    let kind = if pair == start_ok_ids() && self.down.is_some() {
+      Kind::StartOk
+    } else if (pair == connection_close_ids() || pair == channel_close_ids()) && self.up.is_some() {
+      Kind::Close091
+    } else {
+      return Ok(Classified::Forward { total });
     };
     Ok(Classified::Hold { total, kind })
   }
@@ -390,11 +450,17 @@ impl Amqp {
         return Ok(Classified::AbsoluteHead(need));
       }
     };
-    let kind = match (frame_type, code) {
-      (FRAME_SASL, SASL_INIT) => Kind::SaslInit,
-      (FRAME_SASL, SASL_RESPONSE) if self.down.as_ref().is_some_and(|down| down.awaiting_response) => Kind::SaslResponse,
-      (FRAME_AMQP, DETACH | END | CLOSE) => Kind::CloseEndDetach(code),
-      _ => return Ok(forward),
+    let kind = if frame_type == FRAME_SASL && Some(code) == sasl_init_code() {
+      Kind::SaslInit
+    } else if frame_type == FRAME_SASL
+      && Some(code) == sasl_response_code()
+      && self.down.as_ref().is_some_and(|down| down.awaiting_response)
+    {
+      Kind::SaslResponse
+    } else if frame_type == FRAME_AMQP && (Some(code) == detach_code() || Some(code) == end_code() || Some(code) == close_code()) {
+      Kind::CloseEndDetach(code)
+    } else {
+      return Ok(forward);
     };
     Ok(Classified::Hold { total, kind })
   }
@@ -547,20 +613,17 @@ impl Amqp {
     let Some(pair) = self.up.as_ref().filter(|pair| find_new_match(buf, &pair.needle, 0)) else {
       return Ok(None);
     };
-    let frame = match code {
-      CLOSE => {
-        let mut close: Close = decode_10(buf)?;
-        redact_error(close.error.as_mut(), pair).then(|| encode_10(buf, &close))
-      }
-      END => {
-        let mut end: End = decode_10(buf)?;
-        redact_error(end.error.as_mut(), pair).then(|| encode_10(buf, &end))
-      }
-      DETACH => {
-        let mut detach: Detach = decode_10(buf)?;
-        redact_error(detach.error.as_mut(), pair).then(|| encode_10(buf, &detach))
-      }
-      _ => None,
+    let frame = if Some(code) == close_code() {
+      let mut close: Close = decode_10(buf)?;
+      redact_error(close.error.as_mut(), pair).then(|| encode_10(buf, &close))
+    } else if Some(code) == end_code() {
+      let mut end: End = decode_10(buf)?;
+      redact_error(end.error.as_mut(), pair).then(|| encode_10(buf, &end))
+    } else if Some(code) == detach_code() {
+      let mut detach: Detach = decode_10(buf)?;
+      redact_error(detach.error.as_mut(), pair).then(|| encode_10(buf, &detach))
+    } else {
+      None
     };
     let Some(frame) = frame.transpose()? else {
       return Ok(None);
@@ -825,15 +888,80 @@ fn counted_width(body: &[u8], budget: usize, header: usize, len: usize) -> Descr
 fn code_of(descriptor: &Descriptor) -> Option<u64> {
   match descriptor {
     Descriptor::Code(code) => Some(*code),
-    Descriptor::Name(name) => match name.as_str() {
-      "amqp:sasl-init:list" => Some(SASL_INIT),
-      "amqp:sasl-response:list" => Some(SASL_RESPONSE),
-      "amqp:detach:list" => Some(DETACH),
-      "amqp:end:list" => Some(END),
-      "amqp:close:list" => Some(CLOSE),
-      _ => None,
-    },
+    Descriptor::Name(name) => symbolic_code(name.as_str()),
   }
+}
+
+fn symbolic_code(name: &str) -> Option<u64> {
+  if type_accepts_name(name, &sample_sasl_init()) {
+    sasl_init_code()
+  } else if type_accepts_name(name, &sample_sasl_response()) {
+    sasl_response_code()
+  } else if type_accepts_name(name, &sample_detach()) {
+    detach_code()
+  } else if type_accepts_name(name, &sample_end()) {
+    end_code()
+  } else if type_accepts_name(name, &sample_close()) {
+    close_code()
+  } else {
+    None
+  }
+}
+
+fn sample_sasl_init() -> SaslInit {
+  SaslInit {
+    mechanism: fe2o3_amqp_types::primitives::Symbol::default(),
+    initial_response: None,
+    hostname: None,
+  }
+}
+
+fn sample_sasl_response() -> SaslResponse {
+  SaslResponse {
+    response: fe2o3_amqp_types::primitives::Binary::new(),
+  }
+}
+
+fn sample_detach() -> Detach {
+  Detach {
+    handle: fe2o3_amqp_types::definitions::Handle::default(),
+    closed: false,
+    error: None,
+  }
+}
+
+fn sample_end() -> End {
+  End { error: None }
+}
+
+fn sample_close() -> Close {
+  Close { error: None }
+}
+
+fn type_accepts_name<T>(name: &str, sample: &T) -> bool
+where
+  T: Serialize + DeserializeOwned,
+{
+  let Ok(encoded) = serde_amqp::to_vec(sample) else {
+    return false;
+  };
+  let Some(code) = encoded_code(sample) else {
+    return false;
+  };
+  let Ok(prefix) = serde_amqp::to_vec(&Descriptor::Code(code)) else {
+    return false;
+  };
+  if !encoded.starts_with(&prefix) {
+    return false;
+  }
+  let Some(tail) = encoded.get(prefix.len()..) else {
+    return false;
+  };
+  let Ok(mut renamed) = serde_amqp::to_vec(&Descriptor::Name(Symbol::from(name))) else {
+    return false;
+  };
+  renamed.extend_from_slice(tail);
+  serde_amqp::from_slice::<T>(&renamed).is_ok()
 }
 
 fn descriptor_is_short(err: &serde_amqp::Error) -> bool {
@@ -1076,12 +1204,15 @@ fn redact_error(error: Option<&mut AmqpError>, pair: &CredentialPair) -> bool {
 #[cfg(test)]
 mod tests {
   use amq_protocol::frame::{AMQPFrame, WriteContext, gen_frame, parse_frame};
-  use amq_protocol::protocol::{AMQPClass, connection};
+  use amq_protocol::protocol::{AMQPClass, channel, connection};
+  use amq_protocol::types::parsing::parse_id;
   use amq_protocol::types::{AMQPValue, FieldTable};
   use arkham_config::grants::{AmqpScope, Credential, Grant};
   use fe2o3_amqp_types::primitives::{Binary, Symbol};
   use fe2o3_amqp_types::sasl::SaslInit;
   use secrecy::SecretString;
+  use serde_amqp::descriptor::Descriptor;
+  use serde_amqp::serde::Serialize;
 
   use super::{Amqp, SaslMechanism};
   use crate::transports::engine::{Direction, Rewritten, Wire};
@@ -1199,6 +1330,64 @@ mod tests {
 
   fn contains(haystack: &[u8], needle: &str) -> bool {
     haystack.windows(needle.len()).any(|window| window == needle.as_bytes())
+  }
+
+  fn method_ids_on_the_wire(frame: &[u8]) -> (u16, u16) {
+    let payload = frame.get(7..).expect("method payload");
+    let (rest, class_id) = parse_id(payload).unwrap();
+    let (_, method_id) = parse_id(rest).unwrap();
+    (class_id, method_id)
+  }
+
+  fn method_frame(class: AMQPClass) -> Vec<u8> {
+    encode_frame(&AMQPFrame::Method(0, class))
+  }
+
+  fn numeric_descriptor<T: Serialize>(value: &T) -> u64 {
+    let encoded = serde_amqp::to_vec(value).unwrap();
+    let Descriptor::Code(code) = serde_amqp::from_slice(&encoded).unwrap() else {
+      panic!("numeric descriptor");
+    };
+    code
+  }
+
+  #[test]
+  fn class_and_method_ids_match_generated_frames() {
+    let start_ok = method_frame(AMQPClass::Connection(connection::AMQPMethod::StartOk(
+      connection::StartOk::default(),
+    )));
+    assert_eq!(method_ids_on_the_wire(&start_ok), super::start_ok_ids(), "start-ok");
+    let connection_close = method_frame(AMQPClass::Connection(connection::AMQPMethod::Close(connection::Close::default())));
+    assert_eq!(
+      method_ids_on_the_wire(&connection_close),
+      super::connection_close_ids(),
+      "connection.close"
+    );
+    let channel_close = method_frame(AMQPClass::Channel(channel::AMQPMethod::Close(channel::Close::default())));
+    assert_eq!(method_ids_on_the_wire(&channel_close), super::channel_close_ids(), "channel.close");
+  }
+
+  #[test]
+  fn descriptor_codes_match_serialized_fe2o3_types() {
+    assert_eq!(super::sasl_init_code(), Some(numeric_descriptor(&super::sample_sasl_init())));
+    assert_eq!(
+      super::sasl_response_code(),
+      Some(numeric_descriptor(&super::sample_sasl_response()))
+    );
+    assert_eq!(super::detach_code(), Some(numeric_descriptor(&super::sample_detach())));
+    assert_eq!(super::end_code(), Some(numeric_descriptor(&super::sample_end())));
+    assert_eq!(super::close_code(), Some(numeric_descriptor(&super::sample_close())));
+  }
+
+  #[test]
+  fn fe2o3_types_accept_their_descriptor_names() {
+    assert!(super::type_accepts_name("amqp:sasl-init:list", &super::sample_sasl_init()));
+    assert!(!super::type_accepts_name("amqp:sasl-response:list", &super::sample_sasl_init()));
+    assert!(super::type_accepts_name("amqp:sasl-response:list", &super::sample_sasl_response()));
+    assert!(super::type_accepts_name("amqp:detach:list", &super::sample_detach()));
+    assert!(super::type_accepts_name("amqp:end:list", &super::sample_end()));
+    assert!(super::type_accepts_name("amqp:close:list", &super::sample_close()));
+    assert!(!super::type_accepts_name("amqp:close:list", &super::sample_end()));
   }
 
   #[test]
