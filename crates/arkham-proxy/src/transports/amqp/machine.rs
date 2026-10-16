@@ -922,8 +922,10 @@ fn consume_payload(code: &serde_amqp::format_code::EncodingCodes, buf: &[u8], ne
     EncodingCodes::Decimal128 | EncodingCodes::Uuid => fixed_payload(buf, 16),
     EncodingCodes::Vbin8 | EncodingCodes::Str8 | EncodingCodes::Sym8 => variable_payload(buf, 1),
     EncodingCodes::Vbin32 | EncodingCodes::Str32 | EncodingCodes::Sym32 => variable_payload(buf, 4),
-    EncodingCodes::List8 | EncodingCodes::Map8 => compound_payload(buf, 1, nest),
-    EncodingCodes::List32 | EncodingCodes::Map32 => compound_payload(buf, 4, nest),
+    EncodingCodes::List8 => compound_payload(buf, 1, nest, false),
+    EncodingCodes::Map8 => compound_payload(buf, 1, nest, true),
+    EncodingCodes::List32 => compound_payload(buf, 4, nest, false),
+    EncodingCodes::Map32 => compound_payload(buf, 4, nest, true),
     EncodingCodes::Array8 => array_payload(buf, 1, nest),
     EncodingCodes::Array32 => array_payload(buf, 4, nest),
   }
@@ -950,7 +952,7 @@ fn variable_payload(buf: &[u8], width: usize) -> Result<usize, ()> {
   width.checked_add(len).ok_or(())
 }
 
-fn compound_payload(buf: &[u8], width: usize, nest: usize) -> Result<usize, ()> {
+fn compound_payload(buf: &[u8], width: usize, nest: usize, map: bool) -> Result<usize, ()> {
   let size = read_len(buf, width)?;
   let after = buf.get(width..).ok_or(())?;
   if size > after.len() || size < width {
@@ -958,6 +960,10 @@ fn compound_payload(buf: &[u8], width: usize, nest: usize) -> Result<usize, ()> 
   }
   let region = after.get(..size).ok_or(())?;
   let count = read_len(region, width)?;
+  // `MapAccess::next_entry_seed` subtracts 2. An odd count wraps in release and reads the tail.
+  if map && count % 2 != 0 {
+    return Err(());
+  }
   let mut elements = region.get(width..).ok_or(())?;
   if count > elements.len() {
     return Err(());
@@ -1212,6 +1218,19 @@ mod tests {
     body.extend_from_slice(&80_000u32.to_be_bytes());
     body.extend_from_slice(&[0x40, 0x40]);
     super::consume_value(&body, super::PERFORMATIVE_NESTING).unwrap_err();
+  }
+
+  #[test]
+  fn odd_map_count_with_a_long_tail_is_not_decoded() {
+    let mut body = vec![0xc1, 7, 1, 0x40, 0xb0];
+    body.extend_from_slice(&80_000u32.to_be_bytes());
+    super::consume_value(&body, super::PERFORMATIVE_NESTING).unwrap_err();
+  }
+
+  #[test]
+  fn even_map_of_two_nulls_fits() {
+    let body = [0xc1, 3, 2, 0x40, 0x40];
+    super::consume_value(&body, super::PERFORMATIVE_NESTING).unwrap();
   }
 
   #[test]
