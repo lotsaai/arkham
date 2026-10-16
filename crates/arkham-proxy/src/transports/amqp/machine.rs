@@ -378,7 +378,8 @@ impl Amqp {
     let Some(body) = buf.get(data_offset..end) else {
       return Ok(forward);
     };
-    let code = match descriptor_code(body) {
+    let budget = total.checked_sub(data_offset).ok_or(())?;
+    let code = match descriptor_code(body, budget) {
       DescriptorRead::Code(code) => code,
       DescriptorRead::Forward => return Ok(forward),
       DescriptorRead::Need => {
@@ -706,18 +707,118 @@ fn long_uint(buf: &[u8]) -> Result<Option<usize>, ()> {
   }
 }
 
-fn descriptor_code(body: &[u8]) -> DescriptorRead {
-  if body.is_empty() {
-    return DescriptorRead::Need;
+fn descriptor_code(body: &[u8], budget: usize) -> DescriptorRead {
+  // `read_bytes` allocates the declared symbol length before `read_exact`.
+  // Measure that length against the frame first.
+  match descriptor_width(body, budget) {
+    DescriptorWidth::Forward => DescriptorRead::Forward,
+    DescriptorWidth::Need => DescriptorRead::Need,
+    DescriptorWidth::Ready(width) => {
+      let Some(encoded) = body.get(..width) else {
+        return DescriptorRead::Need;
+      };
+      match serde_amqp::from_slice::<Descriptor>(encoded) {
+        Ok(descriptor) => match code_of(&descriptor) {
+          Some(code) => DescriptorRead::Code(code),
+          None => DescriptorRead::Forward,
+        },
+        Err(err) if descriptor_is_short(&err) => DescriptorRead::Need,
+        Err(_) => DescriptorRead::Forward,
+      }
+    }
   }
-  // `to_vec` of a descriptor starts with the described-type marker.
-  match serde_amqp::from_slice::<Descriptor>(body) {
-    Ok(descriptor) => match code_of(&descriptor) {
-      Some(code) => DescriptorRead::Code(code),
-      None => DescriptorRead::Forward,
-    },
-    Err(err) if descriptor_is_short(&err) => DescriptorRead::Need,
-    Err(_) => DescriptorRead::Forward,
+}
+
+enum DescriptorWidth {
+  Ready(usize),
+  Need,
+  Forward,
+}
+
+fn descriptor_width(body: &[u8], budget: usize) -> DescriptorWidth {
+  use serde_amqp::format_code::EncodingCodes;
+
+  let Some(&marker) = body.first() else {
+    return if budget > 0 {
+      DescriptorWidth::Need
+    } else {
+      DescriptorWidth::Forward
+    };
+  };
+  if !matches!(EncodingCodes::try_from(marker), Ok(EncodingCodes::DescribedType)) {
+    return DescriptorWidth::Forward;
+  }
+  let Some(&code) = body.get(1) else {
+    return if budget > 1 {
+      DescriptorWidth::Need
+    } else {
+      DescriptorWidth::Forward
+    };
+  };
+  match EncodingCodes::try_from(code) {
+    Ok(EncodingCodes::Ulong0) => fixed_width(body, budget, 2),
+    Ok(EncodingCodes::SmallUlong) => fixed_width(body, budget, 3),
+    Ok(EncodingCodes::Ulong) => fixed_width(body, budget, 10),
+    Ok(EncodingCodes::Sym8) => sym8_width(body, budget),
+    Ok(EncodingCodes::Sym32) => sym32_width(body, budget),
+    _ => DescriptorWidth::Forward,
+  }
+}
+
+fn fixed_width(body: &[u8], budget: usize, width: usize) -> DescriptorWidth {
+  if width > budget {
+    DescriptorWidth::Forward
+  } else if body.len() < width {
+    DescriptorWidth::Need
+  } else {
+    DescriptorWidth::Ready(width)
+  }
+}
+
+fn sym8_width(body: &[u8], budget: usize) -> DescriptorWidth {
+  const HEADER: usize = 3;
+  if HEADER > budget {
+    return DescriptorWidth::Forward;
+  }
+  if body.len() < HEADER {
+    return DescriptorWidth::Need;
+  }
+  let Some(len) = body.get(2).copied().map(usize::from) else {
+    return DescriptorWidth::Need;
+  };
+  counted_width(body, budget, HEADER, len)
+}
+
+fn sym32_width(body: &[u8], budget: usize) -> DescriptorWidth {
+  const HEADER: usize = 6;
+  if HEADER > budget {
+    return DescriptorWidth::Forward;
+  }
+  if body.len() < HEADER {
+    return DescriptorWidth::Need;
+  }
+  let Some(len_bytes) = body.get(2..HEADER) else {
+    return DescriptorWidth::Need;
+  };
+  let Ok(bytes) = <[u8; 4]>::try_from(len_bytes) else {
+    return DescriptorWidth::Forward;
+  };
+  let Ok(len) = usize::try_from(u32::from_be_bytes(bytes)) else {
+    return DescriptorWidth::Forward;
+  };
+  counted_width(body, budget, HEADER, len)
+}
+
+fn counted_width(body: &[u8], budget: usize, header: usize, len: usize) -> DescriptorWidth {
+  let Some(width) = header.checked_add(len) else {
+    return DescriptorWidth::Forward;
+  };
+  if width > budget {
+    DescriptorWidth::Forward
+  } else if body.len() < width {
+    DescriptorWidth::Need
+  } else {
+    DescriptorWidth::Ready(width)
   }
 }
 
@@ -941,6 +1042,21 @@ mod tests {
 
   fn contains(haystack: &[u8], needle: &str) -> bool {
     haystack.windows(needle.len()).any(|window| window == needle.as_bytes())
+  }
+
+  #[test]
+  fn symbol32_descriptor_past_the_frame_is_forwarded() {
+    let mut body = vec![0x00, 0xb3];
+    body.extend_from_slice(&80_000u32.to_be_bytes());
+    assert!(matches!(super::descriptor_code(&body, body.len()), super::DescriptorRead::Forward));
+  }
+
+  #[test]
+  fn symbol32_prefix_inside_the_frame_waits() {
+    let mut body = vec![0x00, 0xb3];
+    body.extend_from_slice(&4u32.to_be_bytes());
+    body.extend(b"am");
+    assert!(matches!(super::descriptor_code(&body, 64), super::DescriptorRead::Need));
   }
 
   #[tokio::test]
