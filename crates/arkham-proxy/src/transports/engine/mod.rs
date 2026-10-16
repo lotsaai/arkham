@@ -6,6 +6,7 @@
 #[cfg(test)]
 mod fuzz_props;
 
+pub(crate) use super::amqp::machine::Amqp;
 pub(crate) use super::http::h2::H2;
 pub(crate) use super::http::machine::Http;
 pub(crate) use super::ldap::machine::Ldap;
@@ -158,7 +159,7 @@ pub(crate) fn mint_plan_for(grants: &[Grant], scheme: Scheme, host: &str, port: 
 fn grant_pattern(grant: &Grant) -> Option<String> {
   match grant {
     Grant::Token { pattern, .. } => pattern.clone(),
-    Grant::Postgres { .. } | Grant::Redis { .. } | Grant::Smtp { .. } | Grant::Ldap { .. } | Grant::Ssh { .. } => None,
+    Grant::Postgres { .. } | Grant::Redis { .. } | Grant::Smtp { .. } | Grant::Ldap { .. } | Grant::Amqp { .. } | Grant::Ssh { .. } => None,
   }
 }
 

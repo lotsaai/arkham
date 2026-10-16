@@ -3,6 +3,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "ldapts": "9.2.0"
+    "amqplib": "2.2.0",
+    "ldapts": "9.2.0",
+    "rhea": "3.0.5"
   }
 }

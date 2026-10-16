@@ -1,15 +1,17 @@
 //! Grant model: a credential is one real secret, and a grant says what kind
 //! of endpoints that secret may be presented at. A rule is one kind, inferred
 //! from the URL schemes of its `allow` entries. The protocol verticals
-//! (`postgres`, `redis`, `smtp`, `ldap`) own their scope types and their connection-string
+//! (`postgres`, `redis`, `smtp`, `ldap`, `amqp`) own their scope types and their connection-string
 //! laws; this module owns the enum, the matching dispatch, and the
 //! collection of rules into grants.
 
+mod amqp;
 mod ldap;
 mod postgres;
 mod redis;
 mod smtp;
 
+pub use amqp::{AmqpLeg, AmqpScope, AmqpUriError};
 pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
@@ -107,6 +109,11 @@ pub enum Scheme {
   Smtp,
   /// Implicit TLS SMTP from the first byte. Port defaults to 465.
   Smtps,
+  /// Cleartext AMQP (0-9-1 or 1.0). Each connection string states its own
+  /// leg's transport. Port defaults to 5672.
+  Amqp,
+  /// TLS AMQP from the first byte. Port defaults to 5671.
+  Amqps,
 }
 
 impl Scheme {
@@ -125,6 +132,8 @@ impl Scheme {
       Self::Ssh => "ssh",
       Self::Smtp => "smtp",
       Self::Smtps => "smtps",
+      Self::Amqp => "amqp",
+      Self::Amqps => "amqps",
     }
   }
 
@@ -235,7 +244,7 @@ impl FromStr for EndpointScope {
       "https" => Scheme::Https,
       "tcp" => Scheme::Tcp,
       "ssh" => Scheme::Ssh,
-      "postgres" | "redis" | "rediss" | "smtp" | "smtps" | "ldap" | "ldaps" => {
+      "postgres" | "redis" | "rediss" | "smtp" | "smtps" | "ldap" | "ldaps" | "amqp" | "amqps" => {
         return Err(format!(
           "bad allow entry `{entry}`: database rules state no allow entries — the connection string is the grant"
         ));
@@ -277,6 +286,8 @@ impl FromStr for EndpointScope {
       (None, Scheme::Ssh) => 22,
       (None, Scheme::Smtp) => 587,
       (None, Scheme::Smtps) => 465,
+      (None, Scheme::Amqp) => 5672,
+      (None, Scheme::Amqps) => 5671,
     };
     reject_endpoint_query(entry, &url)?;
     Ok(EndpointScope {
@@ -416,6 +427,14 @@ pub enum Grant {
     /// The one scope this rule maps, carrying both legs' facts.
     scope: Box<LdapScope>,
   },
+  /// One AMQP connection-string mapping: fake string to real, 1:1. Each
+  /// string states its own leg's transport in its scheme.
+  Amqp {
+    /// The wire needles: the fake password and the real password.
+    credential: Credential,
+    /// The one scope this rule maps, carrying both legs' facts.
+    scope: Box<AmqpScope>,
+  },
   /// One SSH identity mapping: the guest presents the decoy key, arkham
   /// presents the real key upstream. No wire substitution, so no credential.
   Ssh {
@@ -434,7 +453,8 @@ impl Grant {
       | Grant::Postgres { credential, .. }
       | Grant::Redis { credential, .. }
       | Grant::Smtp { credential, .. }
-      | Grant::Ldap { credential, .. } => Some(credential),
+      | Grant::Ldap { credential, .. }
+      | Grant::Amqp { credential, .. } => Some(credential),
       Grant::Ssh { .. } => None,
     }
   }
@@ -448,6 +468,7 @@ impl Grant {
       Grant::Redis { scope, .. } => RedisScope::matches(scope, scheme, host, port),
       Grant::Smtp { scope, .. } => SmtpScope::matches(scope, scheme, host, port),
       Grant::Ldap { scope, .. } => LdapScope::matches(scope, scheme, host, port),
+      Grant::Amqp { scope, .. } => AmqpScope::matches(scope, scheme, host, port),
       Grant::Ssh { allow } => allow.iter().any(|entry| ssh_match(entry, scheme, host, port)),
     }
   }
@@ -504,6 +525,17 @@ impl Grant {
   #[must_use]
   pub fn ldap(&self, host: Option<&str>, port: u16) -> Option<&LdapScope> {
     let Grant::Ldap { scope, .. } = self else {
+      return None;
+    };
+    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+  }
+
+  /// The AMQP scope whose downstream (guest-side) port and host cover a
+  /// destination, `host` optional as above: transparent capture knows the
+  /// port before it knows the host.
+  #[must_use]
+  pub fn amqp(&self, host: Option<&str>, port: u16) -> Option<&AmqpScope> {
+    let Grant::Amqp { scope, .. } = self else {
       return None;
     };
     (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
@@ -620,6 +652,7 @@ impl GrantCollector {
       Scheme::Redis | Scheme::Rediss => redis::grant(label, rule, real.expose_secret()),
       Scheme::Smtp | Scheme::Smtps => smtp::grant(label, rule, real.expose_secret()),
       Scheme::Ldap | Scheme::Ldaps => ldap::grant(label, rule, real.expose_secret()),
+      Scheme::Amqp | Scheme::Amqps => amqp::grant(label, rule, real.expose_secret()),
       _ => {
         return Err(Error::ConnectionStringScheme {
           label: label.to_string(),
@@ -1132,6 +1165,104 @@ mod tests {
     };
     assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
     assert!(scope.is_downstream_tls);
+  }
+
+  #[test]
+  fn amqp_grant_answers_for_amqp_schemes() {
+    let grant = redis_grant_like(
+      "amqp://agent:fake@mq.internal",                          // betterleaks:allow
+      "amqps://agent:real@mq.internal:5671?sslrootcert=system", // betterleaks:allow
+    );
+    assert!(grant.matches(Scheme::Amqp, "mq.internal", 5672));
+    assert!(grant.matches(Scheme::Amqps, "MQ.INTERNAL", 5672));
+    assert!(!grant.matches(Scheme::Tcp, "mq.internal", 5672));
+    assert!(!grant.matches(Scheme::Amqp, "mq.internal", 5671));
+    assert!(grant.amqp(None, 5672).is_some());
+    assert!(grant.amqp(Some("other.internal"), 5672).is_none());
+    assert!(grant.ldap(Some("mq.internal"), 5672).is_none());
+    let credential = grant.credential().expect("an amqp grant swaps a credential");
+    assert_eq!(credential.fake, "fake");
+    assert_eq!(credential.value.expose_secret(), "real");
+    let scope = grant.amqp(Some("mq.internal"), 5672).expect("scope");
+    assert_eq!(scope.root_cert, Some(RootCert::System));
+    assert!(scope.is_upstream_tls);
+    assert!(!scope.is_downstream_tls);
+  }
+
+  #[test]
+  fn amqp_schemes_are_not_endpoint_grants() {
+    let err = "amqp://mq.internal:5672".parse::<EndpointScope>().unwrap_err();
+    assert!(err.contains("the connection string is the grant"), "{err}");
+    "amqps://mq.internal:5671".parse::<EndpointScope>().unwrap_err();
+  }
+
+  #[test]
+  fn amqp_rule_table_states_only_the_guest_leg() {
+    let mut cfg = cfg_with_db(
+      "amqps://agent:fake@mq.internal",                     // betterleaks:allow
+      "amqps://agent:real@mq.internal?sslrootcert=/ca.pem", // betterleaks:allow
+    );
+    let entry = || HostTlsCfg {
+      client_cert: None,
+      client_key: None,
+      root_cert: None,
+      guest_tls_mode: GuestTlsMode::Mtls,
+      guest_cert: Some(PathBuf::from("/in/cert.pem")),
+      guest_key: Some(PathBuf::from("/in/key.pem")),
+    };
+    let mut tls = BTreeMap::new();
+    let mut e = entry();
+    e.client_cert = Some(PathBuf::from("/c.pem"));
+    e.client_key = Some(PathBuf::from("/c.key"));
+    tls.insert("DATABASE_URL".to_string(), e);
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("amqp states the upstream identity"), "{err}");
+    let mut tls = BTreeMap::new();
+    let mut e = entry();
+    e.root_cert = Some(PathBuf::from("/ca.pem"));
+    tls.insert("DATABASE_URL".to_string(), e);
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+    let err = resolve(&cfg).unwrap_err().to_string();
+    assert!(err.contains("amqp states upstream trust"), "{err}");
+    let mut tls = BTreeMap::new();
+    tls.insert("DATABASE_URL".to_string(), entry());
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+    let resolved = resolve(&cfg).unwrap();
+    let Some(Grant::Amqp { scope, .. }) = resolved.grants.first() else {
+      panic!("an amqp rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(scope.is_downstream_tls);
+    assert_eq!(scope.root_cert, Some(RootCert::Path(PathBuf::from("/ca.pem"))));
+  }
+
+  #[test]
+  fn amqp_mtls_rejects_a_cleartext_fake() {
+    let mut cfg = cfg_with_db(
+      "amqp://agent:arkham_fake_amqp_pass@mq.internal",        // betterleaks:allow
+      "amqps://svc:arkham_real_amqp_pass_01@mq.internal:5671", // betterleaks:allow
+    );
+    let mut tls = BTreeMap::new();
+    tls.insert(
+      "DATABASE_URL".to_string(),
+      crate::config::HostTlsCfg {
+        client_cert: None,
+        client_key: None,
+        root_cert: None,
+        guest_tls_mode: GuestTlsMode::Mtls,
+        guest_cert: None,
+        guest_key: None,
+      },
+    );
+    cfg.rules.get_mut("t").unwrap().tls = tls;
+    let err = resolve(&cfg).expect_err("mtls on a cleartext fake");
+    assert!(matches!(err, crate::Error::AmqpCleartextMtls { .. }), "{err}");
+    let text = err.to_string();
+    assert!(text.contains("amqps://"), "{text}");
+    for secret in ["arkham_fake_amqp_pass", "arkham_real_amqp_pass_01", "agent", "svc"] {
+      assert!(!text.contains(secret), "{text} contains {secret}");
+    }
   }
 
   #[test]

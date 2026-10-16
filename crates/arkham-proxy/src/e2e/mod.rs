@@ -19,6 +19,7 @@ use super::{ProxyState, bind_explicit, parse_authority, serve, serve_transparent
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Direction, Http, Rewritten, Wire};
 
+mod amqp;
 mod http;
 mod https;
 mod ldap;

@@ -9,7 +9,7 @@
 //! `match` on the picked protocol in the crate; every arm lives in its
 //! vertical under `transports/`.
 
-use arkham_config::grants::{Grant, LdapScope, PostgresScope, RedisScope, ResolvedConfig, Scheme, SmtpScope, SshScope};
+use arkham_config::grants::{AmqpScope, Grant, LdapScope, PostgresScope, RedisScope, ResolvedConfig, Scheme, SmtpScope, SshScope};
 use rama::tls::client::{ClientHello, ClientHelloHandshakePrefix, parse_client_hello_handshake_prefix};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 
@@ -68,6 +68,7 @@ pub(crate) enum Expect<'a> {
   /// An `ldap://` or `ldaps://` scope: BER LDAP, each string stating how
   /// its leg opens. A cleartext leg may upgrade with `StartTLS`.
   Ldap(&'a LdapScope),
+  Amqp(&'a AmqpScope),
   /// An `ssh://` scope: the guest leg terminates here against a decoy key.
   Ssh(&'a SshScope),
   Splice,
@@ -90,6 +91,7 @@ impl PartialEq for Expect<'_> {
       (Expect::Redis(a), Expect::Redis(b)) => std::ptr::eq(*a, *b),
       (Expect::Smtp(a), Expect::Smtp(b)) => std::ptr::eq(*a, *b),
       (Expect::Ldap(a), Expect::Ldap(b)) => std::ptr::eq(*a, *b),
+      (Expect::Amqp(a), Expect::Amqp(b)) => std::ptr::eq(*a, *b),
       (Expect::Ssh(a), Expect::Ssh(b)) => std::ptr::eq(*a, *b),
       (Expect::Tls, Expect::Tls) | (Expect::Plain, Expect::Plain) | (Expect::Raw, Expect::Raw) | (Expect::Splice, Expect::Splice) => true,
       _ => false,
@@ -112,6 +114,9 @@ pub(crate) fn expect<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> 
   }
   if let Some(scope) = grants.iter().find_map(|grant| grant.ldap(host, port)) {
     return Expect::Ldap(scope);
+  }
+  if let Some(scope) = grants.iter().find_map(|grant| grant.amqp(host, port)) {
+    return Expect::Amqp(scope);
   }
   if let Some(scope) = grants.iter().find_map(|grant| grant.ssh(host, port)) {
     return Expect::Ssh(scope);
@@ -162,6 +167,7 @@ impl<'a> Expect<'a> {
       Expect::Smtp(scope) => state.smtp.serve(ServeStream { guest, params, scope }).await,
       // Declared LDAP: cleartext may StartTLS; LDAPS settles both legs first.
       Expect::Ldap(scope) => state.ldap.serve(ServeStream { guest, params, scope }).await,
+      Expect::Amqp(scope) => state.amqp.serve(ServeStream { guest, params, scope }).await,
       // Declared ssh: the guest leg terminates here against a decoy key.
       Expect::Ssh(scope) => state.ssh.serve(ServeStream { guest, params, scope }).await,
     }

@@ -45,6 +45,10 @@ Topology:
 | 14 | Same client: StartTLS, then a simple bind with the decoy password | `[rules.ldap_plain]` | the directory accepts the bind. Arkham swapped the decoy for the real password after the upgrade |
 | 15 | `ldapts` simple bind to `ldap:3636` over LDAPS with the decoy password | `[rules.ldap_tls]`: fake `ldaps://` URL; real URL carries `sslrootcert` | same swap on a leg that is TLS from the first byte |
 | 16 | StartTLS and LDAPS binds with a password that is not the decoy | the same two rules | the directory returns `invalidCredentials` (code 49). The password was not swapped, and the error text does not contain the real password |
+| 17 | `amqplib` (AMQP 0-9-1) to `amqp:5672` with the decoy user and password: open, declare a queue, publish with a confirm, read the message back | `[rules.amqp_plain]`: fake `amqp://` URL; the real URL is `amqps://` and carries `sslrootcert` | RabbitMQ accepts the swapped user and password on its TLS port 5671 and the message comes back |
+| 18 | `rhea` (AMQP 1.0) to `amqp:5672` with the decoy: SASL `PLAIN`, then `open` | `[rules.amqp_plain]` | the broker sends `open`, which it never does after a refused login |
+| 19 | Both clients to `amqp:5671` over TLS with the decoy | `[rules.amqp_tls]`: fake `amqps://` URL; real URL carries `sslrootcert` | same swaps on a guest leg that is TLS from the first byte |
+| 20 | Both clients on both rules with a password that is not the decoy | the same two rules | 0-9-1 gets `ACCESS_REFUSED` and 1.0 gets a failed SASL outcome (`amqp:unauthorized-access`). The password was not swapped, and the error text does not contain the real password |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
@@ -88,6 +92,26 @@ directory at bootstrap and named by `sslrootcert` on both real strings.
 `ldap://` carries that anchor because StartTLS verifies the upstream
 certificate after the upgrade. Scenarios 13–16 are gated on `LDAP_URL`
 and `LDAP_TLS_URL`.
+Scenarios 17–20 use the official `rabbitmq` 4.3.6 Alpine image (pinned
+by its manifest-list digest), `amqplib` 2.2.0, and `rhea` 3.0.5. The
+proxy is the only code we wrote on that path. The broker's one user is
+`svc` with the real password; the client holds the user `agent` and the
+decoy, so a pass shows that the user and the password were both swapped.
+AMQP 1.0 is a core protocol in RabbitMQ 4.x; the service still enables
+`rabbitmq_amqp1_0`, the no-op plugin 4.x keeps for deployment tools. The
+broker listens on 5672 and on 5671 with a demo-CA leaf. Its TLS sets
+`ssl_options.verify = verify_none` and
+`ssl_options.fail_if_no_peer_cert = false`, so it does not ask for a
+client certificate. The demo authenticates with SASL passwords, and the
+proxy's upstream leg has no client identity, the same way the Redis demo
+sets `tls-auth-clients no`. The broker is healthy only when
+`rabbitmqctl authenticate_user` accepts the real password and refuses the
+decoy password. Those checks run inside the container and do not pass
+through the proxy. Both real strings are `amqps://` because arkham writes
+the real password only to a TLS upstream. The cleartext-upstream case,
+where the decoy is forwarded, is the in-process test
+`amqp_cleartext_start_ok_forwards_the_decoy`. Scenarios 17–20 are gated
+on `AMQP_URL` and `AMQP_TLS_URL`.
 
 ## Run
 

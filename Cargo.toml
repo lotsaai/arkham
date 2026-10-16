@@ -72,6 +72,9 @@ unneeded_field_pattern = "warn"
 unused_result_ok = "warn"
 
 [workspace.dependencies]
+# One declaration per external dependency so versions cannot drift between
+# crates. rama tracks main deliberately: its 0.5 line is unpublished.
+amq-protocol = { version = "10.6.3", default-features = false }
 arkham-compose = { path = "crates/arkham-compose" }
 arkham-config = { path = "crates/arkham-config" }
 arkham-ebpf = { path = "crates/arkham-ebpf" }
@@ -81,8 +84,6 @@ arkham-plugin = { path = "crates/arkham-plugin" }
 arkham-proxy = { path = "crates/arkham-proxy" }
 arkham-tproxy = { path = "crates/arkham-tproxy" }
 arkham-tun = { path = "crates/arkham-tun" }
-# One declaration per external dependency so versions cannot drift between
-# crates. rama tracks main deliberately: its 0.5 line is unpublished.
 async-trait = "0.1"
 aya = "0.14"
 aya-build = "0.2"
@@ -96,6 +97,7 @@ confique = { version = "0.4", features = ["toml"] }
 dashmap = "6"
 dirs = "6"
 eyre = "0.6"
+fe2o3-amqp-types = "0.18.0"
 fnox-core = "1.33"
 futures = "0.3"
 futures-sink = "0.3"
@@ -130,6 +132,7 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 rustls-native-certs = "0.8"
 secrecy = { version = "0.10", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+serde_amqp = "0.18.0"
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"

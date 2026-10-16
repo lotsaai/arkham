@@ -144,6 +144,28 @@ value = "ldaps://cn%3DDirectory%20Manager:decoy@ldap.internal:636"
 
 The real value in fnox carries the trust anchor on either scheme, for example `ldap://cn%3DDirectory%20Manager:real@ldap.internal:389?sslrootcert=/path/ca.pem`.
 
+### AMQP rules
+
+A rule whose `value` states an `amqp://` or `amqps://` connection string is an AMQP rule. The rule states the FAKE string in `value`. The REAL string resolves from the secret source under `env`/`fnox_key`. No `allow` entries: the connection string is the grant, matched on the fake string's port. The SASL user is the URL user and the password is the URL password; both are required. The vhost is the path without its leading slash, percent-decoded; no path is `/`. Arkham does not rewrite the vhost.
+
+`amqp://` is cleartext. `amqps://` is TLS from the first byte. There is no in-band upgrade: a 1.0 client that asks for TLS inside the stream (protocol id 2) is forwarded without a swap. The scheme states the transport. A `sslmode`, `ssl`, or `sslnegotiation` query is rejected, and so is any other unknown query key. The default port is `5672` for `amqp://` and `5671` for `amqps://`. Only `amqps://` may carry `sslrootcert` (a PEM path, or `system` for the platform store) and `sslcert`/`sslkey` together. Arkham reads the query off the real string and does not send it to the broker. The guest leg's mode is `[rules.<label>.tls."<env>"]`, keyed by the rule's env name: `guest_tls_mode` is `tls` (default) or `mtls`. `mtls` requires an `amqps://` fake. A cleartext `amqp://` fake cannot present a client certificate, and that combination is rejected.
+
+The PLAIN response is rewritten only when the real string is `amqps://`. A cleartext real string forwards the decoy. With `guest_tls_mode = tls`, the fake string's scheme does not decide the swap: a cleartext guest leg to an `amqps://` real string is rewritten. The wire machine reads the 0-9-1 `connection.start-ok` and the 1.0 `sasl-init` (or the `sasl-response` that carries the initial response). When the mechanism is `PLAIN` and the password is the decoy, it writes the real string's user and password, keeps the client's authorization identity, and re-encodes the frame, so the two passwords need not be the same length. A `PLAIN` response whose password is not the decoy is forwarded byte-identical. `AMQPLAIN`, `EXTERNAL`, `ANONYMOUS`, and `RABBIT-CR-DEMO` are forwarded unchanged. Server close and error texts (0-9-1 `connection.close` and `channel.close`, 1.0 `close`, `end`, and `detach`) that carry the real password reach the client with the decoy instead. The real password anywhere else in server bytes closes the connection. Content and transfer frames are not buffered.
+
+```toml
+[rules.broker]
+env = "AMQP_URL"
+value = "amqp://app:decoy@mq.internal:5672"
+```
+
+```toml
+[rules.broker_tls]
+env = "AMQP_TLS_URL"
+value = "amqps://app:decoy@mq.internal:5671"
+```
+
+The real value in fnox is `amqps://` and carries the trust anchor, for example `amqps://app:real@mq.internal:5671?sslrootcert=/path/ca.pem`.
+
 ## `[rules.<label>.tls."<entry>"]`
 
 Per-entry TLS, keyed by the exact `allow` entry string. All keys optional.

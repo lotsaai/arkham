@@ -419,6 +419,10 @@ impl RuleCfg {
       Some(Scheme::Ldaps)
     } else if value.starts_with("ldap://") {
       Some(Scheme::Ldap)
+    } else if value.starts_with("amqps://") {
+      Some(Scheme::Amqps)
+    } else if value.starts_with("amqp://") {
+      Some(Scheme::Amqp)
     } else {
       None
     }
