@@ -4,9 +4,11 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use std::sync::Arc;
+
 use futures_sink::Sink as _;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::tracker::TaskMsg;
 
@@ -16,15 +18,25 @@ pub(crate) struct ChanStream {
   rx: mpsc::Receiver<Vec<u8>>,
   tx: Option<tokio_util::sync::PollSender<TaskMsg>>,
   pending: Option<(Vec<u8>, usize)>,
+  /// The capture loop sleeps while the guest is quiet. A task write does
+  /// not arrive as a TUN packet, so the write wakes that sleep.
+  wake: Arc<Notify>,
 }
 
 impl ChanStream {
-  pub(super) fn new(rx: mpsc::Receiver<Vec<u8>>, tx: mpsc::Sender<TaskMsg>) -> Self {
+  pub(super) fn new(rx: mpsc::Receiver<Vec<u8>>, tx: mpsc::Sender<TaskMsg>, wake: Arc<Notify>) -> Self {
     Self {
       rx,
       tx: Some(tokio_util::sync::PollSender::new(tx)),
       pending: None,
+      wake,
     }
+  }
+}
+
+impl Drop for ChanStream {
+  fn drop(&mut self) {
+    self.wake.notify_one();
   }
 }
 
@@ -69,7 +81,10 @@ impl AsyncWrite for ChanStream {
       return Poll::Ready(Err(broken_pipe("guest stream shut down")));
     };
     match Pin::new(tx).start_send(TaskMsg::Data(buf.to_vec())) {
-      Ok(()) => Poll::Ready(Ok(buf.len())),
+      Ok(()) => {
+        self.wake.notify_one();
+        Poll::Ready(Ok(buf.len()))
+      }
       Err(_) => Poll::Ready(Err(broken_pipe("guest relay gone"))),
     }
   }
@@ -80,6 +95,7 @@ impl AsyncWrite for ChanStream {
 
   fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
     self.tx = None;
+    self.wake.notify_one();
     Poll::Ready(Ok(()))
   }
 }
@@ -94,7 +110,7 @@ mod tests {
     let (guest_tx, task_rx) = mpsc::channel::<Vec<u8>>(8);
     let (task_tx, loop_rx) = mpsc::channel::<TaskMsg>(8);
     let mut loop_rx = loop_rx;
-    let mut stream = ChanStream::new(task_rx, task_tx);
+    let mut stream = ChanStream::new(task_rx, task_tx, Arc::new(Notify::new()));
     // Task → guest direction.
     stream.write_all(b"hello").await.unwrap();
     match loop_rx.recv().await.unwrap() {

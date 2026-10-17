@@ -14,7 +14,7 @@ use std::sync::Arc;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpCidr};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::Error;
 use crate::chan::ChanStream;
@@ -110,9 +110,14 @@ async fn run_loop(
   let mut tracker = TcpTracker::default();
   let mut udp: HashMap<UdpKey, mpsc::Sender<Vec<u8>>> = HashMap::new();
   let mut buf = vec![0u8; 65536];
+  let wake = Arc::new(Notify::new());
   loop {
     let delay = iface.poll_delay(Instant::now(), &sockets);
+    let idle = delay.map_or(std::time::Duration::from_secs(1), |d| {
+      std::time::Duration::from_micros(d.total_micros())
+    });
     tokio::select! {
+      biased;
       result = device.recv(&mut buf) => {
         let n = result?;
         ingress(Ingress {
@@ -126,12 +131,23 @@ async fn run_loop(
           dns_upstream,
         });
       }
-      () = tokio::time::sleep(delay.map_or(std::time::Duration::from_secs(1), |d| std::time::Duration::from_micros(d.total_micros()))) => {}
+      // A connection task writing to the guest does not produce a TUN
+      // packet. Without this, that write waits out `idle`.
+      () = wake.notified() => {}
+      () = tokio::time::sleep(idle) => {}
     }
-    iface.poll(Instant::now(), &mut phy, &mut sockets);
+    let now = Instant::now();
+    iface.poll(now, &mut phy, &mut sockets);
     tracker.relay(&mut sockets);
+    // Bytes relayed this turn are not on the wire until a poll sees them.
+    iface.poll(now, &mut phy, &mut sockets);
     for conn in tracker.take_new(&mut sockets) {
-      tokio::spawn(tun_conn_task(conn, upstream_override, Arc::clone(&state)));
+      tokio::spawn(tun_conn_task(
+        conn,
+        upstream_override,
+        Arc::clone(&state),
+        Arc::clone(&wake),
+      ));
     }
     tracker.cleanup(&mut sockets);
     while let Some(pkt) = phy.tx.pop_front() {
@@ -224,13 +240,13 @@ fn forward_udp(
 /// authority check — the SNI itself is the identity).
 /// `upstream_override` is a test override (DNS remap shape): dial this address
 /// instead of the captured destination. None in production.
-async fn tun_conn_task(conn: NewTcpConn, upstream_override: Option<SocketAddr>, state: Arc<ProxyState>) {
+async fn tun_conn_task(conn: NewTcpConn, upstream_override: Option<SocketAddr>, state: Arc<ProxyState>, wake: Arc<Notify>) {
   let snapshot = state.snapshot();
   let dst = upstream_override.unwrap_or(conn.dst);
   let dial_host = dst.ip().to_string();
   let port = dst.port();
   let abort_tx = conn.to_guest.clone();
-  let guest = ChanStream::new(conn.from_guest, conn.to_guest);
+  let guest = ChanStream::new(conn.from_guest, conn.to_guest, wake);
   let result = serve_transparent_stream(guest, &state, &snapshot, &dial_host, port, &dial_host).await;
   if result.is_err() {
     // Dial/TLS failure: RST so the guest fails fast instead of hanging.
