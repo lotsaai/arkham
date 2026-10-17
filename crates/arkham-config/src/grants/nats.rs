@@ -1133,6 +1133,37 @@ mod tests {
   }
 
   #[test]
+  fn creds_username_with_a_colon_password_stays_user_and_password() {
+    for pass in ["a:b", "a%3Ab"] { // betterleaks:allow
+      let scope = NatsScope::from_strings(
+        &format!("nats://creds:{pass}@nats.internal:4222"),
+        &format!("nats://creds:{pass}@nats.upstream:4222"),
+      )
+      .unwrap_or_else(|err| panic!("{pass}: {err}"));
+      let decoded = if pass.contains('%') { "a:b" } else { pass };
+      assert_eq!(
+        fields(&scope.auth),
+        vec![
+          ("user", "creds".to_string(), "creds".to_string()),
+          ("pass", decoded.to_string(), decoded.to_string()),
+        ],
+        "{pass}"
+      );
+    }
+  }
+
+  #[test]
+  fn creds_seed_whose_jwt_names_another_key_is_rejected() {
+    let (seed, _public) = user_material();
+    let other = user_material().1;
+    let jwt = user_jwt(&other, br#"{"alg":"ed25519-nkey","typ":"JWT"}"#);
+    let uri = format!("nats://creds:{seed}:{jwt}@nats.internal:4222");
+    let err = NatsScope::from_strings(&uri, &uri).expect_err("jwt sub is another key");
+    assert!(matches!(err, NatsUriError::JwtSeedMismatch), "{err}");
+    hides(&err, &[seed.as_str(), jwt.as_str(), other.as_str()]);
+  }
+
+  #[test]
   fn empty_password_userinfo_is_user_and_password() {
     let scope = NatsScope::from_strings("nats://agent:@nats.internal:4222", "nats://agent:@nats.internal:4222").expect("empty password");
     assert_eq!(
