@@ -14,7 +14,8 @@ mod smtp;
 pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub(crate) use nats::NatsUriScheme;
 pub use nats::{
-  NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsPair, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError,
+  NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsPair, NatsScope, NatsSeed, NatsTlsOrder, NatsTrust, NatsUpstream,
+  NatsUriError, Nkey, UserJwt,
 };
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
@@ -429,7 +430,7 @@ pub enum Grant {
   /// One NATS connection-string mapping: fake string to real, 1:1. The real
   /// string's spelling states whether the upstream leg is TLS.
   Nats {
-    /// The wire needles: the fake and real password or token.
+    /// The wire value this grant swaps: password, token, public key, or user JWT.
     credential: Credential,
     /// The one scope this rule maps, carrying both legs' facts.
     scope: Box<NatsScope>,

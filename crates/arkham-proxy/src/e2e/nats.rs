@@ -1,8 +1,11 @@
 //! NATS through the MITM: a `nats://` server leg keeps the decoy, a `tls://`
-//! server leg carries the real password only after its upgrade, and a guest
-//! hello without SNI mints for the grant host.
+//! server leg carries the real password, nkey, or user JWT only after its
+//! upgrade, and a guest hello without SNI mints for the grant host.
 
 use std::path::PathBuf;
+
+use arkham_config::grants::NatsSeed;
+use base64::Engine as _;
 
 use super::*;
 use crate::transports::nats::fixtures::nats_grants;
@@ -259,4 +262,206 @@ async fn nats_handshake_first_settles_both_legs_before_info() {
   drop(tls);
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   proxy.abort();
+}
+
+const E2E_NONCE: &[u8] = b"e2e-nonce";
+const NONCE_INFO: &[u8] = b"INFO {\"server_id\":\"NSTUB\",\"auth_required\":true,\"tls_required\":true,\"nonce\":\"e2e-nonce\"}\r\n";
+
+fn e2e_b64(bytes: &[u8]) -> String {
+  base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn e2e_user_jwt(public: &str) -> String {
+  let header = e2e_b64(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+  let payload = e2e_b64(format!(r#"{{"sub":"{public}"}}"#).as_bytes());
+  format!("{header}.{payload}.{}", e2e_b64(b"sig"))
+}
+
+fn signed_connect(field: &str, value: &str, sig: &str) -> String {
+  format!("CONNECT {{\"{field}\":\"{value}\",\"sig\":\"{sig}\",\"verbose\":false}}\r\n")
+}
+
+struct SignedMaterial {
+  fake_url: String,
+  real_userinfo: String,
+  line: String,
+  field: &'static str,
+  expect: String,
+  absent: Vec<String>,
+  public: String,
+}
+
+fn signed_material(user_jwt: bool, port: u16) -> SignedMaterial {
+  let (fake_raw, fake_seed) = NatsSeed::generate_user().expect("fake user seed");
+  let (real_raw, real_seed) = NatsSeed::generate_user().expect("real user seed");
+  let sig = e2e_b64(&fake_seed.sign(E2E_NONCE).expect("fake seed signs"));
+  if user_jwt {
+    let fake_jwt = e2e_user_jwt(fake_seed.public_key());
+    let real_jwt = e2e_user_jwt(real_seed.public_key());
+    SignedMaterial {
+      fake_url: format!("nats://creds:{fake_raw}:{fake_jwt}@localhost:{port}"),
+      real_userinfo: format!("creds:{real_raw}:{real_jwt}"),
+      line: format!(
+        "CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":\"{}\",\"sig\":\"{sig}\",\"verbose\":false}}\r\n",
+        fake_seed.public_key()
+      ),
+      field: "jwt",
+      expect: real_jwt,
+      absent: vec![fake_jwt, fake_raw, real_raw, fake_seed.public_key().to_string()],
+      public: real_seed.public_key().to_string(),
+    }
+  } else {
+    let fake_public = fake_seed.public_key().to_string();
+    SignedMaterial {
+      fake_url: format!("nats://nkey:{fake_raw}@localhost:{port}"),
+      real_userinfo: format!("nkey:{real_raw}"),
+      line: signed_connect("nkey", &fake_public, &sig),
+      field: "nkey",
+      expect: real_seed.public_key().to_string(),
+      absent: vec![fake_public, fake_raw, real_raw],
+      public: real_seed.public_key().to_string(),
+    }
+  }
+}
+
+/// The stub reads one CONNECT and checks the swapped field plus the nonce signature.
+async fn expect_signed<S: AsyncRead + Unpin>(conn: &mut S, field: &str, expect: &str, public: &str, absent: &[String]) {
+  let connect = read_line(conn).await;
+  let text = String::from_utf8(connect).expect("CONNECT is utf-8");
+  assert!(text.starts_with("CONNECT "), "{text}");
+  let json = text.trim().strip_prefix("CONNECT").expect("verb").trim();
+  let parsed: serde_json::Value = serde_json::from_str(json).expect("CONNECT json");
+  assert_eq!(parsed.get(field).and_then(serde_json::Value::as_str), Some(expect));
+  if parsed.get("nkey").is_some() {
+    assert_eq!(parsed.get("nkey").and_then(serde_json::Value::as_str), Some(public));
+  }
+  let sig = parsed.get("sig").and_then(serde_json::Value::as_str).expect("sig");
+  let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig).expect("sig bytes");
+  assert!(
+    NatsSeed::verify(public, E2E_NONCE, &raw),
+    "upstream sig verifies under the real public key"
+  );
+  for needle in absent {
+    assert!(!text.contains(needle), "{text} still carries a decoy or a seed");
+  }
+}
+
+async fn signed_round_trip(handshake_first: bool, user_jwt: bool) {
+  let stub = nats_stub().await;
+  let material = signed_material(user_jwt, stub.port);
+  let root = stub.bundle.display().to_string();
+  let query = if handshake_first {
+    format!("handshake_first=true&sslrootcert={root}")
+  } else {
+    format!("sslrootcert={root}")
+  };
+  let real = format!("tls://{}@localhost:{}?{query}", material.real_userinfo, stub.port);
+  let grants = nats_grants(&material.fake_url, &real);
+  let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &stub.ca)).await;
+  let port = stub.port;
+  let connector = stub.guest_connector(true);
+  let line = material.line.clone();
+  let field = material.field;
+  let expect = material.expect.clone();
+  let public = material.public.clone();
+  let absent = material.absent.clone();
+  let NatsStub { listener, acceptor, .. } = stub;
+  let stub_task = tokio::spawn(async move {
+    let (conn, _) = listener.accept().await.unwrap();
+    if handshake_first {
+      let mut tls = acceptor.accept(conn).await.unwrap();
+      tls.write_all(NONCE_INFO).await.unwrap();
+      tls.flush().await.unwrap();
+      expect_signed(&mut tls, field, &expect, &public, &absent).await;
+      tls.write_all(b"+OK\r\n").await.unwrap();
+      tls.flush().await.unwrap();
+    } else {
+      let mut plain = conn;
+      plain.write_all(NONCE_INFO).await.unwrap();
+      plain.flush().await.unwrap();
+      let mut tls = acceptor.accept(plain).await.unwrap();
+      expect_signed(&mut tls, field, &expect, &public, &absent).await;
+      tls.write_all(b"+OK\r\n").await.unwrap();
+      tls.flush().await.unwrap();
+    }
+  });
+  if handshake_first {
+    let stream = connect_through_proxy(proxy_addr, port).await;
+    let name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, stream))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(read_line(&mut tls).await, NONCE_INFO);
+    tls.write_all(line.as_bytes()).await.unwrap();
+    assert_eq!(read_line(&mut tls).await, b"+OK\r\n");
+    drop(tls);
+  } else {
+    let mut guest = connect_through_proxy(proxy_addr, port).await;
+    assert_eq!(read_line(&mut guest).await, NONCE_INFO);
+    guest.write_all(line.as_bytes()).await.unwrap();
+    assert_eq!(read_line(&mut guest).await, b"+OK\r\n");
+  }
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  proxy.abort();
+}
+
+#[tokio::test]
+async fn nats_after_info_swaps_a_verifying_nkey() {
+  signed_round_trip(false, false).await;
+}
+
+#[tokio::test]
+async fn nats_handshake_first_swaps_a_verifying_nkey() {
+  signed_round_trip(true, false).await;
+}
+
+#[tokio::test]
+async fn nats_after_info_swaps_a_verifying_user_jwt() {
+  signed_round_trip(false, true).await;
+}
+
+#[tokio::test]
+async fn nats_handshake_first_swaps_a_verifying_user_jwt() {
+  signed_round_trip(true, true).await;
+}
+
+/// `guest_tls_mode = mtls` and a cleartext guest after INFO: the proxy
+/// returns [`crate::Error::NatsGuestPlaintext`] and the stub sees no CONNECT.
+#[tokio::test]
+async fn nats_mtls_plaintext_guest_writes_nothing_upstream() {
+  let stub = nats_stub().await;
+  let port = stub.port;
+  let root = stub.bundle.display().to_string();
+  let fake = format!("nats://agent:{FAKE}@localhost:{port}");
+  let real = format!("tls://agent:{VALUE}@localhost:{port}?sslrootcert={root}");
+  let grants = super::resolve_mtls_grants("NATS_URL", &fake, &real).expect("nats mtls on a cleartext fake still loads");
+  let state = test_state_with(grants, &stub.ca);
+  let snapshot = state.snapshot();
+  let NatsStub { listener, acceptor, .. } = stub;
+  let stub_task = tokio::spawn(async move {
+    let (mut conn, _) = listener.accept().await.unwrap();
+    conn.write_all(INFO).await.unwrap();
+    conn.flush().await.unwrap();
+    let mut tls = acceptor.accept(conn).await.unwrap();
+    let mut buf = [0u8; 64];
+    let upstream = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf))
+      .await
+      .expect("upstream closes");
+    match upstream {
+      Ok(0) | Err(_) => {}
+      Ok(n) => panic!("plaintext mtls guest wrote {n} bytes upstream"),
+    }
+  });
+  let (guest, mut client) = tokio::io::duplex(64 * 1024);
+  let serve = tokio::spawn(async move { serve_connect_stream(guest, &state, snapshot.as_ref(), "localhost", port, &[]).await });
+  assert_eq!(read_line(&mut client).await, INFO);
+  client.write_all(connect_line(FAKE).as_bytes()).await.unwrap();
+  let err = tokio::time::timeout(Duration::from_secs(10), serve)
+    .await
+    .expect("serve finishes")
+    .expect("serve task");
+  let err = err.expect_err("plaintext mtls guest");
+  assert!(matches!(err, crate::Error::NatsGuestPlaintext), "{err}");
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
 }

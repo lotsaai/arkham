@@ -6,8 +6,9 @@
 //! Past [`MAX_COMMAND`] the bytes already held and the rest of that line go
 //! out untouched, and the session stays open. When the server leg is TLS,
 //! `user`/`pass` or `auth_token` carry the real values, and only when every
-//! one of those fields holds the decoy. `nkey`, `jwt`, and `sig` pass
-//! through and are still real secrets inside the agent. Every other byte,
+//! one of those fields holds the decoy. An nkey or user-JWT CONNECT is
+//! rewritten only after the first INFO nonce is armed and the guest
+//! signature verifies under the decoy public key. Every other byte,
 //! including PUB and HPUB payloads, streams as it arrives.
 //!
 //! Verbs follow the protocol message table. Operation names are case
@@ -55,8 +56,10 @@ use std::collections::BTreeMap;
 
 use actson::feeder::PushJsonFeeder;
 use actson::{JsonEvent, JsonParser};
-use arkham_config::grants::{Grant, NatsAuth, NatsPair};
+use arkham_config::grants::{Grant, NatsAuth, NatsPair, NatsSeed};
 use atoi::FromRadix10Checked as _;
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use secrecy::ExposeSecret as _;
 use serde_json::{Map, Value};
 use strum::{EnumIter, EnumString, IntoEnumIterator as _, IntoStaticStr};
@@ -71,6 +74,49 @@ pub(crate) const MAX_COMMAND: usize = 16 * 1024;
 
 /// The two bytes that must follow every counted payload.
 const CRLF: &[u8] = b"\r\n";
+
+/// JSON key of a CONNECT field. The spellings are this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum ConnectField {
+  User,
+  Pass,
+  AuthToken,
+  Nkey,
+  Jwt,
+  Sig,
+}
+
+impl ConnectField {
+  fn as_str(self) -> &'static str {
+    <&str>::from(self)
+  }
+}
+
+/// First INFO `nonce`. Empty is not a value.
+#[derive(Debug)]
+struct Nonce(String);
+
+impl Nonce {
+  fn parse(raw: &str) -> Option<Self> {
+    if raw.is_empty() { None } else { Some(Self(raw.to_string())) }
+  }
+
+  fn as_bytes(&self) -> &[u8] {
+    self.0.as_bytes()
+  }
+}
+
+/// Nonce captured from the opening INFO. Only [`NonceSlot::Ready`] may sign.
+#[derive(Debug)]
+enum NonceSlot {
+  /// `server_info` has not armed this leg.
+  Pending,
+  /// The opening INFO had no nonce.
+  Absent,
+  /// The opening INFO's nonce.
+  Ready(Nonce),
+}
 
 /// Commands a client sends.
 #[derive(Debug, Clone, Copy, EnumIter, EnumString, IntoStaticStr)]
@@ -461,6 +507,7 @@ impl Nats {
       policy,
       connect: Vec::new(),
       spilling: false,
+      nonce: NonceSlot::Pending,
     })
   }
 
@@ -520,11 +567,11 @@ enum Policy {
 }
 
 impl Policy {
-  fn swap(&self, line: &[u8]) -> Option<(Vec<u8>, Hit)> {
+  fn swap(&self, line: &[u8], nonce: &NonceSlot) -> Option<(Vec<u8>, Hit)> {
     let Self::Swap { label, auth } = self else {
       return None;
     };
-    let swapped = swap_connect(line, auth)?;
+    let swapped = swap_connect(line, auth, nonce)?;
     Some((
       swapped,
       Hit {
@@ -533,6 +580,26 @@ impl Policy {
       },
     ))
   }
+}
+
+/// Move the first INFO nonce from the server leg onto the client leg.
+///
+/// A second call keeps the nonce already stored. A leg that is not [`Nats::Up`]
+/// yields nothing. A leg that is not [`Nats::Down`] accepts nothing.
+pub(crate) fn arm_opening(up: &mut Nats, down: &mut Nats) {
+  let Nats::Up(up) = up else {
+    return;
+  };
+  let Nats::Down(down) = down else {
+    return;
+  };
+  if !matches!(down.nonce, NonceSlot::Pending) {
+    return;
+  }
+  down.nonce = match up.info.nonce.take() {
+    Some(nonce) => NonceSlot::Ready(nonce),
+    None => NonceSlot::Absent,
+  };
 }
 
 /// Real values to hide from the guest: every mapped auth field whose fake
@@ -547,14 +614,13 @@ fn upstream_pairs(grants: &[Grant], host: &str, port: u16) -> Vec<CredentialPair
     let Some(credential) = grant.credential() else {
       continue;
     };
-    for (_, field) in auth_fields(&scope.auth) {
-      let real = field.real.expose_secret();
-      if field.fake == real || field.fake.is_empty() || real.is_empty() {
+    for (fake, real) in redaction_pairs(&scope.auth) {
+      if fake == real || fake.is_empty() || real.is_empty() {
         continue;
       }
       pairs.push(CredentialPair {
-        needle: real.as_bytes().to_vec(),
-        replacement: field.fake.as_bytes().to_vec(),
+        needle: real.into_bytes(),
+        replacement: fake.into_bytes(),
         label: credential.label.clone(),
       });
     }
@@ -562,17 +628,147 @@ fn upstream_pairs(grants: &[Grant], host: &str, port: u16) -> Vec<CredentialPair
   pairs
 }
 
-/// The CONNECT fields one auth kind owns.
+/// The CONNECT fields a user/password or token kind owns.
 fn auth_fields(auth: &NatsAuth) -> Vec<(&'static str, &NatsPair)> {
   match auth {
-    NatsAuth::UserPass { user, pass } => vec![("user", user), ("pass", pass)],
-    NatsAuth::Token(token) => vec![("auth_token", token)],
+    NatsAuth::UserPass { user, pass } => vec![(ConnectField::User.as_str(), user), (ConnectField::Pass.as_str(), pass)],
+    NatsAuth::Token(token) => vec![(ConnectField::AuthToken.as_str(), token)],
+    NatsAuth::Nkey(_) | NatsAuth::UserJwt(_) => Vec::new(),
   }
+}
+
+/// Real values a server line may echo, paired with the decoy. The user JWT
+/// comes before its public key, because the public key is a substring of the JWT.
+fn redaction_pairs(auth: &NatsAuth) -> Vec<(String, String)> {
+  match auth {
+    NatsAuth::UserPass { user, pass } => vec![
+      (user.fake.clone(), user.real.expose_secret().to_string()),
+      (pass.fake.clone(), pass.real.expose_secret().to_string()),
+    ],
+    NatsAuth::Token(token) => vec![(token.fake.clone(), token.real.expose_secret().to_string())],
+    NatsAuth::Nkey(nkey) => vec![(nkey.fake_public().to_string(), nkey.real_public().to_string())],
+    NatsAuth::UserJwt(jwt) => vec![
+      (jwt.fake_jwt().to_string(), jwt.real_jwt().expose_secret().to_string()),
+      (jwt.fake_public().to_string(), jwt.real_public().to_string()),
+    ],
+  }
+}
+
+/// Which signed CONNECT field this rule rewrites.
+enum Signed<'a> {
+  Nkey(&'a arkham_config::grants::Nkey),
+  UserJwt(&'a arkham_config::grants::UserJwt),
 }
 
 /// `line` with the real values, when its JSON parses and every auth field
 /// holds the decoy. `None` forwards the line unchanged.
-fn swap_connect(line: &[u8], auth: &NatsAuth) -> Option<Vec<u8>> {
+fn swap_connect(line: &[u8], auth: &NatsAuth, nonce: &NonceSlot) -> Option<Vec<u8>> {
+  match auth {
+    NatsAuth::UserPass { .. } | NatsAuth::Token(_) => rewrite_connect(line, |fields| replace_decoys(fields, auth)),
+    NatsAuth::Nkey(nkey) => {
+      let NonceSlot::Ready(nonce) = nonce else {
+        return None;
+      };
+      rewrite_signed(line, nonce.as_bytes(), &Signed::Nkey(nkey))
+    }
+    NatsAuth::UserJwt(jwt) => {
+      let NonceSlot::Ready(nonce) = nonce else {
+        return None;
+      };
+      rewrite_signed(line, nonce.as_bytes(), &Signed::UserJwt(jwt))
+    }
+  }
+}
+
+fn replace_decoys(fields: &mut Map<String, Value>, auth: &NatsAuth) -> Option<()> {
+  let pairs = auth_fields(auth);
+  let all_decoys = pairs
+    .iter()
+    .all(|(field, pair)| fields.get(*field).and_then(Value::as_str) == Some(pair.fake.as_str()));
+  if !all_decoys {
+    return None;
+  }
+  for (field, pair) in pairs {
+    fields.insert(field.to_string(), Value::String(pair.real.expose_secret().to_string()));
+  }
+  Some(())
+}
+
+/// Nkey and user-JWT CONNECT. `None` forwards the original bytes and does not sign.
+///
+/// An nkey rule rejects a CONNECT that also carries `jwt`. A user-JWT rule
+/// accepts a missing `nkey`. When `nkey` is present it must be the decoy
+/// public key, and the upstream line carries the real public key. nats.js
+/// 2.29.3 `credsAuthenticator` always sends `jwt`, `nkey`, and `sig`.
+fn rewrite_signed(line: &[u8], nonce: &[u8], kind: &Signed<'_>) -> Option<Vec<u8>> {
+  rewrite_connect(line, |fields| {
+    let (field, fake, real, verify_public) = match kind {
+      Signed::Nkey(nkey) => (
+        ConnectField::Nkey,
+        nkey.fake_public().to_string(),
+        nkey.real_public().to_string(),
+        nkey.fake_public().to_string(),
+      ),
+      Signed::UserJwt(jwt) => (
+        ConnectField::Jwt,
+        jwt.fake_jwt().to_string(),
+        jwt.real_jwt().expose_secret().to_string(),
+        jwt.fake_public().to_string(),
+      ),
+    };
+    if fields.get(field.as_str()).and_then(Value::as_str) != Some(fake.as_str()) {
+      return None;
+    }
+    match kind {
+      Signed::Nkey(_) => {
+        if fields.contains_key(ConnectField::Jwt.as_str()) {
+          return None;
+        }
+      }
+      Signed::UserJwt(jwt) => {
+        if let Some(nkey) = fields.get(ConnectField::Nkey.as_str())
+          && nkey.as_str() != Some(jwt.fake_public())
+        {
+          return None;
+        }
+      }
+    }
+    let sig = fields.get(ConnectField::Sig.as_str()).and_then(Value::as_str)?;
+    // nats-server 2.15 tries raw URL base64, then standard. nats.js 2.29 signs
+    // with `btoa`, which is the standard alphabet. The rewritten `sig` stays raw URL.
+    let raw = decode_sig(sig)?;
+    if !NatsSeed::verify(&verify_public, nonce, &raw) {
+      return None;
+    }
+    let signed = match kind {
+      Signed::Nkey(nkey) => nkey.sign(nonce)?,
+      Signed::UserJwt(jwt) => jwt.sign(nonce)?,
+    };
+    fields.insert(field.as_str().to_string(), Value::String(real));
+    if let Signed::UserJwt(jwt) = kind
+      && fields.contains_key(ConnectField::Nkey.as_str())
+    {
+      fields.insert(
+        ConnectField::Nkey.as_str().to_string(),
+        Value::String(jwt.real_public().to_string()),
+      );
+    }
+    fields.insert(ConnectField::Sig.as_str().to_string(), Value::String(sig_b64(&signed)));
+    Some(())
+  })
+}
+
+fn sig_b64(raw: &[u8]) -> String {
+  URL_SAFE_NO_PAD.encode(raw)
+}
+
+/// Guest `sig` bytes. Raw URL base64 first, then standard base64.
+fn decode_sig(sig: &str) -> Option<Vec<u8>> {
+  URL_SAFE_NO_PAD.decode(sig).or_else(|_err| STANDARD.decode(sig)).ok()
+}
+
+/// One sorted-key re-encode of a CONNECT line. `edit` returns `None` to forward.
+fn rewrite_connect(line: &[u8], edit: impl FnOnce(&mut Map<String, Value>) -> Option<()>) -> Option<Vec<u8>> {
   let body = line.strip_suffix(b"\n")?;
   let body = body.strip_suffix(b"\r").unwrap_or(body);
   let ending = line.get(body.len()..)?;
@@ -584,16 +780,7 @@ fn swap_connect(line: &[u8], auth: &NatsAuth) -> Option<Vec<u8>> {
   }
   let (gap, json) = args.split_at_checked(json_at)?;
   let mut fields: Map<String, Value> = serde_json::from_slice(json).ok()?;
-  let pairs = auth_fields(auth);
-  let all_decoys = pairs
-    .iter()
-    .all(|(field, pair)| fields.get(*field).and_then(Value::as_str) == Some(pair.fake.as_str()));
-  if !all_decoys {
-    return None;
-  }
-  for (field, pair) in pairs {
-    fields.insert(field.to_string(), Value::String(pair.real.expose_secret().to_string()));
-  }
+  edit(&mut fields)?;
   // fnox pulls in serde_json `preserve_order` for workspace builds only, so
   // the key order is fixed here instead of depending on feature unification.
   let sorted: BTreeMap<&str, &Value> = fields.iter().map(|(key, value)| (key.as_str(), value)).collect();
@@ -616,6 +803,8 @@ pub(crate) struct Down {
   connect: Vec<u8>,
   /// This CONNECT line passed the cap. The rest of it is forwarded.
   spilling: bool,
+  /// Opening INFO nonce. [`NonceSlot::Pending`] until [`arm_opening`].
+  nonce: NonceSlot,
 }
 
 impl Down {
@@ -670,7 +859,7 @@ impl Down {
     self.connect.extend_from_slice(bytes);
     if end {
       let line = std::mem::take(&mut self.connect);
-      match self.policy.swap(&line) {
+      match self.policy.swap(&line, &self.nonce) {
         Some((swapped, hit)) => {
           out.extend_from_slice(&swapped);
           hits.push(hit);
@@ -709,6 +898,13 @@ enum TlsKey {
   Verify,
 }
 
+/// A depth-1 INFO key the parser keeps.
+#[derive(Clone, Copy)]
+enum InfoKey {
+  Tls(TlsKey),
+  Nonce,
+}
+
 /// actson events for one INFO object.
 ///
 /// `current_buffer` holds the open token and the feeder holds unread input.
@@ -720,8 +916,12 @@ struct InfoParse {
   /// [`JsonParser::parsed_bytes`] at the previous event.
   mark: usize,
   depth: u32,
-  key: Option<TlsKey>,
+  key: Option<InfoKey>,
   tls: InfoTls,
+  /// First depth-1 `nonce` string. Empty is not stored.
+  nonce: Option<Nonce>,
+  /// The first `nonce` field was seen, even when its value was empty.
+  nonce_seen: bool,
   ended: bool,
   failed: bool,
 }
@@ -735,6 +935,8 @@ impl InfoParse {
       depth: 0,
       key: None,
       tls: InfoTls::default(),
+      nonce: None,
+      nonce_seen: false,
       ended: false,
       failed: false,
     }
@@ -783,7 +985,7 @@ impl InfoParse {
     }
   }
 
-  fn finish(mut self) -> InfoVerdict {
+  fn finish(mut self) -> (InfoVerdict, Option<Nonce>) {
     if !self.failed {
       self.parser.feeder.done();
       loop {
@@ -803,11 +1005,13 @@ impl InfoParse {
         }
       }
     }
-    if self.tls.tls_required || self.ended {
+    let verdict = if self.tls.tls_required || self.ended {
       InfoVerdict::Flags(self.tls)
     } else {
       InfoVerdict::Unreadable
-    }
+    };
+    let nonce = if self.failed { None } else { self.nonce };
+    (verdict, nonce)
   }
 
   /// Parsed bytes of the open token, plus bytes still sitting in the feeder.
@@ -830,10 +1034,7 @@ impl InfoParse {
       }
       JsonEvent::FieldName => self.note_name(),
       JsonEvent::ValueTrue | JsonEvent::ValueFalse => self.note_bool(matches!(event, JsonEvent::ValueTrue)),
-      JsonEvent::ValueString => {
-        self.reject_long_text();
-        self.key = None;
-      }
+      JsonEvent::ValueString => self.note_string(),
       JsonEvent::ValueInt | JsonEvent::ValueFloat | JsonEvent::ValueNull => self.key = None,
       JsonEvent::NeedMoreInput => {}
     }
@@ -849,7 +1050,7 @@ impl InfoParse {
         self.failed = true;
         self.key = None;
       }
-      Ok(name) => self.key = tls_key(name.as_bytes()),
+      Ok(name) => self.key = info_key(name.as_bytes()),
       Err(_) => {
         self.failed = true;
         self.key = None;
@@ -858,31 +1059,48 @@ impl InfoParse {
   }
 
   fn note_bool(&mut self, value: bool) {
-    if self.depth == 1 {
-      match self.key {
-        Some(TlsKey::Required) => self.tls.tls_required = value,
-        Some(TlsKey::Available) => self.tls.tls_available = value,
-        Some(TlsKey::Verify) => self.tls.tls_verify = value,
-        None => {}
+    if self.depth == 1
+      && let Some(InfoKey::Tls(key)) = self.key
+    {
+      match key {
+        TlsKey::Required => self.tls.tls_required = value,
+        TlsKey::Available => self.tls.tls_available = value,
+        TlsKey::Verify => self.tls.tls_verify = value,
       }
     }
     self.key = None;
   }
 
-  fn reject_long_text(&mut self) {
-    match self.parser.current_str() {
-      Ok(text) if text.len() > MAX_COMMAND => self.failed = true,
-      Ok(_) => {}
-      Err(_) => self.failed = true,
+  fn note_string(&mut self) {
+    let text = match self.parser.current_str() {
+      Ok(text) if text.len() > MAX_COMMAND => {
+        self.failed = true;
+        self.key = None;
+        return;
+      }
+      Ok(text) => text,
+      Err(_) => {
+        self.failed = true;
+        self.key = None;
+        return;
+      }
+    };
+    if self.depth == 1 && matches!(self.key, Some(InfoKey::Nonce)) && !self.nonce_seen {
+      self.nonce_seen = true;
+      if !self.failed {
+        self.nonce = Nonce::parse(text);
+      }
     }
+    self.key = None;
   }
 }
 
-fn tls_key(raw: &[u8]) -> Option<TlsKey> {
+fn info_key(raw: &[u8]) -> Option<InfoKey> {
   match raw {
-    b"tls_required" => Some(TlsKey::Required),
-    b"tls_available" => Some(TlsKey::Available),
-    b"tls_verify" => Some(TlsKey::Verify),
+    b"tls_required" => Some(InfoKey::Tls(TlsKey::Required)),
+    b"tls_available" => Some(InfoKey::Tls(TlsKey::Available)),
+    b"tls_verify" => Some(InfoKey::Tls(TlsKey::Verify)),
+    b"nonce" => Some(InfoKey::Nonce),
     _ => None,
   }
 }
@@ -896,6 +1114,10 @@ struct InfoWatch {
   /// Set when an INFO line reaches LF. Taken once.
   ready: Option<InfoVerdict>,
   parse: Option<InfoParse>,
+  /// Nonce from the first INFO line that reached LF.
+  nonce: Option<Nonce>,
+  /// That first INFO line has been committed.
+  opening_done: bool,
 }
 
 impl Default for InfoWatch {
@@ -905,6 +1127,8 @@ impl Default for InfoWatch {
       active: false,
       ready: None,
       parse: None,
+      nonce: None,
+      opening_done: false,
     }
   }
 }
@@ -924,10 +1148,15 @@ impl InfoWatch {
     }
     if end {
       if self.active && self.ready.is_none() {
-        self.ready = Some(match self.parse.take() {
+        let (verdict, nonce) = match self.parse.take() {
           Some(parse) => parse.finish(),
-          None => InfoVerdict::Unreadable,
-        });
+          None => (InfoVerdict::Unreadable, None),
+        };
+        self.ready = Some(verdict);
+        if !self.opening_done {
+          self.nonce = nonce;
+          self.opening_done = true;
+        }
       }
       self.active = false;
       self.parse = None;
@@ -1316,5 +1545,331 @@ mod tests {
     let mut machine = down(&grants, false);
     let huge = format!("CONNECT {{\"name\":\"{}\"", "a".repeat(MAX_COMMAND));
     assert_eq!(feed(&mut machine, huge.as_bytes()).await, (emit(&huge), 0));
+  }
+
+  use arkham_config::grants::NatsSeed;
+  use base64::Engine as _;
+
+  struct Minted {
+    raw: String,
+    seed: NatsSeed,
+  }
+
+  fn minted() -> Minted {
+    let (raw, seed) = NatsSeed::generate_user().expect("user seed");
+    Minted { raw, seed }
+  }
+
+  fn b64(bytes: &[u8]) -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+  }
+
+  fn user_jwt(public: &str) -> String {
+    let header = b64(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+    let payload = b64(format!(r#"{{"sub":"{public}"}}"#).as_bytes());
+    format!("{header}.{payload}.{}", b64(b"sig"))
+  }
+
+  fn sig_of(seed: &NatsSeed, nonce: &[u8]) -> String {
+    b64(&seed.sign(nonce).expect("seed signs"))
+  }
+
+  fn nkey_grants(fake: &Minted, real: &Minted) -> Vec<Grant> {
+    nats_grants(
+      &format!("nats://nkey:{}@nats.internal:4222", fake.raw),
+      &format!("tls://nkey:{}@nats.upstream:4222", real.raw),
+    )
+  }
+
+  fn jwt_grants(fake: &Minted, real: &Minted, fake_jwt: &str, real_jwt: &str) -> Vec<Grant> {
+    nats_grants(
+      &format!("nats://creds:{}:{fake_jwt}@nats.internal:4222", fake.raw),
+      &format!("tls://creds:{}:{real_jwt}@nats.upstream:4222", real.raw),
+    )
+  }
+
+  fn nkey_line(public: &str, sig: &str) -> String {
+    format!("CONNECT {{\"nkey\":\"{public}\",\"sig\":\"{sig}\",\"verbose\":false}}\r\n")
+  }
+
+  fn jwt_line(jwt: &str, sig: &str) -> String {
+    format!("CONNECT {{\"jwt\":\"{jwt}\",\"sig\":\"{sig}\",\"verbose\":false}}\r\n")
+  }
+
+  fn text_of(out: Out) -> String {
+    let Out::Emit(text) = out else {
+      panic!("expected the line, got {out:?}");
+    };
+    text
+  }
+
+  async fn arm_info(up: &mut Nats, down: &mut Nats, info: &str) {
+    let (out, hits) = feed(up, info.as_bytes()).await;
+    assert_eq!(hits, 0);
+    assert!(matches!(out, Out::Emit(_)), "{out:?}");
+    super::arm_opening(up, down);
+  }
+
+  fn assert_original(out: &str, original: &str, real_public: &str, real_sig: &str) {
+    assert_eq!(out, original);
+    assert!(!out.contains(real_public), "{out}");
+    assert!(!out.contains(real_sig), "{out}");
+  }
+
+  #[tokio::test]
+  async fn ready_nonce_swaps_a_verifying_nkey_connect() {
+    let fake = minted();
+    let real = minted();
+    let grants = nkey_grants(&fake, &real);
+    let nonce = b"N0NCE";
+    let mut down = down(&grants, true);
+    let mut up = up(&grants);
+    arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\",\"server_id\":\"N1\"}\r\n").await;
+    arm_info(&mut up, &mut down, "INFO {\"nonce\":\"OTHER\"}\r\n").await;
+    let line = nkey_line(fake.seed.public_key(), &sig_of(&fake.seed, nonce));
+    let (out, hits) = feed(&mut down, line.as_bytes()).await;
+    let out = text_of(out);
+    assert_eq!(hits, 1);
+    let value: serde_json::Value = serde_json::from_str(out.trim().strip_prefix("CONNECT").expect("verb")).expect("json");
+    assert_eq!(value.get("nkey").and_then(serde_json::Value::as_str), Some(real.seed.public_key()));
+    let sig = value.get("sig").and_then(serde_json::Value::as_str).expect("sig");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig).expect("sig bytes");
+    assert!(NatsSeed::verify(real.seed.public_key(), nonce, &raw));
+    assert!(!NatsSeed::verify(real.seed.public_key(), b"OTHER", &raw));
+    assert!(!out.contains(fake.seed.public_key()), "{out}");
+    assert!(!out.contains(&fake.raw), "{out}");
+    assert!(!out.contains(&real.raw), "{out}");
+  }
+
+  /// `nkeyAuthenticator` in nats.js 2.29.3 encodes `sig` with standard base64.
+  #[tokio::test]
+  async fn standard_base64_sig_still_swaps_a_verifying_nkey() {
+    let fake = minted();
+    let real = minted();
+    let grants = nkey_grants(&fake, &real);
+    let nonce = b"N0NCE";
+    let mut guest_down = down(&grants, true);
+    let mut guest_up = up(&grants);
+    arm_info(&mut guest_up, &mut guest_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let raw = fake.seed.sign(nonce).expect("fake seed signs");
+    let sig = base64::engine::general_purpose::STANDARD.encode(&raw);
+    assert!(sig.ends_with('='), "standard base64 of a 64-byte signature is padded");
+    let line = nkey_line(fake.seed.public_key(), &sig);
+    let (out, hits) = feed(&mut guest_down, line.as_bytes()).await;
+    let out = text_of(out);
+    assert_eq!(hits, 1, "{out}");
+    let value: serde_json::Value = serde_json::from_str(out.trim().strip_prefix("CONNECT").expect("verb")).expect("json");
+    assert_eq!(value.get("nkey").and_then(serde_json::Value::as_str), Some(real.seed.public_key()));
+    let swapped = value.get("sig").and_then(serde_json::Value::as_str).expect("sig");
+    assert!(
+      !swapped.contains('=') && !swapped.contains('+') && !swapped.contains('/'),
+      "{swapped}"
+    );
+    let swapped_raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(swapped).expect("sig bytes");
+    assert!(NatsSeed::verify(real.seed.public_key(), nonce, &swapped_raw));
+  }
+
+  #[tokio::test]
+  async fn bad_sig_pending_and_absent_forward_the_nkey_line() {
+    let fake = minted();
+    let real = minted();
+    let grants = nkey_grants(&fake, &real);
+    let nonce = b"N0NCE";
+    let good = sig_of(&fake.seed, nonce);
+    let bad = sig_of(&fake.seed, b"OTHER");
+    let real_sig = sig_of(&real.seed, nonce);
+    let cases = [
+      nkey_line(fake.seed.public_key(), &bad),
+      format!("CONNECT {{\"nkey\":\"{}\",\"verbose\":false}}\r\n", fake.seed.public_key()),
+      nkey_line("not-the-fake-public", &good),
+    ];
+    for line in cases {
+      let mut down = down(&grants, true);
+      let mut up = up(&grants);
+      arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+      let (out, hits) = feed(&mut down, line.as_bytes()).await;
+      assert_eq!(hits, 0, "{line}");
+      assert_original(&text_of(out), &line, real.seed.public_key(), &real_sig);
+    }
+    let line = nkey_line(fake.seed.public_key(), &good);
+    let mut pending = down(&grants, true);
+    let (out, hits) = feed(&mut pending, line.as_bytes()).await;
+    assert_eq!(hits, 0);
+    assert_original(&text_of(out), &line, real.seed.public_key(), &real_sig);
+    let mut absent_down = down(&grants, true);
+    let mut absent_up = up(&grants);
+    arm_info(&mut absent_up, &mut absent_down, "INFO {\"server_id\":\"N1\"}\r\n").await;
+    let (out, hits) = feed(&mut absent_down, line.as_bytes()).await;
+    assert_eq!(hits, 0);
+    assert_original(&text_of(out), &line, real.seed.public_key(), &real_sig);
+  }
+
+  /// `jwtAuthenticator` and `credsAuthenticator` in nats.js 2.29.3 return
+  /// `{jwt, nkey, sig}`. A `nkey` equal to the decoy public key is rewritten
+  /// to the real public key. A foreign `nkey` is forwarded with the line.
+  #[tokio::test]
+  async fn user_jwt_swaps_a_matching_nkey_and_forwards_a_foreign_one() {
+    let fake = minted();
+    let real = minted();
+    let fake_jwt = user_jwt(fake.seed.public_key());
+    let real_jwt = user_jwt(real.seed.public_key());
+    let grants = jwt_grants(&fake, &real, &fake_jwt, &real_jwt);
+    let nonce = b"N0NCE";
+    let mut guest_down = down(&grants, true);
+    let mut guest_up = up(&grants);
+    arm_info(&mut guest_up, &mut guest_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let line = jwt_line(&fake_jwt, &sig_of(&fake.seed, nonce));
+    let (out, hits) = feed(&mut guest_down, line.as_bytes()).await;
+    let out = text_of(out);
+    assert_eq!(hits, 1);
+    let value: serde_json::Value = serde_json::from_str(out.trim().strip_prefix("CONNECT").expect("verb")).expect("json");
+    assert_eq!(value.get("jwt").and_then(serde_json::Value::as_str), Some(real_jwt.as_str()));
+    assert!(value.get("nkey").is_none());
+    let sig = value.get("sig").and_then(serde_json::Value::as_str).expect("sig");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig).expect("sig bytes");
+    assert!(NatsSeed::verify(real.seed.public_key(), nonce, &raw));
+    assert!(!out.contains(&fake_jwt), "{out}");
+    let matching = format!(
+      "CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":\"{}\",\"sig\":\"{}\",\"verbose\":false}}\r\n",
+      fake.seed.public_key(),
+      sig_of(&fake.seed, nonce)
+    );
+    let mut matching_down = down(&grants, true);
+    let mut matching_up = up(&grants);
+    arm_info(&mut matching_up, &mut matching_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let (out, hits) = feed(&mut matching_down, matching.as_bytes()).await;
+    let out = text_of(out);
+    assert_eq!(hits, 1, "{out}");
+    let value: serde_json::Value = serde_json::from_str(out.trim().strip_prefix("CONNECT").expect("verb")).expect("json");
+    assert_eq!(value.get("jwt").and_then(serde_json::Value::as_str), Some(real_jwt.as_str()));
+    assert_eq!(value.get("nkey").and_then(serde_json::Value::as_str), Some(real.seed.public_key()));
+    let sig = value.get("sig").and_then(serde_json::Value::as_str).expect("sig");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig).expect("sig bytes");
+    assert!(NatsSeed::verify(real.seed.public_key(), nonce, &raw));
+    assert!(!out.contains(&fake_jwt), "{out}");
+    assert!(!out.contains(fake.seed.public_key()), "{out}");
+    let foreign = format!(
+      "CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":\"not-the-fake-public\",\"sig\":\"{}\",\"verbose\":false}}\r\n",
+      sig_of(&fake.seed, nonce)
+    );
+    let mut foreign_down = down(&grants, true);
+    let mut foreign_up = up(&grants);
+    arm_info(&mut foreign_up, &mut foreign_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let (out, hits) = feed(&mut foreign_down, foreign.as_bytes()).await;
+    assert_eq!(hits, 0);
+    assert_eq!(text_of(out), foreign);
+    assert!(!foreign.contains(&real_jwt));
+  }
+
+  #[tokio::test]
+  async fn nkey_connect_with_jwt_is_forwarded() {
+    let fake = minted();
+    let real = minted();
+    let grants = nkey_grants(&fake, &real);
+    let nonce = b"N0NCE";
+    let line = format!(
+      "CONNECT {{\"jwt\":\"eyJleHRyYQ\",\"nkey\":\"{}\",\"sig\":\"{}\",\"verbose\":false}}\r\n",
+      fake.seed.public_key(),
+      sig_of(&fake.seed, nonce)
+    );
+    let mut down = down(&grants, true);
+    let mut up = up(&grants);
+    arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let (out, hits) = feed(&mut down, line.as_bytes()).await;
+    assert_eq!(hits, 0);
+    assert_original(&text_of(out), &line, real.seed.public_key(), &sig_of(&real.seed, nonce));
+  }
+
+  #[tokio::test]
+  async fn user_pass_still_swaps_while_the_nonce_is_pending() {
+    let grants = user_pass();
+    let mut machine = down(&grants, true);
+    let input = user_connect("agent", FAKE_PASS);
+    let swapped = format!("CONNECT {{\"name\":\"agent-app\",\"pass\":\"{REAL_PASS}\",\"user\":\"agent\",\"verbose\":false}}\r\n");
+    assert_eq!(feed(&mut machine, input.as_bytes()).await, (emit(&swapped), 1));
+  }
+
+  #[tokio::test]
+  async fn cleartext_forwards_the_guest_nkey_line() {
+    let fake = minted();
+    let real = minted();
+    let grants = nkey_grants(&fake, &real);
+    let line = nkey_line(fake.seed.public_key(), &sig_of(&fake.seed, b"N0NCE"));
+    let mut down = down(&grants, false);
+    let mut up = up(&grants);
+    arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let (out, hits) = feed(&mut down, line.as_bytes()).await;
+    assert_eq!(hits, 0);
+    assert_eq!(text_of(out), line);
+    assert!(!line.contains(real.seed.public_key()));
+  }
+
+  #[tokio::test]
+  async fn server_lines_redact_the_real_public_key_and_jwt_and_keep_the_seed() {
+    let fake = minted();
+    let real = minted();
+    let nkey = nkey_grants(&fake, &real);
+    let mut machine = up(&nkey);
+    let err = format!("-ERR '{}'\r\n", real.seed.public_key());
+    let (out, hits) = feed(&mut machine, err.as_bytes()).await;
+    assert_eq!(hits, 1);
+    assert_eq!(text_of(out), format!("-ERR '{}'\r\n", fake.seed.public_key()));
+    let fake_jwt = user_jwt(fake.seed.public_key());
+    let real_jwt = user_jwt(real.seed.public_key());
+    let jwt = jwt_grants(&fake, &real, &fake_jwt, &real_jwt);
+    let mut machine = up(&jwt);
+    let err = format!("-ERR '{real_jwt}'\r\n");
+    let (out, hits) = feed(&mut machine, err.as_bytes()).await;
+    assert_eq!(hits, 1);
+    assert_eq!(text_of(out), format!("-ERR '{fake_jwt}'\r\n"));
+    let mut machine = up(&nkey);
+    let err = format!("-ERR '{}'\r\n", real.raw);
+    let (out, hits) = feed(&mut machine, err.as_bytes()).await;
+    assert_eq!(hits, 0);
+    assert_eq!(text_of(out), err);
+  }
+
+  #[tokio::test]
+  async fn payload_with_the_real_jwt_closes_and_a_seed_payload_does_not() {
+    let fake = minted();
+    let real = minted();
+    let fake_jwt = user_jwt(fake.seed.public_key());
+    let real_jwt = user_jwt(real.seed.public_key());
+    let jwt = jwt_grants(&fake, &real, &fake_jwt, &real_jwt);
+    let mut machine = up(&jwt);
+    let msg = format!("MSG orders 1 {}\r\n{real_jwt}\r\n", real_jwt.len());
+    assert_eq!(feed(&mut machine, msg.as_bytes()).await.0, Out::Close);
+    let mut machine = up(&jwt);
+    let msg = format!("MSG orders 1 {}\r\n{}\r\n", real.seed.public_key().len(), real.seed.public_key());
+    assert_eq!(feed(&mut machine, msg.as_bytes()).await.0, Out::Close);
+    let mut machine = up(&jwt);
+    let msg = format!("MSG orders 1 {}\r\n{}\r\n", real.raw.len(), real.raw);
+    assert_eq!(feed(&mut machine, msg.as_bytes()).await, (emit(&msg), 0));
+  }
+
+  #[tokio::test]
+  async fn nkey_connect_past_the_cap_is_forwarded() {
+    let fake = minted();
+    let real = minted();
+    let grants = nkey_grants(&fake, &real);
+    let nonce = b"N0NCE";
+    let sig = sig_of(&fake.seed, nonce);
+    let name = "a".repeat(MAX_COMMAND);
+    let line = format!(
+      "CONNECT {{\"name\":\"{name}\",\"nkey\":\"{}\",\"sig\":\"{sig}\"}}\r\n",
+      fake.seed.public_key()
+    );
+    assert!(line.len() > MAX_COMMAND);
+    let follow = nkey_line(fake.seed.public_key(), &sig);
+    let mut down = down(&grants, true);
+    let mut up = up(&grants);
+    arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let (out, hits) = feed(&mut down, format!("{line}{follow}").as_bytes()).await;
+    let out = text_of(out);
+    let swapped = nkey_line(real.seed.public_key(), &sig_of(&real.seed, nonce));
+    assert_eq!(hits, 1);
+    assert_eq!(out, format!("{line}{swapped}"));
+    assert!(!line.contains(real.seed.public_key()));
+    assert!(!line.contains(&sig_of(&real.seed, nonce)));
   }
 }

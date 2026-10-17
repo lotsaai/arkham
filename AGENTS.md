@@ -19,7 +19,7 @@ Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates
 | Crate | Role | Dependencies Allowed |
 |---|---|---|
 | `arkham` (binary) | Face: CLI dispatch, `with_capture`, allocator | `arkham-config`, `arkham-fnox`, `arkham-pki`, `arkham-proxy`, `arkham-compose`, `arkham-tproxy`, `arkham-tun`, `arkham-ebpf`; external `clap`, `eyre`, `miette`, `tokio`, `tracing` |
-| `arkham-config` | Config overlay, grants, registry, CLI types | No workspace crates; external `base62`, `clap`, `code-workspace`, `confique`, `dirs`, `hex`, `percent-encoding`, `secrecy`, `serde`, `serde_json`, `sha2`, `strum`, `toml`, `tracing`, `url`, `validator`, `thiserror` |
+| `arkham-config` | Config overlay, grants, registry, CLI types | No workspace crates; external `base62`, `base64`, `clap`, `code-workspace`, `confique`, `dirs`, `hex`, `nkeys`, `percent-encoding`, `secrecy`, `serde`, `serde_json`, `sha2`, `strum`, `toml`, `tracing`, `url`, `validator`, `thiserror` |
 | `arkham-fnox` | fnox discovery and value resolution | `arkham-config`; external `fnox-core`, `miette`, `secrecy`, `serde`, `tokio`, `toml`, `tracing`, `thiserror` |
 | `arkham-pki` | CA, leaf generation, SSH key helpers | No workspace crates; external `rama` (boring), `rcgen`, `rand`, `russh`, `rustls`, `time`, `tracing`, `thiserror` |
 | `arkham-proxy` | MITM relay and substitution engines | `arkham-config`, `arkham-pki`, `arkham-plugin`; external `base64`, `bytes`, `rama`, `rasn`, `rasn-ldap`, `rustls`, `rustls-native-certs`, `tokio-rustls`, `httparse`, `httlib-hpack`, `pgwire`, `russh`, `secrecy`, `serde_json`, `smtp-proto`, `strum`, `url`, `tracing`, `thiserror` |

@@ -6,13 +6,15 @@
 //! that runner, draw each case with `Strategy::new_tree`, and await the case
 //! on the `#[tokio::test]` runtime.
 
+use arkham_config::grants::{Grant, NatsSeed};
+use base64::Engine as _;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 
 use crate::transports::engine::harness::{CutPend, feed_parts};
 use crate::transports::nats::fixtures::nats_grants;
-use crate::transports::nats::machine::{MAX_COMMAND as NATS_MAX_COMMAND, Nats};
+use crate::transports::nats::machine::{self, MAX_COMMAND as NATS_MAX_COMMAND, Nats};
 use crate::transports::nats::server_info;
 
 fn count_bytes(hay: &[u8], needle: &[u8]) -> usize {
@@ -353,8 +355,9 @@ async fn prop_nats_info_cut_leaves_the_rest_unread() {
       let expected = run_nats(NatsLeg::Up, &info, &[]).await.out;
       let mut clear_reader = CutPend::new(stream.clone(), &cuts);
       let mut clear_up = nats_leg(NatsLeg::Up);
+      let mut clear_down = nats_leg(NatsLeg::DownSwap);
       let mut clear_guest = Vec::new();
-      let err = server_info(&mut clear_reader, &mut clear_up, &mut clear_guest, true)
+      let err = server_info(&mut clear_reader, &mut clear_up, &mut clear_down, &mut clear_guest, true)
         .await
         .expect_err("cleartext INFO with tls_required must close");
       prop_assert!(
@@ -377,8 +380,11 @@ async fn prop_nats_info_cut_leaves_the_rest_unread() {
       );
       let mut reader = CutPend::new(stream, &cuts);
       let mut up = nats_leg(NatsLeg::Up);
+      let mut down = nats_leg(NatsLeg::DownSwap);
       let mut guest = Vec::new();
-      let opened = server_info(&mut reader, &mut up, &mut guest, false).await.expect("info read");
+      let opened = server_info(&mut reader, &mut up, &mut down, &mut guest, false)
+        .await
+        .expect("info read");
       let Some(mut rest) = opened else {
         return Err(TestCaseError::fail("the INFO reader closed"));
       };
@@ -484,8 +490,167 @@ async fn prop_nats_arbitrary_no_panic() {
       let _ = run_nats(leg, &data, &[cut.min(data.len())]).await;
       let mut reader = CutPend::new(data, &[cut]);
       let mut up = nats_leg(NatsLeg::Up);
-      let _ = server_info(&mut reader, &mut up, &mut Vec::new(), false).await;
+      let mut down = nats_leg(NatsLeg::DownSwap);
+      let mut guest = Vec::new();
+      let _ = server_info(&mut reader, &mut up, &mut down, &mut guest, false).await;
       Ok(())
+    },
+  )
+  .await;
+}
+
+fn prop_b64(bytes: &[u8]) -> String {
+  base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn prop_user_jwt(public: &str) -> String {
+  let header = prop_b64(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+  let payload = prop_b64(format!(r#"{{"sub":"{public}"}}"#).as_bytes());
+  format!("{header}.{payload}.{}", prop_b64(b"sig"))
+}
+
+fn prop_sig(seed: &NatsSeed, nonce: &[u8]) -> String {
+  prop_b64(&seed.sign(nonce).expect("seed signs"))
+}
+
+async fn arm_down(grants: &[Grant]) -> Nats {
+  let mut up = Nats::upstream(grants, NATS_HOST, NATS_PORT);
+  let mut down = Nats::downstream(grants, NATS_HOST, NATS_PORT, true);
+  let info = b"INFO {\"nonce\":\"N0NCE\"}\r\n";
+  let (out, _, closed) = feed_parts(&mut up, info, &[]).await;
+  assert!(!closed && out == info, "opening INFO");
+  machine::arm_opening(&mut up, &mut down);
+  down
+}
+
+/// A verifying CONNECT, cut anywhere, rewrites the same way and never emits the real seed.
+#[tokio::test]
+async fn prop_nats_signed_connect_is_split_stable() {
+  let (fake_raw, fake) = NatsSeed::generate_user().expect("fake");
+  let (real_raw, real) = NatsSeed::generate_user().expect("real");
+  let fake_jwt = prop_user_jwt(fake.public_key());
+  let real_jwt = prop_user_jwt(real.public_key());
+  let nkey = nats_grants(
+    &format!("nats://nkey:{fake_raw}@{NATS_HOST}:{NATS_PORT}"),
+    &format!("tls://nkey:{real_raw}@nats.upstream:{NATS_PORT}"),
+  );
+  let jwt = nats_grants(
+    &format!("nats://creds:{fake_raw}:{fake_jwt}@{NATS_HOST}:{NATS_PORT}"),
+    &format!("tls://creds:{real_raw}:{real_jwt}@nats.upstream:{NATS_PORT}"),
+  );
+  let nonce = b"N0NCE";
+  let nkey_line = format!(
+    "CONNECT {{\"nkey\":\"{}\",\"sig\":\"{}\",\"verbose\":false}}\r\n",
+    fake.public_key(),
+    prop_sig(&fake, nonce)
+  )
+  .into_bytes();
+  let jwt_line = format!(
+    "CONNECT {{\"jwt\":\"{fake_jwt}\",\"sig\":\"{}\",\"verbose\":false}}\r\n",
+    prop_sig(&fake, nonce)
+  )
+  .into_bytes();
+  let real_public = real.public_key().to_string();
+  drive(
+    concat!(module_path!(), "::prop_nats_signed_connect_is_split_stable"),
+    (any::<bool>(), proptest::collection::vec(any::<usize>(), 0..6)),
+    move |(jwt_kind, cuts)| {
+      let grants = if jwt_kind { jwt.clone() } else { nkey.clone() };
+      let line = if jwt_kind { jwt_line.clone() } else { nkey_line.clone() };
+      let real_raw = real_raw.clone();
+      let real_public = real_public.clone();
+      let real_jwt = real_jwt.clone();
+      async move {
+        let mut once_down = arm_down(&grants).await;
+        let mut split_down = arm_down(&grants).await;
+        let once = feed_parts(&mut once_down, &line, &[]).await;
+        let split = feed_parts(&mut split_down, &line, &nats_cuts(&cuts, &line)).await;
+        prop_assert_eq!(&once.0, &split.0);
+        prop_assert_eq!(once.1, split.1);
+        prop_assert_eq!(once.2, split.2);
+        prop_assert!(!once.2, "a verifying CONNECT closed");
+        prop_assert!(!contains_bytes(&once.0, real_raw.as_bytes()), "the real seed reached upstream");
+        if jwt_kind {
+          prop_assert!(contains_bytes(&once.0, real_jwt.as_bytes()), "the real jwt was not written");
+        } else {
+          prop_assert!(
+            contains_bytes(&once.0, real_public.as_bytes()),
+            "the real public key was not written"
+          );
+        }
+        Ok(())
+      }
+    },
+  )
+  .await;
+}
+
+/// Server bytes, cut anywhere, agree. Guest-bound output never carries the real seed, JWT, or public key.
+#[tokio::test]
+async fn prop_nats_guest_output_hides_signed_material() {
+  let (fake_raw, fake) = NatsSeed::generate_user().expect("fake");
+  let (real_raw, real) = NatsSeed::generate_user().expect("real");
+  let fake_jwt = prop_user_jwt(fake.public_key());
+  let real_jwt = prop_user_jwt(real.public_key());
+  let fake_public = fake.public_key().to_string();
+  let real_public = real.public_key().to_string();
+  let nkey = nats_grants(
+    &format!("nats://nkey:{fake_raw}@{NATS_HOST}:{NATS_PORT}"),
+    &format!("tls://nkey:{real_raw}@nats.upstream:{NATS_PORT}"),
+  );
+  let jwt = nats_grants(
+    &format!("nats://creds:{fake_raw}:{fake_jwt}@{NATS_HOST}:{NATS_PORT}"),
+    &format!("tls://creds:{real_raw}:{real_jwt}@nats.upstream:{NATS_PORT}"),
+  );
+  drive(
+    concat!(module_path!(), "::prop_nats_guest_output_hides_signed_material"),
+    (
+      any::<bool>(),
+      any::<bool>(),
+      nats_word(),
+      nats_word(),
+      proptest::collection::vec(any::<usize>(), 0..6),
+    ),
+    move |(jwt_kind, payload, pre, post, cuts)| {
+      let grants = if jwt_kind { jwt.clone() } else { nkey.clone() };
+      let real_raw = real_raw.clone();
+      let real_public = real_public.clone();
+      let real_jwt = real_jwt.clone();
+      let fake_public = fake_public.clone();
+      let fake_jwt = fake_jwt.clone();
+      async move {
+        let secret = if jwt_kind { real_jwt.as_str() } else { real_public.as_str() };
+        let frame = if payload {
+          let mut body = pre.into_bytes();
+          body.extend_from_slice(secret.as_bytes());
+          body.extend_from_slice(post.as_bytes());
+          nats_counted("MSG orders 1", false, &body)
+        } else {
+          format!("-ERR '{pre}{secret}{post}'\r\n").into_bytes()
+        };
+        let mut once_up = Nats::upstream(&grants, NATS_HOST, NATS_PORT);
+        let mut split_up = Nats::upstream(&grants, NATS_HOST, NATS_PORT);
+        let once = feed_parts(&mut once_up, &frame, &[]).await;
+        let split = feed_parts(&mut split_up, &frame, &nats_cuts(&cuts, &frame)).await;
+        for run in [&once, &split] {
+          prop_assert!(!contains_bytes(&run.0, real_raw.as_bytes()), "guest output carried the real seed");
+          prop_assert!(!contains_bytes(&run.0, real_jwt.as_bytes()), "guest output carried the real jwt");
+          prop_assert!(
+            !contains_bytes(&run.0, real_public.as_bytes()),
+            "guest output carried the real public key"
+          );
+        }
+        if payload {
+          prop_assert!(once.2 && split.2, "a payload holding the real value stayed open");
+        } else {
+          prop_assert_eq!(&once.0, &split.0);
+          prop_assert_eq!(once.1, split.1);
+          prop_assert!(!once.2 && !split.2, "a redacted line closed");
+          let decoy = if jwt_kind { fake_jwt.as_str() } else { fake_public.as_str() };
+          prop_assert!(contains_bytes(&once.0, decoy.as_bytes()), "the decoy was not written");
+        }
+        Ok(())
+      }
     },
   )
   .await;

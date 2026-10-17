@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use super::{ProxyState, bind_explicit, parse_authority, serve, serve_transparent_stream};
+use super::{ProxyState, bind_explicit, parse_authority, serve, serve_connect_stream, serve_transparent_stream};
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Direction, Http, Rewritten, Wire};
 
