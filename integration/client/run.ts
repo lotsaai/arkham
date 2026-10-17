@@ -745,6 +745,12 @@ function natsServer(raw: string): string {
   return `${url.hostname}:${url.port}`;
 }
 
+// nkeys.js fromSeed rejects a trailing newline. nsc seed files and the
+// mounted decoy both end with one.
+function nkeySeed(bytes: Uint8Array): Uint8Array {
+  return new TextEncoder().encode(new TextDecoder().decode(bytes).trim());
+}
+
 function openNatsAuth(raw: string, authenticator: Authenticator): Promise<NatsConnection> {
   return race("nats connect", natsConnect({
     servers: natsServer(raw),
@@ -823,7 +829,7 @@ if (process.env.NATS_DISCOVERED === "1") {
     const ctx = await selectedNatsContext();
     if (!ctx.nkey || !ctx.url) return false;
     const nkeyPath = ctx.nkey.startsWith("~/") ? join(homedir(), ctx.nkey.slice(2)) : ctx.nkey;
-    const fromFile = await readFile(nkeyPath);
+    const fromFile = nkeySeed(await readFile(nkeyPath));
     if (NATS_NKEY_URL) {
       const fnoxFake = decodeURIComponent(new URL(NATS_NKEY_URL).password);
       if (new TextDecoder().decode(fromFile).includes(fnoxFake)) return false;
@@ -849,7 +855,7 @@ if (NATS_NKEY_URL) {
   await retry("nats", "nats tls CONNECT swaps the decoy nkey read from ~/.config/nats; publish and receive", async () => {
     const ctx = await selectedNatsContext();
     if (!ctx.nkey || !ctx.url) return false;
-    const fromFile = await readFile(ctx.nkey);
+    const fromFile = nkeySeed(await readFile(ctx.nkey));
     return natsRoundTrip(ctx.url, nkeyAuthenticator(fromFile), "nkey");
   });
 
