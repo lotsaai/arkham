@@ -478,7 +478,7 @@ struct CloseLeg;
 /// One NATS direction leg.
 pub(crate) enum Nats {
   Down(Down),
-  Up(Up),
+  Up(Box<Up>),
   /// A leg that closed stays closed.
   Closed,
 }
@@ -488,17 +488,22 @@ impl Nats {
   /// already TLS. A cleartext server leg keeps the decoy.
   pub(crate) fn downstream(grants: &[Grant], host: &str, port: u16, swap: bool) -> Self {
     let policy = if swap {
-      grants
+      let auths: Vec<SwapGrant> = grants
         .iter()
-        .find_map(|grant| {
+        .filter_map(|grant| {
           let scope = grant.nats(Some(host), port)?;
           let label = grant.credential()?.label.clone();
-          Some(Policy::Swap {
+          Some(SwapGrant {
             label,
             auth: scope.auth.clone(),
           })
         })
-        .unwrap_or(Policy::Forward)
+        .collect();
+      if auths.is_empty() {
+        Policy::Forward
+      } else {
+        Policy::Swap { auths }
+      }
     } else {
       Policy::Forward
     };
@@ -514,7 +519,7 @@ impl Nats {
   /// Server-to-guest leg. Lines redact every real auth field. Payloads close on it.
   pub(crate) fn upstream(grants: &[Grant], host: &str, port: u16) -> Self {
     let pairs = upstream_pairs(grants, host, port);
-    Self::Up(Up {
+    Self::Up(Box::new(Up {
       framer: Framer::new(Side::Server),
       lines: Raw::from_pairs(pairs.clone()),
       guard: Guard {
@@ -523,7 +528,7 @@ impl Nats {
         held: Vec::new(),
       },
       info: InfoWatch::default(),
-    })
+    }))
   }
 
   /// TLS verdict of the INFO line whose LF was just framed, once.
@@ -557,28 +562,37 @@ impl Wire for Nats {
   }
 }
 
+/// One NATS grant that covers this endpoint. Several can share a host and port.
+#[derive(Debug)]
+struct SwapGrant {
+  label: String,
+  auth: NatsAuth,
+}
+
 /// Whether CONNECT carries the real values.
 #[derive(Debug)]
 enum Policy {
   /// The server leg is cleartext: CONNECT keeps the decoy.
   Forward,
-  /// The server leg is TLS.
-  Swap { label: String, auth: NatsAuth },
+  /// The server leg is TLS. Each grant is tried until one CONNECT matches.
+  Swap { auths: Vec<SwapGrant> },
 }
 
 impl Policy {
   fn swap(&self, line: &[u8], nonce: &NonceSlot) -> Option<(Vec<u8>, Hit)> {
-    let Self::Swap { label, auth } = self else {
+    let Self::Swap { auths } = self else {
       return None;
     };
-    let swapped = swap_connect(line, auth, nonce)?;
-    Some((
-      swapped,
-      Hit {
-        label: label.clone(),
-        location: Location::Header,
-      },
-    ))
+    auths.iter().find_map(|grant| {
+      let swapped = swap_connect(line, &grant.auth, nonce)?;
+      Some((
+        swapped,
+        Hit {
+          label: grant.label.clone(),
+          location: Location::Header,
+        },
+      ))
+    })
   }
 }
 
@@ -1614,6 +1628,35 @@ mod tests {
     assert_eq!(out, original);
     assert!(!out.contains(real_public), "{out}");
     assert!(!out.contains(real_sig), "{out}");
+  }
+
+  /// A password grant and an nkey grant can share one host and port. The
+  /// CONNECT fields pick the grant. The password grant is first here, which
+  /// is the integration file order.
+  #[tokio::test]
+  async fn nkey_connect_swaps_when_a_password_grant_is_first() {
+    let fake = minted();
+    let real = minted();
+    let mut grants = user_pass();
+    grants.extend(nkey_grants(&fake, &real));
+    let nonce = b"N0NCE";
+    let mut guest_down = down(&grants, true);
+    let mut guest_up = up(&grants);
+    arm_info(&mut guest_up, &mut guest_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let line = nkey_line(fake.seed.public_key(), &sig_of(&fake.seed, nonce));
+    let (out, hits) = feed(&mut guest_down, line.as_bytes()).await;
+    let out = text_of(out);
+    assert_eq!(hits, 1, "{out}");
+    let value: serde_json::Value = serde_json::from_str(out.trim().strip_prefix("CONNECT").expect("verb")).expect("json");
+    assert_eq!(value.get("nkey").and_then(serde_json::Value::as_str), Some(real.seed.public_key()));
+    let sig = value.get("sig").and_then(serde_json::Value::as_str).expect("sig");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig).expect("sig bytes");
+    assert!(NatsSeed::verify(real.seed.public_key(), nonce, &raw));
+    assert!(!out.contains(fake.seed.public_key()), "{out}");
+    let mut pass_down = down(&grants, true);
+    let input = user_connect("agent", FAKE_PASS);
+    let swapped = format!("CONNECT {{\"name\":\"agent-app\",\"pass\":\"{REAL_PASS}\",\"user\":\"agent\",\"verbose\":false}}\r\n");
+    assert_eq!(feed(&mut pass_down, input.as_bytes()).await, (emit(&swapped), 1));
   }
 
   #[tokio::test]
