@@ -660,9 +660,9 @@ mod tests {
     write_context(
       &root,
       "demo",
-      r#"{"url":"tls://nats.internal:4222","user":"agent","password":"real-nats-pass","tls_first":true,"jetstream_domain":"app"}"#,
+      r#"{"url":"tls://nats.internal:4222","user":"agent","password":"real-nats-pass","tls_first":true,"jetstream_domain":"app"}"#, // betterleaks:allow
     );
-    fs::write(root.join("context").join("other.json"), r#"{"password":"other-real-pass"}"#).unwrap();
+    fs::write(root.join("context").join("other.json"), r#"{"password":"other-real-pass"}"#).unwrap(); // betterleaks:allow
     let found = adapted(&root, home.path());
     let rule = rule_of(&found);
     let fake = rule.value.as_ref().unwrap().expose_secret();
