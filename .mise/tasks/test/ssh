@@ -72,11 +72,12 @@ nats_client_log_hides_real_material() {
   done
 }
 
-# Host ~/.config/nats discovery. Start certs, copy its CA, then `arkham init`
-# in an empty workspace. That reads the context (no project [rules.nats_*],
-# no fnox key) and writes the generated grant. The guest tree is the decoy
-# mount. The grant file, which states the real seed, is appended to the
-# global config and mounted only on the arkham service.
+# Host ~/.config/nats discovery. The caller has already run certs to
+# completion. Copy that CA, then `arkham init` in an empty workspace. That
+# reads the context (no project [rules.nats_*], no fnox key) and writes the
+# generated grant. The guest tree is the decoy mount. The grant file, which
+# states the real seed, is appended to the global config. The caller must
+# not start certs again: gen-secrets.sh truncates that file.
 prepare_nats_discovery() {
   local real_seed home isolate workspace certs_cid status code
   local state_root grant_toml compose_file env_name label dest rel host rest container
@@ -91,7 +92,8 @@ prepare_nats_discovery() {
   fi
 
   echo "=== nats discovery: certs ==="
-  $compose up -d certs
+  # Certs already ran inside the stack bring-up. Starting it here would
+  # rerun gen-secrets.sh and truncate the config this function appends to.
   certs_cid=$($compose ps -aq certs)
   certs_cid=${certs_cid%%$'\n'*}
   if [ -z "$certs_cid" ]; then
@@ -241,10 +243,21 @@ for backend in $backends; do
   # The bind-mounted file survives `down`. A leftover from the previous
   # backend, or from an earlier run, must not satisfy this round.
   rm -f integration/out/covered.json
+  # Bring the stack up without the client. This is the one certs run:
+  # dependents wait until it exits, and nothing below starts it again.
+  services=()
+  service_list=$($compose config --services)
+  while IFS= read -r svc; do
+    [ "$svc" = client ] && continue
+    [ -z "$svc" ] && continue
+    services+=("$svc")
+  done <<< "$service_list"
+  ARKHAM_BACKEND="$backend" $compose up -d --build "${services[@]}"
   prepare_nats_discovery
-  # Certs already completed. Recreating it would rerun gen-secrets.sh and
-  # drop the discovered grant from the global config.
-  ARKHAM_BACKEND="$backend" NATS_DISCOVERED=1 $compose up -d --build --no-recreate
+  # Reload arkham so it reads the appended grant. --no-deps leaves the
+  # exited certs container alone.
+  ARKHAM_BACKEND="$backend" $compose up -d --no-deps --force-recreate arkham
+  ARKHAM_BACKEND="$backend" NATS_DISCOVERED=1 $compose up -d --no-deps client
 
   # A failed one-shot leaves the client in `created`. Don't spend the
   # rest of the poll on a container that will never start.
