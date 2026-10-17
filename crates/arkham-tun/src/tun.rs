@@ -501,4 +501,79 @@ mod tests {
     loop_task.abort();
     let _ = loop_task.await;
   }
+
+  /// A guest-bound byte written while the capture loop is idle must arrive
+  /// before the loop's idle wait. A full second here stacks across a NATS
+  /// signing handshake until the client timer fires.
+  #[tokio::test]
+  #[ignore = "needs root + ARKHAM_TEST_TUN=1 (mutates host routes)"]
+  async fn tun_live_idle_guest_write_is_prompt() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    if !live_enabled() {
+      return;
+    }
+    let _live = LIVE_LOCK.lock().await;
+
+    let stub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = stub.local_addr().unwrap().port();
+    let device = make_tun("arkhami0", Ipv4Addr::new(10, 98, 79, 1));
+    let nl = netlink().unwrap();
+    let idx = link_index(&nl, "arkhami0").await.unwrap();
+    let guest_route = RoutePlan {
+      dst: Some((Ipv4Addr::new(198, 51, 100, 0), 24)),
+      via: None,
+      oif: idx,
+    };
+    add_route(&nl, TABLE_MAIN, &guest_route).await.unwrap();
+    let _routes = RouteGuard::new(vec![Undo::DelRoute {
+      table: TABLE_MAIN,
+      plan: guest_route,
+    }]);
+    let state = test_state(Vec::new(), Some(FWMARK));
+    let loop_task = tokio::spawn(run_loop(
+      device,
+      Ipv4Addr::new(10, 98, 79, 1),
+      v4([127, 0, 0, 1], 53),
+      Some(v4([127, 0, 0, 1], stub_port)),
+      state,
+    ));
+
+    let accept = stub.accept();
+    let guest = tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect(v4([198, 51, 100, 7], stub_port)))
+      .await
+      .unwrap()
+      .unwrap();
+    guest.set_nodelay(true).unwrap();
+    let (server, _) = tokio::time::timeout(Duration::from_secs(10), accept).await.unwrap().unwrap();
+    server.set_nodelay(true).unwrap();
+    let mut guest = guest;
+    let mut server = server;
+
+    guest.write_all(b"ping").await.unwrap();
+    let mut opened = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), server.read_exact(&mut opened))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(&opened, b"ping");
+
+    let mut samples = Vec::new();
+    for step in 0..4u8 {
+      tokio::time::sleep(Duration::from_millis(300)).await;
+      let started = std::time::Instant::now();
+      server.write_all(&[b'A' + step]).await.unwrap();
+      let mut byte = [0u8; 1];
+      tokio::time::timeout(Duration::from_secs(3), guest.read_exact(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+      assert_eq!(byte[0], b'A' + step);
+      samples.push(started.elapsed());
+    }
+    loop_task.abort();
+    let _ = loop_task.await;
+    let slow = samples.iter().any(|elapsed| *elapsed >= Duration::from_millis(200));
+    assert!(!slow, "idle guest-bound byte waited on the capture loop: {samples:?}");
+  }
 }
