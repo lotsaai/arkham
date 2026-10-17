@@ -1065,7 +1065,12 @@ mod tests {
     let guest = found.adapted[0]
       .decoy_files
       .iter()
-      .find(|file| file.container.contains("decoy") || file.container.ends_with(".creds"))
+      .find(|file| {
+        file.container.contains("decoy")
+          || Path::new(&file.container)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("creds"))
+      })
       .expect("guest creds");
     let guest_text = String::from_utf8(guest.bytes.clone()).unwrap();
     assert!(guest_text.contains(JWT_BEGIN));
