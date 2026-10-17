@@ -14,7 +14,7 @@ use std::sync::Arc;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpCidr};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::Error;
 use crate::chan::ChanStream;
@@ -110,9 +110,14 @@ async fn run_loop(
   let mut tracker = TcpTracker::default();
   let mut udp: HashMap<UdpKey, mpsc::Sender<Vec<u8>>> = HashMap::new();
   let mut buf = vec![0u8; 65536];
+  let wake = Arc::new(Notify::new());
   loop {
     let delay = iface.poll_delay(Instant::now(), &sockets);
+    let idle = delay.map_or(std::time::Duration::from_secs(1), |d| {
+      std::time::Duration::from_micros(d.total_micros())
+    });
     tokio::select! {
+      biased;
       result = device.recv(&mut buf) => {
         let n = result?;
         ingress(Ingress {
@@ -126,12 +131,18 @@ async fn run_loop(
           dns_upstream,
         });
       }
-      () = tokio::time::sleep(delay.map_or(std::time::Duration::from_secs(1), |d| std::time::Duration::from_micros(d.total_micros()))) => {}
+      // A connection task writing to the guest does not produce a TUN
+      // packet, so the write wakes the idle sleep.
+      () = wake.notified() => {}
+      () = tokio::time::sleep(idle) => {}
     }
-    iface.poll(Instant::now(), &mut phy, &mut sockets);
+    let now = Instant::now();
+    iface.poll(now, &mut phy, &mut sockets);
     tracker.relay(&mut sockets);
+    // Bytes relayed this turn are not on the wire until a poll sees them.
+    iface.poll(now, &mut phy, &mut sockets);
     for conn in tracker.take_new(&mut sockets) {
-      tokio::spawn(tun_conn_task(conn, upstream_override, Arc::clone(&state)));
+      tokio::spawn(tun_conn_task(conn, upstream_override, Arc::clone(&state), Arc::clone(&wake)));
     }
     tracker.cleanup(&mut sockets);
     while let Some(pkt) = phy.tx.pop_front() {
@@ -224,18 +235,19 @@ fn forward_udp(
 /// authority check — the SNI itself is the identity).
 /// `upstream_override` is a test override (DNS remap shape): dial this address
 /// instead of the captured destination. None in production.
-async fn tun_conn_task(conn: NewTcpConn, upstream_override: Option<SocketAddr>, state: Arc<ProxyState>) {
+async fn tun_conn_task(conn: NewTcpConn, upstream_override: Option<SocketAddr>, state: Arc<ProxyState>, wake: Arc<Notify>) {
   let snapshot = state.snapshot();
   let dst = upstream_override.unwrap_or(conn.dst);
   let dial_host = dst.ip().to_string();
   let port = dst.port();
   let abort_tx = conn.to_guest.clone();
-  let guest = ChanStream::new(conn.from_guest, conn.to_guest);
+  let guest = ChanStream::new(conn.from_guest, conn.to_guest, Arc::clone(&wake));
   let result = serve_transparent_stream(guest, &state, &snapshot, &dial_host, port, &dial_host).await;
   if result.is_err() {
-    // Dial/TLS failure: RST so the guest fails fast instead of hanging.
-    let _ = abort_tx.send(TaskMsg::Abort).await;
+    let _ = abort_tx.try_send(TaskMsg::Abort);
   }
+  drop(abort_tx);
+  wake.notify_one();
 }
 
 #[cfg(test)]
@@ -500,5 +512,160 @@ mod tests {
     stub_task.await.unwrap();
     loop_task.abort();
     let _ = loop_task.await;
+  }
+
+  /// A guest-bound byte written while the capture loop is idle must arrive
+  /// before the loop's idle wait. A full second here stacks across a NATS
+  /// signing handshake until the client timer fires.
+  #[tokio::test]
+  #[ignore = "needs root + ARKHAM_TEST_TUN=1 (mutates host routes)"]
+  async fn tun_live_idle_guest_write_is_prompt() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    if !live_enabled() {
+      return;
+    }
+    let _live = LIVE_LOCK.lock().await;
+
+    let stub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = stub.local_addr().unwrap().port();
+    let device = make_tun("arkhami0", Ipv4Addr::new(10, 98, 79, 1));
+    let nl = netlink().unwrap();
+    let idx = link_index(&nl, "arkhami0").await.unwrap();
+    let guest_route = RoutePlan {
+      dst: Some((Ipv4Addr::new(198, 51, 100, 0), 24)),
+      via: None,
+      oif: idx,
+    };
+    add_route(&nl, TABLE_MAIN, &guest_route).await.unwrap();
+    let _routes = RouteGuard::new(vec![Undo::DelRoute {
+      table: TABLE_MAIN,
+      plan: guest_route,
+    }]);
+    let state = test_state(Vec::new(), Some(FWMARK));
+    let loop_task = tokio::spawn(run_loop(
+      device,
+      Ipv4Addr::new(10, 98, 79, 1),
+      v4([127, 0, 0, 1], 53),
+      Some(v4([127, 0, 0, 1], stub_port)),
+      state,
+    ));
+
+    let accept = stub.accept();
+    let guest = tokio::time::timeout(
+      Duration::from_secs(10),
+      tokio::net::TcpStream::connect(v4([198, 51, 100, 7], stub_port)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    guest.set_nodelay(true).unwrap();
+    let (server, _) = tokio::time::timeout(Duration::from_secs(10), accept).await.unwrap().unwrap();
+    server.set_nodelay(true).unwrap();
+    let mut guest = guest;
+    let mut server = server;
+
+    guest.write_all(b"ping").await.unwrap();
+    let mut opened = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(10), server.read_exact(&mut opened))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(&opened, b"ping");
+
+    let mut samples = Vec::new();
+    for step in 0..4u8 {
+      tokio::time::sleep(Duration::from_millis(300)).await;
+      let started = std::time::Instant::now();
+      server.write_all(&[b'A' + step]).await.unwrap();
+      let mut byte = [0u8; 1];
+      tokio::time::timeout(Duration::from_secs(3), guest.read_exact(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+      assert_eq!(byte[0], b'A' + step);
+      samples.push(started.elapsed());
+    }
+    loop_task.abort();
+    let _ = loop_task.await;
+    let slow = samples.iter().any(|elapsed| *elapsed >= Duration::from_millis(200));
+    assert!(!slow, "idle guest-bound byte waited on the capture loop: {samples:?}");
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  #[ignore = "needs root + ARKHAM_TEST_TUN=1 (mutates host routes)"]
+  async fn tun_live_idle_abort_rst_is_prompt() {
+    use std::io::ErrorKind;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    if !live_enabled() {
+      return;
+    }
+    let _live = LIVE_LOCK.lock().await;
+
+    let stub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = stub.local_addr().unwrap().port();
+    let device = make_tun("arkhamr0", Ipv4Addr::new(10, 98, 80, 1));
+    let nl = netlink().unwrap();
+    let idx = link_index(&nl, "arkhamr0").await.unwrap();
+    let guest_route = RoutePlan {
+      dst: Some((Ipv4Addr::new(198, 51, 100, 0), 24)),
+      via: None,
+      oif: idx,
+    };
+    add_route(&nl, TABLE_MAIN, &guest_route).await.unwrap();
+    let _routes = RouteGuard::new(vec![Undo::DelRoute {
+      table: TABLE_MAIN,
+      plan: guest_route,
+    }]);
+    let state = test_state(Vec::new(), Some(FWMARK));
+    let loop_task = tokio::spawn(run_loop(
+      device,
+      Ipv4Addr::new(10, 98, 80, 1),
+      v4([127, 0, 0, 1], 53),
+      Some(v4([127, 0, 0, 1], stub_port)),
+      state,
+    ));
+
+    let mut samples = Vec::new();
+    for _step in 0..4u8 {
+      let accept = stub.accept();
+      let mut guest = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(v4([198, 51, 100, 7], stub_port)),
+      )
+      .await
+      .unwrap()
+      .unwrap();
+      guest.set_nodelay(true).unwrap();
+      let (server, _) = tokio::time::timeout(Duration::from_secs(10), accept).await.unwrap().unwrap();
+      let mut server = server;
+      server.set_nodelay(true).unwrap();
+
+      guest.write_all(b"ping").await.unwrap();
+      let mut opened = [0u8; 4];
+      tokio::time::timeout(Duration::from_secs(10), server.read_exact(&mut opened))
+        .await
+        .unwrap()
+        .unwrap();
+      assert_eq!(&opened, b"ping");
+
+      tokio::time::sleep(Duration::from_millis(300)).await;
+      let started = std::time::Instant::now();
+      let peer = server.into_std().unwrap();
+      socket2::SockRef::from(&peer).set_linger(Some(Duration::ZERO)).unwrap();
+      drop(peer);
+      let mut buf = [0u8; 8];
+      let read = tokio::time::timeout(Duration::from_millis(1500), guest.read(&mut buf)).await;
+      let elapsed = started.elapsed();
+      let reset = matches!(read, Ok(Err(ref err)) if err.kind() == ErrorKind::ConnectionReset);
+      samples.push((elapsed, reset));
+    }
+    loop_task.abort();
+    let _ = loop_task.await;
+    let slow = samples
+      .iter()
+      .any(|(elapsed, reset)| *elapsed >= Duration::from_millis(200) || !*reset);
+    assert!(!slow, "idle abort RST waited on the capture loop: {samples:?}");
   }
 }

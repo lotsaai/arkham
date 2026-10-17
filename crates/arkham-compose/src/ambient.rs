@@ -1,5 +1,5 @@
 //! Ambient-source pass: the authentication sources every workspace carries —
-//! gitconfig, jj, ssh, kubectl, talosctl — mapped onto grants plus the
+//! gitconfig, jj, ssh, nats, kubectl, talosctl — mapped onto grants plus the
 //! agent's decoy twin at each tool's default path.
 
 use std::env;
@@ -12,6 +12,7 @@ use crate::expand::expand_path;
 use crate::git;
 use crate::jj;
 use crate::kube;
+use crate::nats;
 use crate::paths::{Mount, expand};
 use crate::rewrites::{RewriteCollector, RewriteOutputs};
 use crate::ssh;
@@ -50,7 +51,7 @@ pub(crate) struct DeriveInputs<'a> {
 /// declaration, like fnox's own chain — and map each onto grants plus the
 /// agent's decoy twin at the tool's default path. The gitconfig resolves
 /// from the workspace root the way `git` there resolves it; jj reads its
-/// user chain; the ssh, kubectl, and talosctl configs come from their
+/// user chain; the ssh, nats, kubectl, and talosctl configs come from their
 /// default paths. An absent source derives nothing; a present one that
 /// does not map fails closed naming the file.
 ///
@@ -102,12 +103,13 @@ pub(crate) fn derive_sources(inputs: &DeriveInputs<'_>) -> Result<RewriteOutputs
   deriver.git()?;
   deriver.jj()?;
   deriver.ssh()?;
+  deriver.nats()?;
   deriver.kube_and_talos()?;
   Ok(deriver.collector.outputs())
 }
 
 /// One workspace's ambient-source pass: the authentication sources every
-/// workspace carries — gitconfig, jj, ssh, kubectl, talosctl — map onto
+/// workspace carries — gitconfig, jj, ssh, nats, kubectl, talosctl — map onto
 /// grants plus the agent's decoy twin at the tool's default path. A source
 /// the workspace declared explicitly stays with its declaration; a present
 /// source that does not map warns, and one whose guest CA is unavailable
@@ -211,6 +213,28 @@ impl AmbientDeriver<'_> {
       Ok(adapted) => self.collector.twin(adapted, "ssh-config", &dest),
       Err(err) => {
         tracing::warn!(source = %ssh_config.display(), %err, "ssh source skipped");
+        Ok(())
+      }
+    }
+  }
+
+  /// The selected NATS CLI context under `~/.config/nats`.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the twin output cannot be written. A context
+  /// that does not map warns and derives nothing.
+  fn nats(&mut self) -> Result<(), Error> {
+    let root = self.host_home.join(".config").join("nats");
+    let selected = root.join("context.txt");
+    if self.declared.iter().any(|path| path == &root || path.starts_with(&root)) || !selected.is_file() {
+      return Ok(());
+    }
+    match nats::adapt(&root, self.home, self.host_home) {
+      Ok(Some(found)) => self.collector.twin(found.adapted, "nats-context", &found.context_dest),
+      Ok(None) => Ok(()),
+      Err(err) => {
+        tracing::warn!(source = %root.display(), %err, "nats source skipped");
         Ok(())
       }
     }

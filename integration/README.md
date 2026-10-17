@@ -47,6 +47,11 @@ Topology:
 | 16 | StartTLS and LDAPS binds with a password that is not the decoy | the same two rules | the directory returns `invalidCredentials` (code 49). The password was not swapped, and the error text does not contain the real password |
 | 17 | `nats` client to `nats:4222` with the decoy password: TLS upgrade after INFO, subscribe, publish a payload that carries the decoy, receive it | `[rules.nats]`: fake `nats://` URL; real `tls://` URL carries `sslrootcert` | nats-server accepts the swapped password, and the message comes back with the decoy unchanged |
 | 18 | Same client with a password that is not the decoy | `[rules.nats]` | nats-server returns `Authorization Violation`. The password was not swapped, and the error text does not contain the real password |
+| 19 | `nkeyAuthenticator` to `nats:4222`. The client writes the decoy seed under `~/.config/nats`, selects it from `context.txt`, and reads the `nkey` path: subscribe and publish | `[rules.nats_nkey]`: `nats://nkey:<user-seed>@nats:4222`; the real string is the same form on `tls://` | nats-server accepts the session, which is the proof the proxy signed the nonce with the real seed. The client never sends that seed |
+| 20 | Same client with a user seed that is not the decoy | `[rules.nats_nkey]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
+| 21 | `credsAuthenticator` to `nats-jwt:4223`. The client writes the decoy creds file under `~/.config/nats`, selects it from `context.txt`, and reads the `creds` path | `[rules.nats_jwt]`: `nats://creds:<user-seed>:<user-jwt>@nats-jwt:4223`; the account JWT is preloaded on the operator server | publish and subscribe succeed only when the proxy replaces the decoy JWT and signs with the real seed |
+| 22 | Same client with a user JWT that is not the decoy | `[rules.nats_jwt]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
+| 23 | The client reads the decoy nkey context that host discovery mounted, then subscribes and publishes. `test:ssh` is the only path that runs it | no hand-written `[rules.nats_*]` and no fnox key. `arkham init` reads a host `~/.config/nats` context whose nkey file is the real seed and whose `ca` is the demo CA. The generated fragment (`generated = true`, `if_missing = ignore`) is appended to the global config. The arkham service mounts the CA blob. The client receives only the decoy files | nats-server accepts the session, so the proxy swapped the mounted decoy for the real seed. The real seed is absent from the guest tree |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
@@ -101,7 +106,25 @@ keeps cluster client URLs out of INFO. The real string is `tls://`, which
 is what lets arkham swap: the CONNECT password is replaced only after the
 upstream leg is TLS. Payloads are never rewritten, so the decoy in the
 published message arrives unchanged. Scenarios 17 and 18 are gated on
-`NATS_URL`.
+`NATS_URL`. Scenarios 19 and 20 use the same server, with a user nkey
+added beside the password user. `integration/gen-nats.sh` mints the
+seeds with `nkeys` and writes `integration/out`, which is gitignored.
+Scenarios 21 and 22 use a second `nats:2.15.1-alpine` service in
+operator mode. The account JWT is preloaded under `resolver: MEMORY`,
+so the server checks the user JWT. The client uses `nkeyAuthenticator`
+and `credsAuthenticator` from the `nats` package 2.29.3. Scenarios 19
+and 20 are gated on `NATS_NKEY_URL`. Scenarios 21 and 22 are gated on
+`NATS_JWT_URL`. Scenarios 19 and 21 write the fnox decoy into the client
+container's own `~/.config/nats` and read it back. That is not discovery:
+the proxy grant is still the fnox URL, and `compose::nats::adapt` does not
+run. Scenario 23 is the discovery proof. `test:ssh` writes a host
+`~/.config/nats` context, runs `arkham init` in an empty workspace with no
+`[rules.nats_*]` and no fnox entry for that grant, and mounts the decoy
+files into the client. The client reads those files before scenarios 19 and
+21 overwrite the same directory. `credsAuthenticator` sends `jwt`, `nkey`, and `sig`. A matching `nkey` is
+rewritten to the real public key. The client container does not receive the
+real nkey seed or the real user JWT. `test:ssh` greps the client log for
+those values in `integration/out/nats/nats.env`.
 
 ## Run
 

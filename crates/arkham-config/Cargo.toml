@@ -9,11 +9,14 @@ publish = false
 
 [dependencies]
 base62 = { workspace = true }
+base64 = { workspace = true }
 clap = { workspace = true }
 code-workspace = { workspace = true }
 confique = { workspace = true }
 dirs = { workspace = true }
 hex = { workspace = true }
+jwt = { workspace = true }
+nkeys = { workspace = true }
 percent-encoding = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }

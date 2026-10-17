@@ -34,6 +34,8 @@ services:
       ARKHAM_LDAP_REAL: ${ARKHAM_LDAP_REAL:?copy integration/.env.example to integration/.env}
       ARKHAM_LDAP_TLS_REAL: ${ARKHAM_LDAP_TLS_REAL:?copy integration/.env.example to integration/.env}
       ARKHAM_NATS_REAL: ${ARKHAM_NATS_REAL:?copy integration/.env.example to integration/.env}
+      ARKHAM_NATS_NKEY_REAL: ${ARKHAM_NATS_NKEY_REAL:?run integration/gen-nats.sh}
+      ARKHAM_NATS_JWT_REAL: ${ARKHAM_NATS_JWT_REAL:?run integration/gen-nats.sh}
     volumes:
       - ./gen-certs.sh:/srv/gen-certs.sh:ro
       - ./gen-secrets.sh:/srv/gen-secrets.sh:ro
@@ -70,9 +72,11 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     volumes:
-      - ./arkham.toml:/etc/arkham/arkham.toml:ro
+      - ./out/arkham.toml:/etc/arkham/arkham.toml:ro
       - certs:/certs:ro
       - arkham-config:/arkham-config:ro
+      # Discovered NATS grant blobs (CA). Empty unless test:ssh ran arkham init.
+      - ./out/nats-discovery/grants:/arkham/grants:ro
     networks:
       default: {}
       server:
@@ -323,33 +327,15 @@ services:
         condition: service_completed_successfully
 
   # Official NATS server. TLS is required on 4222: the server writes one
-  # cleartext INFO line, then expects a handshake. Its only account is the
-  # real password. The tls block sets no `verify`, so the server does not
-  # ask for a client certificate; the proxy's upstream leg has none.
-  # `no_advertise` keeps cluster client URLs out of INFO, so the client
-  # never learns an address it did not dial.
+  # cleartext INFO line, then expects a handshake. gen-nats.sh writes the
+  # config: the password user for scenarios 17 and 18, plus the real user
+  # nkey. The tls block sets no `verify`, so the server does not ask for a
+  # client certificate; the proxy's upstream leg has none. `no_advertise`
+  # keeps cluster client URLs out of INFO, so the client never learns an
+  # address it did not dial.
   nats:
     image: nats:2.15.1-alpine
-    command:
-      - sh
-      - -c
-      - |
-        cat > /tmp/nats.conf <<'EOF'
-        port: 4222
-        http_port: 8222
-        tls {
-          cert_file: /certs/nats.crt
-          key_file: /certs/nats.key
-        }
-        authorization {
-          user: agent
-          password: arkham_real_nats_pass
-        }
-        cluster {
-          no_advertise: true
-        }
-        EOF
-        exec nats-server -c /tmp/nats.conf
+    command: ["nats-server", "-c", "/etc/nats/server.conf"]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz"]
       interval: 2s
@@ -357,9 +343,35 @@ services:
       retries: 15
     volumes:
       - certs:/certs:ro
+      - ./out/nats/server.conf:/etc/nats/server.conf:ro
     networks:
       server:
         ipv4_address: 10.202.0.90
+    depends_on:
+      certs:
+        condition: service_completed_successfully
+
+  # Operator mode cannot share the authorization-users server. The account
+  # JWT is preloaded so the server checks the user JWT. gen-nats.sh writes
+  # the config. The same leaf covers DNS:nats-jwt. Port 4223 is its own
+  # shortlist: transparent capture picks the NATS grant by destination port
+  # before the guest sends SNI, and the password grant on 4222 would
+  # otherwise become the authority.
+  nats-jwt:
+    image: nats:2.15.1-alpine
+    command: ["nats-server", "-c", "/etc/nats/jwt.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - certs:/certs:ro
+      - ./out/nats/jwt.conf:/etc/nats/jwt.conf:ro
+      - ./out/nats/operator.jwt:/etc/nats/operator.jwt:ro
+    networks:
+      server:
+        ipv4_address: 10.202.0.91
     depends_on:
       certs:
         condition: service_completed_successfully
@@ -429,6 +441,14 @@ services:
         cp /srv/package.json /srv/run.ts /opt/client/
         (cd /opt/client && bun install)
         chmod -R a+rX /opt/client
+        if [ -f /opt/nats-discovered/context.txt ]; then
+          mkdir -p /tmp/.config/nats
+          cp -a /opt/nats-discovered/. /tmp/.config/nats/
+          if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
+            gid="$${HOST_GID:-$$HOST_UID}"
+            chown -R "$$HOST_UID:$$gid" /tmp/.config/nats
+          fi
+        fi
         if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
           gid="$${HOST_GID:-$$HOST_UID}"
           mkdir -p /out
@@ -463,11 +483,18 @@ services:
       LDAP_URL: ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3389 # nosemgrep: deterministic demo decoy, not a credential
       LDAP_TLS_URL: ldaps://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3636 # nosemgrep: deterministic demo decoy, not a credential
       NATS_URL: nats://agent:arkham_fake_nats_pass@nats:4222 # nosemgrep: deterministic demo decoy, not a credential
+      NATS_NKEY_URL: ${NATS_NKEY_URL:?run integration/gen-nats.sh}
+      NATS_JWT_URL: ${NATS_JWT_URL:?run integration/gen-nats.sh}
+      NATS_NKEY_FOREIGN: ${NATS_NKEY_FOREIGN:?run integration/gen-nats.sh}
+      NATS_JWT_FOREIGN_SEED: ${NATS_JWT_FOREIGN_SEED:?run integration/gen-nats.sh}
+      NATS_JWT_FOREIGN_JWT: ${NATS_JWT_FOREIGN_JWT:?run integration/gen-nats.sh}
+      NATS_DISCOVERED: ${NATS_DISCOVERED:-}
       SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
       - ./out:/out
+      - ./out/nats-discovery/guest:/opt/nats-discovered:ro
     network_mode: service:arkham
     depends_on:
       smtp-direct:
@@ -487,6 +514,8 @@ services:
       ldap:
         condition: service_healthy
       nats:
+        condition: service_healthy
+      nats-jwt:
         condition: service_healthy
 
 networks:

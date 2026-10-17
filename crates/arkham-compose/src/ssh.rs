@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use arkham_config::config::{HostSshCfg, IfMissing};
 use arkham_pki::ssh::SshKey;
 
-use crate::adapt::{DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
+use crate::adapt::{BLOB_PREFIX_SSH, DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
 use crate::error::Error;
 
 /// One `Host` block as the config states it.
@@ -98,13 +98,19 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
         registry: false,
         allow: vec![entry.clone()],
         value: None,
+        real: None,
+        generated: false,
         if_missing: Some(IfMissing::Ignore),
         tls: BTreeMap::new(),
         ssh: BTreeMap::from([(
           entry,
           HostSshCfg {
-            identity: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/ssh-{label}.identity"))),
-            guest_key: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/ssh-{label}.guest_key"))),
+            identity: Some(PathBuf::from(format!(
+              "{GRANTS_STATE_DIR}/rules.d/{BLOB_PREFIX_SSH}{label}.identity"
+            ))),
+            guest_key: Some(PathBuf::from(format!(
+              "{GRANTS_STATE_DIR}/rules.d/{BLOB_PREFIX_SSH}{label}.guest_key"
+            ))),
           },
         )]),
       },
@@ -115,7 +121,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
       continue;
     };
     let decoy_files = vec![DecoyFile {
-      name: format!("ssh-{label}.decoy-key"),
+      name: format!("{BLOB_PREFIX_SSH}{label}.decoy-key"),
       bytes: decoy_key.into_bytes(),
       container,
     }];
@@ -123,8 +129,8 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
       fragment,
       decoy: String::new(),
       materialized: vec![
-        (format!("ssh-{label}.identity"), real.into_bytes()),
-        (format!("ssh-{label}.guest_key"), decoy_line.into_bytes()),
+        (format!("{BLOB_PREFIX_SSH}{label}.identity"), real.into_bytes()),
+        (format!("{BLOB_PREFIX_SSH}{label}.guest_key"), decoy_line.into_bytes()),
       ],
       decoy_files,
     };
@@ -136,7 +142,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
     // first use — ssh's mechanism is the allowlist, arkham adds no pins.
     first.decoy = format!("StrictHostKeyChecking accept-new\n\n{}", String::from_utf8_lossy(content));
     first.decoy_files.push(DecoyFile {
-      name: "ssh-known-hosts".to_string(),
+      name: format!("{BLOB_PREFIX_SSH}known-hosts"),
       bytes: Vec::new(),
       container: format!("{home}/.ssh/known_hosts"),
     });
@@ -202,15 +208,23 @@ pub(crate) fn host_identity_path(identity: &str, host_home: &Path) -> PathBuf {
 /// layout under the container home. `~`-relative and home-relative paths
 /// mirror; anything else off the host home does not.
 pub(crate) fn mirror_container_path(identity: &str, host_home: &Path, home: &str) -> Option<String> {
-  if let Some(rest) = identity.strip_prefix("~/") {
-    return Some(format!("{home}/{rest}"));
+  let host_path = if let Some(rest) = identity.strip_prefix("~/") {
+    host_home.join(rest)
+  } else if Path::new(identity).is_absolute() {
+    PathBuf::from(identity)
+  } else {
+    host_home.join(".ssh").join(identity)
+  };
+  let host_path = crate::paths::normalize(&host_path);
+  let rest = host_path.strip_prefix(host_home).ok()?;
+  if rest.as_os_str().is_empty() {
+    return None;
   }
-  let path = Path::new(identity);
-  if path.is_absolute() {
-    let rest = path.strip_prefix(host_home).ok()?;
-    return Some(format!("{home}/{}", rest.display()));
+  let rel = rest.to_string_lossy().replace('\\', "/");
+  if rel.split('/').any(|part| part.is_empty() || part == "..") {
+    return None;
   }
-  Some(format!("{home}/.ssh/{identity}"))
+  Some(format!("{home}/{rel}"))
 }
 
 #[cfg(test)]
@@ -313,6 +327,56 @@ mod tests {
     let config = "Host git.example\n IdentityFile ~/.ssh/id_ed25519\n IdentityFile ~/.ssh/other\n";
     let adapted = adapt_in(&dir, config);
     assert!(adapted.is_empty(), "{adapted:?}");
+  }
+
+  #[test]
+  fn tilde_parent_does_not_escape_the_container_home() {
+    let home = Path::new("/host/home/eng");
+    let mirrored = mirror_container_path("~/../.ssh/id_ed25519", home, "/home/eng");
+    assert!(
+      mirrored
+        .as_deref()
+        .is_none_or(|path| !path.contains("..") && path.starts_with("/home/eng/")),
+      "{mirrored:?}"
+    );
+  }
+
+  #[test]
+  fn relative_parent_identity_does_not_keep_the_parent_segment() {
+    let home = Path::new("/host/home/eng");
+    let mirrored = mirror_container_path("../id_ed25519", home, "/home/eng");
+    assert!(mirrored.as_deref().is_some_and(|path| !path.contains("..")), "{mirrored:?}");
+  }
+
+  #[test]
+  fn relative_identity_mirrors_under_ssh() {
+    let home = Path::new("/host/home/eng");
+    assert_eq!(
+      mirror_container_path("id_ed25519", home, "/home/eng").as_deref(),
+      Some("/home/eng/.ssh/id_ed25519")
+    );
+  }
+
+  #[test]
+  fn symlink_identity_mounts_at_the_link_path() {
+    let (dir, real) = host_home_with_key();
+    std::os::unix::fs::symlink(dir.path().join(".ssh").join("id_ed25519"), dir.path().join(".ssh").join("link")).unwrap();
+    let config = "Host git.example\n IdentityFile ~/.ssh/link\n";
+    let adapted = adapt_in(&dir, config);
+    assert_eq!(adapted.len(), 1);
+    let decoy = adapted[0]
+      .decoy_files
+      .iter()
+      .find(|file| file.name.ends_with(".decoy-key"))
+      .unwrap();
+    assert_eq!(decoy.container, "/home/agent/.ssh/link");
+    let identity = adapted[0]
+      .materialized
+      .iter()
+      .find(|(name, _)| name.ends_with(".identity"))
+      .map(|(_, bytes)| String::from_utf8(bytes.clone()).unwrap())
+      .unwrap();
+    assert_eq!(identity, real.to_openssh().unwrap());
   }
 
   #[test]

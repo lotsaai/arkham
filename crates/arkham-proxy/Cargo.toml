@@ -43,6 +43,7 @@ h2 = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+nkeys = { workspace = true }
 # server-api-aws-lc-rs also turns on pgwire's TLS acceptor, which the
 # handshake tests drive with a real rustls server.
 pgwire = { workspace = true, features = ["server-api-aws-lc-rs"] }

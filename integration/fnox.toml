@@ -45,3 +45,14 @@ value = "ldaps://cn%3DDirectory%20Manager:arkham_real_ldap_pass_01@ldap:3636?ssl
 [secrets.NATS_URL]
 provider = "plain"
 value = "tls://agent:arkham_real_nats_pass@nats:4222?sslrootcert=/certs/ca.crt"
+
+# The container copy of these two is rendered by gen-secrets.sh from
+# ARKHAM_NATS_NKEY_REAL and ARKHAM_NATS_JWT_REAL. gen-nats.sh writes those
+# variables into the gitignored .env. These lines show the string form.
+[secrets.NATS_NKEY_URL]
+provider = "plain"
+value = "tls://nkey:SU_REAL_USER_SEED@nats:4222?sslrootcert=/certs/ca.crt"
+
+[secrets.NATS_JWT_URL]
+provider = "plain"
+value = "tls://creds:SU_REAL_JWT_SEED:REAL_USER_JWT@nats-jwt:4223?sslrootcert=/certs/ca.crt"

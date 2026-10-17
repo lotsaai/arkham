@@ -260,8 +260,8 @@ pub struct FileRewrite {
   #[serde(default)]
   pub envs: Vec<String>,
   /// Declared format, skipping detection. Known formats: `kubeconfig`
-  /// (kubectl), `talos` (talosctl). The git, jj, and ssh configs are not
-  /// declared: arkham reads them as ambient sources from their default
+  /// (kubectl), `talos` (talosctl). The git, jj, ssh, and nats configs are
+  /// not declared: arkham reads them as ambient sources from their default
   /// locations. Unknown files keep the raw byte-swap when this is absent.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub format: Option<RewriteFormat>,
@@ -366,11 +366,18 @@ pub struct RuleCfg {
   /// connection string resolves from the secret source into `real`.
   #[serde(default, skip_serializing)]
   pub value: Option<SecretString>,
-  /// Database rules only: the REAL connection string, resolved from the
-  /// secret source (fnox) under `env`/`fnox_key` at load time. Never
-  /// serialized, never stated in config.
+  /// Database and NATS connection-string rules: the real connection string.
+  /// Fnox fills it when the key is present. A generated grant fragment may
+  /// also state it. That stated value is used only when [`Self::generated`]
+  /// is true and fnox has no value. A hand-written rule's stated real is ignored.
   #[serde(default, skip_serializing)]
   pub real: Option<SecretString>,
+  /// Set by a generated grant fragment. A stated [`Self::real`] is kept only
+  /// when this is true and fnox has no value for the rule. A hand-written
+  /// rule leaves it false, and a stated real is ignored.
+  #[config(default = false)]
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub generated: bool,
   /// fnox secret name; defaults to `env`.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub fnox_key: Option<String>,
@@ -1089,6 +1096,7 @@ pub fn reference_samples() -> Result<String, Error> {
     env: "EXAMPLE_TOKEN".to_string(),
     value: None,
     real: None,
+    generated: false,
     fnox_key: Some("EXAMPLE_FNOX_KEY".to_string()),
     allow: vec![
       "https://api.example".to_string(),

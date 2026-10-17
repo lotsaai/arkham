@@ -17,6 +17,8 @@ dir=${1:-/arkham-config}
 : "${ARKHAM_LDAP_REAL:?ARKHAM_LDAP_REAL not set: copy integration/.env.example to integration/.env and export it}"
 : "${ARKHAM_LDAP_TLS_REAL:?ARKHAM_LDAP_TLS_REAL not set: copy integration/.env.example to integration/.env and export it}"
 : "${ARKHAM_NATS_REAL:?ARKHAM_NATS_REAL not set: copy integration/.env.example to integration/.env and export it}"
+: "${ARKHAM_NATS_NKEY_REAL:?ARKHAM_NATS_NKEY_REAL not set: run integration/gen-nats.sh}"
+: "${ARKHAM_NATS_JWT_REAL:?ARKHAM_NATS_JWT_REAL not set: run integration/gen-nats.sh}"
 
 mkdir -p "$dir"
 
@@ -69,6 +71,14 @@ value = "$ARKHAM_LDAP_TLS_REAL"
 [secrets.NATS_URL]
 provider = "plain"
 value = "$ARKHAM_NATS_REAL"
+
+[secrets.NATS_NKEY_URL]
+provider = "plain"
+value = "$ARKHAM_NATS_NKEY_REAL"
+
+[secrets.NATS_JWT_URL]
+provider = "plain"
+value = "$ARKHAM_NATS_JWT_REAL"
 EOF
 chmod -R a+rX "$dir"
 echo "fnox config ready in $dir"

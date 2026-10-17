@@ -14,7 +14,8 @@ mod smtp;
 pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub(crate) use nats::NatsUriScheme;
 pub use nats::{
-  NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsPair, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError,
+  AuthField, AuthSign, FieldPresence, NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsField, NatsPair, NatsPlain,
+  NatsScope, NatsSeed, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError,
 };
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
@@ -429,7 +430,7 @@ pub enum Grant {
   /// One NATS connection-string mapping: fake string to real, 1:1. The real
   /// string's spelling states whether the upstream leg is TLS.
   Nats {
-    /// The wire needles: the fake and real password or token.
+    /// The wire value this grant swaps: password, token, public key, or user JWT.
     credential: Credential,
     /// The one scope this rule maps, carrying both legs' facts.
     scope: Box<NatsScope>,
@@ -837,6 +838,7 @@ mod tests {
         env: "DATABASE_URL".into(),
         value: Some(SecretString::from(fake)),
         real: Some(SecretString::from(real)),
+        generated: false,
         fnox_key: None,
         allow: vec![],
         pattern: None,
@@ -1558,6 +1560,7 @@ mod tests {
         env: "T".into(),
         value: Some(SecretString::from("value")),
         real: None,
+        generated: false,
         fnox_key: None,
         allow: entries.iter().map(|entry| (*entry).to_string()).collect(),
         pattern: None,
@@ -1592,6 +1595,7 @@ mod tests {
         env: env.to_string(),
         value: Some(SecretString::from(value)),
         real: None,
+        generated: false,
         fnox_key: None,
         allow: allow.into_iter().map(str::to_string).collect(),
         pattern: None,
@@ -1970,6 +1974,7 @@ mod tests {
         env: "T".into(),
         value: None,
         real: None,
+        generated: false,
         fnox_key: None,
         allow: entries.iter().map(|entry| (*entry).to_string()).collect(),
         pattern: None,

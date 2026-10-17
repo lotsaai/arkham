@@ -15,6 +15,7 @@ mod git;
 mod jj;
 mod kube;
 mod mounts;
+mod nats;
 mod paths;
 mod profiles;
 mod rewrites;
@@ -1683,6 +1684,251 @@ users:
       "the ssh config source minted the identity grant: {:?}",
       outputs.grants.iter().map(|grant| grant.fragment.clone()).collect::<Vec<_>>()
     );
+  }
+
+  /// Puts the ambient-source environment on a temp home and puts it back.
+  #[must_use]
+  struct AmbientEnv {
+    saved: Vec<(&'static str, Option<OsString>)>,
+  }
+
+  impl AmbientEnv {
+    fn isolate(home: &Path, xdg: &Path) -> Self {
+      let saved = [
+        "KUBECONFIG",
+        "TALOSCONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "JJ_CONFIG",
+      ]
+      .map(|name| (name, std::env::var_os(name)))
+      .to_vec();
+      unset_env("KUBECONFIG");
+      unset_env("TALOSCONFIG");
+      unset_env("JJ_CONFIG");
+      unset_env("GIT_CONFIG_GLOBAL");
+      set_env("GIT_CONFIG_NOSYSTEM", "1");
+      set_env("HOME", home);
+      set_env("XDG_CONFIG_HOME", xdg);
+      Self { saved }
+    }
+  }
+
+  impl Drop for AmbientEnv {
+    fn drop(&mut self) {
+      for (name, value) in self.saved.drain(..) {
+        match value {
+          Some(value) => set_env(name, value),
+          None => unset_env(name),
+        }
+      }
+    }
+  }
+
+  fn token_context(host: &Path) -> PathBuf {
+    let nats = host.join(".config").join("nats");
+    fs::create_dir_all(nats.join("context")).unwrap();
+    fs::write(nats.join("context.txt"), "demo\n").unwrap();
+    fs::write(
+      nats.join("context").join("demo.json"),
+      r#"{"url":"nats://nats.internal:4222","token":"real-token","jetstream_domain":"app"}"#,
+    )
+    .unwrap();
+    fs::write(nats.join("context").join("other.json"), r#"{"token":"other-real"}"#).unwrap();
+    nats
+  }
+
+  struct DerivedHome {
+    _work: tempfile::TempDir,
+    _xdg: tempfile::TempDir,
+    _env: AmbientEnv,
+    outputs: RewriteOutputs,
+  }
+
+  fn derive_home(host: &Path) -> DerivedHome {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let work = tempdir().unwrap();
+    let xdg = tempdir().unwrap();
+    let env = AmbientEnv::isolate(host, xdg.path());
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    DerivedHome {
+      _work: work,
+      _xdg: xdg,
+      _env: env,
+      outputs,
+    }
+  }
+
+  fn mounted_text(outputs: &RewriteOutputs, suffix: &str) -> String {
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container.to_string_lossy().ends_with(suffix))
+      .unwrap_or_else(|| panic!("{suffix} missing"));
+    fs::read_to_string(&mount.host).unwrap()
+  }
+
+  /// An nkey context mounts a decoy seed. The real seed stays in the grant.
+  #[test]
+  fn derive_sources_mounts_a_decoy_nkey() {
+    use arkham_config::grants::NatsSeed;
+    use secrecy::SecretString;
+
+    let host = tempdir().unwrap();
+    let nats = host.path().join(".config").join("nats");
+    fs::create_dir_all(nats.join("context")).unwrap();
+    let seed = nkeys::KeyPair::new_user().seed().unwrap();
+    let nkey = nats.join("user.nk");
+    fs::write(&nkey, format!("{seed}\n")).unwrap();
+    fs::write(nats.join("context.txt"), "demo\n").unwrap();
+    fs::write(
+      nats.join("context").join("demo.json"),
+      format!(r#"{{"url":"nats://nats.internal:4222","nkey":"{}"}}"#, nkey.display()),
+    )
+    .unwrap();
+    let derived = derive_home(host.path());
+    let guest = mounted_text(&derived.outputs, "/.config/nats/user.nk");
+    assert!(!guest.contains(&seed), "{guest}");
+    NatsSeed::from_seed(SecretString::from(guest.trim().to_string())).expect("decoy seed");
+    assert!(derived.outputs.grants.iter().any(|grant| grant.fragment.contains(&seed)));
+    assert!(!mounted_text(&derived.outputs, "context/demo.json").contains(&seed));
+  }
+
+  /// A creds context mounts a decoy file. The real seed and JWT stay in the grant.
+  #[test]
+  fn derive_sources_mounts_a_decoy_creds_file() {
+    use arkham_config::grants::NatsSeed;
+    use base64::Engine as _;
+    use secrecy::SecretString;
+
+    let host = tempdir().unwrap();
+    let nats = host.path().join(".config").join("nats");
+    let creds_dir = nats.join("creds");
+    fs::create_dir_all(creds_dir).unwrap();
+    fs::create_dir_all(nats.join("context")).unwrap();
+    let seed = nkeys::KeyPair::new_user().seed().unwrap();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
+      .unwrap()
+      .public_key()
+      .to_string();
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"{public}"}}"#).as_bytes());
+    let jwt = format!(
+      "{header}.{payload}.{}",
+      base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"sig")
+    );
+    let creds = nats.join("creds").join("user.creds");
+    fs::write(
+      &creds,
+      format!("-----BEGIN NATS USER JWT-----\n{jwt}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{seed}\n------END USER NKEY SEED------\n"),
+    )
+    .unwrap();
+    fs::write(nats.join("context.txt"), "demo\n").unwrap();
+    fs::write(
+      nats.join("context").join("demo.json"),
+      r#"{"url":"nats://nats.internal:4222","creds":"creds/user.creds"}"#,
+    )
+    .unwrap();
+    let derived = derive_home(host.path());
+    let guest = mounted_text(&derived.outputs, "/.config/nats/creds/user.creds");
+    assert!(!guest.contains(&seed), "{guest}");
+    assert!(!guest.contains(&jwt), "{guest}");
+    let fragment = derived
+      .outputs
+      .grants
+      .iter()
+      .find(|grant| grant.fragment.contains(&seed))
+      .expect("grant holds the real seed");
+    assert!(fragment.fragment.contains(&jwt));
+    assert!(!mounted_text(&derived.outputs, "context/demo.json").contains(&seed));
+  }
+
+  /// The selected `~/.config/nats` context becomes one grant. The guest
+  /// mounts that context only.
+  #[test]
+  fn derive_sources_mounts_the_selected_nats_context() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    token_context(host.path());
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
+    for expected in ["/home/eng/.config/nats/context.txt", "/home/eng/.config/nats/context/demo.json"] {
+      assert!(containers.contains(&expected.to_string()), "{expected} missing from {containers:?}");
+    }
+    assert!(!containers.iter().any(|path| path.ends_with("other.json")), "{containers:?}");
+    let context = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.config/nats/context/demo.json"))
+      .unwrap();
+    let twin = fs::read_to_string(&context.host).unwrap();
+    assert!(twin.contains("app"), "{twin}");
+    assert!(!twin.contains("real-token"), "{twin}");
+    assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("real-token")));
+    assert!(!outputs.grants.iter().any(|grant| grant.fragment.contains("other-real")));
+  }
+
+  /// A declared path under `~/.config/nats` stays with that declaration.
+  #[test]
+  fn declared_nats_context_is_not_derived_again() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    let nats = token_context(host.path());
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let declared = [FileRewrite {
+      source: nats.join("context.txt"),
+      dest: "{home}/.config/nats/context.txt".to_string(),
+      envs: Vec::new(),
+      format: None,
+    }];
+    let skipped = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &declared,
+    })
+    .unwrap();
+    assert!(!skipped.mounts.iter().any(|mount| mount.container.ends_with("context/demo.json")));
   }
 
   /// Broken ambient sources warn and skip; the healthy ones still map.

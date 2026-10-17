@@ -202,7 +202,7 @@ impl<'a> StackBuilder<'a> {
     })
   }
 
-  /// The ambient sources — gitconfig, jj, ssh, kube, talos from their
+  /// The ambient sources — gitconfig, jj, ssh, nats, kube, talos from their
   /// default locations: decoy twins mounted read-only plus the grants they
   /// derive, joined onto the declared rewrites.
   ///
@@ -829,6 +829,7 @@ mod tests {
       env: "GITHUB_TOKEN".into(),
       value: None,
       real: None,
+      generated: false,
       fnox_key: None,
       allow: vec!["https://api.github.com".to_string()],
       pattern: None,

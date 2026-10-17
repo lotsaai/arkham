@@ -211,8 +211,8 @@ impl NatsTransport {
     }
     let upstream = &open.scope.upstream;
     let mut tcp = dial_marked(&upstream.host, upstream.port, open.fwmark).await?;
-    let (down, mut up) = open.pair(trust.is_some());
-    let Some(rest) = server_info(&mut tcp, &mut up, &mut guest, trust.is_none()).await? else {
+    let (mut down, mut up) = open.pair(trust.is_some());
+    let Some(rest) = server_info(&mut tcp, &mut up, &mut down, &mut guest, trust.is_none()).await? else {
       return Ok(());
     };
     if let Some(trust) = trust {
@@ -246,14 +246,17 @@ impl NatsTransport {
     };
     let upstream = &open.scope.upstream;
     let tcp = dial_marked(&upstream.host, upstream.port, open.fwmark).await?;
-    let server = within(open.budget, self.connect_server(trust, &upstream.host, tcp)).await?;
-    let guest = within(
+    let mut server = within(open.budget, self.connect_server(trust, &upstream.host, tcp)).await?;
+    let mut guest = within(
       open.budget,
       self.accept_guest(&identity, Prefixed::new(hello_buf, guest), open.scope.guest_tls),
     )
     .await?;
     let (mut down, mut up) = open.pair(true);
-    relay_guarded(guest, server, &mut down, &mut up, &[], &[]).await
+    let Some(rest) = server_info(&mut server, &mut up, &mut down, &mut guest, false).await? else {
+      return Ok(());
+    };
+    relay_guarded(guest, server, &mut down, &mut up, &[], &rest).await
   }
 
   /// After INFO, a guest whose first byte opens a TLS record is terminated
@@ -308,7 +311,8 @@ async fn within<T>(budget: Duration, step: impl Future<Output = Result<T, Error>
 /// `up` reads the object with actson as those reads stream, and the check
 /// runs once the read that holds the LF has been framed, before that read
 /// is written to the guest. A line that does not finish an object, and
-/// does not set `tls_required`, closes too.
+/// does not set `tls_required`, closes too. The success path that has seen
+/// LF moves that line's nonce onto `down` before returning the bytes past it.
 ///
 /// # Errors
 ///
@@ -316,7 +320,13 @@ async fn within<T>(budget: Duration, step: impl Future<Output = Result<T, Error>
 /// object sets `tls_required`. Returns [`Error::NatsInfoUnreadable`] when
 /// `cleartext` is set and the object does not finish without that flag.
 /// Returns an error when the server read or the guest write fails.
-pub(crate) async fn server_info<S, G>(server: &mut S, up: &mut Nats, guest: &mut G, cleartext: bool) -> Result<Option<Vec<u8>>, Error>
+pub(crate) async fn server_info<S, G>(
+  server: &mut S,
+  up: &mut Nats,
+  down: &mut Nats,
+  guest: &mut G,
+  cleartext: bool,
+) -> Result<Option<Vec<u8>>, Error>
 where
   S: AsyncRead + Unpin,
   G: AsyncWrite + Unpin,
@@ -352,6 +362,7 @@ where
       Rewritten::Emit(bytes) => write_guest(guest, &bytes).await?,
     }
     if newline.is_some() {
+      machine::arm_opening(up, down);
       return Ok(Some(rest.to_vec()));
     }
   }
@@ -400,17 +411,20 @@ mod tests {
   use std::task::{Context, Poll};
   use std::time::Duration;
 
-  use arkham_config::grants::GuestTlsMode;
+  use arkham_config::grants::{GuestTlsMode, NatsSeed};
   use arkham_pki::ca::CertAuthority;
+  use base64::Engine as _;
   use pretty_assertions::assert_eq;
   use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
 
   use super::{NatsTransport, Open, ServerLeg, nats_pair};
 
-  use super::fixtures::nats_grants;
+  use super::fixtures::{mint_user, nats_grants};
   use super::machine::Nats;
   use super::server_info;
   use crate::transports::engine::{Rewritten, Wire};
+
+  type OpeningFailure<'a> = (&'a [u8], fn(&crate::Error) -> bool);
 
   #[tokio::test]
   async fn mtls_plaintext_guest_closes_without_forwarding() {
@@ -472,7 +486,8 @@ mod tests {
     let mut server = Cursor::new(wire);
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let rest = server_info(&mut server, &mut up, &mut guest, false).await.unwrap();
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
     assert_eq!(rest, Some(vec![0x16, 0x03, 0x01]));
     assert_eq!(guest, info);
     let Rewritten::Emit(next) = up.feed(b"+OK\r\n").await.0 else {
@@ -491,7 +506,8 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
         err,
@@ -515,7 +531,8 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let rest = server_info(&mut server, &mut up, &mut guest, true).await.unwrap();
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
     assert_eq!(guest, info);
   }
@@ -531,7 +548,8 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
         err,
@@ -556,7 +574,8 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(matches!(err, crate::Error::NatsInfoUnreadable), "{err}");
   }
 
@@ -571,7 +590,8 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
         err,
@@ -598,7 +618,8 @@ mod tests {
     let mut server = SliceReads { parts: &parts, index: 0 };
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
         err,
@@ -625,7 +646,8 @@ mod tests {
     let mut server = SliceReads { parts: &parts, index: 0 };
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
         err,
@@ -653,7 +675,8 @@ mod tests {
     let mut server = SliceReads { parts: &parts, index: 0 };
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let err = server_info(&mut server, &mut up, &mut guest, true).await.unwrap_err();
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
         err,
@@ -681,9 +704,132 @@ mod tests {
     let mut server = SliceReads { parts: &parts, index: 0 };
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let rest = server_info(&mut server, &mut up, &mut guest, true).await.unwrap();
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap();
     assert_eq!(rest, Some(b"EXTRA".to_vec()));
     assert_eq!(guest, &line[..line.len() - b"EXTRA".len()]);
+  }
+
+  fn sig_b64(seed: &NatsSeed, nonce: &[u8]) -> String {
+    let raw = seed.sign(nonce).expect("seed signs");
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &raw)
+  }
+
+  fn nkey_connect(public: &str, sig: &str) -> String {
+    format!("CONNECT {{\"nkey\":\"{public}\",\"sig\":\"{sig}\",\"verbose\":false}}\r\n")
+  }
+
+  /// The opening INFO's nonce is on the guest leg before CONNECT, including a second arm.
+  #[tokio::test]
+  async fn server_info_arms_a_ready_nonce_before_connect() {
+    let (fake_raw, fake) = mint_user();
+    let (real_raw, real) = mint_user();
+    let grants = nats_grants(
+      &format!("nats://nkey:{fake_raw}@nats.internal:4222"),
+      &format!("tls://nkey:{real_raw}@nats.upstream:4222"),
+    );
+    let info = b"INFO {\"nonce\":\"N0NCE\",\"server_id\":\"N1\"}\r\n";
+    let mut server = Cursor::new(info.to_vec());
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
+    assert_eq!(rest, Some(Vec::new()));
+    assert_eq!(guest, info);
+    let line = nkey_connect(fake.public_key(), &sig_b64(&fake, b"N0NCE"));
+    let (rewritten, hits) = down.feed(line.as_bytes()).await;
+    assert_eq!(hits.len(), 1);
+    let Rewritten::Emit(bytes) = rewritten else {
+      panic!("swapped connect");
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let value: serde_json::Value = serde_json::from_str(text.trim().strip_prefix("CONNECT").expect("verb")).expect("json");
+    assert_eq!(value.get("nkey").and_then(serde_json::Value::as_str), Some(real.public_key()));
+    let sig = value.get("sig").and_then(serde_json::Value::as_str).expect("sig");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig).expect("sig bytes");
+    assert!(NatsSeed::verify(real.public_key(), b"N0NCE", &raw));
+    assert!(!text.contains(fake.public_key()));
+  }
+
+  /// The first INFO had no nonce. A later INFO's nonce does not replace that.
+  #[tokio::test]
+  async fn a_second_info_does_not_replace_an_absent_nonce() {
+    let (fake_raw, fake) = mint_user();
+    let (real_raw, real) = mint_user();
+    let grants = nats_grants(
+      &format!("nats://nkey:{fake_raw}@nats.internal:4222"),
+      &format!("tls://nkey:{real_raw}@nats.upstream:4222"),
+    );
+    let first: &[u8] = b"INFO {\"server_id\":\"N1\"}\r\n";
+    let second: &[u8] = b"INFO {\"nonce\":\"N0NCE\"}\r\n";
+    let parts = [first, second];
+    let mut server = SliceReads { parts: &parts, index: 0 };
+    let mut guest = Vec::new();
+    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
+    assert_eq!(rest, Some(Vec::new()));
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
+    assert_eq!(rest, Some(Vec::new()));
+    let line = nkey_connect(fake.public_key(), &sig_b64(&fake, b"N0NCE"));
+    let (rewritten, hits) = down.feed(line.as_bytes()).await;
+    assert_eq!(hits.len(), 0);
+    let Rewritten::Emit(bytes) = rewritten else {
+      panic!("forwarded connect");
+    };
+    assert_eq!(bytes.as_ref(), line.as_bytes());
+    assert!(!line.contains(real.public_key()));
+  }
+
+  /// A close, `tls_required`, or an unreadable INFO does not arm a nonce.
+  #[tokio::test]
+  async fn closing_info_does_not_arm_a_nonce() {
+    let (fake_raw, fake) = mint_user();
+    let (real_raw, real) = mint_user();
+    let grants = nats_grants(
+      &format!("nats://nkey:{fake_raw}@nats.internal:4222"),
+      &format!("nats://nkey:{real_raw}@nats.upstream:4222"),
+    );
+    let line = nkey_connect(fake.public_key(), &sig_b64(&fake, b"N0NCE"));
+    let cases: Vec<OpeningFailure<'_>> = vec![
+      (b"", |_| false),
+      (b"INFO {\"nonce\":\"N0NCE\",\"tls_required\":true}\r\n", |err| {
+        matches!(
+          err,
+          crate::Error::NatsTlsRequired {
+            tls_available: false,
+            tls_verify: false
+          }
+        )
+      }),
+      (b"INFO {\"nonce\":\"N0NCE\"\r\n", |err| {
+        matches!(err, crate::Error::NatsInfoUnreadable)
+      }),
+    ];
+    for (wire, expect_err) in cases {
+      let mut server = Cursor::new(wire.to_vec());
+      let mut guest = Vec::new();
+      let mut up = Nats::upstream(&grants, "nats.internal", 4222);
+      let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+      let opened = server_info(&mut server, &mut up, &mut down, &mut guest, true).await;
+      if wire.is_empty() {
+        assert_eq!(opened.unwrap(), None);
+      } else {
+        let err = opened.unwrap_err();
+        assert!(expect_err(&err), "{err}");
+      }
+      let (rewritten, hits) = down.feed(line.as_bytes()).await;
+      assert!(hits.is_empty(), "{err_case}", err_case = String::from_utf8_lossy(wire));
+      let Rewritten::Emit(bytes) = rewritten else {
+        panic!("forwarded connect");
+      };
+      assert_eq!(bytes.as_ref(), line.as_bytes());
+      assert!(
+        !bytes
+          .windows(real.public_key().len())
+          .any(|window| window == real.public_key().as_bytes())
+      );
+    }
   }
 
   /// Yields one slice per read so a command line can cross the read boundary.

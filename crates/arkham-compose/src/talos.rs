@@ -187,6 +187,8 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
       registry: false,
       allow: allows.clone(),
       value: Some(value),
+      real: None,
+      generated: false,
       if_missing: None,
       tls: allows.iter().map(|allow| (allow.clone(), tls.clone())).collect(),
       ssh: BTreeMap::new(),
