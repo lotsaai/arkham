@@ -861,7 +861,8 @@ fn userinfo_parts(entry: &str) -> Result<(String, Option<String>), NatsUriError>
 
 /// `nkey` and `creds` select that kind only when the password parses as it.
 /// An ordinary password stays user and password, including a user whose
-/// name is one of those spellings.
+/// name is one of those spellings. A `creds` password whose seed parses
+/// and whose jwt does not is rejected, so the seed is not sent as a password.
 fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriError> {
   if user == NatsPlain::NKEY_USER {
     return match NatsSeed::from_seed(SecretString::from(pass.clone())) {
@@ -873,11 +874,24 @@ fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
   if user == NatsPlain::CREDS_USER {
     return match plain_creds(&pass) {
       Ok(plain) => Ok(plain),
+      Err(NatsUriError::UserJwt) if creds_seed_parsed(&pass) => Err(NatsUriError::UserJwt),
       Err(NatsUriError::UserJwt | NatsUriError::Seed) => Ok(NatsPlain::UserPass { user, pass }),
       Err(err) => Err(err),
     };
   }
   Ok(NatsPlain::UserPass { user, pass })
+}
+
+/// The first `creds` segment is a user seed. No colon, or a segment that
+/// does not parse, is an ordinary password.
+fn creds_seed_parsed(password: &str) -> bool {
+  let Some((seed, _)) = password.split_once(':') else {
+    return false;
+  };
+  if seed.is_empty() {
+    return false;
+  }
+  NatsSeed::from_seed(SecretString::from(seed.to_string())).is_ok()
 }
 
 fn plain_creds(password: &str) -> Result<NatsPlain, NatsUriError> {
@@ -1660,7 +1674,7 @@ mod tests {
       (
         format!("nats://creds:{}:aaaa.bbbb@nats.internal:4222", case.fake_seed),
         case.real_creds.clone(),
-        NatsUriError::AuthKindMismatch,
+        NatsUriError::UserJwt,
       ),
     ];
     for (fake, real, kind) in rejected {
