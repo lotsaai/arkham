@@ -42,9 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   let nkey_fake_url = format!("nats://nkey:{}@nats:4222", nkey_fake.seed);
   let nkey_real_url = format!("tls://nkey:{}@nats:4222?sslrootcert=/certs/ca.crt", nkey_real.seed);
-  let jwt_fake_url = format!("nats://creds:{}:{jwt_fake_token}@nats-jwt:4222", jwt_fake.seed);
+  let jwt_fake_url = format!("nats://creds:{}:{jwt_fake_token}@nats-jwt:4223", jwt_fake.seed);
   let jwt_real_url = format!(
-    "tls://creds:{}:{jwt_real_token}@nats-jwt:4222?sslrootcert=/certs/ca.crt",
+    "tls://creds:{}:{jwt_real_token}@nats-jwt:4223?sslrootcert=/certs/ca.crt",
     jwt_real.seed
   );
   NatsScope::from_strings(&nkey_fake_url, &nkey_real_url)?;
@@ -185,7 +185,7 @@ cluster {{
 fn jwt_conf(account_public: &str, account_jwt: &str) -> String {
   format!(
     "\
-port: 4222
+port: 4223
 http_port: 8222
 tls {{
   cert_file: /certs/nats.crt

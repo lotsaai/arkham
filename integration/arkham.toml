@@ -122,6 +122,8 @@ value = "nats://agent:arkham_fake_nats_pass@nats:4222"
 env = "NATS_NKEY_URL"
 value = "nats://nkey:SU_FAKE_USER_SEED@nats:4222"
 
+# Port 4223, not 4222. Transparent capture shortlists the NATS grant by
+# destination port before SNI, and the password grant already owns 4222.
 [rules.nats_jwt]
 env = "NATS_JWT_URL"
-value = "nats://creds:SU_FAKE_JWT_SEED:FAKE_USER_JWT@nats-jwt:4222"
+value = "nats://creds:SU_FAKE_JWT_SEED:FAKE_USER_JWT@nats-jwt:4223"

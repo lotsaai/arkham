@@ -55,4 +55,4 @@ value = "tls://nkey:SU_REAL_USER_SEED@nats:4222?sslrootcert=/certs/ca.crt"
 
 [secrets.NATS_JWT_URL]
 provider = "plain"
-value = "tls://creds:SU_REAL_JWT_SEED:REAL_USER_JWT@nats-jwt:4222?sslrootcert=/certs/ca.crt"
+value = "tls://creds:SU_REAL_JWT_SEED:REAL_USER_JWT@nats-jwt:4223?sslrootcert=/certs/ca.crt"

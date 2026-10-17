@@ -351,7 +351,10 @@ services:
 
   # Operator mode cannot share the authorization-users server. The account
   # JWT is preloaded so the server checks the user JWT. gen-nats.sh writes
-  # the config. The same leaf covers DNS:nats-jwt.
+  # the config. The same leaf covers DNS:nats-jwt. Port 4223 is its own
+  # shortlist: transparent capture picks the NATS grant by destination port
+  # before the guest sends SNI, and the password grant on 4222 would
+  # otherwise become the authority.
   nats-jwt:
     image: nats:2.15.1-alpine
     command: ["nats-server", "-c", "/etc/nats/jwt.conf"]

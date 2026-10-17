@@ -49,7 +49,7 @@ Topology:
 | 18 | Same client with a password that is not the decoy | `[rules.nats]` | nats-server returns `Authorization Violation`. The password was not swapped, and the error text does not contain the real password |
 | 19 | `nkeyAuthenticator` to `nats:4222` with the decoy user seed: subscribe and publish | `[rules.nats_nkey]`: `nats://nkey:<user-seed>@nats:4222`; the real string is the same form on `tls://` | nats-server accepts the session, which is the proof the proxy signed the nonce with the real seed. The client never sends that seed |
 | 20 | Same client with a user seed that is not the decoy | `[rules.nats_nkey]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
-| 21 | `credsAuthenticator` to `nats-jwt:4222` with the decoy seed and the decoy user JWT | `[rules.nats_jwt]`: `nats://creds:<user-seed>:<user-jwt>@nats-jwt:4222`; the account JWT is preloaded on the operator server | publish and subscribe succeed only when the proxy replaces the decoy JWT and signs with the real seed |
+| 21 | `credsAuthenticator` to `nats-jwt:4223` with the decoy seed and the decoy user JWT | `[rules.nats_jwt]`: `nats://creds:<user-seed>:<user-jwt>@nats-jwt:4223`; the account JWT is preloaded on the operator server | publish and subscribe succeed only when the proxy replaces the decoy JWT and signs with the real seed |
 | 22 | Same client with a user JWT that is not the decoy | `[rules.nats_jwt]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
