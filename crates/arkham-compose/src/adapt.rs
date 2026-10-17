@@ -320,4 +320,31 @@ mod tests {
     assert!(!stale_talos.exists(), "removed talos rewrites stop granting");
     assert!(stale_other.exists(), "non-adapter blobs are untouched");
   }
+
+  #[test]
+  fn write_state_prunes_a_removed_nats_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("grants");
+    let adapted = RewriteAdapted {
+      fragment: "[rules.x]\n".to_string(),
+      decoy: String::new(),
+      materialized: vec![("kube-a.crt".to_string(), b"a".to_vec())],
+      decoy_files: Vec::new(),
+    };
+    write_state(&state, &[adapted]).unwrap();
+    let rules = state.join("rules.d");
+    let stale_key = rules.join("nats-old.key");
+    let stale_crt = rules.join("nats-old.crt");
+    let stale_ca = rules.join("nats-old.ca");
+    let stale_other = rules.join("other.crt");
+    fs::write(&stale_key, "stale").unwrap();
+    fs::write(&stale_crt, "stale").unwrap();
+    fs::write(&stale_ca, "stale").unwrap();
+    fs::write(&stale_other, "stale").unwrap();
+    write_state(&state, &[]).unwrap();
+    assert!(!stale_key.exists(), "a removed nats context drops its client key");
+    assert!(!stale_crt.exists(), "a removed nats context drops its client cert");
+    assert!(!stale_ca.exists(), "a removed nats context drops its ca");
+    assert!(stale_other.exists(), "non-adapter blobs are untouched");
+  }
 }

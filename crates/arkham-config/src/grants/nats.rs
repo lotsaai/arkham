@@ -907,6 +907,25 @@ mod tests {
   use crate::grants::RootCert;
 
   #[test]
+  fn username_nkey_or_creds_with_an_ordinary_password_is_userinfo() {
+    for user in ["nkey", "creds"] {
+      let scope = NatsScope::from_strings(
+        &format!("nats://{user}:ordinary-pass@nats.internal:4222"),
+        &format!("nats://{user}:ordinary-pass@nats.upstream:4222"),
+      )
+      .unwrap_or_else(|err| panic!("{user}: {err}"));
+      assert_eq!(
+        fields(&scope.auth),
+        vec![
+          ("user", user.to_string(), user.to_string()),
+          ("pass", "ordinary-pass".to_string(), "ordinary-pass".to_string()),
+        ],
+        "{user}"
+      );
+    }
+  }
+
+  #[test]
   fn empty_password_userinfo_is_user_and_password() {
     let scope = NatsScope::from_strings("nats://agent:@nats.internal:4222", "nats://agent:@nats.internal:4222").expect("empty password");
     assert_eq!(

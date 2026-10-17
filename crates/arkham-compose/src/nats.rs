@@ -1060,6 +1060,123 @@ mod tests {
   }
 
   #[test]
+  fn context_debug_redacts_secrets_and_deserialize_trims() {
+    let doc: NatsContext = serde_json::from_str(
+      r#"{"user":"  agent  ","password":" ZZZ-PASS ","token":"ZZZ-TOKEN","user_seed":"ZZZ-SEED","user_jwt":"ZZZ-JWT"}"#,
+    )
+    .unwrap();
+    assert_eq!(doc.user, "agent");
+    assert_eq!(doc.password, "ZZZ-PASS");
+    let shown = format!("{doc:?}");
+    assert!(shown.contains("redacted"), "{shown}");
+    for secret in ["ZZZ-PASS", "ZZZ-TOKEN", "ZZZ-SEED", "ZZZ-JWT"] {
+      assert!(!shown.contains(secret), "{shown}");
+    }
+  }
+
+  #[test]
+  fn user_named_nkey_or_creds_with_a_password_is_userinfo() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    for (user, password) in [("nkey", "ordinary-pass"), ("creds", "ordinary-pass")] {
+      write_context(
+        &root,
+        "demo",
+        &format!(r#"{{"url":"nats://nats.internal:4222","user":"{user}","password":"{password}"}}"#),
+      );
+      let found = adapted(&root, home.path());
+      let rule = rule_of(&found);
+      let scope = NatsScope::from_strings(rule.value.unwrap().expose_secret(), rule.real.unwrap().expose_secret())
+        .unwrap_or_else(|err| panic!("{user}: {err}"));
+      assert!(scope.auth.signer().is_none(), "{user}");
+      let pairs: Vec<_> = scope
+        .auth
+        .fields()
+        .iter()
+        .map(|field| (field.name.as_str(), field.pair.fake.clone(), field.pair.real.expose_secret().to_string()))
+        .collect();
+      assert_eq!(pairs[0].0, "user", "{user}");
+      assert_eq!(pairs[0].1, user, "{user}");
+      assert_eq!(pairs[0].2, user, "{user}");
+      assert_eq!(pairs[1].0, "pass", "{user}");
+      assert_eq!(pairs[1].2, password, "{user}");
+      assert_ne!(pairs[1].1, password, "{user}");
+    }
+  }
+
+  #[test]
+  fn absolute_creds_path_outside_home_falls_back_to_the_decoy_dir() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let outside = tempdir().unwrap();
+    let seed = user_seed();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
+      .unwrap()
+      .public_key()
+      .to_string();
+    let jwt = user_jwt(&public);
+    let creds = outside.path().join("user.creds");
+    fs::write(&creds, creds_file(&seed, &jwt)).unwrap();
+    write_context(
+      &root,
+      "demo",
+      &format!(r#"{{"url":"nats://nats.internal:4222","creds":"{}"}}"#, creds.display()),
+    );
+    let found = adapted(&root, home.path());
+    let containers: Vec<&str> = found.adapted[0].decoy_files.iter().map(|file| file.container.as_str()).collect();
+    assert!(
+      containers.iter().any(|path| path.starts_with("/home/eng/.config/nats/decoy/")),
+      "{containers:?}"
+    );
+    assert!(containers.iter().all(|path| !path.contains(outside.path().to_string_lossy().as_ref())), "{containers:?}");
+    let guest = found.adapted[0]
+      .decoy_files
+      .iter()
+      .find(|file| file.container.contains("decoy"))
+      .expect("decoy creds");
+    let guest_text = String::from_utf8(guest.bytes.clone()).unwrap();
+    assert!(!guest_text.contains(&seed));
+    assert!(!guest_text.contains(&jwt));
+    let real = rule_of(&found).real.unwrap().expose_secret().to_string();
+    assert!(real.contains(&seed));
+    assert!(real.contains(&jwt));
+  }
+
+  #[test]
+  fn inline_user_jwt_and_user_seed_grant_and_the_guest_file_hides_them() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let seed = user_seed();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
+      .unwrap()
+      .public_key()
+      .to_string();
+    let jwt = user_jwt(&public);
+    write_context(
+      &root,
+      "demo",
+      &format!(r#"{{"url":"nats://nats.internal:4222","user_jwt":"{jwt}","user_seed":"{seed}"}}"#),
+    );
+    let found = adapted(&root, home.path());
+    let real = rule_of(&found).real.unwrap().expose_secret().to_string();
+    assert!(real.contains(&seed));
+    assert!(real.contains(&jwt));
+    let guest = found.adapted[0]
+      .decoy_files
+      .iter()
+      .find(|file| file.container.contains("decoy") || file.container.ends_with(".creds"))
+      .expect("guest creds");
+    let guest_text = String::from_utf8(guest.bytes.clone()).unwrap();
+    assert!(guest_text.contains(JWT_BEGIN));
+    assert!(!guest_text.contains(&seed));
+    assert!(!guest_text.contains(&jwt));
+    assert!(!found.adapted[0].decoy.contains(&seed));
+    assert!(!found.adapted[0].decoy.contains(&jwt));
+    let scope = NatsScope::from_strings(rule_of(&found).value.unwrap().expose_secret(), &real).expect("inline user jwt");
+    assert!(scope.auth.signer().is_some());
+  }
+
+  #[test]
   fn inline_nkey_text_is_not_a_path() {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
