@@ -11,13 +11,14 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use strum::{EnumIter, IntoEnumIterator as _, IntoStaticStr};
 use url::Url;
 
 use super::{Credential, Grant, GuestTlsMode, RootCert, Scheme};
-use crate::config::RuleCfg;
+use crate::config::{RuleCfg, fake_for};
 use crate::error::Error;
 
 /// Port a NATS string means when it names none.
@@ -65,28 +66,35 @@ pub struct NatsPair {
   pub real: SecretString,
 }
 
-/// Username that selects a signature kind. The tag spellings are this enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-enum AuthTag {
-  /// `nats://nkey:<user-seed>@host`.
-  Nkey,
-  /// `nats://creds:<user-seed>:<user-jwt>@host`.
-  Creds,
+/// Username and password of one NATS string.
+///
+/// `password: None` is a token, so the string has no colon. `Some("")` is a
+/// user whose password is empty, so the string keeps `user:@host`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NatsUserinfo {
+  /// Username, or the token when [`Self::password`] is `None`.
+  pub user: String,
+  /// Password. `None` is a token. `Some("")` keeps the colon.
+  pub password: Option<String>,
 }
 
-impl AuthTag {
-  fn as_str(self) -> &'static str {
-    <&str>::from(self)
-  }
-
-  fn parse(user: &str) -> Option<Self> {
-    Self::iter().find(|tag| tag.as_str() == user)
+impl NatsUserinfo {
+  /// `user`, `user:pass`, or `user:` when the password is empty.
+  #[must_use]
+  pub fn encode(&self) -> String {
+    let user = encode_userinfo_component(&self.user);
+    match &self.password {
+      None => user,
+      Some(pass) => format!("{user}:{}", encode_userinfo_component(pass)),
+    }
   }
 }
 
-/// One credential before it is paired with the other string. The `nkey` and
-/// `creds` username spellings come from [`AuthTag`].
+/// One credential before it is paired with the other string.
+///
+/// [`Self::NKEY_USER`] and [`Self::CREDS_USER`] are the username spellings.
+/// A username with one of those spellings is that kind only when the
+/// password parses as that kind. Any other password is [`Self::UserPass`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatsPlain {
   /// CONNECT `user` and `pass`. `pass` may be empty.
@@ -98,9 +106,9 @@ pub enum NatsPlain {
   },
   /// CONNECT `auth_token`.
   Token(String),
-  /// Username `nkey` and a user seed.
+  /// Username [`Self::NKEY_USER`] and a user seed.
   Nkey(String),
-  /// Username `creds` and `seed:jwt`.
+  /// Username [`Self::CREDS_USER`] and `seed:jwt`.
   Creds {
     /// User seed.
     seed: String,
@@ -109,20 +117,284 @@ pub enum NatsPlain {
   },
 }
 
+/// Guest credential file a discovered context mounts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NatsGuestFile {
+  /// File body. The real seed and JWT are not in it.
+  pub body: String,
+  /// Suffix used when the context named no in-home path.
+  pub suffix: &'static str,
+}
+
+/// Decoy credential and the guest file it needs.
+///
+/// `signs` is true when CONNECT must sign the server nonce. The proxy reads
+/// that from [`NatsAuth::signer`] after the two strings are paired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NatsPrepared {
+  /// Decoy of the same kind as the real credential.
+  pub decoy: NatsPlain,
+  /// Guest file, when this kind is read from a file.
+  pub file: Option<NatsGuestFile>,
+  /// CONNECT signs the nonce.
+  pub signs: bool,
+}
+
+/// Auth fields of a decoy context file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NatsContextAuth {
+  /// Context `user`.
+  pub user: String,
+  /// Context `password`.
+  pub password: String,
+  /// Context `token`.
+  pub token: String,
+  /// Context `nkey`. A path, not a seed.
+  pub nkey: String,
+  /// Context `creds`. A path, not the file body.
+  pub creds: String,
+}
+
 impl NatsPlain {
+  /// Username spelling of [`Self::Nkey`].
+  pub const NKEY_USER: &'static str = "nkey";
+  /// Username spelling of [`Self::Creds`].
+  pub const CREDS_USER: &'static str = "creds";
+
   /// Username and password for a connection string.
-  ///
-  /// `None` is a token, so the string has no colon. `Some("")` is a user
-  /// whose password is empty, so the string keeps `user:@host`.
   #[must_use]
-  pub fn userinfo(&self) -> (String, Option<String>) {
+  pub fn userinfo(&self) -> NatsUserinfo {
     match self {
-      Self::UserPass { user, pass } => (user.clone(), Some(pass.clone())),
-      Self::Token(token) => (token.clone(), None),
-      Self::Nkey(seed) => (AuthTag::Nkey.as_str().to_owned(), Some(seed.clone())),
-      Self::Creds { seed, jwt } => (AuthTag::Creds.as_str().to_owned(), Some(format!("{seed}:{jwt}"))),
+      Self::UserPass { user, pass } => NatsUserinfo {
+        user: user.clone(),
+        password: Some(pass.clone()),
+      },
+      Self::Token(token) => NatsUserinfo {
+        user: token.clone(),
+        password: None,
+      },
+      Self::Nkey(seed) => NatsUserinfo {
+        user: Self::NKEY_USER.to_string(),
+        password: Some(seed.clone()),
+      },
+      Self::Creds { seed, jwt } => NatsUserinfo {
+        user: Self::CREDS_USER.to_string(),
+        password: Some(format!("{seed}:{jwt}")),
+      },
     }
   }
+
+  /// Connection string. An empty password stays `user:@host`.
+  #[must_use]
+  pub fn connection_string(&self, scheme: &str, host: &str, port: Option<u16>, query: &[(&str, &str)]) -> String {
+    let host_part = if host.contains(':') {
+      format!("[{host}]")
+    } else {
+      host.to_string()
+    };
+    let authority = match port {
+      Some(port) => format!("{host_part}:{port}"),
+      None => host_part,
+    };
+    let mut rendered = format!("{scheme}://{}@{authority}", self.userinfo().encode());
+    if query.is_empty() {
+      return rendered;
+    }
+    let Ok(mut url) = Url::parse("nats://placeholder.invalid/") else {
+      return rendered;
+    };
+    {
+      let mut pairs = url.query_pairs_mut();
+      for (key, value) in query {
+        pairs.append_pair(key, value);
+      }
+    }
+    if let Some(query) = url.query() {
+      rendered.push('?');
+      rendered.push_str(query);
+    }
+    rendered
+  }
+
+  /// Mint the decoy and the guest file for this credential.
+  ///
+  /// # Errors
+  ///
+  /// [`NatsUriError::Decoy`] when the decoy user seed cannot be minted.
+  pub fn prepare(&self, env: &str) -> Result<NatsPrepared, NatsUriError> {
+    match self {
+      Self::UserPass { user, pass } => {
+        let decoy_pass = if pass.is_empty() { String::new() } else { fake_for(env, None) };
+        Ok(NatsPrepared {
+          decoy: Self::UserPass {
+            user: user.clone(),
+            pass: decoy_pass,
+          },
+          file: None,
+          signs: false,
+        })
+      }
+      Self::Token(_) => Ok(NatsPrepared {
+        decoy: Self::Token(fake_for(env, None)),
+        file: None,
+        signs: false,
+      }),
+      Self::Nkey(_) => {
+        let seed = mint_user_seed()?;
+        Ok(NatsPrepared {
+          decoy: Self::Nkey(seed.clone()),
+          file: Some(NatsGuestFile {
+            body: format!("{seed}\n"),
+            suffix: "nk",
+          }),
+          signs: true,
+        })
+      }
+      Self::Creds { .. } => {
+        let seed = mint_user_seed()?;
+        let public = NatsSeed::from_seed(SecretString::from(seed.clone()))?.public_key().to_string();
+        let jwt = decoy_user_jwt(&public);
+        Ok(NatsPrepared {
+          decoy: Self::Creds {
+            seed: seed.clone(),
+            jwt: jwt.clone(),
+          },
+          file: Some(NatsGuestFile {
+            body: decorate_creds(&jwt, &seed),
+            suffix: "creds",
+          }),
+          signs: true,
+        })
+      }
+    }
+  }
+
+  /// Context auth fields for this decoy. `guest_path` is the mounted file.
+  #[must_use]
+  pub fn context_auth(&self, guest_path: Option<&str>) -> NatsContextAuth {
+    let path = guest_path.unwrap_or("").to_string();
+    match self {
+      Self::UserPass { user, pass } => NatsContextAuth {
+        user: user.clone(),
+        password: pass.clone(),
+        ..NatsContextAuth::default()
+      },
+      Self::Token(token) => NatsContextAuth {
+        token: token.clone(),
+        ..NatsContextAuth::default()
+      },
+      Self::Nkey(_) => NatsContextAuth {
+        nkey: path,
+        ..NatsContextAuth::default()
+      },
+      Self::Creds { .. } => NatsContextAuth {
+        creds: path,
+        ..NatsContextAuth::default()
+      },
+    }
+  }
+
+  fn pair(self, real: Self) -> Result<NatsAuth, NatsUriError> {
+    if std::mem::discriminant(&self) != std::mem::discriminant(&real) {
+      return Err(NatsUriError::AuthKindMismatch);
+    }
+    match (self, real) {
+      (
+        Self::UserPass {
+          user: fake_user,
+          pass: fake_pass,
+        },
+        Self::UserPass {
+          user: real_user,
+          pass: real_pass,
+        },
+      ) => Ok(NatsAuth::UserPass {
+        user: NatsPair {
+          fake: fake_user,
+          real: SecretString::from(real_user),
+        },
+        pass: NatsPair {
+          fake: fake_pass,
+          real: SecretString::from(real_pass),
+        },
+      }),
+      (Self::Token(fake), Self::Token(real)) => Ok(NatsAuth::Token(NatsPair {
+        fake,
+        real: SecretString::from(real),
+      })),
+      (Self::Nkey(fake), Self::Nkey(real)) => {
+        let fake = NatsSeed::from_seed(SecretString::from(fake))?;
+        let real = NatsSeed::from_seed(SecretString::from(real))?;
+        Ok(NatsAuth::Nkey {
+          public_key: NatsPair {
+            fake: fake.public_key().to_string(),
+            real: SecretString::from(real.public_key().to_string()),
+          },
+          seed: real,
+        })
+      }
+      (
+        Self::Creds {
+          seed: fake_seed,
+          jwt: fake_jwt,
+        },
+        Self::Creds {
+          seed: real_seed,
+          jwt: real_jwt,
+        },
+      ) => {
+        let fake = NatsSeed::from_seed(SecretString::from(fake_seed))?;
+        check_user_jwt(&fake_jwt, fake.public_key())?;
+        let real = NatsSeed::from_seed(SecretString::from(real_seed))?;
+        check_user_jwt(&real_jwt, real.public_key())?;
+        Ok(NatsAuth::UserJwt {
+          jwt: NatsPair {
+            fake: fake_jwt,
+            real: SecretString::from(real_jwt),
+          },
+          public_key: NatsPair {
+            fake: fake.public_key().to_string(),
+            real: SecretString::from(real.public_key().to_string()),
+          },
+          seed: real,
+        })
+      }
+      _ => Err(NatsUriError::AuthKindMismatch),
+    }
+  }
+}
+
+fn mint_user_seed() -> Result<String, NatsUriError> {
+  nkeys::KeyPair::new_user().seed().map_err(|_source| NatsUriError::Decoy)
+}
+
+fn decoy_user_jwt(public: &str) -> String {
+  let header = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+  let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"{public}"}}"#).as_bytes());
+  let sig = URL_SAFE_NO_PAD.encode([0u8; 64]);
+  format!("{header}.{payload}.{sig}")
+}
+
+fn decorate_creds(jwt: &str, seed: &str) -> String {
+  format!(
+    "-----BEGIN NATS USER JWT-----\n{jwt}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{seed}\n------END USER NKEY SEED------\n"
+  )
+}
+
+/// Percent-encode one userinfo component the way `url` does, so a later
+/// parse decodes the same text.
+fn encode_userinfo_component(value: &str) -> String {
+  let Ok(mut url) = Url::parse("nats://placeholder.invalid/") else {
+    return String::new();
+  };
+  if url.set_username(value).is_err() {
+    return String::new();
+  }
+  let rendered = url.as_str();
+  let Some(rest) = rendered.strip_prefix("nats://") else {
+    return String::new();
+  };
+  rest.split_once('@').map(|(encoded, _)| encoded.to_string()).unwrap_or_default()
 }
 
 /// User nkey seed. The raw seed is not a CONNECT field.
@@ -494,6 +766,9 @@ pub enum NatsUriError {
   /// The two strings use different auth kinds.
   #[error("bad connection strings: fake and real use different auth kinds")]
   AuthKindMismatch,
+  /// A decoy user seed could not be minted.
+  #[error("decoy nkey seed could not be minted")]
+  Decoy,
   /// The `nkey` or `creds` password is not a parseable nkey seed.
   #[error("bad connection string: nkey seed does not parse")]
   Seed,
@@ -508,21 +783,12 @@ pub enum NatsUriError {
   JwtSeedMismatch,
 }
 
-/// Userinfo as one string states it, before pairing with the other string.
-#[derive(Debug)]
-enum UriAuth {
-  UserPass { user: String, pass: SecretString },
-  Token(SecretString),
-  Nkey(NatsSeed),
-  UserJwt { jwt: SecretString, signer: NatsSeed },
-}
-
 /// One parsed NATS string. Callers only ever see [`NatsScope`].
 #[derive(Debug)]
 struct NatsUri {
   scheme: NatsUriScheme,
   endpoint: NatsEndpoint,
-  auth: UriAuth,
+  auth: NatsPlain,
   query: Vec<(String, String)>,
 }
 
@@ -541,30 +807,10 @@ impl FromStr for NatsUri {
       Some(url::Host::Ipv6(addr)) => addr.to_string(),
       None => return Err(NatsUriError::EmptyHost),
     };
-    // `url` drops the colon when the password is empty. The raw userinfo
-    // still has it, and that form is a user with an empty password.
-    let auth = if let Some(user) = explicit_empty_password(entry) {
-      if AuthTag::parse(&user).is_some() {
-        return Err(NatsUriError::Seed);
-      }
-      UriAuth::UserPass {
-        user,
-        pass: SecretString::from(""),
-      }
-    } else {
-      match (url.username(), url.password()) {
-        ("", None) => return Err(NatsUriError::CredentialRequired),
-        ("", Some(_)) => return Err(NatsUriError::UserRequired),
-        (token, None) => UriAuth::Token(SecretString::from(decode(token, "token")?)),
-        (user, Some(pass)) => {
-          let user = decode(user, "user")?;
-          let pass = SecretString::from(decode(pass, "password")?);
-          match AuthTag::parse(&user) {
-            Some(tag) => parse_tagged(tag, pass)?,
-            None => UriAuth::UserPass { user, pass },
-          }
-        }
-      }
+    let (user, password) = userinfo_parts(entry)?;
+    let auth = match password {
+      None => NatsPlain::Token(user),
+      Some(pass) => classify_userinfo(user, pass)?,
     };
     if url.path() != "" && url.path() != "/" {
       return Err(NatsUriError::Path);
@@ -594,90 +840,51 @@ fn decode(raw: &str, label: &'static str) -> Result<String, NatsUriError> {
     .map_err(|source| NatsUriError::UserinfoUtf8 { label, source })
 }
 
-/// `user:@host` in the raw string. `url` keeps the username and drops the colon.
-fn explicit_empty_password(entry: &str) -> Option<String> {
-  let info = entry.split_once("://")?.1.split_once('@')?.0;
-  let (user, pass) = info.split_once(':')?;
-  if user.is_empty() || !pass.is_empty() {
-    return None;
+/// Userinfo from the raw string. `url` drops the colon of an empty password,
+/// so this split is the only read of that form. `None` is a token.
+fn userinfo_parts(entry: &str) -> Result<(String, Option<String>), NatsUriError> {
+  let rest = entry.split_once("://").ok_or(NatsUriError::Scheme)?.1;
+  let info = rest.split_once('@').ok_or(NatsUriError::CredentialRequired)?.0;
+  if info.is_empty() {
+    return Err(NatsUriError::CredentialRequired);
   }
-  decode(user, "user").ok()
-}
-
-impl UriAuth {
-  fn pair(self, real: Self) -> Result<NatsAuth, NatsUriError> {
-    match (self, real) {
-      (
-        Self::UserPass {
-          user: fake_user,
-          pass: fake_pass,
-        },
-        Self::UserPass {
-          user: real_user,
-          pass: real_pass,
-        },
-      ) => Ok(NatsAuth::UserPass {
-        user: NatsPair {
-          fake: fake_user,
-          real: SecretString::from(real_user),
-        },
-        pass: NatsPair {
-          fake: fake_pass.expose_secret().to_string(),
-          real: real_pass,
-        },
-      }),
-      (Self::Token(fake), Self::Token(real)) => Ok(NatsAuth::Token(NatsPair {
-        fake: fake.expose_secret().to_string(),
-        real,
-      })),
-      (Self::Nkey(fake), Self::Nkey(real)) => Ok(NatsAuth::Nkey {
-        public_key: NatsPair {
-          fake: fake.public_key().to_string(),
-          real: SecretString::from(real.public_key().to_string()),
-        },
-        seed: real,
-      }),
-      (
-        Self::UserJwt {
-          jwt: fake_jwt,
-          signer: fake,
-        },
-        Self::UserJwt {
-          jwt: real_jwt,
-          signer: real,
-        },
-      ) => Ok(NatsAuth::UserJwt {
-        jwt: NatsPair {
-          fake: fake_jwt.expose_secret().to_string(),
-          real: real_jwt,
-        },
-        public_key: NatsPair {
-          fake: fake.public_key().to_string(),
-          real: SecretString::from(real.public_key().to_string()),
-        },
-        seed: real,
-      }),
-      (
-        Self::UserPass { .. } | Self::Token(_) | Self::Nkey(_) | Self::UserJwt { .. },
-        Self::UserPass { .. } | Self::Token(_) | Self::Nkey(_) | Self::UserJwt { .. },
-      ) => Err(NatsUriError::AuthKindMismatch),
+  match info.split_once(':') {
+    None => Ok((decode(info, "token")?, None)),
+    Some((user, pass)) => {
+      if user.is_empty() {
+        return Err(NatsUriError::UserRequired);
+      }
+      Ok((decode(user, "user")?, Some(decode(pass, "password")?)))
     }
   }
 }
 
-fn parse_tagged(tag: AuthTag, password: SecretString) -> Result<UriAuth, NatsUriError> {
-  match tag {
-    AuthTag::Nkey => Ok(UriAuth::Nkey(NatsSeed::from_seed(password)?)),
-    AuthTag::Creds => {
-      let (seed, jwt) = split_creds(password.expose_secret())?;
-      let signer = NatsSeed::from_seed(SecretString::from(seed))?;
-      check_user_jwt(&jwt, signer.public_key())?;
-      Ok(UriAuth::UserJwt {
-        jwt: SecretString::from(jwt),
-        signer,
-      })
-    }
+/// `nkey` and `creds` select that kind only when the password parses as it.
+/// An ordinary password stays user and password, including a user whose
+/// name is one of those spellings.
+fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriError> {
+  if user == NatsPlain::NKEY_USER {
+    return match NatsSeed::from_seed(SecretString::from(pass.clone())) {
+      Ok(_) => Ok(NatsPlain::Nkey(pass)),
+      Err(NatsUriError::Seed) => Ok(NatsPlain::UserPass { user, pass }),
+      Err(err) => Err(err),
+    };
   }
+  if user == NatsPlain::CREDS_USER {
+    return match plain_creds(&pass) {
+      Ok(plain) => Ok(plain),
+      Err(NatsUriError::UserJwt) => Ok(NatsPlain::UserPass { user, pass }),
+      Err(err) => Err(err),
+    };
+  }
+  Ok(NatsPlain::UserPass { user, pass })
+}
+
+fn plain_creds(password: &str) -> Result<NatsPlain, NatsUriError> {
+  let (seed, jwt) = split_creds(password)?;
+  let signer = NatsSeed::from_seed(SecretString::from(seed.clone()))?;
+  check_user_jwt(&jwt, signer.public_key())?;
+  Ok(NatsPlain::Creds { seed, jwt })
 }
 
 /// `seed:jwt`. The seed has no colon, so the first colon is the split.
@@ -1387,12 +1594,12 @@ mod tests {
       (
         "nats://nkey:not-a-seed@nats.internal:4222".to_string(),
         case.real_nkey.clone(),
-        NatsUriError::Seed,
+        NatsUriError::AuthKindMismatch,
       ),
       (
         format!("nats://creds:{}@nats.internal:4222", case.fake_seed),
         case.real_creds.clone(),
-        NatsUriError::UserJwt,
+        NatsUriError::AuthKindMismatch,
       ),
       (
         format!("nats://creds:{account_seed}:{}@nats.internal:4222", case.fake_jwt),
@@ -1407,7 +1614,7 @@ mod tests {
       (
         format!("nats://creds:{}:aaaa.bbbb@nats.internal:4222", case.fake_seed),
         case.real_creds.clone(),
-        NatsUriError::UserJwt,
+        NatsUriError::AuthKindMismatch,
       ),
     ];
     for (fake, real, kind) in rejected {

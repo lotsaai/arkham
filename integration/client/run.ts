@@ -818,6 +818,20 @@ function natsRejected(err: unknown): boolean {
   return text.includes("Authorization Violation") && !text.includes(NATS_REAL);
 }
 
+if (process.env.NATS_DISCOVERED === "1") {
+  await retry("nats", "nats host ~/.config/nats discovery swaps the mounted decoy nkey; publish and receive", async () => {
+    const ctx = await selectedNatsContext();
+    if (!ctx.nkey || !ctx.url) return false;
+    const nkeyPath = ctx.nkey.startsWith("~/") ? join(homedir(), ctx.nkey.slice(2)) : ctx.nkey;
+    const fromFile = await readFile(nkeyPath);
+    if (NATS_NKEY_URL) {
+      const fnoxFake = decodeURIComponent(new URL(NATS_NKEY_URL).password);
+      if (new TextDecoder().decode(fromFile).includes(fnoxFake)) return false;
+    }
+    return natsRoundTrip(ctx.url, nkeyAuthenticator(fromFile), "discovered");
+  });
+}
+
 if (NATS_NKEY_URL) {
   if (!NATS_NKEY_FOREIGN) {
     console.error("nats nkey material is incomplete");

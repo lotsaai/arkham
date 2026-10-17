@@ -72,6 +72,167 @@ nats_client_log_hides_real_material() {
   done
 }
 
+# Host ~/.config/nats discovery. Start certs, copy its CA, then `arkham init`
+# in an empty workspace. That reads the context (no project [rules.nats_*],
+# no fnox key) and writes the generated grant. The guest tree is the decoy
+# mount. The grant file, which states the real seed, is appended to the
+# global config and mounted only on the arkham service.
+prepare_nats_discovery() {
+  local real_seed home isolate workspace certs_cid status code
+  local state_root grant_toml compose_file env_name label dest rel host rest container
+  real_seed=$(nats_env_value NATS_NKEY_REAL_SEED)
+  if [ -z "$real_seed" ]; then
+    echo "missing NATS_NKEY_REAL_SEED in integration/out/nats/nats.env"
+    return 1
+  fi
+  if grep -q 'generated = true' integration/arkham.toml integration/out/arkham.toml; then
+    echo "a hand-written nats rule is marked generated"
+    return 1
+  fi
+
+  echo "=== nats discovery: certs ==="
+  $compose up -d certs
+  certs_cid=$($compose ps -aq certs)
+  certs_cid=${certs_cid%%$'\n'*}
+  if [ -z "$certs_cid" ]; then
+    echo "certs container is absent"
+    return 1
+  fi
+  status=created
+  code=1
+  for _ in $(seq 1 300); do
+    status=$(docker inspect -f '{{.State.Status}}' "$certs_cid" 2>/dev/null || echo missing)
+    if [ "$status" = exited ]; then
+      code=$(docker inspect -f '{{.State.ExitCode}}' "$certs_cid" 2>/dev/null || echo 1)
+      break
+    fi
+    sleep 1
+  done
+  if [ "$status" != exited ] || [ "$code" != 0 ]; then
+    echo "certs exited ${code} (status ${status})"
+    docker logs "$certs_cid" || true
+    return 1
+  fi
+
+  isolate=$(mktemp -d /tmp/arkham-nats-discovery.XXXXXX)
+  trap 'rm -rf "$isolate"' RETURN
+  home=$isolate/home
+  workspace=$isolate/workspace
+  mkdir -p "$home/.config/nats/context" "$workspace" "$isolate/xdg-config" "$isolate/xdg-state" "$isolate/xdg-data"
+  docker cp "$certs_cid":/certs/ca.crt "$home/.config/nats/ca.crt"
+  printf '%s\n' "$real_seed" >"$home/.config/nats/user.nk"
+  chmod 600 "$home/.config/nats/user.nk"
+  printf 'discovered\n' >"$home/.config/nats/context.txt"
+  cat >"$home/.config/nats/context/discovered.json" <<EOF
+{
+  "description": "integration discovery",
+  "url": "tls://nats:4222",
+  "nkey": "${home}/.config/nats/user.nk",
+  "ca": "${home}/.config/nats/ca.crt"
+}
+EOF
+
+  echo "=== nats discovery: arkham init ==="
+  env -u ARKHAM_CONFIG -u KUBECONFIG -u TALOSCONFIG \
+    HOME="$home" \
+    XDG_CONFIG_HOME="$isolate/xdg-config" \
+    XDG_STATE_HOME="$isolate/xdg-state" \
+    XDG_DATA_HOME="$isolate/xdg-data" \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_SYSTEM=/dev/null \
+    integration/docker/arkham init --backend tun "$workspace"
+
+  state_root=$isolate/xdg-state/arkham/ws
+  grant_toml=$(find "$state_root" -path '*/grants/arkham.toml' -type f -print -quit)
+  compose_file=$(find "$state_root" -name compose.yml -type f -print -quit)
+  if [ -z "$grant_toml" ] || [ -z "$compose_file" ]; then
+    echo "arkham init did not write a grant layer"
+    return 1
+  fi
+  if ! grep -q 'generated = true' "$grant_toml"; then
+    echo "discovered grant is not marked generated"
+    return 1
+  fi
+  if ! grep -q 'if_missing = "ignore"' "$grant_toml"; then
+    echo "discovered grant does not ignore a missing fnox key"
+    return 1
+  fi
+  if ! grep -q 'sslrootcert=' "$grant_toml"; then
+    echo "discovered grant does not name a CA"
+    return 1
+  fi
+  if [ -z "$(find "$(dirname "$grant_toml")/rules.d" -name 'nats-*.ca' -type f -print -quit)" ]; then
+    echo "discovered grant did not copy the CA"
+    return 1
+  fi
+  if ! grep -F -q -- "$real_seed" "$grant_toml"; then
+    echo "discovered grant does not state the real nkey"
+    return 1
+  fi
+  env_name=$(grep -m 1 -E '^env = ' "$grant_toml" || true)
+  env_name=${env_name#env = }
+  env_name=${env_name#\"}
+  env_name=${env_name#\'}
+  env_name=${env_name%\"}
+  env_name=${env_name%\'}
+  label=$(grep -m 1 -E '^\[rules\.' "$grant_toml" || true)
+  label=${label#\[rules.}
+  label=${label%\]}
+  if [ -z "$env_name" ] || [ -z "$label" ]; then
+    echo "discovered grant has no env name"
+    return 1
+  fi
+  if grep -F -q -- "[rules.${label}]" integration/out/arkham.toml integration/arkham.toml; then
+    echo "discovered rule is hand-written in the project config"
+    return 1
+  fi
+
+  dest=integration/out/nats-discovery
+  rm -rf "$dest"
+  mkdir -p "$dest/grants" "$dest/guest"
+  cp -a "$(dirname "$grant_toml")/." "$dest/grants/"
+  while IFS= read -r line; do
+    case "$line" in
+      *"/home/eng/.config/nats/"*) ;;
+      *) continue ;;
+    esac
+    rest=${line#*- }
+    host=${rest%%:*}
+    container=${rest#*:}
+    container=${container%%:*}
+    rel=${container#/home/eng/.config/nats/}
+    if [ "$rel" = "$container" ] || [ -z "$rel" ]; then
+      echo "unexpected nats mount: ${line}"
+      return 1
+    fi
+    mkdir -p "$dest/guest/$(dirname "$rel")"
+    cp "$host" "$dest/guest/$rel"
+  done <"$compose_file"
+  if [ ! -f "$dest/guest/context.txt" ]; then
+    echo "discovery did not mount a nats context into the guest"
+    return 1
+  fi
+  if grep -R -F -q -- "$real_seed" "$dest/guest"; then
+    echo "discovered guest tree contains the real nkey"
+    return 1
+  fi
+
+  $compose run --rm --no-deps -T \
+    -v "${grant_toml}:/discovered.toml:ro" \
+    --entrypoint bash certs \
+    -c 'cat /discovered.toml >> /arkham-config/config.toml'
+  docker cp "$certs_cid":/arkham-config/config.toml "$dest/config.toml"
+  docker cp "$certs_cid":/arkham-config/fnox.toml "$dest/fnox.toml"
+  if ! grep -q 'generated = true' "$dest/config.toml"; then
+    echo "global config is missing the discovered grant"
+    return 1
+  fi
+  if grep -F -q -- "[secrets.${env_name}]" "$dest/fnox.toml"; then
+    echo "discovered grant env is a fnox secret"
+    return 1
+  fi
+}
+
 for backend in $backends; do
   echo "=== backend: $backend ==="
   # A leftover stack holds an old CA while the rerun rotates the volume, and
@@ -80,7 +241,10 @@ for backend in $backends; do
   # The bind-mounted file survives `down`. A leftover from the previous
   # backend, or from an earlier run, must not satisfy this round.
   rm -f integration/out/covered.json
-  ARKHAM_BACKEND="$backend" $compose up -d --build
+  prepare_nats_discovery
+  # Certs already completed. Recreating it would rerun gen-secrets.sh and
+  # drop the discovered grant from the global config.
+  ARKHAM_BACKEND="$backend" NATS_DISCOVERED=1 $compose up -d --build --no-recreate
 
   # A failed one-shot leaves the client in `created`. Don't spend the
   # rest of the poll on a container that will never start.

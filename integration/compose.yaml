@@ -75,6 +75,8 @@ services:
       - ./out/arkham.toml:/etc/arkham/arkham.toml:ro
       - certs:/certs:ro
       - arkham-config:/arkham-config:ro
+      # Discovered NATS grant blobs (CA). Empty unless test:ssh ran arkham init.
+      - ./out/nats-discovery/grants:/arkham/grants:ro
     networks:
       default: {}
       server:
@@ -439,6 +441,14 @@ services:
         cp /srv/package.json /srv/run.ts /opt/client/
         (cd /opt/client && bun install)
         chmod -R a+rX /opt/client
+        if [ -f /opt/nats-discovered/context.txt ]; then
+          mkdir -p /tmp/.config/nats
+          cp -a /opt/nats-discovered/. /tmp/.config/nats/
+          if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
+            gid="$${HOST_GID:-$$HOST_UID}"
+            chown -R "$$HOST_UID:$$gid" /tmp/.config/nats
+          fi
+        fi
         if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
           gid="$${HOST_GID:-$$HOST_UID}"
           mkdir -p /out
@@ -478,11 +488,13 @@ services:
       NATS_NKEY_FOREIGN: ${NATS_NKEY_FOREIGN:?run integration/gen-nats.sh}
       NATS_JWT_FOREIGN_SEED: ${NATS_JWT_FOREIGN_SEED:?run integration/gen-nats.sh}
       NATS_JWT_FOREIGN_JWT: ${NATS_JWT_FOREIGN_JWT:?run integration/gen-nats.sh}
+      NATS_DISCOVERED: ${NATS_DISCOVERED:-}
       SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
       - ./out:/out
+      - ./out/nats-discovery/guest:/opt/nats-discovered:ro
     network_mode: service:arkham
     depends_on:
       smtp-direct:

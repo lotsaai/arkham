@@ -195,6 +195,27 @@ pub(crate) fn rewrite_label(source: &Path, name: &str) -> Result<String, Error> 
   Ok(format!("{}-{}-{}", path_slug, clean(&stem), clean(name)))
 }
 
+/// Blob-name prefixes the adapters write. [`write_state`] deletes a file
+/// with one of these prefixes when the current adapt did not write it.
+pub(crate) const BLOB_PREFIX_KUBE: &str = "kube-";
+/// Talos client material.
+pub(crate) const BLOB_PREFIX_TALOS: &str = "talos-";
+/// SSH identity material.
+pub(crate) const BLOB_PREFIX_SSH: &str = "ssh-";
+/// Git identity material.
+pub(crate) const BLOB_PREFIX_GIT: &str = "git-";
+/// NATS client certificate, key, and CA.
+pub(crate) const BLOB_PREFIX_NATS: &str = "nats-";
+
+/// Every adapter blob prefix, in the order the writers name files.
+pub(crate) const ADAPTER_BLOB_PREFIXES: &[&str] = &[
+  BLOB_PREFIX_KUBE,
+  BLOB_PREFIX_TALOS,
+  BLOB_PREFIX_SSH,
+  BLOB_PREFIX_GIT,
+  BLOB_PREFIX_NATS,
+];
+
 /// Write the grant layer: the grant fragments concatenated into the marker
 /// global config, plus the blobs under `rules.d`, pruning stale adapter blobs
 /// so a removed rewrite stops granting. The arkham service mounts the marker
@@ -226,10 +247,7 @@ pub(crate) fn write_state(state_dir: &Path, adapted: &[RewriteAdapted]) -> Resul
     }
   }
   write_secret(&marker, toml.as_bytes())?;
-  let stale = |name: &str| {
-    (name.starts_with("kube-") || name.starts_with("talos-") || name.starts_with("ssh-") || name.starts_with("git-"))
-      && !current.contains(name)
-  };
+  let stale = |name: &str| ADAPTER_BLOB_PREFIXES.iter().any(|prefix| name.starts_with(prefix)) && !current.contains(name);
   for entry in fs::read_dir(&rules_dir).map_err(|source| Error::ReadFile {
     path: rules_dir.clone(),
     source,

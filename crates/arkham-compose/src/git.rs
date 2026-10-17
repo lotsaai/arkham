@@ -41,7 +41,7 @@ use gix_config::file::{SectionId, SectionRef};
 use gix_config::{File as GitConfig, Source as ConfigSource};
 use url::Url;
 
-use crate::adapt::{DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
+use crate::adapt::{BLOB_PREFIX_GIT, DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
 use crate::decoys::Decoy;
 use crate::error::Error;
 use crate::ssh::{host_identity_path, mirror_container_path};
@@ -441,8 +441,12 @@ fn ssh_mint(source: &Path, config: &GitConfig, endpoint: &ForgeEndpoint, home: &
       ssh: BTreeMap::from([(
         entry,
         HostSshCfg {
-          identity: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/git-{label}.identity"))),
-          guest_key: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/git-{label}.guest_key"))),
+          identity: Some(PathBuf::from(format!(
+            "{GRANTS_STATE_DIR}/rules.d/{BLOB_PREFIX_GIT}{label}.identity"
+          ))),
+          guest_key: Some(PathBuf::from(format!(
+            "{GRANTS_STATE_DIR}/rules.d/{BLOB_PREFIX_GIT}{label}.guest_key"
+          ))),
         },
       )]),
     },
@@ -455,11 +459,11 @@ fn ssh_mint(source: &Path, config: &GitConfig, endpoint: &ForgeEndpoint, home: &
   Ok(Some(SshGrant {
     fragment,
     materialized: vec![
-      (format!("git-{label}.identity"), real.into_bytes()),
-      (format!("git-{label}.guest_key"), decoy.public_line()?.into_bytes()),
+      (format!("{BLOB_PREFIX_GIT}{label}.identity"), real.into_bytes()),
+      (format!("{BLOB_PREFIX_GIT}{label}.guest_key"), decoy.public_line()?.into_bytes()),
     ],
     decoy_files: vec![DecoyFile {
-      name: format!("git-{label}.decoy-key"),
+      name: format!("{BLOB_PREFIX_GIT}{label}.decoy-key"),
       bytes: decoy_key.into_bytes(),
       container,
     }],

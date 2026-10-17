@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use arkham_config::config::{HostSshCfg, IfMissing};
 use arkham_pki::ssh::SshKey;
 
-use crate::adapt::{DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
+use crate::adapt::{BLOB_PREFIX_SSH, DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
 use crate::error::Error;
 
 /// One `Host` block as the config states it.
@@ -105,8 +105,12 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
         ssh: BTreeMap::from([(
           entry,
           HostSshCfg {
-            identity: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/ssh-{label}.identity"))),
-            guest_key: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/ssh-{label}.guest_key"))),
+            identity: Some(PathBuf::from(format!(
+              "{GRANTS_STATE_DIR}/rules.d/{BLOB_PREFIX_SSH}{label}.identity"
+            ))),
+            guest_key: Some(PathBuf::from(format!(
+              "{GRANTS_STATE_DIR}/rules.d/{BLOB_PREFIX_SSH}{label}.guest_key"
+            ))),
           },
         )]),
       },
@@ -117,7 +121,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
       continue;
     };
     let decoy_files = vec![DecoyFile {
-      name: format!("ssh-{label}.decoy-key"),
+      name: format!("{BLOB_PREFIX_SSH}{label}.decoy-key"),
       bytes: decoy_key.into_bytes(),
       container,
     }];
@@ -125,8 +129,8 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
       fragment,
       decoy: String::new(),
       materialized: vec![
-        (format!("ssh-{label}.identity"), real.into_bytes()),
-        (format!("ssh-{label}.guest_key"), decoy_line.into_bytes()),
+        (format!("{BLOB_PREFIX_SSH}{label}.identity"), real.into_bytes()),
+        (format!("{BLOB_PREFIX_SSH}{label}.guest_key"), decoy_line.into_bytes()),
       ],
       decoy_files,
     };
@@ -138,7 +142,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
     // first use — ssh's mechanism is the allowlist, arkham adds no pins.
     first.decoy = format!("StrictHostKeyChecking accept-new\n\n{}", String::from_utf8_lossy(content));
     first.decoy_files.push(DecoyFile {
-      name: "ssh-known-hosts".to_string(),
+      name: format!("{BLOB_PREFIX_SSH}known-hosts"),
       bytes: Vec::new(),
       container: format!("{home}/.ssh/known_hosts"),
     });
