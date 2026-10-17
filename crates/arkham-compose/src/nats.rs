@@ -679,12 +679,8 @@ struct DecoyContext {
   jetstream_event_prefix: String,
   #[serde(skip_serializing_if = "String::is_empty")]
   color_scheme: String,
-  #[serde(skip_serializing_if = "is_false")]
-  tls_first: bool,
-}
-
-fn is_false(value: &bool) -> bool {
-  !*value
+  #[serde(skip_serializing_if = "Option::is_none")]
+  tls_first: Option<bool>,
 }
 
 fn decoy_context(doc: &NatsContext, dial: &Url, guest: Option<&GuestCred>, fake: &NatsPlain) -> DecoyContext {
@@ -701,7 +697,7 @@ fn decoy_context(doc: &NatsContext, dial: &Url, guest: Option<&GuestCred>, fake:
     jetstream_api_prefix: doc.jetstream_api_prefix.clone(),
     jetstream_event_prefix: doc.jetstream_event_prefix.clone(),
     color_scheme: doc.color_scheme.clone(),
-    tls_first: doc.tls_first,
+    tls_first: doc.tls_first.then_some(true),
   };
   match fake {
     NatsPlain::UserPass { user, pass } => {
@@ -815,6 +811,7 @@ mod tests {
     assert!(!fake.contains("handshake_first"), "{fake}");
     let decoy: Value = serde_json::from_str(&found.adapted[0].decoy).unwrap();
     assert_eq!(decoy["user"], "agent");
+    assert_eq!(decoy["tls_first"], true);
     assert_eq!(decoy["jetstream_domain"], "app");
     assert_ne!(decoy["password"], "real-nats-pass");
     assert!(!found.adapted[0].decoy.contains("real-nats-pass"));

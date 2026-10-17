@@ -93,8 +93,8 @@ pub(crate) struct GrantFragment {
 pub(crate) struct Redacted(pub(crate) String);
 
 impl fmt::Debug for Redacted {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter.write_str("redacted")
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("redacted")
   }
 }
 
