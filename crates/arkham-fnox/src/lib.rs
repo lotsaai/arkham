@@ -338,6 +338,12 @@ impl RulePass<'_> {
       tracing::info!(label, env = %rule.env, "connection-string rule resolved: stated fake string, real connection string from fnox");
       return Ok(false);
     }
+    // A generated grant states the real string beside the fake one. Fnox
+    // wins when it has the key. When it does not, the stated real stays.
+    if rule.real.is_some() {
+      tracing::info!(label, env = %rule.env, "connection-string rule resolved: stated fake string, stated real connection string");
+      return Ok(false);
+    }
     let what = if self.fnox.is_some() {
       "no resolved real connection string and fnox does not declare its key"
     } else {
@@ -818,6 +824,25 @@ value = ""
       assert!(err.to_string().contains("DECLARED_BUT_EMPTY"), "{if_missing:?}: {err:?}");
       assert!(err.to_string().contains("empty"), "{if_missing:?}: {err:?}");
     }
+  }
+
+  #[tokio::test]
+  async fn stated_real_connection_string_stays_when_fnox_has_no_key() {
+    let registry = Registry::load(None).unwrap();
+    let mut rule = rule("NATS_CONTEXT");
+    rule.value = Some(SecretString::from("nats://decoy-token@nats.internal:4222"));
+    rule.real = Some(SecretString::from("nats://real-token@nats.internal:4222"));
+    rule.if_missing = IfMissing::Error;
+    let mut config = config_with("nats", rule);
+    resolve(&mut config, &registry, None)
+      .await
+      .expect("a stated real connection string is the secret");
+    let real = config.rules["nats"].real.as_ref().expect("stated real stays");
+    assert_eq!(real.expose_secret(), "nats://real-token@nats.internal:4222");
+    assert_eq!(
+      config.rules["nats"].value.as_ref().unwrap().expose_secret(),
+      "nats://decoy-token@nats.internal:4222"
+    );
   }
 
   #[tokio::test]
