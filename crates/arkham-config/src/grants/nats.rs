@@ -873,7 +873,7 @@ fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
   if user == NatsPlain::CREDS_USER {
     return match plain_creds(&pass) {
       Ok(plain) => Ok(plain),
-      Err(NatsUriError::UserJwt) => Ok(NatsPlain::UserPass { user, pass }),
+      Err(NatsUriError::UserJwt | NatsUriError::Seed) => Ok(NatsPlain::UserPass { user, pass }),
       Err(err) => Err(err),
     };
   }
@@ -1134,7 +1134,9 @@ mod tests {
 
   #[test]
   fn creds_username_with_a_colon_password_stays_user_and_password() {
-    for pass in ["a:b", "a%3Ab"] { // betterleaks:allow
+    let colon = "a:b"; // betterleaks:allow
+    let encoded = "a%3Ab"; // betterleaks:allow
+    for pass in [colon, encoded] {
       let scope = NatsScope::from_strings(
         &format!("nats://creds:{pass}@nats.internal:4222"),
         &format!("nats://creds:{pass}@nats.upstream:4222"),
