@@ -317,6 +317,50 @@ mod tests {
   }
 
   #[test]
+  fn tilde_parent_does_not_escape_the_container_home() {
+    let home = Path::new("/host/home/eng");
+    let mirrored = mirror_container_path("~/../.ssh/id_ed25519", home, "/home/eng");
+    assert!(
+      mirrored.as_deref().is_none_or(|path| !path.contains("..") && path.starts_with("/home/eng/")),
+      "{mirrored:?}"
+    );
+  }
+
+  #[test]
+  fn relative_parent_identity_does_not_keep_the_parent_segment() {
+    let home = Path::new("/host/home/eng");
+    let mirrored = mirror_container_path("../id_ed25519", home, "/home/eng");
+    assert!(mirrored.as_deref().is_some_and(|path| !path.contains("..")), "{mirrored:?}");
+  }
+
+  #[test]
+  fn relative_identity_mirrors_under_ssh() {
+    let home = Path::new("/host/home/eng");
+    assert_eq!(
+      mirror_container_path("id_ed25519", home, "/home/eng").as_deref(),
+      Some("/home/eng/.ssh/id_ed25519")
+    );
+  }
+
+  #[test]
+  fn symlink_identity_mounts_at_the_link_path() {
+    let (dir, real) = host_home_with_key();
+    std::os::unix::fs::symlink(dir.path().join(".ssh").join("id_ed25519"), dir.path().join(".ssh").join("link")).unwrap();
+    let config = "Host git.example\n IdentityFile ~/.ssh/link\n";
+    let adapted = adapt_in(&dir, config);
+    assert_eq!(adapted.len(), 1);
+    let decoy = adapted[0].decoy_files.iter().find(|file| file.name.ends_with(".decoy-key")).unwrap();
+    assert_eq!(decoy.container, "/home/agent/.ssh/link");
+    let identity = adapted[0]
+      .materialized
+      .iter()
+      .find(|(name, _)| name.ends_with(".identity"))
+      .map(|(_, bytes)| String::from_utf8(bytes.clone()).unwrap())
+      .unwrap();
+    assert_eq!(identity, real.to_openssh().unwrap());
+  }
+
+  #[test]
   fn include_and_match_skip_their_block_not_the_source() {
     let (dir, _) = host_home_with_key();
     let config = "Include other\nMatch final\nHost git.example\n IdentityFile ~/.ssh/id_ed25519\n";

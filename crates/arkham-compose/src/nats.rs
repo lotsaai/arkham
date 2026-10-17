@@ -773,4 +773,178 @@ mod tests {
     );
     assert!(adapt(&root, "/home/eng", home.path()).unwrap().is_none());
   }
+
+  #[test]
+  fn traversal_creds_path_stays_inside_the_decoy_dir() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let seed = user_seed();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
+      .unwrap()
+      .public_key()
+      .to_string();
+    let jwt = user_jwt(&public);
+    let ssh = home.path().join(".ssh");
+    fs::create_dir_all(&ssh).unwrap();
+    fs::write(ssh.join("config"), creds_file(&seed, &jwt)).unwrap();
+    write_context(
+      &root,
+      "demo",
+      r#"{"url":"nats://nats.internal:4222","creds":"../../.ssh/config"}"#,
+    );
+    let found = adapted(&root, home.path());
+    let containers: Vec<&str> = found.adapted[0].decoy_files.iter().map(|file| file.container.as_str()).collect();
+    assert!(containers.iter().all(|path| !path.contains("..")), "{containers:?}");
+    assert!(
+      containers.iter().any(|path| path.starts_with("/home/eng/.config/nats/decoy/")),
+      "{containers:?}"
+    );
+    let guest = found
+      .adapted[0]
+      .decoy_files
+      .iter()
+      .find(|file| file.container.contains("decoy"))
+      .expect("decoy creds");
+    let guest_text = String::from_utf8(guest.bytes.clone()).unwrap();
+    assert!(!guest_text.contains(&seed));
+    assert!(rule_of(&found).real.unwrap().expose_secret().contains(&seed));
+  }
+
+  #[test]
+  fn relative_creds_path_mirrors_under_the_nats_dir() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let seed = user_seed();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
+      .unwrap()
+      .public_key()
+      .to_string();
+    let jwt = user_jwt(&public);
+    let creds = root.join("creds");
+    fs::create_dir_all(&creds).unwrap();
+    fs::write(creds.join("user.creds"), creds_file(&seed, &jwt)).unwrap();
+    write_context(
+      &root,
+      "demo",
+      r#"{"url":"nats://nats.internal:4222","creds":"creds/user.creds"}"#,
+    );
+    let found = adapted(&root, home.path());
+    let guest = found
+      .adapted[0]
+      .decoy_files
+      .iter()
+      .find(|file| file.container.ends_with("/.config/nats/creds/user.creds"))
+      .expect("mirrored relative creds");
+    let guest_text = String::from_utf8(guest.bytes.clone()).unwrap();
+    assert!(!guest_text.contains(&seed));
+  }
+
+  #[test]
+  fn symlink_creds_mounts_at_the_lexical_path() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let seed = user_seed();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
+      .unwrap()
+      .public_key()
+      .to_string();
+    let jwt = user_jwt(&public);
+    let outside = home.path().join("outside.creds");
+    fs::write(&outside, creds_file(&seed, &jwt)).unwrap();
+    let creds = root.join("creds");
+    fs::create_dir_all(&creds).unwrap();
+    std::os::unix::fs::symlink(&outside, creds.join("link.creds")).unwrap();
+    write_context(
+      &root,
+      "demo",
+      r#"{"url":"nats://nats.internal:4222","creds":"creds/link.creds"}"#,
+    );
+    let found = adapted(&root, home.path());
+    let guest = found
+      .adapted[0]
+      .decoy_files
+      .iter()
+      .find(|file| file.container == "/home/eng/.config/nats/creds/link.creds")
+      .expect("lexical symlink path");
+    let guest_text = String::from_utf8(guest.bytes.clone()).unwrap();
+    assert!(!guest_text.contains(&seed));
+    assert!(rule_of(&found).real.unwrap().expose_secret().contains(&seed));
+    assert!(!found.adapted[0].decoy_files.iter().any(|file| file.container.contains("outside.creds")));
+  }
+
+  #[test]
+  fn unknown_context_field_is_absent_from_the_decoy() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(
+      &root,
+      "demo",
+      r#"{"url":"nats://nats.internal:4222","token":"real-token","description":"kept","operator_note":"not-for-the-guest"}"#,
+    );
+    let found = adapted(&root, home.path());
+    assert!(!found.adapted[0].decoy.contains("not-for-the-guest"));
+    assert!(!found.adapted[0].decoy.contains("operator_note"));
+    assert!(found.adapted[0].decoy.contains("kept"));
+  }
+
+  #[test]
+  fn short_banner_creds_file_still_grants() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let seed = user_seed();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
+      .unwrap()
+      .public_key()
+      .to_string();
+    let jwt = user_jwt(&public);
+    let creds = root.join("user.creds");
+    fs::create_dir_all(&root).unwrap();
+    let body = format!("---BEGIN NATS USER JWT---\n{jwt}\n---END NATS USER JWT---\n\n---BEGIN USER NKEY SEED---\n{seed}\n---END USER NKEY SEED---\n");
+    fs::write(&creds, body).unwrap();
+    write_context(
+      &root,
+      "demo",
+      &format!(r#"{{"url":"nats://nats.internal:4222","creds":"{}"}}"#, creds.display()),
+    );
+    let found = adapted(&root, home.path());
+    let real = rule_of(&found).real.unwrap().expose_secret().to_string();
+    assert!(real.contains(&seed));
+    assert!(real.contains(&jwt));
+  }
+
+  #[test]
+  fn user_with_empty_password_is_userinfo() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(
+      &root,
+      "demo",
+      r#"{"url":"nats://nats.internal:4222","user":"agent","password":""}"#,
+    );
+    let found = adapted(&root, home.path());
+    let rule = rule_of(&found);
+    let scope = NatsScope::from_strings(rule.value.unwrap().expose_secret(), rule.real.unwrap().expose_secret()).expect("userinfo");
+    assert_eq!(
+      scope
+        .auth
+        .fields()
+        .iter()
+        .map(|field| (field.name.as_str(), field.pair.fake.as_str(), field.pair.real.expose_secret()))
+        .collect::<Vec<_>>(),
+      vec![("user", "agent", "agent"), ("pass", "", "")]
+    );
+  }
+
+  #[test]
+  fn inline_nkey_text_is_not_a_path() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let seed = user_seed();
+    write_context(
+      &root,
+      "demo",
+      &format!(r#"{{"url":"nats://nats.internal:4222","nkey":"{seed}"}}"#),
+    );
+    assert!(adapt(&root, "/home/eng", home.path()).unwrap().is_none());
+  }
 }

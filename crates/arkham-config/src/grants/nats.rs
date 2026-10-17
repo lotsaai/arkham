@@ -830,6 +830,18 @@ mod tests {
   };
   use crate::grants::RootCert;
 
+  #[test]
+  fn empty_password_userinfo_is_user_and_password() {
+    let scope = NatsScope::from_strings("nats://agent:@nats.internal:4222", "nats://agent:@nats.internal:4222").expect("empty password");
+    assert_eq!(
+      fields(&scope.auth),
+      vec![
+        ("user", "agent".to_string(), "agent".to_string()),
+        ("pass", String::new(), String::new()),
+      ]
+    );
+  }
+
   const FAKE_PASS: &str = "arkham_fake_nats_pass"; // betterleaks:allow
   const REAL_PASS: &str = "real-nats-pass"; // betterleaks:allow
   const FAKE_TOKEN: &str = "arkham_fake_nats_token"; // betterleaks:allow
