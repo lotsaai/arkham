@@ -8,6 +8,7 @@ cd "$proj_dir" || exit 1
 set -euo pipefail
 
 mise run build
+bash integration/gen-nats.sh
 mkdir -p integration/docker
 cp target/release/arkham integration/docker/arkham
 

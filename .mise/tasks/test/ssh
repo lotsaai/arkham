@@ -24,6 +24,7 @@ if [ ! -f integration/.env ]; then
   echo "skip: test:ssh needs integration/.env"
   exit 0
 fi
+bash integration/gen-nats.sh
 
 # eBPF is not here: it captures by cgroup membership and compose cannot pin
 # a service's cgroup path — `ARKHAM_BACKEND=ebpf mise run demo:bwrap` runs

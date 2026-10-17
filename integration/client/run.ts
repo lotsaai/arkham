@@ -10,7 +10,7 @@ import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { readFile, writeFile } from "node:fs/promises";
 import { RedisClient } from "bun";
 import { Client } from "ldapts";
-import { connect as natsConnect, StringCodec, type NatsConnection } from "nats";
+import { connect as natsConnect, StringCodec, credsAuthenticator, nkeyAuthenticator, type Authenticator, type NatsConnection } from "nats";
 
 const FAKE = process.env.ARKHAM_FAKE ?? "";
 const OIDC_FAKE_SECRET = process.env.OIDC_FAKE_SECRET ?? "";
@@ -25,6 +25,13 @@ const LDAP_TLS_URL = process.env.LDAP_TLS_URL ?? "";
 const LDAP_REAL = "arkham_real_ldap_pass_01";
 const NATS_URL = process.env.NATS_URL ?? "";
 const NATS_REAL = "arkham_real_nats_pass";
+const NATS_NKEY_URL = process.env.NATS_NKEY_URL ?? "";
+const NATS_JWT_URL = process.env.NATS_JWT_URL ?? "";
+const NATS_NKEY_FOREIGN = process.env.NATS_NKEY_FOREIGN ?? "";
+const NATS_JWT_FOREIGN_SEED = process.env.NATS_JWT_FOREIGN_SEED ?? "";
+const NATS_JWT_FOREIGN_JWT = process.env.NATS_JWT_FOREIGN_JWT ?? "";
+const NATS_NKEY_REAL_SEED = process.env.NATS_NKEY_REAL_SEED ?? "";
+const NATS_JWT_REAL_ASSERT = process.env.NATS_JWT_REAL_ASSERT ?? "";
 const ATTEMPT_TIMEOUT_MS = 5000;
 const SCENARIO_BUDGET_MS = 20000;
 const TOTAL_BUDGET_MS = 90000;
@@ -729,6 +736,116 @@ if (NATS_URL) {
   });
 } else {
   stage("nats scenarios skipped: no NATS_URL");
+}
+
+function natsServer(raw: string): string {
+  const url = new URL(raw);
+  return `${url.hostname}:${url.port}`;
+}
+
+function openNatsAuth(raw: string, authenticator: Authenticator): Promise<NatsConnection> {
+  return race("nats connect", natsConnect({
+    servers: natsServer(raw),
+    authenticator,
+    tls: { ca: ca.toString() },
+    timeout: 4000,
+    reconnect: false,
+  }));
+}
+
+function credsFile(jwt: string, seed: string): Uint8Array {
+  const text = [
+    "-----BEGIN NATS USER JWT-----",
+    jwt,
+    "------END NATS USER JWT------",
+    "",
+    "-----BEGIN USER NKEY SEED-----",
+    seed,
+    "------END USER NKEY SEED------",
+    "",
+  ].join("\n");
+  return new TextEncoder().encode(text);
+}
+
+async function natsRoundTrip(raw: string, authenticator: Authenticator, label: string): Promise<boolean> {
+  const sc = StringCodec();
+  const nc = await openNatsAuth(raw, authenticator);
+  try {
+    const subject = `arkham.${label}`;
+    const body = `payload keeps ${label}`;
+    const sub = nc.subscribe(subject, { max: 1 });
+    nc.publish(subject, sc.encode(body));
+    const got = await race("nats message", (async () => {
+      for await (const msg of sub) return sc.decode(msg.data);
+      return "";
+    })());
+    stage(`nats ${label} received: ${got}`);
+    return got === body;
+  } finally {
+    await nc.close();
+  }
+}
+
+function natsRejected(err: unknown): boolean {
+  const text = String(err);
+  stage(`nats unswapped authenticator error: ${text}`);
+  return text.includes("Authorization Violation")
+    && !text.includes(NATS_REAL)
+    && !text.includes(NATS_NKEY_REAL_SEED)
+    && !text.includes(NATS_JWT_REAL_ASSERT);
+}
+
+if (NATS_NKEY_URL) {
+  if (!NATS_NKEY_FOREIGN || !NATS_NKEY_REAL_SEED || !NATS_JWT_REAL_ASSERT) {
+    console.error("nats nkey material is incomplete");
+    process.exit(1);
+  }
+  const seed = decodeURIComponent(new URL(NATS_NKEY_URL).password);
+  await retry("nats", "nats tls CONNECT swaps the decoy nkey; publish and receive", async () => {
+    return natsRoundTrip(NATS_NKEY_URL, nkeyAuthenticator(new TextEncoder().encode(seed)), "nkey");
+  });
+
+  await retry("nats", "nats non-decoy nkey is not swapped", async () => {
+    try {
+      const nc = await openNatsAuth(NATS_NKEY_URL, nkeyAuthenticator(new TextEncoder().encode(NATS_NKEY_FOREIGN)));
+      await nc.close();
+      return false;
+    } catch (err) {
+      return natsRejected(err);
+    }
+  });
+} else {
+  stage("nats nkey scenarios skipped: no NATS_NKEY_URL");
+}
+
+if (NATS_JWT_URL) {
+  if (!NATS_JWT_FOREIGN_SEED || !NATS_JWT_FOREIGN_JWT || !NATS_NKEY_REAL_SEED || !NATS_JWT_REAL_ASSERT) {
+    console.error("nats user jwt material is incomplete");
+    process.exit(1);
+  }
+  const jwtUrl = new URL(NATS_JWT_URL);
+  const password = decodeURIComponent(jwtUrl.password);
+  const split = password.indexOf(":");
+  const fakeSeed = split < 0 ? "" : password.slice(0, split);
+  const fakeJwt = split < 0 ? "" : password.slice(split + 1);
+  await retry("nats", "nats tls CONNECT swaps the decoy user jwt; publish and receive", async () => {
+    return natsRoundTrip(NATS_JWT_URL, credsAuthenticator(credsFile(fakeJwt, fakeSeed)), "jwt");
+  });
+
+  await retry("nats", "nats non-decoy user jwt is not swapped", async () => {
+    try {
+      const nc = await openNatsAuth(
+        NATS_JWT_URL,
+        credsAuthenticator(credsFile(NATS_JWT_FOREIGN_JWT, NATS_JWT_FOREIGN_SEED)),
+      );
+      await nc.close();
+      return false;
+    } catch (err) {
+      return natsRejected(err);
+    }
+  });
+} else {
+  stage("nats user jwt scenarios skipped: no NATS_JWT_URL");
 }
 
 const coveredPath = process.env.ARKHAM_COVERED ?? "";
