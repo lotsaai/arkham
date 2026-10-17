@@ -138,81 +138,64 @@ impl NatsSeed {
   }
 }
 
-/// Nkey rule. CONNECT `nkey` is the public key. There is no JWT slot.
-#[derive(Debug, Clone)]
-pub struct Nkey {
-  fake_public: String,
-  real: NatsSeed,
+/// JSON key of a CONNECT field. The spellings are this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum NatsField {
+  /// CONNECT `user`.
+  User,
+  /// CONNECT `pass`.
+  Pass,
+  /// CONNECT `auth_token`.
+  AuthToken,
+  /// CONNECT `nkey`.
+  Nkey,
+  /// CONNECT `jwt`.
+  Jwt,
+  /// CONNECT `sig`.
+  Sig,
 }
 
-impl Nkey {
-  /// Decoy public key the guest CONNECT `nkey` must equal.
+impl NatsField {
+  /// The JSON key.
   #[must_use]
-  pub fn fake_public(&self) -> &str {
-    &self.fake_public
-  }
-
-  /// Real public key written into the upstream CONNECT `nkey`.
-  #[must_use]
-  pub fn real_public(&self) -> &str {
-    self.real.public_key()
-  }
-
-  /// Sign with the real seed.
-  #[must_use]
-  pub fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
-    self.real.sign(message)
+  pub fn as_str(self) -> &'static str {
+    <&str>::from(self)
   }
 }
 
-/// User-JWT rule. CONNECT `jwt` is the pair.
-///
-/// A present CONNECT `nkey` must be [`Self::fake_public`]. The upstream line
-/// then carries [`Self::real_public`]. nats.js `credsAuthenticator` sends
-/// `jwt`, `nkey`, and `sig` together. A missing `nkey` is still accepted.
-/// [`Self::fake_public`] is the guest key a decoy signature must verify under.
-/// The signer is the real seed that signs the upstream nonce.
-#[derive(Debug, Clone)]
-pub struct UserJwt {
-  jwt: NatsPair,
-  fake_public: String,
-  signer: NatsSeed,
+/// Whether a CONNECT field has to be present for the method to match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldPresence {
+  /// The field must equal the decoy.
+  Required,
+  /// Absent is allowed. A present value must equal the decoy.
+  Optional,
 }
 
-impl UserJwt {
-  /// Decoy user JWT the guest CONNECT `jwt` must equal.
-  #[must_use]
-  pub fn fake_jwt(&self) -> &str {
-    &self.jwt.fake
-  }
+/// One CONNECT field this method rewrites and redacts.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthField<'a> {
+  /// JSON key.
+  pub name: NatsField,
+  /// Decoy and real value.
+  pub pair: &'a NatsPair,
+  /// Whether the field may be absent.
+  pub presence: FieldPresence,
+}
 
-  /// Real user JWT written into the upstream CONNECT `jwt`.
-  #[must_use]
-  pub fn real_jwt(&self) -> &SecretString {
-    &self.jwt.real
-  }
-
-  /// Public key of the decoy seed. The decoy seed itself is not kept.
-  #[must_use]
-  pub fn fake_public(&self) -> &str {
-    &self.fake_public
-  }
-
-  /// Public key of the real seed.
-  #[must_use]
-  pub fn real_public(&self) -> &str {
-    self.signer.public_key()
-  }
-
-  /// Sign with the real seed.
-  #[must_use]
-  pub fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
-    self.signer.sign(message)
-  }
+/// Nonce signature step. User/password and token have none.
+#[derive(Debug, Clone, Copy)]
+pub struct AuthSign<'a> {
+  /// Public key the guest `sig` must verify under.
+  pub verify: &'a str,
+  /// Real seed that signs the upstream nonce.
+  pub seed: &'a NatsSeed,
 }
 
 /// The credential a NATS rule maps. One variant covers both strings, so a
-/// user/password fake with a token real cannot be built.
+/// user/password fake with a token real cannot be built. Every variant
+/// answers [`Self::fields`], [`Self::forbidden`], and [`Self::signer`].
 #[derive(Debug, Clone)]
 pub enum NatsAuth {
   /// `user:pass` userinfo. CONNECT `user` and `pass` swap together.
@@ -226,9 +209,100 @@ pub enum NatsAuth {
   /// `auth_token`.
   Token(NatsPair),
   /// Username `nkey` and a user seed. CONNECT `nkey` swaps the public key.
-  Nkey(Nkey),
+  Nkey {
+    /// CONNECT `nkey`. The real value is the public key, not the seed.
+    public_key: NatsPair,
+    /// Real seed. It signs the upstream nonce and is not a CONNECT field.
+    seed: NatsSeed,
+  },
   /// Username `creds` and `seed:jwt`. CONNECT `jwt` swaps the user JWT.
-  UserJwt(UserJwt),
+  /// A present CONNECT `nkey` swaps the public key. nats.js
+  /// `credsAuthenticator` sends `jwt`, `nkey`, and `sig` together. A missing
+  /// `nkey` still matches.
+  UserJwt {
+    /// CONNECT `jwt`.
+    jwt: NatsPair,
+    /// CONNECT `nkey`, when the client sends one.
+    public_key: NatsPair,
+    /// Real seed. It signs the upstream nonce and is not a CONNECT field.
+    seed: NatsSeed,
+  },
+}
+
+impl NatsAuth {
+  /// CONNECT fields this method rewrites. The user JWT comes before its
+  /// public key, because the public key is a substring of the JWT.
+  #[must_use]
+  pub fn fields(&self) -> Vec<AuthField<'_>> {
+    match self {
+      Self::UserPass { user, pass } => vec![
+        AuthField {
+          name: NatsField::User,
+          pair: user,
+          presence: FieldPresence::Required,
+        },
+        AuthField {
+          name: NatsField::Pass,
+          pair: pass,
+          presence: FieldPresence::Required,
+        },
+      ],
+      Self::Token(token) => vec![AuthField {
+        name: NatsField::AuthToken,
+        pair: token,
+        presence: FieldPresence::Required,
+      }],
+      Self::Nkey { public_key, .. } => vec![AuthField {
+        name: NatsField::Nkey,
+        pair: public_key,
+        presence: FieldPresence::Required,
+      }],
+      Self::UserJwt { jwt, public_key, .. } => vec![
+        AuthField {
+          name: NatsField::Jwt,
+          pair: jwt,
+          presence: FieldPresence::Required,
+        },
+        AuthField {
+          name: NatsField::Nkey,
+          pair: public_key,
+          presence: FieldPresence::Optional,
+        },
+      ],
+    }
+  }
+
+  /// CONNECT fields that reject the line when present.
+  #[must_use]
+  pub fn forbidden(&self) -> &'static [NatsField] {
+    match self {
+      Self::Nkey { .. } => &[NatsField::Jwt],
+      Self::UserPass { .. } | Self::Token(_) | Self::UserJwt { .. } => &[],
+    }
+  }
+
+  /// Nonce signature, when this method signs.
+  #[must_use]
+  pub fn signer(&self) -> Option<AuthSign<'_>> {
+    match self {
+      Self::Nkey { public_key, seed } | Self::UserJwt { public_key, seed, .. } => Some(AuthSign {
+        verify: &public_key.fake,
+        seed,
+      }),
+      Self::UserPass { .. } | Self::Token(_) => None,
+    }
+  }
+
+  /// The value the grant records. A signature seed is not it.
+  #[must_use]
+  pub fn credential(&self) -> (&str, &SecretString) {
+    match self {
+      Self::UserPass { pass, .. } => (&pass.fake, &pass.real),
+      Self::Token(token) => (&token.fake, &token.real),
+      Self::Nkey { public_key, .. } => (&public_key.fake, &public_key.real),
+      Self::UserJwt { jwt, .. } => (&jwt.fake, &jwt.real),
+    }
+  }
 }
 
 /// How the proxy reaches the real server. Only the real string states it.
@@ -644,10 +718,13 @@ impl NatsScope {
         fake: fake.expose_secret().to_string(),
         real,
       }),
-      (UriAuth::Nkey(fake), UriAuth::Nkey(real)) => NatsAuth::Nkey(Nkey {
-        fake_public: fake.public_key().to_string(),
-        real,
-      }),
+      (UriAuth::Nkey(fake), UriAuth::Nkey(real)) => NatsAuth::Nkey {
+        public_key: NatsPair {
+          fake: fake.public_key().to_string(),
+          real: SecretString::from(real.public_key().to_string()),
+        },
+        seed: real,
+      },
       (
         UriAuth::UserJwt {
           jwt: fake_jwt,
@@ -657,14 +734,17 @@ impl NatsScope {
           jwt: real_jwt,
           signer: real,
         },
-      ) => NatsAuth::UserJwt(UserJwt {
+      ) => NatsAuth::UserJwt {
         jwt: NatsPair {
           fake: fake_jwt.expose_secret().to_string(),
           real: real_jwt,
         },
-        fake_public: fake.public_key().to_string(),
-        signer: real,
-      }),
+        public_key: NatsPair {
+          fake: fake.public_key().to_string(),
+          real: SecretString::from(real.public_key().to_string()),
+        },
+        seed: real,
+      },
       (
         UriAuth::UserPass { .. } | UriAuth::Token(_) | UriAuth::Nkey(_) | UriAuth::UserJwt { .. },
         UriAuth::UserPass { .. } | UriAuth::Token(_) | UriAuth::Nkey(_) | UriAuth::UserJwt { .. },
@@ -725,12 +805,8 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
       "nats:// upstream is cleartext; CONNECT forwards the decoy"
     );
   }
-  let (fake, value) = match &scope.auth {
-    NatsAuth::UserPass { pass, .. } => (pass.fake.clone(), pass.real.clone()),
-    NatsAuth::Token(token) => (token.fake.clone(), token.real.clone()),
-    NatsAuth::Nkey(nkey) => (nkey.fake_public().to_string(), SecretString::from(nkey.real_public().to_string())),
-    NatsAuth::UserJwt(jwt) => (jwt.fake_jwt().to_string(), jwt.real_jwt().clone()),
-  };
+  let (fake, value) = scope.auth.credential();
+  let (fake, value) = (fake.to_string(), value.clone());
   let credential = Credential {
     label: label.to_string(),
     fake,
@@ -761,15 +837,17 @@ mod tests {
 
   /// Every CONNECT field a scope swaps, as `(field, fake, real)`.
   fn fields(auth: &NatsAuth) -> Vec<(&'static str, String, String)> {
-    match auth {
-      NatsAuth::UserPass { user, pass } => vec![
-        ("user", user.fake.clone(), user.real.expose_secret().to_string()),
-        ("pass", pass.fake.clone(), pass.real.expose_secret().to_string()),
-      ],
-      NatsAuth::Token(token) => vec![("auth_token", token.fake.clone(), token.real.expose_secret().to_string())],
-      NatsAuth::Nkey(nkey) => vec![("nkey", nkey.fake_public().to_string(), nkey.real_public().to_string())],
-      NatsAuth::UserJwt(jwt) => vec![("jwt", jwt.fake_jwt().to_string(), jwt.real_jwt().expose_secret().to_string())],
-    }
+    auth
+      .fields()
+      .into_iter()
+      .map(|field| {
+        (
+          field.name.as_str(),
+          field.pair.fake.clone(),
+          field.pair.real.expose_secret().to_string(),
+        )
+      })
+      .collect()
   }
 
   fn endpoint(host: &str, port: u16) -> NatsEndpoint {
@@ -1072,17 +1150,19 @@ mod tests {
 
   fn assert_nkey_round_trip(case: &SignedStrings) {
     let scope = NatsScope::from_strings(&case.fake_nkey, &case.real_nkey).expect("nkey");
-    let NatsAuth::Nkey(nkey) = &scope.auth else {
+    let NatsAuth::Nkey { public_key, seed } = &scope.auth else {
       panic!("nkey username is the nkey kind");
     };
-    assert_eq!(nkey.fake_public(), case.fake_public);
-    assert_eq!(nkey.real_public(), case.real_public);
-    assert!(nkey.fake_public().starts_with('U'));
+    assert_eq!(public_key.fake, case.fake_public);
+    assert_eq!(public_key.real.expose_secret(), case.real_public);
+    assert!(public_key.fake.starts_with('U'));
+    assert_eq!(scope.auth.forbidden(), &[super::NatsField::Jwt]);
+    assert!(scope.auth.signer().is_some());
     let nonce = b"N0NCE";
-    let signed = nkey.sign(nonce).expect("real seed signs");
-    assert!(super::NatsSeed::verify(nkey.real_public(), nonce, &signed));
-    assert!(!super::NatsSeed::verify(nkey.fake_public(), nonce, &signed));
-    let shown = format!("{nkey:?}");
+    let signed = seed.sign(nonce).expect("real seed signs");
+    assert!(super::NatsSeed::verify(&case.real_public, nonce, &signed));
+    assert!(!super::NatsSeed::verify(&case.fake_public, nonce, &signed));
+    let shown = format!("{scope:?}");
     assert!(!shown.contains(&case.fake_seed));
     assert!(!shown.contains(&case.real_seed));
   }
@@ -1100,10 +1180,10 @@ mod tests {
       &format!("tls://creds:{}:{}@nats.upstream:4222", case.real_seed, case.real_jwt),
     )
     .expect("padded jwt payload");
-    let NatsAuth::UserJwt(padded_kind) = &padded.auth else {
+    let NatsAuth::UserJwt { public_key, .. } = &padded.auth else {
       panic!("creds username is the user jwt kind");
     };
-    assert_eq!(padded_kind.fake_public(), case.fake_public);
+    assert_eq!(public_key.fake, case.fake_public);
 
     let scope = NatsScope::from_strings(&case.fake_creds, &case.real_creds).expect("creds");
     assert!(matches!(
@@ -1113,16 +1193,19 @@ mod tests {
         ..
       }
     ));
-    let NatsAuth::UserJwt(creds) = &scope.auth else {
+    let NatsAuth::UserJwt { jwt, public_key, seed } = &scope.auth else {
       panic!("creds username is the user jwt kind");
     };
-    assert_eq!(creds.fake_jwt(), case.fake_jwt);
-    assert_eq!(creds.real_jwt().expose_secret(), case.real_jwt);
-    assert_eq!(creds.fake_public(), case.fake_public);
-    assert_eq!(creds.real_public(), case.real_public);
-    let signed = creds.sign(b"N0NCE").expect("real seed signs");
-    assert!(super::NatsSeed::verify(creds.real_public(), b"N0NCE", &signed));
-    let shown = format!("{creds:?}");
+    assert_eq!(jwt.fake, case.fake_jwt);
+    assert_eq!(jwt.real.expose_secret(), case.real_jwt);
+    assert_eq!(public_key.fake, case.fake_public);
+    assert_eq!(public_key.real.expose_secret(), case.real_public);
+    assert_eq!(scope.auth.forbidden(), &[]);
+    let names: Vec<&str> = scope.auth.fields().iter().map(|field| field.name.as_str()).collect();
+    assert_eq!(names, ["jwt", "nkey"]);
+    let signed = seed.sign(b"N0NCE").expect("real seed signs");
+    assert!(super::NatsSeed::verify(public_key.real.expose_secret(), b"N0NCE", &signed));
+    let shown = format!("{scope:?}");
     assert!(!shown.contains(&case.fake_seed));
     assert!(!shown.contains(&case.real_seed));
     assert!(!shown.contains(&case.real_jwt));

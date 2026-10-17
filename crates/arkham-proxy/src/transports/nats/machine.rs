@@ -5,10 +5,10 @@
 //! swap can see every field. A cleartext leg forwards CONNECT as it arrives.
 //! Past [`MAX_COMMAND`] the bytes already held and the rest of that line go
 //! out untouched, and the session stays open. When the server leg is TLS,
-//! `user`/`pass` or `auth_token` carry the real values, and only when every
-//! one of those fields holds the decoy. An nkey or user-JWT CONNECT is
-//! rewritten only after the first INFO nonce is armed and the guest
-//! signature verifies under the decoy public key. Every other byte,
+//! every auth method rewrites the CONNECT fields [`NatsAuth::fields`] lists,
+//! and only when each of those fields holds the decoy. A method that signs
+//! does that after the first INFO nonce is armed and the guest signature
+//! verifies under the decoy public key. Every other byte,
 //! including PUB and HPUB payloads, streams as it arrives.
 //!
 //! Verbs follow the protocol message table. Operation names are case
@@ -56,7 +56,7 @@ use std::collections::BTreeMap;
 
 use actson::feeder::PushJsonFeeder;
 use actson::{JsonEvent, JsonParser};
-use arkham_config::grants::{Grant, NatsAuth, NatsPair, NatsSeed};
+use arkham_config::grants::{FieldPresence, Grant, NatsAuth, NatsField, NatsSeed};
 use atoi::FromRadix10Checked as _;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -74,24 +74,6 @@ pub(crate) const MAX_COMMAND: usize = 16 * 1024;
 
 /// The two bytes that must follow every counted payload.
 const CRLF: &[u8] = b"\r\n";
-
-/// JSON key of a CONNECT field. The spellings are this enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumIter, IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-enum ConnectField {
-  User,
-  Pass,
-  AuthToken,
-  Nkey,
-  Jwt,
-  Sig,
-}
-
-impl ConnectField {
-  fn as_str(self) -> &'static str {
-    <&str>::from(self)
-  }
-}
 
 /// First INFO `nonce`. Empty is not a value.
 #[derive(Debug)]
@@ -642,134 +624,72 @@ fn upstream_pairs(grants: &[Grant], host: &str, port: u16) -> Vec<CredentialPair
   pairs
 }
 
-/// The CONNECT fields a user/password or token kind owns.
-fn auth_fields(auth: &NatsAuth) -> Vec<(&'static str, &NatsPair)> {
-  match auth {
-    NatsAuth::UserPass { user, pass } => vec![(ConnectField::User.as_str(), user), (ConnectField::Pass.as_str(), pass)],
-    NatsAuth::Token(token) => vec![(ConnectField::AuthToken.as_str(), token)],
-    NatsAuth::Nkey(_) | NatsAuth::UserJwt(_) => Vec::new(),
-  }
-}
-
-/// Real values a server line may echo, paired with the decoy. The user JWT
-/// comes before its public key, because the public key is a substring of the JWT.
+/// Real values a server line may echo, paired with the decoy. Longer real
+/// values come first, so a user JWT is replaced before the public key it
+/// contains.
 fn redaction_pairs(auth: &NatsAuth) -> Vec<(String, String)> {
-  match auth {
-    NatsAuth::UserPass { user, pass } => vec![
-      (user.fake.clone(), user.real.expose_secret().to_string()),
-      (pass.fake.clone(), pass.real.expose_secret().to_string()),
-    ],
-    NatsAuth::Token(token) => vec![(token.fake.clone(), token.real.expose_secret().to_string())],
-    NatsAuth::Nkey(nkey) => vec![(nkey.fake_public().to_string(), nkey.real_public().to_string())],
-    NatsAuth::UserJwt(jwt) => vec![
-      (jwt.fake_jwt().to_string(), jwt.real_jwt().expose_secret().to_string()),
-      (jwt.fake_public().to_string(), jwt.real_public().to_string()),
-    ],
-  }
-}
-
-/// Which signed CONNECT field this rule rewrites.
-enum Signed<'a> {
-  Nkey(&'a arkham_config::grants::Nkey),
-  UserJwt(&'a arkham_config::grants::UserJwt),
+  let mut pairs: Vec<(String, String)> = auth
+    .fields()
+    .into_iter()
+    .map(|field| (field.pair.fake.clone(), field.pair.real.expose_secret().to_string()))
+    .filter(|(fake, real)| !fake.is_empty() && !real.is_empty() && fake != real)
+    .collect();
+  pairs.sort_by_key(|pair| std::cmp::Reverse(pair.1.len()));
+  pairs
 }
 
 /// `line` with the real values, when its JSON parses and every auth field
-/// holds the decoy. `None` forwards the line unchanged.
+/// holds the decoy. A method that signs also checks the guest signature and
+/// writes a new one. `None` forwards the line unchanged.
 fn swap_connect(line: &[u8], auth: &NatsAuth, nonce: &NonceSlot) -> Option<Vec<u8>> {
-  match auth {
-    NatsAuth::UserPass { .. } | NatsAuth::Token(_) => rewrite_connect(line, |fields| replace_decoys(fields, auth)),
-    NatsAuth::Nkey(nkey) => {
-      let NonceSlot::Ready(nonce) = nonce else {
-        return None;
-      };
-      rewrite_signed(line, nonce.as_bytes(), &Signed::Nkey(nkey))
-    }
-    NatsAuth::UserJwt(jwt) => {
-      let NonceSlot::Ready(nonce) = nonce else {
-        return None;
-      };
-      rewrite_signed(line, nonce.as_bytes(), &Signed::UserJwt(jwt))
-    }
-  }
-}
-
-fn replace_decoys(fields: &mut Map<String, Value>, auth: &NatsAuth) -> Option<()> {
-  let pairs = auth_fields(auth);
-  let all_decoys = pairs
-    .iter()
-    .all(|(field, pair)| fields.get(*field).and_then(Value::as_str) == Some(pair.fake.as_str()));
-  if !all_decoys {
-    return None;
-  }
-  for (field, pair) in pairs {
-    fields.insert(field.to_string(), Value::String(pair.real.expose_secret().to_string()));
-  }
-  Some(())
-}
-
-/// Nkey and user-JWT CONNECT. `None` forwards the original bytes and does not sign.
-///
-/// An nkey rule rejects a CONNECT that also carries `jwt`. A user-JWT rule
-/// accepts a missing `nkey`. When `nkey` is present it must be the decoy
-/// public key, and the upstream line carries the real public key. nats.js
-/// 2.29.3 `credsAuthenticator` always sends `jwt`, `nkey`, and `sig`.
-fn rewrite_signed(line: &[u8], nonce: &[u8], kind: &Signed<'_>) -> Option<Vec<u8>> {
-  rewrite_connect(line, |fields| {
-    let (field, fake, real, verify_public) = match kind {
-      Signed::Nkey(nkey) => (
-        ConnectField::Nkey,
-        nkey.fake_public().to_string(),
-        nkey.real_public().to_string(),
-        nkey.fake_public().to_string(),
-      ),
-      Signed::UserJwt(jwt) => (
-        ConnectField::Jwt,
-        jwt.fake_jwt().to_string(),
-        jwt.real_jwt().expose_secret().to_string(),
-        jwt.fake_public().to_string(),
-      ),
+  let nonce = if auth.signer().is_some() {
+    let NonceSlot::Ready(nonce) = nonce else {
+      return None;
     };
-    if fields.get(field.as_str()).and_then(Value::as_str) != Some(fake.as_str()) {
+    Some(nonce.as_bytes())
+  } else {
+    None
+  };
+  rewrite_connect(line, |fields| apply_auth(fields, auth, nonce))
+}
+
+/// One CONNECT edit for every auth method. Field checks, the signature
+/// step, and the value swap share this function.
+fn apply_auth(fields: &mut Map<String, Value>, auth: &NatsAuth, nonce: Option<&[u8]>) -> Option<()> {
+  let sign = auth.signer().map(|sign| (sign.verify.to_string(), sign.seed.clone()));
+  for name in auth.forbidden() {
+    if fields.contains_key(name.as_str()) {
       return None;
     }
-    match kind {
-      Signed::Nkey(_) => {
-        if fields.contains_key(ConnectField::Jwt.as_str()) {
-          return None;
-        }
-      }
-      Signed::UserJwt(jwt) => {
-        if let Some(nkey) = fields.get(ConnectField::Nkey.as_str())
-          && nkey.as_str() != Some(jwt.fake_public())
-        {
-          return None;
-        }
-      }
+  }
+  let plan = auth.fields();
+  for field in &plan {
+    match (field.presence, fields.get(field.name.as_str()).and_then(Value::as_str)) {
+      (FieldPresence::Required, Some(value)) if value == field.pair.fake => {}
+      (FieldPresence::Optional, None) => {}
+      (FieldPresence::Optional, Some(value)) if value == field.pair.fake => {}
+      _ => return None,
     }
-    let sig = fields.get(ConnectField::Sig.as_str()).and_then(Value::as_str)?;
+  }
+  if let Some((verify, seed)) = sign {
+    let nonce = nonce?;
+    let sig = fields.get(NatsField::Sig.as_str()).and_then(Value::as_str)?;
     // nats-server 2.15 tries raw URL base64, then standard. nats.js 2.29 signs
     // with `btoa`, which is the standard alphabet. The rewritten `sig` stays raw URL.
     let raw = decode_sig(sig)?;
-    if !NatsSeed::verify(&verify_public, nonce, &raw) {
+    if !NatsSeed::verify(&verify, nonce, &raw) {
       return None;
     }
-    let signed = match kind {
-      Signed::Nkey(nkey) => nkey.sign(nonce)?,
-      Signed::UserJwt(jwt) => jwt.sign(nonce)?,
-    };
-    fields.insert(field.as_str().to_string(), Value::String(real));
-    if let Signed::UserJwt(jwt) = kind
-      && fields.contains_key(ConnectField::Nkey.as_str())
-    {
-      fields.insert(
-        ConnectField::Nkey.as_str().to_string(),
-        Value::String(jwt.real_public().to_string()),
-      );
+    let signed = seed.sign(nonce)?;
+    fields.insert(NatsField::Sig.as_str().to_string(), Value::String(sig_b64(&signed)));
+  }
+  for field in &plan {
+    let key = field.name.as_str();
+    if field.presence == FieldPresence::Required || fields.contains_key(key) {
+      fields.insert(key.to_string(), Value::String(field.pair.real.expose_secret().to_string()));
     }
-    fields.insert(ConnectField::Sig.as_str().to_string(), Value::String(sig_b64(&signed)));
-    Some(())
-  })
+  }
+  Some(())
 }
 
 fn sig_b64(raw: &[u8]) -> String {
