@@ -113,8 +113,10 @@ operator mode. The account JWT is preloaded under `resolver: MEMORY`,
 so the server checks the user JWT. The client uses `nkeyAuthenticator`
 and `credsAuthenticator` from the `nats` package 2.29.3. Scenarios 19
 and 20 are gated on `NATS_NKEY_URL`. Scenarios 21 and 22 are gated on
-`NATS_JWT_URL`. `credsAuthenticator` puts `nkey` on the CONNECT next
-to `jwt`. A user-JWT rule forwards a CONNECT that contains `nkey`.
+`NATS_JWT_URL`. `credsAuthenticator` sends `jwt`, `nkey`, and `sig`. A matching `nkey` is
+rewritten to the real public key. The client container does not receive the
+real nkey seed or the real user JWT. `test:ssh` greps the client log for
+those values in `integration/out/nats/nats.env`.
 
 ## Run
 

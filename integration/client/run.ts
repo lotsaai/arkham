@@ -30,8 +30,6 @@ const NATS_JWT_URL = process.env.NATS_JWT_URL ?? "";
 const NATS_NKEY_FOREIGN = process.env.NATS_NKEY_FOREIGN ?? "";
 const NATS_JWT_FOREIGN_SEED = process.env.NATS_JWT_FOREIGN_SEED ?? "";
 const NATS_JWT_FOREIGN_JWT = process.env.NATS_JWT_FOREIGN_JWT ?? "";
-const NATS_NKEY_REAL_SEED = process.env.NATS_NKEY_REAL_SEED ?? "";
-const NATS_JWT_REAL_ASSERT = process.env.NATS_JWT_REAL_ASSERT ?? "";
 const ATTEMPT_TIMEOUT_MS = 5000;
 const SCENARIO_BUDGET_MS = 20000;
 const TOTAL_BUDGET_MS = 90000;
@@ -789,14 +787,11 @@ async function natsRoundTrip(raw: string, authenticator: Authenticator, label: s
 function natsRejected(err: unknown): boolean {
   const text = String(err);
   stage(`nats unswapped authenticator error: ${text}`);
-  return text.includes("Authorization Violation")
-    && !text.includes(NATS_REAL)
-    && !text.includes(NATS_NKEY_REAL_SEED)
-    && !text.includes(NATS_JWT_REAL_ASSERT);
+  return text.includes("Authorization Violation") && !text.includes(NATS_REAL);
 }
 
 if (NATS_NKEY_URL) {
-  if (!NATS_NKEY_FOREIGN || !NATS_NKEY_REAL_SEED || !NATS_JWT_REAL_ASSERT) {
+  if (!NATS_NKEY_FOREIGN) {
     console.error("nats nkey material is incomplete");
     process.exit(1);
   }
@@ -819,7 +814,7 @@ if (NATS_NKEY_URL) {
 }
 
 if (NATS_JWT_URL) {
-  if (!NATS_JWT_FOREIGN_SEED || !NATS_JWT_FOREIGN_JWT || !NATS_NKEY_REAL_SEED || !NATS_JWT_REAL_ASSERT) {
+  if (!NATS_JWT_FOREIGN_SEED || !NATS_JWT_FOREIGN_JWT) {
     console.error("nats user jwt material is incomplete");
     process.exit(1);
   }

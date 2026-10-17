@@ -44,6 +44,34 @@ cp target/debug/arkham integration/docker/arkham
 compose="docker compose -f integration/compose.yaml --env-file integration/.env"
 client=arkham-integration-client-1
 
+nats_env_value() {
+  local key=$1
+  local line value
+  line=$(grep -E "^${key}=" integration/out/nats/nats.env || true)
+  value=${line#*=}
+  value=${value#\'}
+  value=${value%\'}
+  printf '%s' "$value"
+}
+
+# The client container must not hold the real nkey seed or the real user JWT.
+# Compare its log with the gitignored material gen-nats.sh wrote on the host.
+nats_client_log_hides_real_material() {
+  local log_file=$1
+  local key value
+  for key in NATS_NKEY_REAL_SEED NATS_JWT_REAL_ASSERT; do
+    value=$(nats_env_value "$key")
+    if [ -z "$value" ]; then
+      echo "missing ${key} in integration/out/nats/nats.env"
+      return 1
+    fi
+    if grep -F -q -- "$value" "$log_file"; then
+      echo "client log contains ${key}"
+      return 1
+    fi
+  done
+}
+
 for backend in $backends; do
   echo "=== backend: $backend ==="
   # A leftover stack holds an old CA while the rerun rotates the volume, and
@@ -84,7 +112,13 @@ for backend in $backends; do
       code=124
     fi
   fi
-  docker logs "$client" || true
+  docker logs "$client" > /tmp/arkham-client.log 2>&1 || true
+  cat /tmp/arkham-client.log
+  if ! nats_client_log_hides_real_material /tmp/arkham-client.log; then
+    if [ -z "$code" ] || [ "$code" = 0 ]; then
+      code=1
+    fi
+  fi
   if [ "$code" = 0 ]; then
     covered=integration/out/covered.json
     if [ ! -f "$covered" ]; then

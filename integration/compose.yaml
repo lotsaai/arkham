@@ -478,8 +478,6 @@ services:
       NATS_NKEY_FOREIGN: ${NATS_NKEY_FOREIGN:?run integration/gen-nats.sh}
       NATS_JWT_FOREIGN_SEED: ${NATS_JWT_FOREIGN_SEED:?run integration/gen-nats.sh}
       NATS_JWT_FOREIGN_JWT: ${NATS_JWT_FOREIGN_JWT:?run integration/gen-nats.sh}
-      NATS_NKEY_REAL_SEED: ${NATS_NKEY_REAL_SEED:?run integration/gen-nats.sh}
-      NATS_JWT_REAL_ASSERT: ${NATS_JWT_REAL_ASSERT:?run integration/gen-nats.sh}
       SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
