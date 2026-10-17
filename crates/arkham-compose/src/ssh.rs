@@ -99,6 +99,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
         allow: vec![entry.clone()],
         value: None,
         real: None,
+        generated: false,
         if_missing: Some(IfMissing::Ignore),
         tls: BTreeMap::new(),
         ssh: BTreeMap::from([(
@@ -203,15 +204,23 @@ pub(crate) fn host_identity_path(identity: &str, host_home: &Path) -> PathBuf {
 /// layout under the container home. `~`-relative and home-relative paths
 /// mirror; anything else off the host home does not.
 pub(crate) fn mirror_container_path(identity: &str, host_home: &Path, home: &str) -> Option<String> {
-  if let Some(rest) = identity.strip_prefix("~/") {
-    return Some(format!("{home}/{rest}"));
+  let host_path = if let Some(rest) = identity.strip_prefix("~/") {
+    host_home.join(rest)
+  } else if Path::new(identity).is_absolute() {
+    PathBuf::from(identity)
+  } else {
+    host_home.join(".ssh").join(identity)
+  };
+  let host_path = crate::paths::normalize(&host_path);
+  let rest = host_path.strip_prefix(host_home).ok()?;
+  if rest.as_os_str().is_empty() {
+    return None;
   }
-  let path = Path::new(identity);
-  if path.is_absolute() {
-    let rest = path.strip_prefix(host_home).ok()?;
-    return Some(format!("{home}/{}", rest.display()));
+  let rel = rest.to_string_lossy().replace('\\', "/");
+  if rel.split('/').any(|part| part.is_empty() || part == "..") {
+    return None;
   }
-  Some(format!("{home}/.ssh/{identity}"))
+  Some(format!("{home}/{rel}"))
 }
 
 #[cfg(test)]
@@ -321,7 +330,9 @@ mod tests {
     let home = Path::new("/host/home/eng");
     let mirrored = mirror_container_path("~/../.ssh/id_ed25519", home, "/home/eng");
     assert!(
-      mirrored.as_deref().is_none_or(|path| !path.contains("..") && path.starts_with("/home/eng/")),
+      mirrored
+        .as_deref()
+        .is_none_or(|path| !path.contains("..") && path.starts_with("/home/eng/")),
       "{mirrored:?}"
     );
   }
@@ -349,7 +360,11 @@ mod tests {
     let config = "Host git.example\n IdentityFile ~/.ssh/link\n";
     let adapted = adapt_in(&dir, config);
     assert_eq!(adapted.len(), 1);
-    let decoy = adapted[0].decoy_files.iter().find(|file| file.name.ends_with(".decoy-key")).unwrap();
+    let decoy = adapted[0]
+      .decoy_files
+      .iter()
+      .find(|file| file.name.ends_with(".decoy-key"))
+      .unwrap();
     assert_eq!(decoy.container, "/home/agent/.ssh/link");
     let identity = adapted[0]
       .materialized

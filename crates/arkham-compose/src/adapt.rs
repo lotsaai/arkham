@@ -5,6 +5,7 @@
 
 use arkham_config::config::{HostSshCfg, HostTlsCfg, IfMissing};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 #[cfg(unix)]
 use std::fs::Permissions;
@@ -67,9 +68,13 @@ pub(crate) struct GrantFragment {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) value: Option<String>,
   /// Connection-string rules: the real string, stated beside the fake
-  /// `value`. Absent for token and ssh rules.
+  /// `value`. Absent for token and ssh rules. [`Debug`] redacts it.
   #[serde(skip_serializing_if = "Option::is_none")]
-  pub(crate) real: Option<String>,
+  pub(crate) real: Option<Redacted>,
+  /// `true` on a fragment this adapter wrote. Fnox keeps a stated `real`
+  /// only when this is set and fnox has no value for the rule.
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub(crate) generated: bool,
   /// What the rule does without a fnox value. Absent keeps the default.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) if_missing: Option<IfMissing>,
@@ -79,6 +84,18 @@ pub(crate) struct GrantFragment {
   /// Per-entry SSH key material.
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
   pub(crate) ssh: BTreeMap<String, HostSshCfg>,
+}
+
+/// A real credential that serializes into the grant fragment and prints as
+/// `redacted`.
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct Redacted(pub(crate) String);
+
+impl fmt::Debug for Redacted {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    formatter.write_str("redacted")
+  }
 }
 
 /// Serialize one grant fragment under `[rules.{label}]`, with the generation
@@ -250,6 +267,25 @@ pub(crate) fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn grant_fragment_debug_redacts_the_real_string() {
+    let marker = "ZZZ-REAL-MARKER";
+    let fragment = GrantFragment {
+      env: "NATS_CONTEXT".to_string(),
+      registry: false,
+      allow: Vec::new(),
+      value: Some("nats://fake@nats.internal:4222".to_string()),
+      real: Some(Redacted(format!("nats://{marker}@nats.internal:4222"))),
+      generated: true,
+      if_missing: None,
+      tls: BTreeMap::new(),
+      ssh: BTreeMap::new(),
+    };
+    let rendered = format!("{fragment:?}");
+    assert!(rendered.contains("redacted"), "{rendered}");
+    assert!(!rendered.contains(marker), "{rendered}");
+  }
 
   #[test]
   fn sniff_picks_kubeconfig_over_talos_on_shared_markers() {

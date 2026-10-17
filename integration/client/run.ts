@@ -7,7 +7,9 @@
 import { spawn } from "node:child_process";
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { RedisClient } from "bun";
 import { Client } from "ldapts";
 import { connect as natsConnect, StringCodec, credsAuthenticator, nkeyAuthenticator, type Authenticator, type NatsConnection } from "nats";
@@ -751,6 +753,30 @@ function openNatsAuth(raw: string, authenticator: Authenticator): Promise<NatsCo
   }));
 }
 
+type NatsContextFile = {
+  url: string;
+  nkey?: string;
+  creds?: string;
+};
+
+function natsConfigDir(): string {
+  return join(homedir(), ".config", "nats");
+}
+
+async function installNatsContext(name: string, body: NatsContextFile): Promise<void> {
+  const root = natsConfigDir();
+  await mkdir(join(root, "context"), { recursive: true });
+  await writeFile(join(root, "context", `${name}.json`), `${JSON.stringify(body)}\n`);
+  await writeFile(join(root, "context.txt"), `${name}\n`);
+}
+
+async function selectedNatsContext(): Promise<NatsContextFile> {
+  const root = natsConfigDir();
+  const name = (await readFile(join(root, "context.txt"), "utf8")).trim();
+  const raw = await readFile(join(root, "context", `${name}.json`), "utf8");
+  return JSON.parse(raw) as NatsContextFile;
+}
+
 function credsFile(jwt: string, seed: string): Uint8Array {
   const text = [
     "-----BEGIN NATS USER JWT-----",
@@ -796,8 +822,19 @@ if (NATS_NKEY_URL) {
     process.exit(1);
   }
   const seed = decodeURIComponent(new URL(NATS_NKEY_URL).password);
-  await retry("nats", "nats tls CONNECT swaps the decoy nkey; publish and receive", async () => {
-    return natsRoundTrip(NATS_NKEY_URL, nkeyAuthenticator(new TextEncoder().encode(seed)), "nkey");
+  const nkeyPath = join(natsConfigDir(), "nkey.nk");
+  await mkdir(natsConfigDir(), { recursive: true });
+  await writeFile(nkeyPath, seed);
+  const nkeyServer = new URL(NATS_NKEY_URL);
+  await installNatsContext("nkey", {
+    url: `${nkeyServer.protocol}//${nkeyServer.host}`,
+    nkey: nkeyPath,
+  });
+  await retry("nats", "nats tls CONNECT swaps the decoy nkey read from ~/.config/nats; publish and receive", async () => {
+    const ctx = await selectedNatsContext();
+    if (!ctx.nkey || !ctx.url) return false;
+    const fromFile = await readFile(ctx.nkey);
+    return natsRoundTrip(ctx.url, nkeyAuthenticator(fromFile), "nkey");
   });
 
   await retry("nats", "nats non-decoy nkey is not swapped", async () => {
@@ -823,8 +860,19 @@ if (NATS_JWT_URL) {
   const split = password.indexOf(":");
   const fakeSeed = split < 0 ? "" : password.slice(0, split);
   const fakeJwt = split < 0 ? "" : password.slice(split + 1);
-  await retry("nats", "nats tls CONNECT swaps the decoy user jwt; publish and receive", async () => {
-    return natsRoundTrip(NATS_JWT_URL, credsAuthenticator(credsFile(fakeJwt, fakeSeed)), "jwt");
+  const credsPath = join(natsConfigDir(), "user.creds");
+  await mkdir(natsConfigDir(), { recursive: true });
+  await writeFile(credsPath, credsFile(fakeJwt, fakeSeed));
+  const jwtServer = new URL(NATS_JWT_URL);
+  await installNatsContext("jwt", {
+    url: `${jwtServer.protocol}//${jwtServer.host}`,
+    creds: credsPath,
+  });
+  await retry("nats", "nats tls CONNECT swaps the decoy user jwt read from ~/.config/nats; publish and receive", async () => {
+    const ctx = await selectedNatsContext();
+    if (!ctx.creds || !ctx.url) return false;
+    const fromFile = await readFile(ctx.creds);
+    return natsRoundTrip(ctx.url, credsAuthenticator(fromFile), "jwt");
   });
 
   await retry("nats", "nats non-decoy user jwt is not swapped", async () => {

@@ -47,9 +47,9 @@ Topology:
 | 16 | StartTLS and LDAPS binds with a password that is not the decoy | the same two rules | the directory returns `invalidCredentials` (code 49). The password was not swapped, and the error text does not contain the real password |
 | 17 | `nats` client to `nats:4222` with the decoy password: TLS upgrade after INFO, subscribe, publish a payload that carries the decoy, receive it | `[rules.nats]`: fake `nats://` URL; real `tls://` URL carries `sslrootcert` | nats-server accepts the swapped password, and the message comes back with the decoy unchanged |
 | 18 | Same client with a password that is not the decoy | `[rules.nats]` | nats-server returns `Authorization Violation`. The password was not swapped, and the error text does not contain the real password |
-| 19 | `nkeyAuthenticator` to `nats:4222` with the decoy user seed: subscribe and publish | `[rules.nats_nkey]`: `nats://nkey:<user-seed>@nats:4222`; the real string is the same form on `tls://` | nats-server accepts the session, which is the proof the proxy signed the nonce with the real seed. The client never sends that seed |
+| 19 | `nkeyAuthenticator` to `nats:4222`. The client writes the decoy seed under `~/.config/nats`, selects it from `context.txt`, and reads the `nkey` path: subscribe and publish | `[rules.nats_nkey]`: `nats://nkey:<user-seed>@nats:4222`; the real string is the same form on `tls://` | nats-server accepts the session, which is the proof the proxy signed the nonce with the real seed. The client never sends that seed |
 | 20 | Same client with a user seed that is not the decoy | `[rules.nats_nkey]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
-| 21 | `credsAuthenticator` to `nats-jwt:4223` with the decoy seed and the decoy user JWT | `[rules.nats_jwt]`: `nats://creds:<user-seed>:<user-jwt>@nats-jwt:4223`; the account JWT is preloaded on the operator server | publish and subscribe succeed only when the proxy replaces the decoy JWT and signs with the real seed |
+| 21 | `credsAuthenticator` to `nats-jwt:4223`. The client writes the decoy creds file under `~/.config/nats`, selects it from `context.txt`, and reads the `creds` path | `[rules.nats_jwt]`: `nats://creds:<user-seed>:<user-jwt>@nats-jwt:4223`; the account JWT is preloaded on the operator server | publish and subscribe succeed only when the proxy replaces the decoy JWT and signs with the real seed |
 | 22 | Same client with a user JWT that is not the decoy | `[rules.nats_jwt]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
@@ -113,7 +113,10 @@ operator mode. The account JWT is preloaded under `resolver: MEMORY`,
 so the server checks the user JWT. The client uses `nkeyAuthenticator`
 and `credsAuthenticator` from the `nats` package 2.29.3. Scenarios 19
 and 20 are gated on `NATS_NKEY_URL`. Scenarios 21 and 22 are gated on
-`NATS_JWT_URL`. `credsAuthenticator` sends `jwt`, `nkey`, and `sig`. A matching `nkey` is
+`NATS_JWT_URL`. Scenarios 19 and 21 install that decoy as a NATS CLI context
+under `~/.config/nats` (`context.txt`, `context/<name>.json`, and the nkey
+or creds file) and build the authenticator from the file the context names.
+The proxy grant stays the fnox URL. `credsAuthenticator` sends `jwt`, `nkey`, and `sig`. A matching `nkey` is
 rewritten to the real public key. The client container does not receive the
 real nkey seed or the real user JWT. `test:ssh` greps the client log for
 those values in `integration/out/nats/nats.env`.

@@ -1740,6 +1740,124 @@ users:
     nats
   }
 
+  struct DerivedHome {
+    _work: tempfile::TempDir,
+    _xdg: tempfile::TempDir,
+    _env: AmbientEnv,
+    outputs: RewriteOutputs,
+  }
+
+  fn derive_home(host: &Path) -> DerivedHome {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let work = tempdir().unwrap();
+    let xdg = tempdir().unwrap();
+    let env = AmbientEnv::isolate(host, xdg.path());
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    DerivedHome {
+      _work: work,
+      _xdg: xdg,
+      _env: env,
+      outputs,
+    }
+  }
+
+  fn mounted_text(outputs: &RewriteOutputs, suffix: &str) -> String {
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container.to_string_lossy().ends_with(suffix))
+      .unwrap_or_else(|| panic!("{suffix} missing"));
+    fs::read_to_string(&mount.host).unwrap()
+  }
+
+  /// An nkey context mounts a decoy seed. The real seed stays in the grant.
+  #[test]
+  fn derive_sources_mounts_a_decoy_nkey() {
+    use arkham_config::grants::NatsSeed;
+    use secrecy::SecretString;
+
+    let host = tempdir().unwrap();
+    let nats = host.path().join(".config").join("nats");
+    fs::create_dir_all(nats.join("context")).unwrap();
+    let seed = nkeys::KeyPair::new_user().seed().unwrap();
+    let nkey = nats.join("user.nk");
+    fs::write(&nkey, format!("{seed}\n")).unwrap();
+    fs::write(nats.join("context.txt"), "demo\n").unwrap();
+    fs::write(
+      nats.join("context").join("demo.json"),
+      format!(r#"{{"url":"nats://nats.internal:4222","nkey":"{}"}}"#, nkey.display()),
+    )
+    .unwrap();
+    let derived = derive_home(host.path());
+    let guest = mounted_text(&derived.outputs, "/.config/nats/user.nk");
+    assert!(!guest.contains(&seed), "{guest}");
+    NatsSeed::from_seed(SecretString::from(guest.trim().to_string())).expect("decoy seed");
+    assert!(derived.outputs.grants.iter().any(|grant| grant.fragment.contains(&seed)));
+    assert!(!mounted_text(&derived.outputs, "context/demo.json").contains(&seed));
+  }
+
+  /// A creds context mounts a decoy file. The real seed and JWT stay in the grant.
+  #[test]
+  fn derive_sources_mounts_a_decoy_creds_file() {
+    use arkham_config::grants::NatsSeed;
+    use base64::Engine as _;
+    use secrecy::SecretString;
+
+    let host = tempdir().unwrap();
+    let nats = host.path().join(".config").join("nats");
+    let creds_dir = nats.join("creds");
+    fs::create_dir_all(creds_dir).unwrap();
+    fs::create_dir_all(nats.join("context")).unwrap();
+    let seed = nkeys::KeyPair::new_user().seed().unwrap();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
+      .unwrap()
+      .public_key()
+      .to_string();
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"{public}"}}"#).as_bytes());
+    let jwt = format!(
+      "{header}.{payload}.{}",
+      base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"sig")
+    );
+    let creds = nats.join("creds").join("user.creds");
+    fs::write(
+      &creds,
+      format!("-----BEGIN NATS USER JWT-----\n{jwt}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{seed}\n------END USER NKEY SEED------\n"),
+    )
+    .unwrap();
+    fs::write(nats.join("context.txt"), "demo\n").unwrap();
+    fs::write(
+      nats.join("context").join("demo.json"),
+      r#"{"url":"nats://nats.internal:4222","creds":"creds/user.creds"}"#,
+    )
+    .unwrap();
+    let derived = derive_home(host.path());
+    let guest = mounted_text(&derived.outputs, "/.config/nats/creds/user.creds");
+    assert!(!guest.contains(&seed), "{guest}");
+    assert!(!guest.contains(&jwt), "{guest}");
+    let fragment = derived
+      .outputs
+      .grants
+      .iter()
+      .find(|grant| grant.fragment.contains(&seed))
+      .expect("grant holds the real seed");
+    assert!(fragment.fragment.contains(&jwt));
+    assert!(!mounted_text(&derived.outputs, "context/demo.json").contains(&seed));
+  }
+
   /// The selected `~/.config/nats` context becomes one grant. The guest
   /// mounts that context only.
   #[test]

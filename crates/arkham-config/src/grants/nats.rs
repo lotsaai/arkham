@@ -85,6 +85,46 @@ impl AuthTag {
   }
 }
 
+/// One credential before it is paired with the other string. The `nkey` and
+/// `creds` username spellings come from [`AuthTag`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NatsPlain {
+  /// CONNECT `user` and `pass`. `pass` may be empty.
+  UserPass {
+    /// CONNECT `user`.
+    user: String,
+    /// CONNECT `pass`.
+    pass: String,
+  },
+  /// CONNECT `auth_token`.
+  Token(String),
+  /// Username `nkey` and a user seed.
+  Nkey(String),
+  /// Username `creds` and `seed:jwt`.
+  Creds {
+    /// User seed.
+    seed: String,
+    /// User JWT.
+    jwt: String,
+  },
+}
+
+impl NatsPlain {
+  /// Username and password for a connection string.
+  ///
+  /// `None` is a token, so the string has no colon. `Some("")` is a user
+  /// whose password is empty, so the string keeps `user:@host`.
+  #[must_use]
+  pub fn userinfo(&self) -> (String, Option<String>) {
+    match self {
+      Self::UserPass { user, pass } => (user.clone(), Some(pass.clone())),
+      Self::Token(token) => (token.clone(), None),
+      Self::Nkey(seed) => (AuthTag::Nkey.as_str().to_owned(), Some(seed.clone())),
+      Self::Creds { seed, jwt } => (AuthTag::Creds.as_str().to_owned(), Some(format!("{seed}:{jwt}"))),
+    }
+  }
+}
+
 /// User nkey seed. The raw seed is not a CONNECT field.
 ///
 /// `Debug` shows [`Self::public_key`] only. [`secrecy::SecretString`] redacts the seed.
@@ -117,6 +157,15 @@ impl NatsSeed {
   #[must_use]
   pub fn public_key(&self) -> &str {
     &self.public
+  }
+
+  /// `true` when `jwt` is a NATS user JWT whose `sub` is this seed's public key.
+  ///
+  /// The check is [`jwt::Token::parse_unverified`]. It reads the header and
+  /// claims and does not check the account signature.
+  #[must_use]
+  pub fn matches_user_jwt(&self, jwt: &str) -> bool {
+    check_user_jwt(jwt, &self.public).is_ok()
   }
 
   /// Raw ed25519 signature of `message` under this seed.
@@ -492,17 +541,28 @@ impl FromStr for NatsUri {
       Some(url::Host::Ipv6(addr)) => addr.to_string(),
       None => return Err(NatsUriError::EmptyHost),
     };
-    // `url` drops an empty password, so `user:@host` reads as a token.
-    let auth = match (url.username(), url.password()) {
-      ("", None) => return Err(NatsUriError::CredentialRequired),
-      ("", Some(_)) => return Err(NatsUriError::UserRequired),
-      (token, None) => UriAuth::Token(SecretString::from(decode(token, "token")?)),
-      (user, Some(pass)) => {
-        let user = decode(user, "user")?;
-        let pass = SecretString::from(decode(pass, "password")?);
-        match AuthTag::parse(&user) {
-          Some(tag) => parse_tagged(tag, pass)?,
-          None => UriAuth::UserPass { user, pass },
+    // `url` drops the colon when the password is empty. The raw userinfo
+    // still has it, and that form is a user with an empty password.
+    let auth = if let Some(user) = explicit_empty_password(entry) {
+      if AuthTag::parse(&user).is_some() {
+        return Err(NatsUriError::Seed);
+      }
+      UriAuth::UserPass {
+        user,
+        pass: SecretString::from(""),
+      }
+    } else {
+      match (url.username(), url.password()) {
+        ("", None) => return Err(NatsUriError::CredentialRequired),
+        ("", Some(_)) => return Err(NatsUriError::UserRequired),
+        (token, None) => UriAuth::Token(SecretString::from(decode(token, "token")?)),
+        (user, Some(pass)) => {
+          let user = decode(user, "user")?;
+          let pass = SecretString::from(decode(pass, "password")?);
+          match AuthTag::parse(&user) {
+            Some(tag) => parse_tagged(tag, pass)?,
+            None => UriAuth::UserPass { user, pass },
+          }
         }
       }
     };
@@ -532,6 +592,77 @@ fn decode(raw: &str, label: &'static str) -> Result<String, NatsUriError> {
     .decode_utf8()
     .map(std::borrow::Cow::into_owned)
     .map_err(|source| NatsUriError::UserinfoUtf8 { label, source })
+}
+
+/// `user:@host` in the raw string. `url` keeps the username and drops the colon.
+fn explicit_empty_password(entry: &str) -> Option<String> {
+  let info = entry.split_once("://")?.1.split_once('@')?.0;
+  let (user, pass) = info.split_once(':')?;
+  if user.is_empty() || !pass.is_empty() {
+    return None;
+  }
+  decode(user, "user").ok()
+}
+
+impl UriAuth {
+  fn pair(self, real: Self) -> Result<NatsAuth, NatsUriError> {
+    match (self, real) {
+      (
+        Self::UserPass {
+          user: fake_user,
+          pass: fake_pass,
+        },
+        Self::UserPass {
+          user: real_user,
+          pass: real_pass,
+        },
+      ) => Ok(NatsAuth::UserPass {
+        user: NatsPair {
+          fake: fake_user,
+          real: SecretString::from(real_user),
+        },
+        pass: NatsPair {
+          fake: fake_pass.expose_secret().to_string(),
+          real: real_pass,
+        },
+      }),
+      (Self::Token(fake), Self::Token(real)) => Ok(NatsAuth::Token(NatsPair {
+        fake: fake.expose_secret().to_string(),
+        real,
+      })),
+      (Self::Nkey(fake), Self::Nkey(real)) => Ok(NatsAuth::Nkey {
+        public_key: NatsPair {
+          fake: fake.public_key().to_string(),
+          real: SecretString::from(real.public_key().to_string()),
+        },
+        seed: real,
+      }),
+      (
+        Self::UserJwt {
+          jwt: fake_jwt,
+          signer: fake,
+        },
+        Self::UserJwt {
+          jwt: real_jwt,
+          signer: real,
+        },
+      ) => Ok(NatsAuth::UserJwt {
+        jwt: NatsPair {
+          fake: fake_jwt.expose_secret().to_string(),
+          real: real_jwt,
+        },
+        public_key: NatsPair {
+          fake: fake.public_key().to_string(),
+          real: SecretString::from(real.public_key().to_string()),
+        },
+        seed: real,
+      }),
+      (
+        Self::UserPass { .. } | Self::Token(_) | Self::Nkey(_) | Self::UserJwt { .. },
+        Self::UserPass { .. } | Self::Token(_) | Self::Nkey(_) | Self::UserJwt { .. },
+      ) => Err(NatsUriError::AuthKindMismatch),
+    }
+  }
 }
 
 fn parse_tagged(tag: AuthTag, password: SecretString) -> Result<UriAuth, NatsUriError> {
@@ -694,62 +825,7 @@ impl NatsScope {
     let upstream = real.parse::<NatsUri>()?;
     reject_fake_query(&downstream)?;
     let upstream_tls = upstream_law(&upstream)?;
-    let auth = match (downstream.auth, upstream.auth) {
-      (
-        UriAuth::UserPass {
-          user: fake_user,
-          pass: fake_pass,
-        },
-        UriAuth::UserPass {
-          user: real_user,
-          pass: real_pass,
-        },
-      ) => NatsAuth::UserPass {
-        user: NatsPair {
-          fake: fake_user,
-          real: SecretString::from(real_user),
-        },
-        pass: NatsPair {
-          fake: fake_pass.expose_secret().to_string(),
-          real: real_pass,
-        },
-      },
-      (UriAuth::Token(fake), UriAuth::Token(real)) => NatsAuth::Token(NatsPair {
-        fake: fake.expose_secret().to_string(),
-        real,
-      }),
-      (UriAuth::Nkey(fake), UriAuth::Nkey(real)) => NatsAuth::Nkey {
-        public_key: NatsPair {
-          fake: fake.public_key().to_string(),
-          real: SecretString::from(real.public_key().to_string()),
-        },
-        seed: real,
-      },
-      (
-        UriAuth::UserJwt {
-          jwt: fake_jwt,
-          signer: fake,
-        },
-        UriAuth::UserJwt {
-          jwt: real_jwt,
-          signer: real,
-        },
-      ) => NatsAuth::UserJwt {
-        jwt: NatsPair {
-          fake: fake_jwt.expose_secret().to_string(),
-          real: real_jwt,
-        },
-        public_key: NatsPair {
-          fake: fake.public_key().to_string(),
-          real: SecretString::from(real.public_key().to_string()),
-        },
-        seed: real,
-      },
-      (
-        UriAuth::UserPass { .. } | UriAuth::Token(_) | UriAuth::Nkey(_) | UriAuth::UserJwt { .. },
-        UriAuth::UserPass { .. } | UriAuth::Token(_) | UriAuth::Nkey(_) | UriAuth::UserJwt { .. },
-      ) => return Err(NatsUriError::AuthKindMismatch),
-    };
+    let auth = downstream.auth.pair(upstream.auth)?;
     Ok(Self {
       downstream: downstream.endpoint,
       upstream: upstream.endpoint,

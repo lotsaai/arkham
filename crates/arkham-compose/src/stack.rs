@@ -829,6 +829,7 @@ mod tests {
       env: "GITHUB_TOKEN".into(),
       value: None,
       real: None,
+      generated: false,
       fnox_key: None,
       allow: vec!["https://api.github.com".to_string()],
       pattern: None,
