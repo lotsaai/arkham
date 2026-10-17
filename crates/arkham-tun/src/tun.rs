@@ -132,7 +132,7 @@ async fn run_loop(
         });
       }
       // A connection task writing to the guest does not produce a TUN
-      // packet. Without this, that write waits out `idle`.
+      // packet, so the write wakes the idle sleep.
       () = wake.notified() => {}
       () = tokio::time::sleep(idle) => {}
     }
@@ -142,12 +142,7 @@ async fn run_loop(
     // Bytes relayed this turn are not on the wire until a poll sees them.
     iface.poll(now, &mut phy, &mut sockets);
     for conn in tracker.take_new(&mut sockets) {
-      tokio::spawn(tun_conn_task(
-        conn,
-        upstream_override,
-        Arc::clone(&state),
-        Arc::clone(&wake),
-      ));
+      tokio::spawn(tun_conn_task(conn, upstream_override, Arc::clone(&state), Arc::clone(&wake)));
     }
     tracker.cleanup(&mut sockets);
     while let Some(pkt) = phy.tx.pop_front() {
@@ -556,10 +551,13 @@ mod tests {
     ));
 
     let accept = stub.accept();
-    let guest = tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect(v4([198, 51, 100, 7], stub_port)))
-      .await
-      .unwrap()
-      .unwrap();
+    let guest = tokio::time::timeout(
+      Duration::from_secs(10),
+      tokio::net::TcpStream::connect(v4([198, 51, 100, 7], stub_port)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     guest.set_nodelay(true).unwrap();
     let (server, _) = tokio::time::timeout(Duration::from_secs(10), accept).await.unwrap().unwrap();
     server.set_nodelay(true).unwrap();
