@@ -36,6 +36,16 @@ HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 export HOST_UID HOST_GID
 
+# Discovery writes the real nkey and the generated grant here. Drop the
+# contents after the guest-tree check and the client-log check, including
+# when a round exits early. The directory itself may be a bind mount.
+cleanup_nats_discovery() {
+  if [ -d integration/out/nats-discovery ]; then
+    find integration/out/nats-discovery -mindepth 1 -delete
+  fi
+}
+trap cleanup_nats_discovery EXIT
+
 # The debug binary comes from the `build:debug` dependency; compose mounts
 # it from here (the image is runtime-only, no build stage).
 mkdir -p integration/docker
@@ -326,6 +336,7 @@ for backend in $backends; do
     } | tee -a /tmp/arkham-integration-compose.log
   fi
   $compose down --remove-orphans -v --timeout 3
+  cleanup_nats_discovery
   if [ "$code" != 0 ]; then
     echo "=== backend $backend FAILED (exit $code) ==="
     exit "$code"

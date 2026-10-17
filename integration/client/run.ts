@@ -3,8 +3,8 @@
 // it just talks to api by hostname. It holds ONLY the fake token; every
 // passing scenario proves arkham swapped it for the real one (and redacted
 // replies). Hard bounds everywhere: 5s per network await, 20s per scenario,
-// 120s for the whole run. Tun can spend one full nkey attempt and still
-// finish the rejection check.
+// 90s for the whole run. NATS nkey and user-JWT scenarios fail on the first
+// timeout.
 import { spawn } from "node:child_process";
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
@@ -35,7 +35,7 @@ const NATS_JWT_FOREIGN_SEED = process.env.NATS_JWT_FOREIGN_SEED ?? "";
 const NATS_JWT_FOREIGN_JWT = process.env.NATS_JWT_FOREIGN_JWT ?? "";
 const ATTEMPT_TIMEOUT_MS = 5000;
 const SCENARIO_BUDGET_MS = 20000;
-const TOTAL_BUDGET_MS = 120000;
+const TOTAL_BUDGET_MS = 90000;
 const DEADLINE = Date.now() + TOTAL_BUDGET_MS;
 
 if (!FAKE || !OIDC_FAKE_SECRET) {
@@ -100,6 +100,23 @@ async function readAll(sock: Socket | TLSSocket): Promise<string> {
 }
 
 const covered = new Set<string>();
+
+async function once(scheme: string, what: string, fn: () => Promise<boolean>) {
+  stage(`${what} attempt 1`);
+  try {
+    if (await fn()) {
+      if (scheme) covered.add(scheme);
+      console.log(`PASS ${what}`);
+      return;
+    }
+    console.error(`FAIL ${what}: assertion false`);
+  } catch (err) {
+    const last = String(err);
+    stage(`${what} error: ${last}`);
+    console.error(`FAIL ${what}: ${last}`);
+  }
+  process.exit(1);
+}
 
 async function retry(scheme: string, what: string, fn: () => Promise<boolean>) {
   const deadline = Date.now() + SCENARIO_BUDGET_MS;
@@ -825,7 +842,7 @@ function natsRejected(err: unknown): boolean {
 }
 
 if (process.env.NATS_DISCOVERED === "1") {
-  await retry("nats", "nats host ~/.config/nats discovery swaps the mounted decoy nkey; publish and receive", async () => {
+  await once("nats", "nats host ~/.config/nats discovery swaps the mounted decoy nkey; publish and receive", async () => {
     const ctx = await selectedNatsContext();
     if (!ctx.nkey || !ctx.url) return false;
     const nkeyPath = ctx.nkey.startsWith("~/") ? join(homedir(), ctx.nkey.slice(2)) : ctx.nkey;
@@ -852,14 +869,14 @@ if (NATS_NKEY_URL) {
     url: `${nkeyServer.protocol}//${nkeyServer.host}`,
     nkey: nkeyPath,
   });
-  await retry("nats", "nats tls CONNECT swaps the decoy nkey read from ~/.config/nats; publish and receive", async () => {
+  await once("nats", "nats tls CONNECT swaps the decoy nkey read from ~/.config/nats; publish and receive", async () => {
     const ctx = await selectedNatsContext();
     if (!ctx.nkey || !ctx.url) return false;
     const fromFile = nkeySeed(await readFile(ctx.nkey));
     return natsRoundTrip(ctx.url, nkeyAuthenticator(fromFile), "nkey");
   });
 
-  await retry("nats", "nats non-decoy nkey is not swapped", async () => {
+  await once("nats", "nats non-decoy nkey is not swapped", async () => {
     try {
       const nc = await openNatsAuth(NATS_NKEY_URL, nkeyAuthenticator(new TextEncoder().encode(NATS_NKEY_FOREIGN)));
       await nc.close();
@@ -891,14 +908,14 @@ if (NATS_JWT_URL) {
     url: `${jwtServer.protocol}//${jwtServer.host}`,
     creds: credsPath,
   });
-  await retry("nats", "nats tls CONNECT swaps the decoy user jwt read from ~/.config/nats; publish and receive", async () => {
+  await once("nats", "nats tls CONNECT swaps the decoy user jwt read from ~/.config/nats; publish and receive", async () => {
     const ctx = await selectedNatsContext();
     if (!ctx.creds || !ctx.url) return false;
     const fromFile = await readFile(ctx.creds);
     return natsRoundTrip(ctx.url, credsAuthenticator(fromFile), "jwt");
   });
 
-  await retry("nats", "nats non-decoy user jwt is not swapped", async () => {
+  await once("nats", "nats non-decoy user jwt is not swapped", async () => {
     try {
       const nc = await openNatsAuth(
         NATS_JWT_URL,
