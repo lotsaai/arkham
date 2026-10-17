@@ -1166,6 +1166,19 @@ mod tests {
   }
 
   #[test]
+  fn creds_valid_seed_with_a_malformed_jwt_is_rejected() {
+    let (seed, _public) = user_material();
+    let jwt = "not-a-jwt";
+    let uri = format!("nats://creds:{seed}:{jwt}@nats.internal:4222");
+    let err = match NatsScope::from_strings(&uri, &uri) {
+      Ok(_scope) => panic!("a seed with a malformed jwt was accepted"),
+      Err(err) => err,
+    };
+    assert!(matches!(err, NatsUriError::UserJwt), "{err}");
+    hides(&err, &[seed.as_str(), jwt]);
+  }
+
+  #[test]
   fn empty_password_userinfo_is_user_and_password() {
     let scope = NatsScope::from_strings("nats://agent:@nats.internal:4222", "nats://agent:@nats.internal:4222").expect("empty password");
     assert_eq!(
