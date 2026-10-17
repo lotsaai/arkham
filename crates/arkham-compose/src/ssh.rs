@@ -98,6 +98,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
         registry: false,
         allow: vec![entry.clone()],
         value: None,
+        real: None,
         if_missing: Some(IfMissing::Ignore),
         tls: BTreeMap::new(),
         ssh: BTreeMap::from([(

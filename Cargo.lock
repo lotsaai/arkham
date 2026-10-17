@@ -349,6 +349,7 @@ dependencies = [
  "gix-config",
  "gix-discover",
  "libc",
+ "nkeys",
  "pretty_assertions",
  "secrecy",
  "serde",

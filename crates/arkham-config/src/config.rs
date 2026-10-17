@@ -260,8 +260,8 @@ pub struct FileRewrite {
   #[serde(default)]
   pub envs: Vec<String>,
   /// Declared format, skipping detection. Known formats: `kubeconfig`
-  /// (kubectl), `talos` (talosctl). The git, jj, and ssh configs are not
-  /// declared: arkham reads them as ambient sources from their default
+  /// (kubectl), `talos` (talosctl). The git, jj, ssh, and nats configs are
+  /// not declared: arkham reads them as ambient sources from their default
   /// locations. Unknown files keep the raw byte-swap when this is absent.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub format: Option<RewriteFormat>,

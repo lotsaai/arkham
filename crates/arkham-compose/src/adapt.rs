@@ -62,9 +62,14 @@ pub(crate) struct GrantFragment {
   /// Allow entries the derived rule grants.
   pub(crate) allow: Vec<String>,
   /// Real credential, held inline. Absent for kinds whose secret is key
-  /// material in `ssh` rather than a wire value.
+  /// material in `ssh` rather than a wire value. Connection-string rules
+  /// put the fake string here.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) value: Option<String>,
+  /// Connection-string rules: the real string, stated beside the fake
+  /// `value`. Absent for token and ssh rules.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) real: Option<String>,
   /// What the rule does without a fnox value. Absent keeps the default.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) if_missing: Option<IfMissing>,

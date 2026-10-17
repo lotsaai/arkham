@@ -17,6 +17,7 @@ arkham-config = { workspace = true }
 arkham-fnox = { workspace = true }
 arkham-pki = { workspace = true }
 libc = { workspace = true }
+nkeys = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

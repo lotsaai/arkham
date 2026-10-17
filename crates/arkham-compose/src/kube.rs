@@ -298,6 +298,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
       registry: false,
       allow: vec![cluster.cluster.server.clone()],
       value: Some(value),
+      real: None,
       if_missing: None,
       tls: BTreeMap::from([(cluster.cluster.server.clone(), blobs.tls)]),
       ssh: BTreeMap::new(),

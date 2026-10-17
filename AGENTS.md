@@ -12,7 +12,7 @@ Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates
 - **PKI**: `arkham-pki`: owns the signing CA, leaf and client-pair generation, and the SSH key helpers (host key load-or-generate, decoy keys, `known_hosts` pinning).
 - **Proxy core**: `arkham-proxy`: owns `ProxyState`, `serve`, `serve_connect_stream` / `serve_transparent_stream`, `relay_guarded`, connection sniffing with SNI resolved through rama's ClientHello parser, and the substitution engines (`transports/http`, `transports/postgres`, `transports/redis`, `transports/smtp`, `transports/ldap`, `transports/nats`, `transports/ssh`, `transports/tcp`, and the shared machine in `transports/engine`).
 - **Plugin host**: `arkham-plugin`: owns wasmtime component-model hosting of rewrite guests around the in-core value swap.
-- **Stack generation**: `arkham-compose`: owns compose/stack generation, path expansion, confinement entry, and ambient source adapters (git, jj, ssh, kube, talos). The stack-command args (`Init`, `Up`, `Down`, `Logs`, `Agent`, `Fwd`) live here behind `arkham-config`'s `CliCommand` trait.
+- **Stack generation**: `arkham-compose`: owns compose/stack generation, path expansion, confinement entry, and ambient source adapters (git, jj, ssh, nats, kube, talos). The stack-command args (`Init`, `Up`, `Down`, `Logs`, `Agent`, `Fwd`) live here behind `arkham-config`'s `CliCommand` trait.
 - **Capture backends**: `arkham-tproxy`, `arkham-tun`, `arkham-ebpf` (userspace halves): own packet capture and hand accepted streams to the proxy core.
 - **BPF programs**: `arkham-ebpf-programs`: owns the no_std kernel-side eBPF programs and the shared map ABI.
 

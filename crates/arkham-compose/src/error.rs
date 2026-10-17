@@ -195,6 +195,10 @@ pub enum Error {
     /// What fails to map.
     detail: String,
   },
+  /// A NATS decoy user seed could not be minted. The nkeys error is dropped
+  /// because it can echo the seed.
+  #[error("nats decoy seed could not be minted")]
+  NatsDecoy,
   /// An ambient derivation source does not map onto grants or a decoy twin.
   #[error("derived source `{}`: {detail}", file.display())]
   SourceInvalid {

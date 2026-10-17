@@ -434,6 +434,7 @@ fn ssh_mint(source: &Path, config: &GitConfig, endpoint: &ForgeEndpoint, home: &
       registry: false,
       allow: vec![entry.clone()],
       value: None,
+      real: None,
       if_missing: Some(IfMissing::Ignore),
       tls: BTreeMap::new(),
       ssh: BTreeMap::from([(
