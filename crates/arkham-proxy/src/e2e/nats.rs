@@ -8,7 +8,7 @@ use arkham_config::grants::NatsSeed;
 use base64::Engine as _;
 
 use super::*;
-use crate::transports::nats::fixtures::nats_grants;
+use crate::transports::nats::fixtures::{mint_user, nats_grants};
 
 const FAKE: &str = "arkham_fake_nats_pass"; // betterleaks:allow
 const VALUE: &str = "arkham_real_nats_pass_01"; // betterleaks:allow
@@ -292,8 +292,8 @@ struct SignedMaterial {
 }
 
 fn signed_material(user_jwt: bool, port: u16) -> SignedMaterial {
-  let (fake_raw, fake_seed) = NatsSeed::generate_user().expect("fake user seed");
-  let (real_raw, real_seed) = NatsSeed::generate_user().expect("real user seed");
+  let (fake_raw, fake_seed) = mint_user();
+  let (real_raw, real_seed) = mint_user();
   let sig = e2e_b64(&fake_seed.sign(E2E_NONCE).expect("fake seed signs"));
   if user_jwt {
     let fake_jwt = e2e_user_jwt(fake_seed.public_key());

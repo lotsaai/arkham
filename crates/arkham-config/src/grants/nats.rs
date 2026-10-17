@@ -97,22 +97,6 @@ pub struct NatsSeed {
 }
 
 impl NatsSeed {
-  /// Mint a user seed.
-  ///
-  /// The `String` is the seed text, for a connection string. This value keeps
-  /// its own copy and has no accessor that returns it.
-  ///
-  /// `None` when that seed does not rebuild.
-  #[must_use]
-  pub fn generate_user() -> Option<(String, Self)> {
-    let pair = nkeys::KeyPair::new_user();
-    let Ok(raw) = pair.seed() else {
-      return None;
-    };
-    let seed = Self::from_seed(SecretString::from(raw.clone())).ok()?;
-    Some((raw, seed))
-  }
-
   /// Parse a user seed and keep its public key.
   ///
   /// # Errors
@@ -505,6 +489,10 @@ fn split_creds(password: &str) -> Result<(String, String), NatsUriError> {
 }
 
 /// Three non-empty base64url segments. The payload `sub` must be the seed's public key.
+///
+/// `nkeys` does not read JWT claims. A decoder that verifies the account
+/// signature needs the account key, and this string only carries the user
+/// seed. The segments are decoded with `base64` and `serde_json`.
 fn check_user_jwt(jwt: &str, public: &str) -> Result<(), NatsUriError> {
   let mut parts = jwt.split('.');
   let Some(header) = parts.next().filter(|part| !part.is_empty()) else {

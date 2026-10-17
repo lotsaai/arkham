@@ -1290,7 +1290,7 @@ mod tests {
 
   use super::{ClientVerb, MAX_COMMAND, Nats, ServerVerb};
   use crate::transports::engine::{Rewritten, Wire};
-  use crate::transports::nats::fixtures::nats_grants;
+  use crate::transports::nats::fixtures::{mint_user, nats_grants};
 
   const FAKE_PASS: &str = "arkham_fake_nats_pass"; // betterleaks:allow
   const REAL_PASS: &str = "real-nats-pass-is-longer"; // betterleaks:allow
@@ -1570,7 +1570,7 @@ mod tests {
   }
 
   fn minted() -> Minted {
-    let (raw, seed) = NatsSeed::generate_user().expect("user seed");
+    let (raw, seed) = mint_user();
     Minted { raw, seed }
   }
 

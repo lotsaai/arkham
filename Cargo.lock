@@ -488,6 +488,7 @@ dependencies = [
  "hyper 1.12.0",
  "hyper-util",
  "memchr",
+ "nkeys",
  "pgwire",
  "pretty_assertions",
  "proptest",

@@ -419,7 +419,7 @@ mod tests {
 
   use super::{NatsTransport, Open, ServerLeg, nats_pair};
 
-  use super::fixtures::nats_grants;
+  use super::fixtures::{mint_user, nats_grants};
   use super::machine::Nats;
   use super::server_info;
   use crate::transports::engine::{Rewritten, Wire};
@@ -722,8 +722,8 @@ mod tests {
   /// The opening INFO's nonce is on the guest leg before CONNECT, including a second arm.
   #[tokio::test]
   async fn server_info_arms_a_ready_nonce_before_connect() {
-    let (fake_raw, fake) = NatsSeed::generate_user().expect("fake");
-    let (real_raw, real) = NatsSeed::generate_user().expect("real");
+    let (fake_raw, fake) = mint_user();
+    let (real_raw, real) = mint_user();
     let grants = nats_grants(
       &format!("nats://nkey:{fake_raw}@nats.internal:4222"),
       &format!("tls://nkey:{real_raw}@nats.upstream:4222"),
@@ -754,8 +754,8 @@ mod tests {
   /// The first INFO had no nonce. A later INFO's nonce does not replace that.
   #[tokio::test]
   async fn a_second_info_does_not_replace_an_absent_nonce() {
-    let (fake_raw, fake) = NatsSeed::generate_user().expect("fake");
-    let (real_raw, real) = NatsSeed::generate_user().expect("real");
+    let (fake_raw, fake) = mint_user();
+    let (real_raw, real) = mint_user();
     let grants = nats_grants(
       &format!("nats://nkey:{fake_raw}@nats.internal:4222"),
       &format!("tls://nkey:{real_raw}@nats.upstream:4222"),
@@ -784,8 +784,8 @@ mod tests {
   /// A close, `tls_required`, or an unreadable INFO does not arm a nonce.
   #[tokio::test]
   async fn closing_info_does_not_arm_a_nonce() {
-    let (fake_raw, fake) = NatsSeed::generate_user().expect("fake");
-    let (real_raw, real) = NatsSeed::generate_user().expect("real");
+    let (fake_raw, fake) = mint_user();
+    let (real_raw, real) = mint_user();
     let grants = nats_grants(
       &format!("nats://nkey:{fake_raw}@nats.internal:4222"),
       &format!("nats://nkey:{real_raw}@nats.upstream:4222"),

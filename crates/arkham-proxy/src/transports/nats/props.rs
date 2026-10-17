@@ -13,7 +13,7 @@ use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
 
 use crate::transports::engine::harness::{CutPend, feed_parts};
-use crate::transports::nats::fixtures::nats_grants;
+use crate::transports::nats::fixtures::{mint_user, nats_grants};
 use crate::transports::nats::machine::{self, MAX_COMMAND as NATS_MAX_COMMAND, Nats};
 use crate::transports::nats::server_info;
 
@@ -526,8 +526,8 @@ async fn arm_down(grants: &[Grant]) -> Nats {
 /// A verifying CONNECT, cut anywhere, rewrites the same way and never emits the real seed.
 #[tokio::test]
 async fn prop_nats_signed_connect_is_split_stable() {
-  let (fake_raw, fake) = NatsSeed::generate_user().expect("fake");
-  let (real_raw, real) = NatsSeed::generate_user().expect("real");
+  let (fake_raw, fake) = mint_user();
+  let (real_raw, real) = mint_user();
   let fake_jwt = prop_user_jwt(fake.public_key());
   let real_jwt = prop_user_jwt(real.public_key());
   let nkey = nats_grants(
@@ -588,8 +588,8 @@ async fn prop_nats_signed_connect_is_split_stable() {
 /// Server bytes, cut anywhere, agree. Guest-bound output never carries the real seed, JWT, or public key.
 #[tokio::test]
 async fn prop_nats_guest_output_hides_signed_material() {
-  let (fake_raw, fake) = NatsSeed::generate_user().expect("fake");
-  let (real_raw, real) = NatsSeed::generate_user().expect("real");
+  let (fake_raw, fake) = mint_user();
+  let (real_raw, real) = mint_user();
   let fake_jwt = prop_user_jwt(fake.public_key());
   let real_jwt = prop_user_jwt(real.public_key());
   let fake_public = fake.public_key().to_string();
