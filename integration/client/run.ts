@@ -3,8 +3,7 @@
 // it just talks to api by hostname. It holds ONLY the fake token; every
 // passing scenario proves arkham swapped it for the real one (and redacted
 // replies). Hard bounds everywhere: 5s per network await, 20s per scenario,
-// 90s for the whole run. NATS nkey and user-JWT scenarios fail on the first
-// timeout.
+// 90s for the whole run. NATS scenarios run once. The first failure ends the run.
 import { spawn } from "node:child_process";
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
@@ -724,7 +723,7 @@ if (NATS_URL) {
   // The server's only account holds the real password, so a session that
   // authenticates with the decoy proves the swap. The payload carries the
   // decoy and must arrive unchanged: payloads are never rewritten.
-  await retry("nats", "nats tls CONNECT swaps the decoy password; publish and receive", async () => {
+  await once("nats", "nats tls CONNECT swaps the decoy password; publish and receive", async () => {
     const nc = await openNats(NATS_URL, parts.pass);
     try {
       const subject = "arkham.demo";
@@ -742,7 +741,7 @@ if (NATS_URL) {
     }
   });
 
-  await retry("nats", "nats non-decoy password is not swapped", async () => {
+  await once("nats", "nats non-decoy password is not swapped", async () => {
     try {
       const nc = await openNats(NATS_URL, "not-the-nats-decoy");
       await nc.close();
