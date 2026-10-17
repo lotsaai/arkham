@@ -190,8 +190,10 @@ EOF
   fi
 
   dest=integration/out/nats-discovery
-  rm -rf "$dest"
+  # The grants directory is already bind-mounted into arkham. Remove its
+  # contents, not the mount point.
   mkdir -p "$dest/grants" "$dest/guest"
+  find "$dest/grants" "$dest/guest" -mindepth 1 -delete
   cp -a "$(dirname "$grant_toml")/." "$dest/grants/"
   while IFS= read -r line; do
     case "$line" in
@@ -243,6 +245,9 @@ for backend in $backends; do
   # The bind-mounted file survives `down`. A leftover from the previous
   # backend, or from an earlier run, must not satisfy this round.
   rm -f integration/out/covered.json
+  # Create the bind mounts as this user. Docker would otherwise create a
+  # missing path as root, and the later cleanup cannot remove it.
+  mkdir -p integration/out/nats-discovery/grants integration/out/nats-discovery/guest
   # Bring the stack up without the client. This is the one certs run:
   # dependents wait until it exits, and nothing below starts it again.
   services=()
