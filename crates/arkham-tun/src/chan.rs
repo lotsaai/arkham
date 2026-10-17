@@ -129,4 +129,31 @@ mod tests {
     stream.shutdown().await.unwrap();
     assert!(stream.write_all(b"x").await.is_err());
   }
+
+  #[tokio::test]
+  async fn shutdown_wakes_the_capture_loop() {
+    use tokio::io::AsyncWriteExt as _;
+    let (_guest_tx, task_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (task_tx, _loop_rx) = mpsc::channel::<TaskMsg>(8);
+    let wake = Arc::new(Notify::new());
+    let mut stream = ChanStream::new(task_rx, task_tx, Arc::clone(&wake));
+    let notified = wake.notified();
+    stream.shutdown().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_millis(50), notified)
+      .await
+      .expect("shutdown wakes the capture loop");
+  }
+
+  #[tokio::test]
+  async fn drop_wakes_the_capture_loop() {
+    let (_guest_tx, task_rx) = mpsc::channel::<Vec<u8>>(8);
+    let (task_tx, _loop_rx) = mpsc::channel::<TaskMsg>(8);
+    let wake = Arc::new(Notify::new());
+    let stream = ChanStream::new(task_rx, task_tx, Arc::clone(&wake));
+    let notified = wake.notified();
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_millis(50), notified)
+      .await
+      .expect("drop wakes the capture loop");
+  }
 }
