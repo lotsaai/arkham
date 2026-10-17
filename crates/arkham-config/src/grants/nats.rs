@@ -859,10 +859,6 @@ fn userinfo_parts(entry: &str) -> Result<(String, Option<String>), NatsUriError>
   }
 }
 
-/// `nkey` and `creds` select that kind only when the password parses as it.
-/// An ordinary password stays user and password, including a user whose
-/// name is one of those spellings. A `creds` password whose seed parses
-/// and whose jwt does not is rejected, so the seed is not sent as a password.
 fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriError> {
   if user == NatsPlain::NKEY_USER {
     return match NatsSeed::from_seed(SecretString::from(pass.clone())) {
@@ -882,8 +878,6 @@ fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
   Ok(NatsPlain::UserPass { user, pass })
 }
 
-/// The first `creds` segment is a user seed. No colon, or a segment that
-/// does not parse, is an ordinary password.
 fn creds_seed_parsed(password: &str) -> bool {
   let Some((seed, _)) = password.split_once(':') else {
     return false;

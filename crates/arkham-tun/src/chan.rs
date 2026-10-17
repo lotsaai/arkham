@@ -34,12 +34,6 @@ impl ChanStream {
   }
 }
 
-impl Drop for ChanStream {
-  fn drop(&mut self) {
-    self.wake.notify_one();
-  }
-}
-
 impl AsyncRead for ChanStream {
   fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
     loop {
@@ -142,18 +136,5 @@ mod tests {
     tokio::time::timeout(std::time::Duration::from_millis(50), notified)
       .await
       .expect("shutdown wakes the capture loop");
-  }
-
-  #[tokio::test]
-  async fn drop_wakes_the_capture_loop() {
-    let (_guest_tx, task_rx) = mpsc::channel::<Vec<u8>>(8);
-    let (task_tx, _loop_rx) = mpsc::channel::<TaskMsg>(8);
-    let wake = Arc::new(Notify::new());
-    let stream = ChanStream::new(task_rx, task_tx, Arc::clone(&wake));
-    let notified = wake.notified();
-    drop(stream);
-    tokio::time::timeout(std::time::Duration::from_millis(50), notified)
-      .await
-      .expect("drop wakes the capture loop");
   }
 }

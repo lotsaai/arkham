@@ -244,11 +244,10 @@ async fn tun_conn_task(conn: NewTcpConn, upstream_override: Option<SocketAddr>, 
   let guest = ChanStream::new(conn.from_guest, conn.to_guest, Arc::clone(&wake));
   let result = serve_transparent_stream(guest, &state, &snapshot, &dial_host, port, &dial_host).await;
   if result.is_err() {
-    // The stream drop already woke the loop. That turn can relay before this
-    // abort is queued and then sleep out the idle delay, so wake once the abort is queued.
-    let _ = abort_tx.send(TaskMsg::Abort).await;
-    wake.notify_one();
+    let _ = abort_tx.try_send(TaskMsg::Abort);
   }
+  drop(abort_tx);
+  wake.notify_one();
 }
 
 #[cfg(test)]
@@ -593,8 +592,6 @@ mod tests {
     assert!(!slow, "idle guest-bound byte waited on the capture loop: {samples:?}");
   }
 
-  /// An upstream reset after the capture loop has gone idle must RST the
-  /// guest before that idle wait. The abort is not a TUN packet.
   #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
   #[ignore = "needs root + ARKHAM_TEST_TUN=1 (mutates host routes)"]
   async fn tun_live_idle_abort_rst_is_prompt() {
