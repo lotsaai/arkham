@@ -3,7 +3,8 @@
 // it just talks to api by hostname. It holds ONLY the fake token; every
 // passing scenario proves arkham swapped it for the real one (and redacted
 // replies). Hard bounds everywhere: 5s per network await, 20s per scenario,
-// 90s for the whole run — the demo never sits silent.
+// 120s for the whole run. Tun can spend one full nkey attempt and still
+// finish the rejection check.
 import { spawn } from "node:child_process";
 import { connect, type Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
@@ -34,7 +35,7 @@ const NATS_JWT_FOREIGN_SEED = process.env.NATS_JWT_FOREIGN_SEED ?? "";
 const NATS_JWT_FOREIGN_JWT = process.env.NATS_JWT_FOREIGN_JWT ?? "";
 const ATTEMPT_TIMEOUT_MS = 5000;
 const SCENARIO_BUDGET_MS = 20000;
-const TOTAL_BUDGET_MS = 90000;
+const TOTAL_BUDGET_MS = 120000;
 const DEADLINE = Date.now() + TOTAL_BUDGET_MS;
 
 if (!FAKE || !OIDC_FAKE_SECRET) {
@@ -118,6 +119,7 @@ async function retry(scheme: string, what: string, fn: () => Promise<boolean>) {
       last = "assertion false";
     } catch (err) {
       last = String(err);
+      stage(`${what} error: ${last}`);
     }
     await new Promise((r) => setTimeout(r, 500));
   }
@@ -843,6 +845,7 @@ if (NATS_NKEY_URL) {
       await nc.close();
       return false;
     } catch (err) {
+      if (String(err).includes("timed out")) throw err;
       return natsRejected(err);
     }
   });
@@ -884,6 +887,7 @@ if (NATS_JWT_URL) {
       await nc.close();
       return false;
     } catch (err) {
+      if (String(err).includes("timed out")) throw err;
       return natsRejected(err);
     }
   });
