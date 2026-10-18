@@ -308,7 +308,7 @@ url_api = "https://api.github.com/repos/casualjim/remark/releases/assets/5361243
 [[tools."github:nats-io/nsc"]]
 version = "2.15.0"
 backend = "github:nats-io/nsc"
-specifiers = ["latest"]
+specifiers = ["2.15.0"]
 
 [tools."github:nats-io/nsc"."platforms.linux-arm64"]
 checksum = "sha256:4556613503e2d3e91c970e2c78f17b3f369a3b987c00aa4ffe95d08ea5059a0c"
