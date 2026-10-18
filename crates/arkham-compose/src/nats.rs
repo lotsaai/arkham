@@ -4,8 +4,9 @@
 //! references are read here and never mounted for the guest.
 //!
 //! The selected context becomes one connection-string grant. The decoy
-//! context and decoy credential files are what the guest mounts. Real
-//! seeds and JWTs stay in the grant fragment.
+//! context is that document with secret-bearing values removed and the
+//! auth keys set to the decoy. Real seeds and JWTs stay in the grant
+//! fragment. Unknown keys stay on the decoy.
 //!
 //! A creds or nkey path is mounted only when it is lexically under the
 //! host home and contains no `..` segment. A symlink is not canonicalized:
@@ -16,11 +17,12 @@
 //! leg's mode stays on the rule `tls` table.
 //!
 //! Checked against the NATS CLI context document and the nsc credentials
-//! file: `context.txt`, `context/<name>.json`, the JSON fields below, and
-//! the decorated banners. `$XDG_CONFIG_HOME`, `NATS_*` overrides, `nsc://`,
-//! and a comma-separated server list are not read. async-nats 0.50 keeps
+//! file: `context.txt`, `context/<name>.json`, and the decorated banners.
+//! `$XDG_CONFIG_HOME`, `NATS_*` overrides, `nsc://`, and a comma-separated
+//! server list are not read. async-nats 0.50 keeps
 //! `parse_jwt_and_key_from_creds` private; the banner regex below is that
-//! crate's `USER_CONFIG_RE`. `nkeys` 0.4 parses a seed.
+//! crate's `USER_CONFIG_RE`. `nkeys` 0.4 parses a seed. Context fields are
+//! not trimmed: a password keeps its surrounding whitespace.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -28,91 +30,37 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 use arkham_config::config::IfMissing;
-use arkham_config::grants::{NatsPlain, NatsScope, NatsSeed};
+use arkham_config::grants::{NatsPlain, NatsScope, NatsSeed, check_user_jwt};
 use regex::Regex;
 use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use url::Url;
 
 /// The credentials-file regex from async-nats 0.50 `auth_utils`. The first
-/// capture is the user JWT and the second is the nkey seed. A pattern that
-/// does not compile yields no credential.
-static USER_CONFIG_RE: LazyLock<Option<Regex>> =
-  LazyLock::new(|| Regex::new(r"\s*(?:(?:[-]{3,}.*[-]{3,}\r?\n)([\w\-.=]+)(?:\r?\n[-]{3,}.*[-]{3,}\r?\n))").ok());
+/// capture is the user JWT and the second is the nkey seed.
+static USER_CONFIG_RE: LazyLock<Regex> = LazyLock::new(|| {
+  Regex::new(r"\s*(?:(?:[-]{3,}.*[-]{3,}\r?\n)([\w\-.=]+)(?:\r?\n[-]{3,}.*[-]{3,}\r?\n))").expect("async-nats USER_CONFIG_RE is a constant")
+});
 
 use crate::adapt::{BLOB_PREFIX_NATS, DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
 use crate::error::Error;
-use crate::paths::normalize;
+use crate::paths::{normalize, path_under_home};
 
-fn trimmed<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-  D: serde::Deserializer<'de>,
-{
-  let value = String::deserialize(deserializer)?;
-  Ok(value.trim().to_string())
-}
-
-/// One context file. Unknown JSON keys are dropped. Secret fields stay on
-/// this struct for the grant and are copied onto the decoy only when they
-/// are the rewritten auth field. `Debug` redacts the secret fields.
-#[derive(Deserialize)]
-struct NatsContext {
-  #[serde(default, deserialize_with = "trimmed")]
-  description: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  url: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  user: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  password: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  token: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  creds: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  nkey: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  cert: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  key: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  ca: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  nsc: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  inbox_prefix: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  jetstream_domain: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  jetstream_api_prefix: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  jetstream_event_prefix: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  user_jwt: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  user_seed: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  color_scheme: String,
-  #[serde(default)]
-  tls_first: bool,
-  #[serde(default, deserialize_with = "trimmed")]
-  socks_proxy: String,
-  #[serde(default, deserialize_with = "trimmed")]
-  windows_cert_store: String,
-}
-
-impl std::fmt::Debug for NatsContext {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("NatsContext")
-      .field("url", &self.url)
-      .field("user", &self.user)
-      .field("password", &"redacted")
-      .field("token", &"redacted")
-      .field("user_seed", &"redacted")
-      .field("user_jwt", &"redacted")
-      .finish_non_exhaustive()
-  }
-}
+/// Keys removed from the guest document. Auth keys are written back from the decoy.
+const DROPPED_KEYS: &[&str] = &[
+  "cert",
+  "key",
+  "ca",
+  "user_seed",
+  "user_jwt",
+  "socks_proxy",
+  "nsc",
+  "user",
+  "password",
+  "token",
+  "creds",
+  "nkey",
+];
 
 /// One discovered context, ready for the ambient pass.
 pub(crate) struct AdaptedNats {
@@ -184,11 +132,15 @@ pub(crate) fn adapt(root: &Path, home: &str, host_home: &Path) -> Result<Option<
       return Ok(None);
     }
   };
-  let Ok(doc) = serde_json::from_str::<NatsContext>(&body) else {
+  let Ok(value) = serde_json::from_str::<Value>(&body) else {
+    tracing::warn!(source = %path.display(), "nats source skipped: the context is not json");
+    return Ok(None);
+  };
+  let Some(doc) = value.as_object() else {
     tracing::warn!(source = %path.display(), "nats source skipped: the context is not a context object");
     return Ok(None);
   };
-  map_context(&path, name, &doc, home, host_home, root)
+  map_context(&path, name, doc, home, host_home, root)
 }
 
 fn context_name(text: &str) -> Option<&str> {
@@ -200,38 +152,58 @@ fn context_name(text: &str) -> Option<&str> {
   }
 }
 
+fn text<'a>(doc: &'a Map<String, Value>, key: &str) -> &'a str {
+  doc.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+fn occupied(doc: &Map<String, Value>, key: &str) -> bool {
+  match doc.get(key) {
+    Some(Value::String(value)) => !value.is_empty(),
+    Some(Value::Array(values)) => !values.is_empty(),
+    Some(Value::Null) | None => false,
+    Some(_) => true,
+  }
+}
+
 fn map_context(
   path: &Path,
   name: &str,
-  doc: &NatsContext,
+  doc: &Map<String, Value>,
   home: &str,
   host_home: &Path,
   root: &Path,
 ) -> Result<Option<AdaptedNats>, Error> {
-  if !doc.windows_cert_store.is_empty() || !doc.socks_proxy.is_empty() || !doc.nsc.is_empty() {
-    return Ok(skip(path, "windows cert store, socks proxy, and nsc are not derived"));
+  if occupied(doc, "windows_cert_store") || occupied(doc, "socks_proxy") || occupied(doc, "nsc") {
+    tracing::warn!(source = %path.display(), reason = "windows cert store, socks proxy, and nsc are not derived", "nats context skipped");
+    return Ok(None);
   }
-  let Some(dial) = dial_url(&doc.url) else {
-    return Ok(skip(path, "the server url is not one nats:// or tls:// address"));
+  let Some(dial) = dial_url(text(doc, "url")) else {
+    tracing::warn!(source = %path.display(), reason = "the server url is not one nats:// or tls:// address", "nats context skipped");
+    return Ok(None);
   };
   let Some(found) = found_cred(doc, host_home, root) else {
-    return Ok(skip(path, "the credential does not map onto one auth method"));
+    tracing::warn!(source = %path.display(), reason = "the credential does not map onto one auth method", "nats context skipped");
+    return Ok(None);
   };
   let label = rewrite_label(path, name)?;
   let env = label.to_uppercase().replace('-', "_");
-  let real_tls = dial.scheme() == "tls" || doc.tls_first;
-  if !real_tls && (!doc.cert.is_empty() || !doc.key.is_empty() || !doc.ca.is_empty()) {
-    return Ok(skip(path, "tls material on a cleartext server url is not derived"));
+  let real_tls = dial.scheme() == "tls" || matches!(doc.get("tls_first"), Some(Value::Bool(true)));
+  if !real_tls && (!text(doc, "cert").is_empty() || !text(doc, "key").is_empty() || !text(doc, "ca").is_empty()) {
+    tracing::warn!(source = %path.display(), reason = "tls material on a cleartext server url is not derived", "nats context skipped");
+    return Ok(None);
   }
   let mut query: Vec<(String, String)> = Vec::new();
   let mut materialized = Vec::new();
-  if real_tls && doc.tls_first {
+  if real_tls && matches!(doc.get("tls_first"), Some(Value::Bool(true))) {
     query.push(("handshake_first".to_string(), "true".to_string()));
   }
   if real_tls {
     match tls_material(doc, &label, host_home, root) {
       TlsMaterial::None => {}
-      TlsMaterial::Skip(reason) => return Ok(skip(path, reason)),
+      TlsMaterial::Skip(reason) => {
+        tracing::warn!(source = %path.display(), reason, "nats context skipped");
+        return Ok(None);
+      }
       TlsMaterial::Files { cert, key, ca } => {
         for (name, pair) in [("sslcert", cert), ("sslkey", key), ("sslrootcert", ca)] {
           if let Some((container, blob)) = pair {
@@ -245,11 +217,13 @@ fn map_context(
   let (fake_auth, guest) = wire_auth(&found, &env, host_home, home, &label)?;
   let query_ref: Vec<(&str, &str)> = query.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
   let Some(fake) = auth_url(&dial, dial.scheme(), &fake_auth, &[]) else {
-    return Ok(skip(path, "the decoy connection string could not be built"));
+    tracing::warn!(source = %path.display(), reason = "the decoy connection string could not be built", "nats context skipped");
+    return Ok(None);
   };
   let real_scheme = if real_tls { "tls" } else { "nats" };
   let Some(real) = auth_url(&dial, real_scheme, &found.real, &query_ref) else {
-    return Ok(skip(path, "the real connection string could not be built"));
+    tracing::warn!(source = %path.display(), reason = "the real connection string could not be built", "nats context skipped");
+    return Ok(None);
   };
   if let Err(err) = NatsScope::from_strings(&fake, &real) {
     tracing::warn!(source = %path.display(), %err, "nats context skipped: the connection strings were rejected");
@@ -298,11 +272,6 @@ fn map_context(
   }))
 }
 
-fn skip(path: &Path, reason: &str) -> Option<AdaptedNats> {
-  tracing::warn!(source = %path.display(), reason, "nats context skipped");
-  None
-}
-
 /// Real credential plus the file the context named, when it named one.
 struct FoundCred {
   real: NatsPlain,
@@ -322,57 +291,61 @@ fn wire_auth(found: &FoundCred, env: &str, host_home: &Path, home: &str, label: 
   Ok((prepared.decoy, guest))
 }
 
-fn found_cred(doc: &NatsContext, host_home: &Path, root: &Path) -> Option<FoundCred> {
-  let other_kind =
-    !doc.user.is_empty() || !doc.password.is_empty() || !doc.creds.is_empty() || !doc.nkey.is_empty() || !doc.user_jwt.is_empty();
-  if !doc.token.is_empty() && other_kind {
+fn found_cred(doc: &Map<String, Value>, host_home: &Path, root: &Path) -> Option<FoundCred> {
+  let user = text(doc, "user");
+  let password = text(doc, "password");
+  let token = text(doc, "token");
+  let creds = text(doc, "creds");
+  let nkey = text(doc, "nkey");
+  let user_jwt = text(doc, "user_jwt");
+  let user_seed = text(doc, "user_seed");
+  let other_kind = !user.is_empty() || !password.is_empty() || !creds.is_empty() || !nkey.is_empty() || !user_jwt.is_empty();
+  if !token.is_empty() && other_kind {
     return None;
   }
-  if !doc.user.is_empty() {
+  if !user.is_empty() {
     return Some(FoundCred {
       real: NatsPlain::UserPass {
-        user: doc.user.clone(),
-        pass: doc.password.clone(),
+        user: user.to_string(),
+        pass: password.to_string(),
       },
       source: None,
     });
   }
-  if !doc.password.is_empty() {
+  if !password.is_empty() {
     return None;
   }
-  if !doc.creds.is_empty() {
-    let (seed, jwt) = load_creds(&doc.creds, host_home, root)?;
+  if !creds.is_empty() {
+    let (seed, jwt) = load_creds(creds, host_home, root)?;
     return Some(FoundCred {
       real: NatsPlain::Creds { seed, jwt },
-      source: resolve_path(&doc.creds, host_home, root),
+      source: resolve_path(creds, host_home, root),
     });
   }
-  if !doc.nkey.is_empty() {
-    let path = resolve_path(&doc.nkey, host_home, root)?;
-    let seed = accepted_seed(&fs::read_to_string(&path).ok()?)?;
+  if !nkey.is_empty() {
+    let path = resolve_path(nkey, host_home, root)?;
+    let seed = nkey_file(&path)?;
     return Some(FoundCred {
       real: NatsPlain::Nkey(seed),
       source: Some(path),
     });
   }
-  if !doc.user_jwt.is_empty() && !doc.user_seed.is_empty() {
-    let seed = load_user_seed(&doc.user_seed, host_home, root)?;
-    let jwt = load_jwt(&doc.user_jwt, host_home, root)?;
+  if !user_jwt.is_empty() && !user_seed.is_empty() {
+    let seed = load_user_seed(user_seed, host_home, root)?;
+    let jwt = load_jwt(user_jwt, host_home, root)?;
     let parsed = NatsSeed::from_seed(SecretString::from(seed.clone())).ok()?;
-    if !parsed.matches_user_jwt(&jwt) {
-      return None;
-    }
+    check_user_jwt(&jwt, &parsed.public).ok()?;
     return Some(FoundCred {
       real: NatsPlain::Creds { seed, jwt },
       source: None,
     });
   }
-  if !doc.user_jwt.is_empty() {
+  if !user_jwt.is_empty() {
     return None;
   }
-  if !doc.token.is_empty() {
+  if !token.is_empty() {
     return Some(FoundCred {
-      real: NatsPlain::Token(doc.token.clone()),
+      real: NatsPlain::Token(token.to_string()),
       source: None,
     });
   }
@@ -382,70 +355,51 @@ fn found_cred(doc: &NatsContext, host_home: &Path, root: &Path) -> Option<FoundC
 fn load_creds(raw: &str, host_home: &Path, root: &Path) -> Option<(String, String)> {
   let path = resolve_path(raw, host_home, root)?;
   let text = fs::read_to_string(path).ok()?;
-  let jwt = decorated_jwt(&text)?;
-  let seed = decorated_seed(&text)?;
+  let mut found = USER_CONFIG_RE.captures_iter(&text);
+  let jwt = found.next()?.get(1)?.as_str().to_string();
+  let seed = found.next()?.get(1)?.as_str().to_string();
   let parsed = NatsSeed::from_seed(SecretString::from(seed.clone())).ok()?;
-  parsed.matches_user_jwt(&jwt).then_some((seed, jwt))
+  check_user_jwt(&jwt, &parsed.public).ok()?;
+  Some((seed, jwt))
+}
+
+fn nkey_file(path: &Path) -> Option<String> {
+  let text = fs::read_to_string(path).ok()?;
+  let seed = text.trim();
+  NatsSeed::from_seed(SecretString::from(seed.to_string())).ok()?;
+  Some(seed.to_string())
 }
 
 fn load_user_seed(raw: &str, host_home: &Path, root: &Path) -> Option<String> {
-  if let Some(seed) = accepted_seed(raw) {
-    return Some(seed);
+  if NatsSeed::from_seed(SecretString::from(raw.to_string())).is_ok() {
+    return Some(raw.to_string());
   }
   let path = resolve_path(raw, host_home, root)?;
-  accepted_seed(&fs::read_to_string(path).ok()?)
+  nkey_file(&path)
 }
 
+/// Compact user JWT, or the first regex capture when `raw` is a decorated file.
+///
+/// Go `natscontext` passes this literal to `nats.UserJWTAndSeed`. Creds files
+/// never come through here.
 fn load_jwt(raw: &str, host_home: &Path, root: &Path) -> Option<String> {
   let text = if let Some(path) = resolve_path(raw, host_home, root) {
     fs::read_to_string(path).ok()?
   } else {
     raw.to_string()
   };
-  decorated_jwt(&text)
-}
-
-fn accepted_seed(text: &str) -> Option<String> {
-  let seed = decorated_seed(text)?;
-  NatsSeed::from_seed(SecretString::from(seed.clone())).ok()?;
-  Some(seed)
-}
-
-fn decorated_jwt(text: &str) -> Option<String> {
-  if let Some(re) = USER_CONFIG_RE.as_ref()
-    && let Some(matched) = re.captures_iter(text).next()
-    && let Some(group) = matched.get(1)
-  {
-    return Some(group.as_str().to_string());
+  if let Some(jwt) = USER_CONFIG_RE.captures_iter(&text).next().and_then(|cap| cap.get(1)) {
+    return Some(jwt.as_str().to_string());
   }
-  let trimmed = text.trim();
-  let bare = trimmed.lines().count() == 1
-    && !trimmed.is_empty()
-    && trimmed
-      .bytes()
-      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'='));
-  bare.then(|| trimmed.to_string())
-}
-
-fn decorated_seed(text: &str) -> Option<String> {
-  if let Some(re) = USER_CONFIG_RE.as_ref()
-    && let Some(matched) = re.captures_iter(text).nth(1)
-    && let Some(group) = matched.get(1)
-  {
-    return Some(group.as_str().to_string());
+  let line = text.trim();
+  if line.is_empty() || line.contains('\n') {
+    None
+  } else {
+    Some(line.to_string())
   }
-  text
-    .lines()
-    .map(str::trim)
-    .find(|line| {
-      let bytes = line.as_bytes();
-      bytes.len() >= 2 && bytes[0] == b'S' && matches!(bytes[1], b'O' | b'A' | b'U')
-    })
-    .map(str::to_string)
 }
 
 fn resolve_path(raw: &str, host_home: &Path, root: &Path) -> Option<PathBuf> {
-  let raw = raw.trim();
   if raw.is_empty() || (raw.contains("://") && !raw.starts_with("file://")) {
     return None;
   }
@@ -464,9 +418,8 @@ fn resolve_path(raw: &str, host_home: &Path, root: &Path) -> Option<PathBuf> {
 }
 
 fn dial_url(raw: &str) -> Option<Url> {
-  let raw = raw.trim();
   let raw = if raw.is_empty() { "nats://localhost:4222" } else { raw };
-  if raw.split(',').filter(|part| !part.trim().is_empty()).count() != 1 {
+  if raw.split(',').filter(|part| !part.is_empty()).count() != 1 {
     return None;
   }
   let url = Url::parse(raw).ok()?;
@@ -498,11 +451,14 @@ fn public_url(url: &Url) -> String {
   }
 }
 
-fn tls_material(doc: &NatsContext, label: &str, host_home: &Path, root: &Path) -> TlsMaterial {
-  if doc.cert.is_empty() && doc.key.is_empty() && doc.ca.is_empty() {
+fn tls_material(doc: &Map<String, Value>, label: &str, host_home: &Path, root: &Path) -> TlsMaterial {
+  let cert = text(doc, "cert");
+  let key = text(doc, "key");
+  let ca = text(doc, "ca");
+  if cert.is_empty() && key.is_empty() && ca.is_empty() {
     return TlsMaterial::None;
   }
-  if doc.cert.is_empty() != doc.key.is_empty() {
+  if cert.is_empty() != key.is_empty() {
     return TlsMaterial::Skip("cert and key come together");
   }
   let copied = |raw: &str, kind: &str| {
@@ -511,7 +467,7 @@ fn tls_material(doc: &NatsContext, label: &str, host_home: &Path, root: &Path) -
     }
     copy_tls(label, kind, raw, host_home, root).map(Some)
   };
-  let (Some(cert), Some(key), Some(ca)) = (copied(&doc.cert, "crt"), copied(&doc.key, "key"), copied(&doc.ca, "ca")) else {
+  let (Some(cert), Some(key), Some(ca)) = (copied(cert, "crt"), copied(key, "key"), copied(ca, "ca")) else {
     return TlsMaterial::Skip("a tls file named by the context cannot be read");
   };
   TlsMaterial::Files { cert, key, ca }
@@ -536,67 +492,33 @@ fn guest_file(source: Option<&Path>, host_home: &Path, home: &str, fallback: &st
   if path.components().any(|component| matches!(component, Component::ParentDir)) {
     return fallback_pair;
   }
-  let path = normalize(path);
-  let Ok(rest) = path.strip_prefix(host_home) else {
+  let Some(rel) = path_under_home(&normalize(path), host_home) else {
     return fallback_pair;
   };
-  if rest.as_os_str().is_empty() {
-    return fallback_pair;
-  }
-  let rel = rest.to_string_lossy().replace('\\', "/");
-  if rel.split('/').any(|part| part.is_empty() || part == "..") {
-    return fallback_pair;
-  }
   (format!("~/{rel}"), format!("{home}/{rel}"))
 }
 
-/// Fields the guest may see. Everything else on [`NatsContext`] stays off this struct.
-#[derive(Serialize)]
-struct DecoyContext {
-  #[serde(skip_serializing_if = "String::is_empty")]
-  description: String,
-  url: String,
-  #[serde(skip_serializing_if = "String::is_empty")]
-  user: String,
-  #[serde(skip_serializing_if = "String::is_empty")]
-  password: String,
-  #[serde(skip_serializing_if = "String::is_empty")]
-  token: String,
-  #[serde(skip_serializing_if = "String::is_empty")]
-  creds: String,
-  #[serde(skip_serializing_if = "String::is_empty")]
-  nkey: String,
-  #[serde(skip_serializing_if = "String::is_empty")]
-  inbox_prefix: String,
-  #[serde(skip_serializing_if = "String::is_empty")]
-  jetstream_domain: String,
-  #[serde(skip_serializing_if = "String::is_empty")]
-  jetstream_api_prefix: String,
-  #[serde(skip_serializing_if = "String::is_empty")]
-  jetstream_event_prefix: String,
-  #[serde(skip_serializing_if = "String::is_empty")]
-  color_scheme: String,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  tls_first: Option<bool>,
-}
-
-fn decoy_context(doc: &NatsContext, dial: &Url, guest: Option<&GuestCred>, fake: &NatsPlain) -> DecoyContext {
+fn decoy_context(doc: &Map<String, Value>, dial: &Url, guest: Option<&GuestCred>, fake: &NatsPlain) -> Map<String, Value> {
+  let mut out = doc.clone();
+  out.retain(|key, _| !DROPPED_KEYS.contains(&key.as_str()) && !key.starts_with("windows_"));
+  out.insert("url".to_string(), Value::String(public_url(dial)));
   let auth = fake.context_auth(guest.map(|guest| guest.written.as_str()));
-  DecoyContext {
-    description: doc.description.clone(),
-    url: public_url(dial),
-    user: auth.user,
-    password: auth.password,
-    token: auth.token,
-    creds: auth.creds,
-    nkey: auth.nkey,
-    inbox_prefix: doc.inbox_prefix.clone(),
-    jetstream_domain: doc.jetstream_domain.clone(),
-    jetstream_api_prefix: doc.jetstream_api_prefix.clone(),
-    jetstream_event_prefix: doc.jetstream_event_prefix.clone(),
-    color_scheme: doc.color_scheme.clone(),
-    tls_first: doc.tls_first.then_some(true),
+  match fake {
+    NatsPlain::UserPass { .. } => {
+      out.insert("user".to_string(), Value::String(auth.user));
+      out.insert("password".to_string(), Value::String(auth.password));
+    }
+    NatsPlain::Token(_) => {
+      out.insert("token".to_string(), Value::String(auth.token));
+    }
+    NatsPlain::Nkey(_) => {
+      out.insert("nkey".to_string(), Value::String(auth.nkey));
+    }
+    NatsPlain::Creds { .. } => {
+      out.insert("creds".to_string(), Value::String(auth.creds));
+    }
   }
+  out
 }
 
 #[cfg(test)]
@@ -606,7 +528,6 @@ mod tests {
   use pretty_assertions::assert_eq;
   use secrecy::ExposeSecret as _;
   use serde::Deserialize;
-  use serde_json::Value;
   use tempfile::tempdir;
 
   use super::*;
@@ -719,10 +640,7 @@ mod tests {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     let seed = user_seed();
-    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
-      .unwrap()
-      .public_key()
-      .to_string();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public.clone();
     let jwt = user_jwt(&public);
     let creds = home.path().join(".nkeys").join("user.creds");
     fs::create_dir_all(creds.parent().unwrap()).unwrap();
@@ -762,7 +680,7 @@ mod tests {
     let seed = user_seed();
     let nkey = root.join("operator.nk");
     fs::create_dir_all(&root).unwrap();
-    fs::write(&nkey, format!("# operator key\n{seed}\n")).unwrap();
+    fs::write(&nkey, format!("{seed}\n")).unwrap();
     write_context(
       &root,
       "keyed",
@@ -781,6 +699,8 @@ mod tests {
     let guest = String::from_utf8(guest.clone()).unwrap();
     assert!(!guest.contains(&seed));
     NatsSeed::from_seed(SecretString::from(guest.trim().to_string())).expect("decoy seed");
+    fs::write(&nkey, format!("# operator key\n{seed}\n")).unwrap();
+    assert!(adapt(&root, "/home/eng", home.path()).unwrap().is_none());
 
     write_context(&root, "tok", r#"{"url":"","token":"real-token"}"#);
     let found = adapted(&root, home.path());
@@ -805,10 +725,7 @@ mod tests {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     let seed = user_seed();
-    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
-      .unwrap()
-      .public_key()
-      .to_string();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public.clone();
     let jwt = user_jwt(&public);
     let ssh = home.path().join(".ssh");
     fs::create_dir_all(&ssh).unwrap();
@@ -836,10 +753,7 @@ mod tests {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     let seed = user_seed();
-    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
-      .unwrap()
-      .public_key()
-      .to_string();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public.clone();
     let jwt = user_jwt(&public);
     let creds = root.join("creds");
     fs::create_dir_all(&creds).unwrap();
@@ -860,10 +774,7 @@ mod tests {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     let seed = user_seed();
-    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
-      .unwrap()
-      .public_key()
-      .to_string();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public.clone();
     let jwt = user_jwt(&public);
     let outside = home.path().join("outside.creds");
     fs::write(&outside, decorate_creds(&jwt, &seed)).unwrap();
@@ -889,18 +800,23 @@ mod tests {
   }
 
   #[test]
-  fn unknown_context_field_is_absent_from_the_decoy() {
+  fn unknown_context_field_stays_on_the_decoy_and_secret_keys_do_not() {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     write_context(
       &root,
       "demo",
-      r#"{"url":"nats://nats.internal:4222","token":"real-token","description":"kept","operator_note":"not-for-the-guest"}"#,
+      r#"{"url":"nats://nats.internal:4222","user":"agent","password":"real-token","description":"kept","name":"demo","operator_note":"kept-too","windows_cert_match":"subject","user_jwt":"eyJhbGci.e30.sig"}"#, // betterleaks:allow
     );
     let found = adapted(&root, home.path());
-    assert!(!found.adapted[0].decoy.contains("not-for-the-guest"));
-    assert!(!found.adapted[0].decoy.contains("operator_note"));
-    assert!(found.adapted[0].decoy.contains("kept"));
+    let decoy: Value = serde_json::from_str(&found.adapted[0].decoy).unwrap();
+    assert_eq!(decoy["description"], "kept");
+    assert_eq!(decoy["name"], "demo");
+    assert_eq!(decoy["operator_note"], "kept-too");
+    assert!(decoy.get("windows_cert_match").is_none());
+    assert!(decoy.get("user_jwt").is_none());
+    assert!(!found.adapted[0].decoy.contains("real-token"));
+    assert_ne!(decoy["password"], "real-token");
   }
 
   #[test]
@@ -908,10 +824,7 @@ mod tests {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     let seed = user_seed();
-    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
-      .unwrap()
-      .public_key()
-      .to_string();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public.clone();
     let jwt = user_jwt(&public);
     let creds = root.join("user.creds");
     fs::create_dir_all(&root).unwrap();
@@ -943,25 +856,44 @@ mod tests {
         .auth
         .fields()
         .iter()
-        .map(|field| (field.name.as_str(), field.pair.fake.as_str(), field.pair.real.expose_secret()))
+        .map(|field| (<&str>::from(field.name), field.pair.fake.as_str(), field.pair.real.expose_secret()))
         .collect::<Vec<_>>(),
       vec![("user", "agent", "agent"), ("pass", "", "")]
     );
   }
 
   #[test]
-  fn context_debug_redacts_secrets_and_deserialize_trims() {
-    let doc: NatsContext = serde_json::from_str(
-      r#"{"user":"  agent  ","password":" ZZZ-PASS ","token":"ZZZ-TOKEN","user_seed":"ZZZ-SEED","user_jwt":"ZZZ-JWT"}"#, // betterleaks:allow
-    )
-    .unwrap();
-    assert_eq!(doc.user, "agent");
-    assert_eq!(doc.password, "ZZZ-PASS");
-    let shown = format!("{doc:?}");
-    assert!(shown.contains("redacted"), "{shown}");
-    for secret in ["ZZZ-PASS", "ZZZ-TOKEN", "ZZZ-SEED", "ZZZ-JWT"] {
-      assert!(!shown.contains(secret), "{shown}");
-    }
+  fn password_and_token_keep_surrounding_whitespace() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let password = "  spaced  "; // betterleaks:allow
+    write_context(
+      &root,
+      "demo",
+      &format!(r#"{{"url":"nats://nats.internal:4222","user":"agent","password":"{password}"}}"#),
+    );
+    let found = adapted(&root, home.path());
+    let rule = rule_of(&found);
+    let scope = NatsScope::from_strings(rule.value.unwrap().expose_secret(), rule.real.unwrap().expose_secret()).expect("spaced password");
+    let pass = scope
+      .auth
+      .fields()
+      .into_iter()
+      .find(|field| <&str>::from(field.name) == "pass")
+      .expect("pass");
+    assert_eq!(pass.pair.real.expose_secret(), password);
+    assert!(!found.adapted[0].decoy.contains(password));
+
+    write_context(
+      &root,
+      "demo",
+      &format!(r#"{{"url":"nats://nats.internal:4222","token":"{password}"}}"#),
+    );
+    let found = adapted(&root, home.path());
+    let rule = rule_of(&found);
+    let scope = NatsScope::from_strings(rule.value.unwrap().expose_secret(), rule.real.unwrap().expose_secret()).expect("spaced token");
+    let token = scope.auth.fields().into_iter().next().expect("token");
+    assert_eq!(token.pair.real.expose_secret(), password);
   }
 
   #[test]
@@ -985,7 +917,7 @@ mod tests {
         .iter()
         .map(|field| {
           (
-            field.name.as_str(),
+            <&str>::from(field.name),
             field.pair.fake.clone(),
             field.pair.real.expose_secret().to_string(),
           )
@@ -1006,10 +938,7 @@ mod tests {
     let root = home.path().join(".config").join("nats");
     let outside = tempdir().unwrap();
     let seed = user_seed();
-    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
-      .unwrap()
-      .public_key()
-      .to_string();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public.clone();
     let jwt = user_jwt(&public);
     let creds = outside.path().join("user.creds");
     fs::write(&creds, decorate_creds(&jwt, &seed)).unwrap();
@@ -1048,10 +977,7 @@ mod tests {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     let seed = user_seed();
-    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
-      .unwrap()
-      .public_key()
-      .to_string();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public.clone();
     let jwt = user_jwt(&public);
     write_context(
       &root,
@@ -1080,6 +1006,26 @@ mod tests {
     assert!(!found.adapted[0].decoy.contains(&jwt));
     let scope = NatsScope::from_strings(rule_of(&found).value.unwrap().expose_secret(), &real).expect("inline user jwt");
     assert!(scope.auth.signer().is_some());
+  }
+
+  #[test]
+  fn bare_jwt_or_seed_line_is_not_a_creds_file() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let seed = user_seed();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public;
+    let jwt = user_jwt(&public);
+    let creds = root.join("user.creds");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&creds, format!("{jwt}\n")).unwrap();
+    write_context(
+      &root,
+      "demo",
+      &format!(r#"{{"url":"nats://nats.internal:4222","creds":"{}"}}"#, creds.display()),
+    );
+    assert!(adapt(&root, "/home/eng", home.path()).unwrap().is_none());
+    fs::write(&creds, format!("{jwt}\n{seed}\n")).unwrap();
+    assert!(adapt(&root, "/home/eng", home.path()).unwrap().is_none());
   }
 
   #[test]

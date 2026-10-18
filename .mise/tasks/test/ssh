@@ -190,14 +190,6 @@ EOF
     echo "discovered grant does not state the real nkey"
     return 1
   fi
-  # The password and nkey grants on nats:4222 trust /certs/ca.crt. Discovery
-  # names the copied CA, which is that same demo CA at another path. A shared
-  # fake endpoint has to share the upstream trust path.
-  sed -i -E 's#sslrootcert=[^&"'\''[:space:]]+#sslrootcert=/certs/ca.crt#' "$grant_toml"
-  if ! grep -q 'sslrootcert=/certs/ca.crt' "$grant_toml"; then
-    echo "discovered grant does not share the nats:4222 trust path"
-    return 1
-  fi
   env_name=$(grep -m 1 -E '^env = ' "$grant_toml" || true)
   env_name=${env_name#env = }
   env_name=${env_name#\"}

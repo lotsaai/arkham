@@ -294,32 +294,32 @@ struct SignedMaterial {
 fn signed_material(user_jwt: bool, port: u16) -> SignedMaterial {
   let (fake_raw, fake_seed) = mint_user();
   let (real_raw, real_seed) = mint_user();
-  let sig = e2e_b64(&fake_seed.sign(E2E_NONCE).expect("fake seed signs"));
+  let sig = e2e_b64(&fake_seed.pair.sign(E2E_NONCE).expect("fake seed signs"));
   if user_jwt {
-    let fake_jwt = e2e_user_jwt(fake_seed.public_key());
-    let real_jwt = e2e_user_jwt(real_seed.public_key());
+    let fake_jwt = e2e_user_jwt(&fake_seed.public);
+    let real_jwt = e2e_user_jwt(&real_seed.public);
     SignedMaterial {
       fake_url: format!("nats://creds:{fake_raw}:{fake_jwt}@localhost:{port}"),
       real_userinfo: format!("creds:{real_raw}:{real_jwt}"),
       line: format!(
         "CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":\"{}\",\"sig\":\"{sig}\",\"verbose\":false}}\r\n",
-        fake_seed.public_key()
+        fake_seed.public
       ),
       field: "jwt",
       expect: real_jwt,
-      absent: vec![fake_jwt, fake_raw, real_raw, fake_seed.public_key().to_string()],
-      public: real_seed.public_key().to_string(),
+      absent: vec![fake_jwt, fake_raw, real_raw, fake_seed.public.clone()],
+      public: real_seed.public.clone(),
     }
   } else {
-    let fake_public = fake_seed.public_key().to_string();
+    let fake_public = fake_seed.public.clone();
     SignedMaterial {
       fake_url: format!("nats://nkey:{fake_raw}@localhost:{port}"),
       real_userinfo: format!("nkey:{real_raw}"),
       line: signed_connect("nkey", &fake_public, &sig),
       field: "nkey",
-      expect: real_seed.public_key().to_string(),
+      expect: real_seed.public.clone(),
       absent: vec![fake_public, fake_raw, real_raw],
-      public: real_seed.public_key().to_string(),
+      public: real_seed.public.clone(),
     }
   }
 }

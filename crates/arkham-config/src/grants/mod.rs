@@ -17,7 +17,7 @@ pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub(crate) use nats::NatsUriScheme;
 pub use nats::{
   AuthField, AuthSign, FieldPresence, NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsField, NatsPair, NatsPlain,
-  NatsScope, NatsSeed, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError,
+  NatsScope, NatsSeed, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError, check_user_jwt,
 };
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
@@ -705,7 +705,10 @@ impl GrantCollector {
         if previous.downstream != scope.downstream {
           continue;
         }
-        if previous.upstream != scope.upstream || previous.upstream_tls != scope.upstream_tls || previous.guest_tls != scope.guest_tls {
+        if previous.upstream != scope.upstream
+          || !previous.upstream_tls.same_dial(&scope.upstream_tls)
+          || previous.guest_tls != scope.guest_tls
+        {
           return Err(Error::NatsSharedEndpoint {
             previous: credential.label.clone(),
             label: label.to_string(),
@@ -1299,6 +1302,41 @@ mod tests {
     );
     let resolved = resolve(&cfg).expect("same upstream and guest tls");
     assert_eq!(resolved.grants.len(), 2);
+  }
+
+  #[test]
+  fn nats_shared_endpoint_compares_ca_file_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = dir.path().join("copied.ca");
+    let right = dir.path().join("demo.ca");
+    let pem = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+    std::fs::write(&left, pem).unwrap();
+    std::fs::write(&right, pem).unwrap();
+    let real_a = format!("tls://agent:one@nats.upstream:4222?sslrootcert={}", left.display());
+    let real_b = format!("tls://tok@nats.upstream:4222?sslrootcert={}", right.display());
+    let cfg = two_nats(
+      ("nats_a", "nats://agent:one@nats.internal:4222", &real_a),
+      ("nats_b", "nats://tok@nats.internal:4222", &real_b),
+    );
+    let resolved = resolve(&cfg).expect("the same CA bytes are one trust anchor");
+    assert_eq!(resolved.grants.len(), 2);
+
+    std::fs::write(&right, b"-----BEGIN CERTIFICATE-----\nOTHER\n-----END CERTIFICATE-----\n").unwrap();
+    let cfg = two_nats(
+      ("nats_a", "nats://agent:one@nats.internal:4222", &real_a),
+      ("nats_b", "nats://tok@nats.internal:4222", &real_b),
+    );
+    let err = resolve(&cfg).expect_err("different CA bytes");
+    assert!(err.to_string().contains("nats.internal"), "{err}");
+
+    let missing = dir.path().join("missing.ca");
+    let real_missing = format!("tls://tok@nats.upstream:4222?sslrootcert={}", missing.display());
+    let cfg = two_nats(
+      ("nats_a", "nats://agent:one@nats.internal:4222", &real_a),
+      ("nats_b", "nats://tok@nats.internal:4222", &real_missing),
+    );
+    let err = resolve(&cfg).expect_err("an unreadable CA is not the other file");
+    assert!(err.to_string().contains("nats.internal"), "{err}");
   }
 
   #[test]

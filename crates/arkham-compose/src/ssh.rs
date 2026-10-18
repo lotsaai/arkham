@@ -216,14 +216,7 @@ pub(crate) fn mirror_container_path(identity: &str, host_home: &Path, home: &str
     host_home.join(".ssh").join(identity)
   };
   let host_path = crate::paths::normalize(&host_path);
-  let rest = host_path.strip_prefix(host_home).ok()?;
-  if rest.as_os_str().is_empty() {
-    return None;
-  }
-  let rel = rest.to_string_lossy().replace('\\', "/");
-  if rel.split('/').any(|part| part.is_empty() || part == "..") {
-    return None;
-  }
+  let rel = crate::paths::path_under_home(&host_path, host_home)?;
   Some(format!("{home}/{rel}"))
 }
 

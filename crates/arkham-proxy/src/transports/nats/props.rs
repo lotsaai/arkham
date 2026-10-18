@@ -636,8 +636,9 @@ async fn prop_nats_signed_connect_is_split_stable() {
       let sig = prop_b64(
         &fake
           .seed
+          .pair
           .sign(nonce.as_bytes())
-          .ok_or_else(|| TestCaseError::fail("fake seed signs"))?,
+          .map_err(|_err| TestCaseError::fail("fake seed signs"))?,
       );
       let names: &[&str] = if jwt_kind && with_nkey {
         &["jwt", "nkey", "sig", "name"]
@@ -748,8 +749,9 @@ async fn prop_nats_tampered_signed_connect_is_forwarded() {
       }
       let sig = prop_b64(
         &signer
+          .pair
           .sign(signed_nonce.as_bytes())
-          .ok_or_else(|| TestCaseError::fail("seed signs"))?,
+          .map_err(|_err| TestCaseError::fail("seed signs"))?,
       );
       let mut fields = vec![
         ("nkey".to_string(), json_quote(&nkey_public)),
@@ -804,10 +806,10 @@ async fn prop_nats_tampered_signed_connect_is_forwarded() {
 async fn prop_nats_guest_output_hides_signed_material() {
   let (fake_raw, fake) = mint_user();
   let (real_raw, real) = mint_user();
-  let fake_jwt = prop_user_jwt(fake.public_key());
-  let real_jwt = prop_user_jwt(real.public_key());
-  let fake_public = fake.public_key().to_string();
-  let real_public = real.public_key().to_string();
+  let fake_jwt = prop_user_jwt(&fake.public);
+  let real_jwt = prop_user_jwt(&real.public);
+  let fake_public = fake.public.clone();
+  let real_public = real.public.clone();
   let nkey = nats_grants(
     &format!("nats://nkey:{fake_raw}@{NATS_HOST}:{NATS_PORT}"),
     &format!("tls://nkey:{real_raw}@nats.upstream:{NATS_PORT}"),

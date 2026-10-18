@@ -82,10 +82,10 @@ impl NatsUserinfo {
   /// `user`, `user:pass`, or `user:` when the password is empty.
   #[must_use]
   pub fn encode(&self) -> String {
-    let user = encode_userinfo_component(&self.user);
+    let user = percent_encoding::utf8_percent_encode(&self.user, USERINFO_COMPONENT).to_string();
     match &self.password {
       None => user,
-      Some(pass) => format!("{user}:{}", encode_userinfo_component(pass)),
+      Some(pass) => format!("{user}:{}", percent_encoding::utf8_percent_encode(pass, USERINFO_COMPONENT)),
     }
   }
 }
@@ -240,7 +240,7 @@ impl NatsPlain {
         signs: false,
       }),
       Self::Nkey(_) => {
-        let seed = mint_user_seed()?;
+        let seed = nkeys::KeyPair::new_user().seed().map_err(|_source| NatsUriError::Decoy)?;
         Ok(NatsPrepared {
           decoy: Self::Nkey(seed.clone()),
           file: Some(NatsGuestFile {
@@ -251,8 +251,8 @@ impl NatsPlain {
         })
       }
       Self::Creds { .. } => {
-        let seed = mint_user_seed()?;
-        let public = NatsSeed::from_seed(SecretString::from(seed.clone()))?.public_key().to_string();
+        let seed = nkeys::KeyPair::new_user().seed().map_err(|_source| NatsUriError::Decoy)?;
+        let public = NatsSeed::from_seed(SecretString::from(seed.clone()))?.public.clone();
         let jwt = decoy_user_jwt(&public);
         Ok(NatsPrepared {
           decoy: Self::Creds {
@@ -327,8 +327,8 @@ impl NatsPlain {
         let real = NatsSeed::from_seed(SecretString::from(real))?;
         Ok(NatsAuth::Nkey {
           public_key: NatsPair {
-            fake: fake_seed.public_key().to_string(),
-            real: SecretString::from(real.public_key().to_string()),
+            fake: fake_seed.public.clone(),
+            real: SecretString::from(real.public.clone()),
           },
           seed: real,
           decoy_seed: SecretString::from(fake),
@@ -345,17 +345,17 @@ impl NatsPlain {
         },
       ) => {
         let fake = NatsSeed::from_seed(SecretString::from(fake_seed.clone()))?;
-        check_user_jwt(&fake_jwt, fake.public_key())?;
+        check_user_jwt(&fake_jwt, &fake.public)?;
         let real = NatsSeed::from_seed(SecretString::from(real_seed))?;
-        check_user_jwt(&real_jwt, real.public_key())?;
+        check_user_jwt(&real_jwt, &real.public)?;
         Ok(NatsAuth::UserJwt {
           jwt: NatsPair {
             fake: fake_jwt,
             real: SecretString::from(real_jwt),
           },
           public_key: NatsPair {
-            fake: fake.public_key().to_string(),
-            real: SecretString::from(real.public_key().to_string()),
+            fake: fake.public.clone(),
+            real: SecretString::from(real.public.clone()),
           },
           seed: real,
           decoy_seed: SecretString::from(fake_seed),
@@ -364,10 +364,6 @@ impl NatsPlain {
       _ => Err(NatsUriError::AuthKindMismatch),
     }
   }
-}
-
-fn mint_user_seed() -> Result<String, NatsUriError> {
-  nkeys::KeyPair::new_user().seed().map_err(|_source| NatsUriError::Decoy)
 }
 
 fn decoy_user_jwt(public: &str) -> String {
@@ -391,17 +387,18 @@ const USERINFO_COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_A
   .remove(b'_')
   .remove(b'~');
 
-fn encode_userinfo_component(value: &str) -> String {
-  percent_encoding::utf8_percent_encode(value, USERINFO_COMPONENT).to_string()
-}
-
 /// User nkey seed. The raw seed is not a CONNECT field.
 ///
-/// `Debug` shows [`Self::public_key`] only. [`secrecy::SecretString`] redacts the seed.
+/// [`secrecy::SecretString`] redacts [`Self::raw`]. [`nkeys::KeyPair`]'s `Debug`
+/// prints the key type and not the seed.
 #[derive(Debug, Clone)]
 pub struct NatsSeed {
-  raw: SecretString,
-  public: String,
+  /// Seed text.
+  pub raw: SecretString,
+  /// Public key derived from [`Self::raw`].
+  pub public: String,
+  /// Signing key for this seed.
+  pub pair: nkeys::KeyPair,
 }
 
 impl NatsSeed {
@@ -419,38 +416,9 @@ impl NatsSeed {
     }
     Ok(Self {
       public: pair.public_key(),
+      pair,
       raw,
     })
-  }
-
-  /// Public key derived from the seed.
-  #[must_use]
-  pub fn public_key(&self) -> &str {
-    &self.public
-  }
-
-  /// `true` when `jwt` is a NATS user JWT whose `sub` is this seed's public key.
-  ///
-  /// The check is [`jwt::Token::parse_unverified`]. It reads the header and
-  /// claims and does not check the account signature.
-  #[must_use]
-  pub fn matches_user_jwt(&self, jwt: &str) -> bool {
-    check_user_jwt(jwt, &self.public).is_ok()
-  }
-
-  /// The seed text. Redaction and the nonce signature are the callers.
-  #[must_use]
-  pub fn expose_secret(&self) -> &str {
-    self.raw.expose_secret()
-  }
-
-  /// Raw ed25519 signature of `message` under this seed.
-  ///
-  /// `None` when the stored seed does not rebuild. The seed is not copied into that `None`.
-  #[must_use]
-  pub fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
-    let pair = nkeys::KeyPair::from_seed(self.raw.expose_secret()).ok()?;
-    pair.sign(message).ok()
   }
 
   /// `true` when `sig` is an ed25519 signature of `message` under `public`.
@@ -479,14 +447,6 @@ pub enum NatsField {
   Jwt,
   /// CONNECT `sig`.
   Sig,
-}
-
-impl NatsField {
-  /// The JSON key.
-  #[must_use]
-  pub fn as_str(self) -> &'static str {
-    <&str>::from(self)
-  }
 }
 
 /// Whether a CONNECT field has to be present for the method to match.
@@ -617,7 +577,7 @@ impl NatsAuth {
   pub fn concealed(&self) -> Option<(&str, &str)> {
     match self {
       Self::Nkey { seed, decoy_seed, .. } | Self::UserJwt { seed, decoy_seed, .. } => {
-        Some((decoy_seed.expose_secret(), seed.expose_secret()))
+        Some((decoy_seed.expose_secret(), seed.raw.expose_secret()))
       }
       Self::UserPass { .. } | Self::Token(_) => None,
     }
@@ -668,6 +628,39 @@ pub enum NatsTlsOrder {
   AfterInfo,
   /// `handshake_first=true`. TLS before any protocol byte, on both legs.
   HandshakeFirst,
+}
+
+impl NatsUpstream {
+  /// Same upstream dial for one fake endpoint.
+  ///
+  /// Root CA paths compare by file bytes, so a copied bundle and the path it
+  /// was copied from are one trust anchor. A path that cannot be read does
+  /// not match a different path. Client identity paths stay path identity.
+  pub(crate) fn same_dial(&self, other: &Self) -> bool {
+    match (self, other) {
+      (Self::Cleartext, Self::Cleartext) => true,
+      (
+        Self::Tls {
+          order: left_order,
+          trust: left,
+        },
+        Self::Tls {
+          order: right_order,
+          trust: right,
+        },
+      ) => left_order == right_order && left.identity == right.identity && root_certs_match(&left.root_cert, &right.root_cert),
+      (Self::Cleartext, Self::Tls { .. }) | (Self::Tls { .. }, Self::Cleartext) => false,
+    }
+  }
+}
+
+fn root_certs_match(left: &RootCert, right: &RootCert) -> bool {
+  match (left, right) {
+    (RootCert::System, RootCert::System) => true,
+    (RootCert::Path(left), RootCert::Path(right)) if left == right => true,
+    (RootCert::Path(left), RootCert::Path(right)) => std::fs::read(left).ok().zip(std::fs::read(right).ok()).is_some_and(|(a, b)| a == b),
+    (RootCert::System, RootCert::Path(_)) | (RootCert::Path(_), RootCert::System) => false,
+  }
 }
 
 /// Upstream verification material. It lives only inside
@@ -942,7 +935,7 @@ fn creds_parsed_seed(password: &str) -> Option<NatsUriError> {
 fn plain_creds(password: &str) -> Result<NatsPlain, NatsUriError> {
   let (seed, jwt) = split_creds(password)?;
   let signer = NatsSeed::from_seed(SecretString::from(seed.clone()))?;
-  check_user_jwt(&jwt, signer.public_key())?;
+  check_user_jwt(&jwt, &signer.public)?;
   Ok(NatsPlain::Creds { seed, jwt })
 }
 
@@ -975,7 +968,16 @@ struct UserJwtClaims {
 /// not check the account signature. This string carries the user seed, not
 /// the account key. `jwt::Error::Json` can echo a segment, so a parse failure
 /// stays a static variant.
-fn check_user_jwt(jwt: &str, public: &str) -> Result<(), NatsUriError> {
+/// `Ok` when `jwt` is a NATS user JWT whose `sub` is `public`.
+///
+/// [`jwt::Token::parse_unverified`] reads the header and claims. It does
+/// not check the account signature.
+///
+/// # Errors
+///
+/// [`NatsUriError::UserJwt`] when the text is not that JWT.
+/// [`NatsUriError::JwtSeedMismatch`] when `sub` is a different public key.
+pub fn check_user_jwt(jwt: &str, public: &str) -> Result<(), NatsUriError> {
   let token = jwt::Token::<UserJwtHeader, UserJwtClaims, _>::parse_unverified(jwt).map_err(|_source| NatsUriError::UserJwt)?;
   let header = token.header();
   if header.alg != "ed25519-nkey" || header.typ != "JWT" {
@@ -1247,128 +1249,135 @@ mod tests {
     }
   }
 
-  #[test]
-  fn creds_seed_whose_jwt_names_another_key_is_rejected() {
-    let (seed, _public) = user_material();
-    let other = user_material().1;
-    let jwt = user_jwt(&other, br#"{"alg":"ed25519-nkey","typ":"JWT"}"#);
-    let uri = format!("nats://creds:{seed}:{jwt}@nats.internal:4222");
-    let err = NatsScope::from_strings(&uri, &uri).expect_err("jwt sub is another key");
-    assert!(matches!(err, NatsUriError::JwtSeedMismatch), "{err}");
-    hides(&err, &[seed.as_str(), jwt.as_str(), other.as_str()]);
+  #[derive(Clone, Copy)]
+  enum SeedReject {
+    JwtSeedMismatch,
+    UserJwt,
+    UserSeed,
+    MisplacedSeed,
+  }
+
+  struct SeedCase {
+    label: &'static str,
+    fake: String,
+    real: String,
+    expect: SeedReject,
+    secrets: Vec<String>,
+  }
+
+  fn both(label: &'static str, uri: String, expect: SeedReject, secrets: &[&str]) -> SeedCase {
+    SeedCase {
+      label,
+      fake: uri.clone(),
+      real: uri,
+      expect,
+      secrets: secrets.iter().map(|secret| (*secret).to_string()).collect(),
+    }
+  }
+
+  fn seed_cases(seed: &str, public: &str, other: &str, account: &str, operator: &str) -> Vec<SeedCase> {
+    let jwt = user_jwt(public, br#"{"alg":"ed25519-nkey","typ":"JWT"}"#);
+    let other_jwt = user_jwt(other, br#"{"alg":"ed25519-nkey","typ":"JWT"}"#);
+    let host = "nats.internal:4222";
+    vec![
+      both(
+        "jwt names another key",
+        format!("nats://creds:{seed}:{other_jwt}@{host}"),
+        SeedReject::JwtSeedMismatch,
+        &[seed, other_jwt.as_str(), other],
+      ),
+      both(
+        "malformed jwt",
+        format!("nats://creds:{seed}:not-a-jwt@{host}"),
+        SeedReject::UserJwt,
+        &[seed, "not-a-jwt"],
+      ),
+      both(
+        "seed without jwt",
+        format!("nats://creds:{seed}@{host}"),
+        SeedReject::UserJwt,
+        &[seed],
+      ),
+      both(
+        "account seed without jwt",
+        format!("nats://creds:{account}@{host}"),
+        SeedReject::UserSeed,
+        &[account],
+      ),
+      both(
+        "jwt then seed",
+        format!("nats://creds:{jwt}:{seed}@{host}"),
+        SeedReject::MisplacedSeed,
+        &[seed, jwt.as_str()],
+      ),
+      both("seed token", format!("nats://{seed}@{host}"), SeedReject::MisplacedSeed, &[seed]),
+      both(
+        "username",
+        format!("nats://{seed}:ordinary-pass@{host}"),
+        SeedReject::MisplacedSeed,
+        &[seed],
+      ),
+      both(
+        "password",
+        format!("nats://agent:{seed}@{host}"),
+        SeedReject::MisplacedSeed,
+        &[seed],
+      ),
+      both(
+        "account password",
+        format!("nats://agent:{account}@{host}"),
+        SeedReject::MisplacedSeed,
+        &[account],
+      ),
+      both(
+        "account token",
+        format!("nats://{account}@{host}"),
+        SeedReject::MisplacedSeed,
+        &[account],
+      ),
+      both(
+        "operator token",
+        format!("nats://{operator}@{host}"),
+        SeedReject::MisplacedSeed,
+        &[operator],
+      ),
+      both(
+        "nkey segment",
+        format!("nats://nkey:not-a-seed:{seed}@{host}"),
+        SeedReject::MisplacedSeed,
+        &[seed],
+      ),
+      SeedCase {
+        label: "real password",
+        fake: "nats://agent:ordinary-pass@nats.internal:4222".to_string(),
+        real: format!("tls://agent:{seed}@nats.upstream:4222"),
+        expect: SeedReject::MisplacedSeed,
+        secrets: vec![seed.to_string()],
+      },
+    ]
   }
 
   #[test]
-  fn creds_valid_seed_with_a_malformed_jwt_is_rejected() {
-    let (seed, _public) = user_material();
-    let jwt = "not-a-jwt";
-    let uri = format!("nats://creds:{seed}:{jwt}@nats.internal:4222");
-    let err = match NatsScope::from_strings(&uri, &uri) {
-      Ok(_scope) => panic!("a seed with a malformed jwt was accepted"),
-      Err(err) => err,
-    };
-    assert!(matches!(err, NatsUriError::UserJwt), "{err}");
-    hides(&err, &[seed.as_str(), jwt]);
-  }
-
-  #[test]
-  fn creds_valid_seed_without_a_jwt_is_rejected() {
-    let (seed, _public) = user_material();
-    let uri = format!("nats://creds:{seed}@nats.internal:4222");
-    let err = match NatsScope::from_strings(&uri, &uri) {
-      Ok(_scope) => panic!("a seed with no jwt was accepted"),
-      Err(err) => err,
-    };
-    assert!(matches!(err, NatsUriError::UserJwt), "{err}");
-    hides(&err, &[seed.as_str()]);
-  }
-
-  #[test]
-  fn creds_account_seed_without_a_jwt_is_rejected() {
-    let seed = nkeys::KeyPair::new_account().seed().expect("account seed");
-    let uri = format!("nats://creds:{seed}@nats.internal:4222");
-    let err = match NatsScope::from_strings(&uri, &uri) {
-      Ok(_scope) => panic!("an account seed with no jwt was accepted"),
-      Err(err) => err,
-    };
-    assert!(matches!(err, NatsUriError::UserSeed), "{err}");
-    hides(&err, &[seed.as_str()]);
-  }
-
-  #[test]
-  fn creds_jwt_then_seed_is_rejected() {
+  fn creds_and_userinfo_reject_a_seed_outside_its_place() {
     let (seed, public) = user_material();
-    let jwt = user_jwt(&public, br#"{"alg":"ed25519-nkey","typ":"JWT"}"#);
-    let uri = format!("nats://creds:{jwt}:{seed}@nats.internal:4222");
-    let err = match NatsScope::from_strings(&uri, &uri) {
-      Ok(_scope) => panic!("a jwt then a seed was accepted"),
-      Err(err) => err,
-    };
-    assert!(matches!(err, NatsUriError::MisplacedSeed), "{err}");
-    hides(&err, &[seed.as_str(), jwt.as_str()]);
-  }
-
-  #[test]
-  fn seed_as_token_is_rejected() {
-    let (seed, _public) = user_material();
-    let uri = format!("nats://{seed}@nats.internal:4222");
-    let err = match NatsScope::from_strings(&uri, &uri) {
-      Ok(_scope) => panic!("a seed token was accepted"),
-      Err(err) => err,
-    };
-    assert!(matches!(err, NatsUriError::MisplacedSeed), "{err}");
-    hides(&err, &[seed.as_str()]);
-  }
-
-  #[test]
-  fn seed_in_other_userinfo_positions_is_rejected() {
-    let (seed, _public) = user_material();
+    let other = user_material().1;
     let account = nkeys::KeyPair::new_account().seed().expect("account seed");
     let operator = nkeys::KeyPair::new_operator().seed().expect("operator seed");
-    let cases = [
-      (
-        "username",
-        format!("nats://{seed}:ordinary-pass@nats.internal:4222"),
-        vec![seed.as_str()],
-      ),
-      ("password", format!("nats://agent:{seed}@nats.internal:4222"), vec![seed.as_str()]),
-      (
-        "account password",
-        format!("nats://agent:{account}@nats.internal:4222"),
-        vec![account.as_str()],
-      ),
-      (
-        "account token",
-        format!("nats://{account}@nats.internal:4222"),
-        vec![account.as_str()],
-      ),
-      (
-        "operator token",
-        format!("nats://{operator}@nats.internal:4222"),
-        vec![operator.as_str()],
-      ),
-      (
-        "nkey segment",
-        format!("nats://nkey:not-a-seed:{seed}@nats.internal:4222"),
-        vec![seed.as_str()],
-      ),
-      (
-        "real password",
-        format!("tls://agent:{seed}@nats.upstream:4222"),
-        vec![seed.as_str()],
-      ),
-    ];
-    for (label, uri, secrets) in cases {
-      let fake = if label == "real password" {
-        "nats://agent:ordinary-pass@nats.internal:4222".to_string()
-      } else {
-        uri.clone()
-      };
-      let err = match NatsScope::from_strings(&fake, &uri) {
-        Ok(_scope) => panic!("{label} was accepted"),
+    let cases = seed_cases(&seed, &public, &other, &account, &operator);
+    for case in cases {
+      let err = match NatsScope::from_strings(&case.fake, &case.real) {
+        Ok(_scope) => panic!("{} was accepted", case.label),
         Err(err) => err,
       };
-      assert!(matches!(err, NatsUriError::MisplacedSeed), "{label}: {err}");
+      let matched = matches!(
+        (case.expect, &err),
+        (SeedReject::JwtSeedMismatch, NatsUriError::JwtSeedMismatch)
+          | (SeedReject::UserJwt, NatsUriError::UserJwt)
+          | (SeedReject::UserSeed, NatsUriError::UserSeed)
+          | (SeedReject::MisplacedSeed, NatsUriError::MisplacedSeed)
+      );
+      assert!(matched, "{}: {err}", case.label);
+      let secrets: Vec<&str> = case.secrets.iter().map(String::as_str).collect();
       hides(&err, &secrets);
     }
   }
@@ -1397,7 +1406,7 @@ mod tests {
       .into_iter()
       .map(|field| {
         (
-          field.name.as_str(),
+          <&str>::from(field.name),
           field.pair.fake.clone(),
           field.pair.real.expose_secret().to_string(),
         )
@@ -1714,7 +1723,7 @@ mod tests {
     assert_eq!(scope.auth.forbidden(), &[super::NatsField::Jwt]);
     assert!(scope.auth.signer().is_some());
     let nonce = b"N0NCE";
-    let signed = seed.sign(nonce).expect("real seed signs");
+    let signed = seed.pair.sign(nonce).expect("real seed signs");
     assert!(super::NatsSeed::verify(&case.real_public, nonce, &signed));
     assert!(!super::NatsSeed::verify(&case.fake_public, nonce, &signed));
     let shown = format!("{scope:?}");
@@ -1756,9 +1765,9 @@ mod tests {
     assert_eq!(public_key.fake, case.fake_public);
     assert_eq!(public_key.real.expose_secret(), case.real_public);
     assert_eq!(scope.auth.forbidden(), &[]);
-    let names: Vec<&str> = scope.auth.fields().iter().map(|field| field.name.as_str()).collect();
+    let names: Vec<&str> = scope.auth.fields().iter().map(|field| <&str>::from(field.name)).collect();
     assert_eq!(names, ["jwt", "nkey"]);
-    let signed = seed.sign(b"N0NCE").expect("real seed signs");
+    let signed = seed.pair.sign(b"N0NCE").expect("real seed signs");
     assert!(super::NatsSeed::verify(public_key.real.expose_secret(), b"N0NCE", &signed));
     let shown = format!("{scope:?}");
     assert!(!shown.contains(&case.fake_seed));

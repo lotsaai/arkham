@@ -711,7 +711,7 @@ mod tests {
   }
 
   fn sig_b64(seed: &NatsSeed, nonce: &[u8]) -> String {
-    let raw = seed.sign(nonce).expect("seed signs");
+    let raw = seed.pair.sign(nonce).expect("seed signs");
     base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &raw)
   }
 
@@ -736,7 +736,7 @@ mod tests {
     let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
     assert_eq!(guest, info);
-    let line = nkey_connect(fake.public_key(), &sig_b64(&fake, b"N0NCE"));
+    let line = nkey_connect(fake.public.as_str(), &sig_b64(&fake, b"N0NCE"));
     let (rewritten, hits) = down.feed(line.as_bytes()).await;
     assert_eq!(hits.len(), 1);
     let Rewritten::Emit(bytes) = rewritten else {
@@ -744,11 +744,11 @@ mod tests {
     };
     let text = String::from_utf8_lossy(&bytes);
     let value: serde_json::Value = serde_json::from_str(text.trim().strip_prefix("CONNECT").expect("verb")).expect("json");
-    assert_eq!(value.get("nkey").and_then(serde_json::Value::as_str), Some(real.public_key()));
+    assert_eq!(value.get("nkey").and_then(serde_json::Value::as_str), Some(real.public.as_str()));
     let sig = value.get("sig").and_then(serde_json::Value::as_str).expect("sig");
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig).expect("sig bytes");
-    assert!(NatsSeed::verify(real.public_key(), b"N0NCE", &raw));
-    assert!(!text.contains(fake.public_key()));
+    assert!(NatsSeed::verify(real.public.as_str(), b"N0NCE", &raw));
+    assert!(!text.contains(fake.public.as_str()));
   }
 
   /// The first INFO had no nonce. A later INFO's nonce does not replace that.
@@ -771,14 +771,14 @@ mod tests {
     assert_eq!(rest, Some(Vec::new()));
     let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
-    let line = nkey_connect(fake.public_key(), &sig_b64(&fake, b"N0NCE"));
+    let line = nkey_connect(fake.public.as_str(), &sig_b64(&fake, b"N0NCE"));
     let (rewritten, hits) = down.feed(line.as_bytes()).await;
     assert_eq!(hits.len(), 0);
     let Rewritten::Emit(bytes) = rewritten else {
       panic!("forwarded connect");
     };
     assert_eq!(bytes.as_ref(), line.as_bytes());
-    assert!(!line.contains(real.public_key()));
+    assert!(!line.contains(real.public.as_str()));
   }
 
   /// A close, `tls_required`, or an unreadable INFO does not arm a nonce.
@@ -790,7 +790,7 @@ mod tests {
       &format!("nats://nkey:{fake_raw}@nats.internal:4222"),
       &format!("nats://nkey:{real_raw}@nats.upstream:4222"),
     );
-    let line = nkey_connect(fake.public_key(), &sig_b64(&fake, b"N0NCE"));
+    let line = nkey_connect(fake.public.as_str(), &sig_b64(&fake, b"N0NCE"));
     let cases: Vec<OpeningFailure<'_>> = vec![
       (b"", |_| false),
       (b"INFO {\"nonce\":\"N0NCE\",\"tls_required\":true}\r\n", |err| {
@@ -826,8 +826,8 @@ mod tests {
       assert_eq!(bytes.as_ref(), line.as_bytes());
       assert!(
         !bytes
-          .windows(real.public_key().len())
-          .any(|window| window == real.public_key().as_bytes())
+          .windows(real.public.as_str().len())
+          .any(|window| window == real.public.as_bytes())
       );
     }
   }

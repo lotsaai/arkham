@@ -481,10 +481,7 @@ mod moved_suite {
     fs::create_dir_all(creds_dir).unwrap();
     fs::create_dir_all(nats.join("context")).unwrap();
     let seed = nkeys::KeyPair::new_user().seed().unwrap();
-    let public = NatsSeed::from_seed(SecretString::from(seed.clone()))
-      .unwrap()
-      .public_key()
-      .to_string();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public;
     let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"{public}"}}"#).as_bytes());
     let jwt = format!(
