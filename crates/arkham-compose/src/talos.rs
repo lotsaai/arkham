@@ -409,3 +409,93 @@ mod tests {
     assert!(adapted.decoy.contains("nodes:\n    - 10.5.0.7"), "{}", adapted.decoy);
   }
 }
+
+#[cfg(test)]
+mod moved_suite {
+
+  use std::fs;
+
+  use arkham_config::config::{FileRewrite, RewriteFormat};
+  use tempfile::tempdir;
+
+  use crate::decoys::*;
+  use crate::expand::*;
+
+  use crate::rewrites::*;
+
+  /// Talosconfig sources adapt with no `envs`, stated or sniffed, and an
+  /// `envs` statement is rejected either way.
+  #[test]
+  fn talos_rewrites_adapt_stated_or_sniffed() {
+    use std::collections::HashMap;
+
+    use arkham_pki::ca::CertAuthority;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let talos_doc = format!(
+      "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n",
+      STANDARD.encode(b"CA"),
+      STANDARD.encode(b"CRT"),
+      STANDARD.encode(b"KEY"),
+    );
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("talosconfig");
+    fs::write(&source, talos_doc).unwrap();
+    let ca = CertAuthority::generate().unwrap();
+    let expander = build_expander(HashMap::new());
+    let files = dir.path().join("files");
+    let guests = dir.path().join("guests");
+    for format in [None, Some(RewriteFormat::Talos)] {
+      let outputs = write_rewrites(&RewriteInputs {
+        files_dir: &files,
+        root: dir.path(),
+        rewrites: &[FileRewrite {
+          source: source.clone(),
+          dest: "{home}/.talos/config".to_string(),
+          envs: Vec::new(),
+          format,
+        }],
+        decoys: &[],
+        env: &HashMap::new(),
+        expander: &expander,
+        home: "/home/eng",
+        host_home: None,
+        kube_ca: Some(&ca),
+        guests_dir: &guests,
+      })
+      .unwrap();
+      assert_eq!(outputs.grants.len(), 1);
+      assert!(
+        outputs.grants[0].fragment.contains("https://10.5.0.6:50000"),
+        "{}",
+        outputs.grants[0].fragment
+      );
+      let body = fs::read_to_string(&outputs.mounts[0].host).unwrap();
+      assert!(body.contains("endpoints:\n    - 10.5.0.6"), "{body}");
+      assert!(!body.contains(&STANDARD.encode(b"CRT")), "no real credential survives: {body}");
+    }
+    let error = write_rewrites(&RewriteInputs {
+      files_dir: &files,
+      root: dir.path(),
+      rewrites: &[FileRewrite {
+        source: source.clone(),
+        dest: "{home}/.talos/config".to_string(),
+        envs: vec!["TALOS_CERT".to_string()],
+        format: Some(RewriteFormat::Talos),
+      }],
+      decoys: &[Decoy {
+        env: "TALOS_CERT".to_string(),
+        value: "decoy-cert".to_string(),
+      }],
+      env: &HashMap::from([("TALOS_CERT".to_string(), "real-cert".to_string())]),
+      expander: &expander,
+      home: "/home/eng",
+      host_home: None,
+      kube_ca: Some(&ca),
+      guests_dir: &guests,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("drop `envs`"), "{error}");
+  }
+}

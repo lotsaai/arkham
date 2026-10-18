@@ -916,3 +916,386 @@ mod tests {
     assert_eq!(uncovered_warning(&[]), None);
   }
 }
+
+#[cfg(test)]
+mod moved_suite {
+
+  use arkham_config::config::WorkspaceBuild;
+  use std::fs;
+  use tempfile::tempdir;
+
+  use crate::stack::*;
+  use crate::test_support::*;
+  use crate::workspace::*;
+
+  #[test]
+  fn the_agent_service_carries_what_inner_containers_need() {
+    let yaml = test_stack(ProxyBackend::Tproxy).render();
+    for expected in [
+      "image: ghcr.io/casualjim/devagent:26.04",
+      "security_opt: [seccomp=unconfined, systempaths=unconfined, apparmor=unconfined]",
+      "cap_add: [SYS_CHROOT, AUDIT_WRITE, NET_ADMIN, SETUID, SETGID, SYS_ADMIN]",
+      "devices: [/dev/net/tun]",
+      "user: \"1000\"",
+      "- /state/arkham/ws/arkham/containers:/home/eng/.local/share/containers",
+    ] {
+      assert!(yaml.contains(expected), "missing {expected}:\n{yaml}");
+    }
+    // The agent runs its own runtime; it never reaches the host's.
+    assert!(!yaml.contains("docker.sock") && !yaml.contains("/var/run/docker"), "{yaml}");
+  }
+
+  #[test]
+  fn render_keeps_comments_at_their_key_indent() {
+    let yaml = test_stack(ProxyBackend::Ebpf).render();
+    for expected in [
+      "    # Capture dies with this process: the eBPF attachments are fd-held\n    # and the listeners live in it",
+      "    restart: unless-stopped",
+      "# (global layer plus this workspace's .config/arkham/config.toml, discovered\n# from its working directory",
+    ] {
+      assert!(yaml.contains(expected), "{yaml}");
+    }
+    assert!(!yaml.contains("\n          #") && !yaml.contains("\n       # "), "{yaml}");
+  }
+
+  #[test]
+  fn workspace_image_overrides_the_agent_image() {
+    let mut stack = test_stack(ProxyBackend::Tproxy);
+    stack.agent.image = "ghcr.io/example/devenv:1.0".to_string();
+    let yaml = stack.render();
+    assert!(yaml.contains("image: ghcr.io/example/devenv:1.0"), "{yaml}");
+    assert!(!yaml.contains(DEFAULT_AGENT_IMAGE), "{yaml}");
+  }
+
+  #[test]
+  fn agent_build_renders_context_and_dockerfile() {
+    let mut stack = test_stack(ProxyBackend::Tproxy);
+    let build = AgentBuild {
+      context: PathBuf::from("/ws/docker"),
+      dockerfile: PathBuf::from("/ws/docker/Dockerfile.agent"),
+    };
+    stack.agent.build = Some(build);
+    let yaml = stack.render();
+    assert!(
+      yaml.contains("build:\n      context: /ws/docker\n      dockerfile: /ws/docker/Dockerfile.agent"),
+      "{yaml}"
+    );
+  }
+
+  #[test]
+  fn default_agent_service_has_no_build_section() {
+    let yaml = test_stack(ProxyBackend::Tproxy).render();
+    assert!(!yaml.contains("\n    build:\n"), "{yaml}");
+  }
+
+  #[test]
+  fn agent_image_resolution_prefers_config_then_build_then_default() {
+    assert_eq!(
+      AgentSpec::image("arkham", Some("ghcr.io/example/devenv:1.0"), false).unwrap(),
+      "ghcr.io/example/devenv:1.0"
+    );
+    assert_eq!(AgentSpec::image("arkham", None, false).unwrap(), DEFAULT_AGENT_IMAGE);
+    assert_eq!(AgentSpec::image("arkham", None, true).unwrap(), "arkham-agent-arkham:local");
+    AgentSpec::image("arkham", Some(""), false).unwrap_err();
+  }
+
+  #[test]
+  fn agent_build_resolution_rejects_missing_inputs() {
+    let dir = tempdir().unwrap();
+    let build = WorkspaceBuild {
+      dockerfile: PathBuf::from("docker/Dockerfile.agent"),
+      context: PathBuf::from("docker"),
+    };
+    let layout = Layout::new(dir.path(), String::new(), None);
+    let err = layout.resolve_build(&build).unwrap_err();
+    assert!(err.to_string().contains("dockerfile"), "{err:?}");
+    let docker = dir.path().join("docker");
+    fs::create_dir(&docker).unwrap();
+    fs::write(docker.join("Dockerfile.agent"), "FROM scratch\n").unwrap();
+    let (context, dockerfile) = layout.resolve_build(&build).unwrap();
+    assert_eq!(context, docker);
+    assert_eq!(dockerfile, docker.join("Dockerfile.agent"));
+    fs::remove_dir_all(&docker).unwrap();
+    fs::write(dir.path().join("Dockerfile.agent"), "FROM scratch\n").unwrap();
+    let lone = WorkspaceBuild {
+      dockerfile: PathBuf::from("Dockerfile.agent"),
+      context: PathBuf::from("docker"),
+    };
+    let err = layout.resolve_build(&lone).unwrap_err();
+    assert!(err.to_string().contains("context"), "{err:?}");
+  }
+
+  #[test]
+  fn workspace_devices_and_caps_append_to_the_agent_builtin_set() {
+    let mut stack = test_stack(ProxyBackend::Tproxy);
+    stack.agent.devices = vec!["/dev/kvm".to_string()];
+    stack.agent.cap_add = vec!["SYS_PTRACE".to_string()];
+    let yaml = stack.render();
+    assert!(yaml.contains("devices: [/dev/net/tun, /dev/kvm]"), "{yaml}");
+    assert!(
+      yaml.contains("cap_add: [SYS_CHROOT, AUDIT_WRITE, NET_ADMIN, SETUID, SETGID, SYS_ADMIN, SYS_PTRACE]"),
+      "{yaml}"
+    );
+  }
+
+  #[test]
+  fn compose_yaml_indents_every_mapping_key_under_its_parent() {
+    // The generated stack is parsed by docker's YAML loader, so a key at the
+    // wrong depth is a hard failure, not a cosmetic one. In these literals a
+    // `\`-continued line drops its leading whitespace while the first line
+    // keeps it.
+    let yaml = test_stack(ProxyBackend::Tproxy).render();
+    for expected in [
+      "\n    cap_add:\n      - NET_ADMIN\n",
+      "\n    stop_grace_period: 1s\n",
+      "\n    volumes:\n",
+      "\n  agent:\n",
+      "\n  arkham:\n",
+      "\nservices:\n",
+    ] {
+      assert!(yaml.contains(expected), "missing {expected:?}:\n{yaml}");
+    }
+  }
+
+  #[test]
+  fn compose_yaml_mounts_the_workspace_at_its_translated_path() {
+    let mounts = vec![
+      mount("/home/ivan/github/arkham", "/home/eng/github/arkham", false),
+      mount("/home/ivan/.config/mise", "/home/eng/.config/mise", true),
+    ];
+    let yaml = Stack {
+      agent: agent_paths("/home/eng/github/arkham"),
+      mounts: mounts.clone(),
+      ..test_stack(ProxyBackend::Tproxy)
+    }
+    .render();
+    assert!(yaml.contains("name: arkham\nservices:"), "{yaml}");
+    assert!(yaml.contains("working_dir: \"/home/eng/github/arkham\""), "{yaml}");
+    assert!(yaml.contains("- /home/ivan/github/arkham:/home/eng/github/arkham:rw"), "{yaml}");
+    assert!(yaml.contains("- /home/ivan/.config/mise:/home/eng/.config/mise:ro"), "{yaml}");
+    assert!(
+      yaml.contains("entrypoint: [\"/home/eng/.config/arkham/agent-entrypoint.sh\"]"),
+      "the entrypoint is the in-container path: {yaml}"
+    );
+    assert!(
+      yaml.contains(":/home/eng/.config/arkham/agent-entrypoint.sh:ro"),
+      "mounted where the entrypoint names it: {yaml}"
+    );
+    assert!(yaml.contains("network_mode: \"service:arkham\""), "{yaml}");
+    assert!(yaml.contains(":/certs/ca.pem"), "the CA is mounted for arkham: {yaml}");
+    assert!(!yaml.contains("/root/.config/fnox"), "no fnox mount without binds to mount: {yaml}");
+    assert!(yaml.contains("init: true"), "{yaml}");
+    assert!(yaml.contains(&format!("GITHUB_TOKEN: \"{}\"", decoys()[0].value)), "{yaml}");
+  }
+
+  #[test]
+  fn slug_uses_path_segments() {
+    assert_eq!(slug(Path::new("/home/ivan/github/arkham")), "home-ivan-github-arkham");
+    assert_eq!(slug(Path::new("/srv/My_Project")), "srv-my-project");
+  }
+
+  #[test]
+  fn each_backend_shapes_the_serve_command_and_its_host_wiring() {
+    let render = |backend| test_stack(backend).render();
+
+    let tproxy = render(ProxyBackend::Tproxy);
+    assert!(tproxy.contains("command: [\"serve\", \"--proxy-backend\", \"tproxy\"]"), "{tproxy}");
+    assert_eq!(
+      tproxy.matches("/dev/net/tun").count(),
+      1,
+      "only the agent service asks for the tun device: {tproxy}"
+    );
+    assert!(!tproxy.contains("cgroup"), "{tproxy}");
+
+    let tun = render(ProxyBackend::Tun);
+    assert!(tun.contains("command: [\"serve\", \"--proxy-backend\", \"tun\"]"), "{tun}");
+    assert_eq!(tun.matches("/dev/net/tun").count(), 2, "arkham needs the tun device too: {tun}");
+    assert!(!tun.contains("--ebpf-cgroup"), "{tun}");
+
+    let ebpf = render(ProxyBackend::Ebpf);
+    assert!(
+      ebpf.contains("command: [\"serve\", \"--proxy-backend\", \"ebpf\", \"--ebpf-cgroup\", \"enclosing\"]"),
+      "{ebpf}"
+    );
+    for expected in ["    cgroup: host\n", "      - BPF\n      - PERFMON\n"] {
+      assert!(ebpf.contains(expected), "missing {expected:?}:\n{ebpf}");
+    }
+    assert_eq!(
+      ebpf.matches("    cgroup_parent: arkham-arkham.slice\n").count(),
+      2,
+      "both services carry the shared cgroup, so docker creates it as arkham starts: {ebpf}"
+    );
+    assert_eq!(ebpf.matches("/dev/net/tun").count(), 1, "ebpf needs no tun device: {ebpf}");
+    assert_eq!(
+      ebpf.matches("ARKHAM_EBPF_BYPASS_FILE: /arkham/ebpf-bypass\n").count(),
+      2,
+      "arkham reads and the agent writes the same shared bypass file: {ebpf}"
+    );
+    assert!(!tun.contains("ARKHAM_EBPF_BYPASS_FILE"), "{tun}");
+    assert!(!tproxy.contains("ARKHAM_EBPF_BYPASS_FILE"), "{tproxy}");
+  }
+
+  #[test]
+  fn the_bypass_mount_names_the_shared_state_file() {
+    let mount = Layout::new(Path::new("/root"), String::new(), None).bypass_mount();
+    assert_eq!(mount.container, Path::new("/arkham/ebpf-bypass"));
+    assert!(
+      mount.host.ends_with("ebpf-bypass"),
+      "the host side is the per-workspace state file: {}",
+      mount.host.display()
+    );
+    assert!(!mount.ro, "the agent entrypoint writes the file, so the shared mount is read-write");
+  }
+
+  #[test]
+  fn workspace_ports_render_as_stable_host_bindings() {
+    let yaml = Stack {
+      ports: vec![3000, 5432],
+      ..test_stack(ProxyBackend::Tproxy)
+    }
+    .render();
+    let arkham_block = &yaml[..yaml.find("\n  agent:\n").unwrap()];
+    assert!(
+      arkham_block.contains("    ports:\n"),
+      "ports belong to the arkham service: {arkham_block}"
+    );
+    for port in [3000, 5432] {
+      assert!(
+        arkham_block.contains(&format!("      - \"127.0.0.1:{port}:{port}\"\n")),
+        "{arkham_block}"
+      );
+    }
+    assert!(
+      !arkham_block.contains("15000"),
+      "the capture listener port is not published: {arkham_block}"
+    );
+    assert_eq!(
+      arkham_block.matches("      - \"127.0.0.1:").count(),
+      2,
+      "exactly the declared ports, nothing else: {arkham_block}"
+    );
+    let empty = test_stack(ProxyBackend::Tproxy).render();
+    assert!(!empty.contains("ports:"), "no ports key without declared ports: {empty}");
+  }
+
+  #[test]
+  fn workspace_networks_extra_hosts_and_expose_render() {
+    let yaml = Stack {
+      ports: vec![3000],
+      expose: vec![ExposeMap { port: 5173, host: 5174 }],
+      networks: vec!["headroom_default".to_string()],
+      extra_hosts: vec!["host.docker.internal:host-gateway".to_string()],
+      ..test_stack(ProxyBackend::Tproxy)
+    }
+    .render();
+    let arkham_block = &yaml[..yaml.find("\n  agent:\n").unwrap()];
+    assert!(
+      arkham_block.contains("      - \"127.0.0.1:3000:3000\"\n"),
+      "symmetric ports keep rendering: {arkham_block}"
+    );
+    assert!(
+      arkham_block.contains("      - \"127.0.0.1:5174:5173\"\n"),
+      "expose maps host onto container port: {arkham_block}"
+    );
+    assert!(
+      arkham_block.contains("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"),
+      "arkham carries the hosts entry: {arkham_block}"
+    );
+    assert_eq!(
+      arkham_block.matches("host.docker.internal").count(),
+      1,
+      "a stated gateway is not repeated beside the automatic one: {arkham_block}"
+    );
+    assert!(
+      arkham_block.contains("    networks:\n      - \"headroom_default\"\n"),
+      "arkham joins the named network: {arkham_block}"
+    );
+    assert!(
+      yaml.contains("networks:\n  \"headroom_default\":\n    external: true\n"),
+      "joined networks are declared external at the top level: {yaml}"
+    );
+    let agent_block = &yaml[yaml.find("\n  agent:\n").unwrap()..yaml.find("\n  fwd:\n").unwrap()];
+    assert!(
+      !agent_block.contains("extra_hosts:"),
+      "the daemon rejects host mappings on a `network_mode` service: {agent_block}"
+    );
+    assert!(
+      !agent_block.contains("networks:"),
+      "a `network_mode` service takes no networks key: {agent_block}"
+    );
+    let empty = test_stack(ProxyBackend::Tproxy).render();
+    let empty_arkham = &empty[..empty.find("\n  agent:\n").unwrap()];
+    let empty_agent = &empty[empty.find("\n  agent:\n").unwrap()..empty.find("\n  fwd:\n").unwrap()];
+    assert!(
+      empty_arkham.contains("    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"),
+      "arkham always carries the gateway: {empty_arkham}"
+    );
+    assert!(
+      !empty_agent.contains("extra_hosts:"),
+      "the agent never carries host mappings: {empty_agent}"
+    );
+    assert!(!empty.contains("external: true"), "no networks block without joins: {empty}");
+  }
+
+  #[test]
+  fn the_generated_stack_renders_the_sidecar_and_moves_the_explicit_proxy_off_8080() {
+    let yaml = test_stack(ProxyBackend::Tproxy).render();
+    assert!(
+      yaml.starts_with(&format!("# stack shape: {STACK_SHAPE}\n")),
+      "the shape marker leads the generated file, so staleness can see it: {yaml}"
+    );
+    for expected in [
+      "  fwd:\n",
+      "    command: [\"fwd\"]\n",
+      "    network_mode: \"service:arkham\"\n",
+      "    pid: \"service:agent\"\n",
+    ] {
+      assert!(yaml.contains(expected), "missing {expected:?}:\n{yaml}");
+    }
+    assert_eq!(
+      yaml
+        .matches(&format!("    image: ghcr.io/casualjim/arkham:{TEST_VERSION}\n"))
+        .count(),
+      2,
+      "arkham and fwd services both pin the threaded version:\n{yaml}"
+    );
+    // One service key each: a duplicated key is a compose parse error, not a
+    // cosmetic slip.
+    for service in ["arkham", "agent", "fwd"] {
+      assert_eq!(
+        yaml.matches(&format!("\n  {service}:\n")).count(),
+        1,
+        "service `{service}` must be defined exactly once:\n{yaml}"
+      );
+    }
+    assert!(
+      yaml.contains(&format!("ARKHAM_LISTEN: {EXPLICIT_LISTEN}")),
+      "the explicit proxy must not hold the common dev-server port:\n{yaml}"
+    );
+    assert!(!yaml.contains("ARKHAM_LISTEN: 127.0.0.1:8080"), "{yaml}");
+    // The sidecar shares the agent's PID namespace, never arkham's.
+    assert!(!yaml.contains("pid: \"service:arkham\""), "{yaml}");
+    // Only the agent and arkham get cgroup placement; the sidecar must stay
+    // outside the captured subtree so its own relays are never rewritten.
+    let fwd_block = &yaml[yaml.find("\n  fwd:\n").unwrap()..];
+    assert!(!fwd_block.contains("cgroup"), "the sidecar is not captured: {fwd_block}");
+  }
+
+  /// Passthrough renders doubled so compose leaves a literal `${NAME}` for
+  /// the agent; file mounts ride read-only right after workspace mounts.
+  #[test]
+  fn passthrough_renders_interpolated_and_file_mounts_follow_workspace_mounts() {
+    let yaml = Stack {
+      passthrough: vec!["WAYLAND_DISPLAY".to_string()],
+      mounts: vec![mount("/srv/ws", "/home/eng/ws", false)],
+      file_mounts: vec![mount("/state/files/00-npmrc", "/home/eng/.npmrc", true)],
+      ..test_stack(ProxyBackend::Tproxy)
+    }
+    .render();
+    assert!(yaml.contains("      WAYLAND_DISPLAY: \"${WAYLAND_DISPLAY}\"\n"), "{yaml}");
+    let agent = &yaml[yaml.find("\n  agent:\n").unwrap()..];
+    let workspace_at = agent.find("/srv/ws:/home/eng/ws:rw").unwrap();
+    let file_at = agent.find("/state/files/00-npmrc:/home/eng/.npmrc:ro").unwrap();
+    assert!(workspace_at < file_at, "rewrites overlay workspace mounts: {agent}");
+  }
+}

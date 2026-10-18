@@ -942,3 +942,443 @@ mod tests {
     );
   }
 }
+
+#[cfg(test)]
+mod moved_suite {
+
+  use crate::confine::*;
+
+  use crate::mounts::*;
+
+  use crate::stack::*;
+  use crate::test_support::*;
+  use crate::workspace::*;
+
+  #[test]
+  fn the_example_workspace_loads_and_inherits_registry_hosts() {
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/agentic-devenv/.config/arkham/config.toml");
+    let cli = Cli {
+      config: Some(example.clone()),
+    };
+    let (config, _) = arkham_config::config::load(&cli, None).unwrap_or_else(|err| panic!("{} does not load: {err}", example.display()));
+    assert_eq!(config.workspace.home.as_deref(), Some("/home/eng"));
+    assert_eq!(config.workspace.shell.as_deref(), Some("bash"));
+    let registry = generation_registry(None).unwrap();
+    for (label, env) in [("anthropic", "ANTHROPIC_API_KEY"), ("github", "GH_TOKEN")] {
+      let rule = config
+        .rules
+        .get(label)
+        .unwrap_or_else(|| panic!("`{label}` missing from {}", example.display()));
+      assert_eq!(rule.env, env);
+      assert!(rule.value.is_none(), "`{label}` must resolve from fnox, not carry a value");
+      assert!(!registry.hosts_for(rule).is_empty(), "`{label}` needs hosts from the registry");
+    }
+  }
+
+  #[test]
+  fn includes_absorb_overlaps_and_reject_missing() {
+    let host_home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let sibling = root.path().join("sibling");
+    std::fs::create_dir_all(&sibling).unwrap();
+
+    let layout = Layout::new(root.path(), "/home/eng".to_string(), Some(host_home.path().to_path_buf()));
+    let mounts = layout.include_mounts(&[PathBuf::from("sibling:ro")]).unwrap();
+    assert_eq!(mounts.len(), 1, "{mounts:?}");
+    assert_eq!(mounts[0].host, root.path(), "{mounts:?}");
+    assert!(!mounts[0].ro, "{mounts:?}");
+
+    let err = layout.include_mounts(&[PathBuf::from("missing")]).unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "{err:?}");
+    assert!(err.to_string().contains("missing"), "{err:?}");
+  }
+
+  #[test]
+  fn fnox_binds_mount_only_what_exists_and_forward_present_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let fnox_dir = home.path().join(".config").join("fnox");
+    std::fs::create_dir_all(&fnox_dir).unwrap();
+    std::fs::write(fnox_dir.join("age.txt"), "AGE-SECRET-KEY-1\n").unwrap();
+    std::fs::write(
+      config_dir.path().join("fnox.toml"),
+      "[secrets.X]\nprovider = \"plain\"\nvalue = \"x\"\n",
+    )
+    .unwrap();
+    std::fs::write(config_dir.path().join("config.toml"), "[proxy]\n").unwrap();
+
+    let binds = FnoxBinds::resolve(Some(&fnox_dir), Some(config_dir.path()));
+    let rendered: Vec<String> = binds
+      .mounts
+      .iter()
+      .map(|entry| format!("{}:{}:ro", entry.host.display(), entry.container.display()))
+      .collect();
+    assert_eq!(
+      rendered,
+      vec![
+        format!("{}:/root/.config/fnox:ro", fnox_dir.display()),
+        format!(
+          "{}:/root/.config/arkham/fnox.toml:ro",
+          config_dir.path().join("fnox.toml").display()
+        ),
+      ],
+      "the fnox config directory and arkham's own fnox level, and not the host's arkham config.toml"
+    );
+
+    let empty = tempfile::tempdir().unwrap();
+    assert!(
+      FnoxBinds::resolve(Some(&empty.path().join("missing")), Some(empty.path()))
+        .mounts
+        .is_empty(),
+      "a path that is not there is never mounted: docker would create a directory in its place"
+    );
+
+    // Credentials in the shell are not the proxy's business: whatever the
+    // environment carries, the generated stack forwards nothing.
+    let key = "BWS_ACCESS_TOKEN";
+    let previous = std::env::var_os(key);
+    set_env(key, "0.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let yaml = Stack {
+      fnox: FnoxBinds::resolve(None, None),
+      ..test_stack(ProxyBackend::Tproxy)
+    }
+    .render();
+    assert!(!yaml.contains("${"), "no environment interpolation survives generation: {yaml}");
+    assert!(!yaml.contains(key), "the credential name is not forwarded either: {yaml}");
+    assert!(
+      !yaml.contains("0.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+      "the value must not be written"
+    );
+    match previous {
+      Some(value) => set_env(key, value),
+      None => unset_env(key),
+    }
+  }
+
+  #[test]
+  fn rules_d_overrides_mount_into_the_arkham_service() {
+    let config_dir = tempfile::tempdir().unwrap();
+    let rules_d = config_dir.path().join("rules.d");
+    std::fs::create_dir_all(&rules_d).unwrap();
+    std::fs::write(
+      rules_d.join("gitea.toml"),
+      "[names.GITEA_TOKEN]\nhosts = [\"https://code.lotsa.ai\"]\n",
+    )
+    .unwrap();
+
+    let binds = FnoxBinds::resolve(None, Some(config_dir.path()));
+    let rendered: Vec<String> = binds
+      .mounts
+      .iter()
+      .map(|entry| format!("{}:{}:ro", entry.host.display(), entry.container.display()))
+      .collect();
+    assert_eq!(
+      rendered,
+      vec![format!("{}:/root/.config/arkham/rules.d:ro", rules_d.display())],
+      "serve derives rules from the registry in-container, so the global rules.d must be in view"
+    );
+  }
+
+  #[test]
+  fn support_files_are_written_when_absent_and_stale_entrypoints_regenerate() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let entrypoint = dir.path().join("agent-entrypoint.sh");
+    let storage = dir.path().join("state").join("containers");
+
+    let files = ensure_support_files(dir.path(), &storage).unwrap();
+    assert!(files.iter().all(|(_, created)| *created), "{files:?}");
+    let pem = std::fs::read_to_string(dir.path().join("ca.pem")).unwrap();
+    let crt = std::fs::read_to_string(dir.path().join("ca.crt")).unwrap();
+    let key = std::fs::read_to_string(dir.path().join("ca.key")).unwrap();
+    assert!(entrypoint.is_file());
+    assert!(storage.is_dir(), "storage belongs to the workspace state, not the config dir");
+    assert!(
+      !dir.path().join("agent-containers").exists(),
+      "no storage under the config dir: {files:?}"
+    );
+    // `ca.pem` is what arkham reads; `ca.crt` is the certificate alone, which is
+    // what the agent gets. A clean system needs both.
+    assert!(
+      pem.contains("BEGIN CERTIFICATE") && pem.contains("PRIVATE KEY"),
+      "ca.pem carries both halves"
+    );
+    assert!(
+      crt.contains("BEGIN CERTIFICATE") && !crt.contains("PRIVATE KEY"),
+      "ca.crt carries the certificate only"
+    );
+    assert!(
+      key.contains("PRIVATE KEY") && !key.contains("CERTIFICATE"),
+      "ca.key carries the key only"
+    );
+    let script = std::fs::read_to_string(&entrypoint).unwrap();
+    assert!(
+      script.contains("update-ca-certificates"),
+      "the entrypoint installs the CA into the system store"
+    );
+    assert!(
+      script.contains("${ARKHAM_INIT:-}") && script.contains("docker-entrypoint.sh"),
+      "the entrypoint chains to the image's init: ARKHAM_INIT first, common names next"
+    );
+    assert!(script.contains("exec \"$@\""), "the entrypoint hands off to the command");
+    assert!(
+      script.contains("${ARKHAM_EBPF_BYPASS_FILE:-}") && script.contains("podman network inspect"),
+      "the entrypoint publishes podman subnets for arkham's bypass list when the stack wires the file"
+    );
+    assert_ne!(
+      std::fs::metadata(&entrypoint).unwrap().permissions().mode() & 0o111,
+      0,
+      "the agent runs the entrypoint directly, so it must be executable"
+    );
+
+    std::fs::write(&entrypoint, "#!/bin/sh\necho mine\n").unwrap();
+    std::fs::remove_file(dir.path().join("ca.pem")).unwrap();
+    let files = ensure_support_files(dir.path(), &storage).unwrap();
+    let created: BTreeMap<&str, bool> = files
+      .iter()
+      .map(|(path, created)| (path.file_name().unwrap().to_str().unwrap(), *created))
+      .collect();
+    assert_eq!(
+      created.get("agent-entrypoint.sh"),
+      Some(&false),
+      "an edited entrypoint is replaced, not created anew"
+    );
+    assert_eq!(created.get("ca.pem"), Some(&true), "a deleted CA comes back");
+    assert_eq!(
+      std::fs::read_to_string(&entrypoint).unwrap(),
+      ENTRYPOINT_SCRIPT,
+      "a stale or edited entrypoint is regenerated"
+    );
+  }
+
+  #[test]
+  fn workspace_init_names_the_agent_images_init_script() {
+    let yaml = Stack {
+      init: Some("/usr/local/bin/devagent-entrypoint".to_string()),
+      ..test_stack(ProxyBackend::Tproxy)
+    }
+    .render();
+    assert!(
+      yaml.contains("      ARKHAM_INIT: \"/usr/local/bin/devagent-entrypoint\"\n"),
+      "the entrypoint chains to the image's init through ARKHAM_INIT: {yaml}"
+    );
+  }
+
+  #[test]
+  fn the_backend_defaults_to_ebpf_on_linux_and_none_is_refused() {
+    #[cfg(target_os = "linux")]
+    assert_eq!(resolve_backend(None).unwrap(), ProxyBackend::Ebpf);
+    #[cfg(not(target_os = "linux"))]
+    assert!(resolve_backend(None).is_err(), "no capture backend exists outside Linux");
+
+    assert_eq!(resolve_backend(Some(ProxyBackend::Tun)).unwrap(), ProxyBackend::Tun);
+    let err = resolve_backend(Some(ProxyBackend::None)).unwrap_err();
+    assert!(err.to_string().contains("none"), "{err:?}");
+  }
+
+  /// `init` writes the workspace config once and never overwrites it: a stack
+  /// that cannot substitute anything is worse than no stack, and an edited
+  /// rules file is the user's.
+  #[test]
+  fn the_workspace_config_is_written_once_and_never_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".config").join("arkham.toml");
+
+    assert!(write_if_absent(&path, "[rules.x]\n").unwrap(), "first write lands");
+    assert!(
+      !write_if_absent(&path, "something else\n").unwrap(),
+      "an existing file is left alone"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "[rules.x]\n");
+  }
+
+  /// Regeneration keys off the workspace config: a stack generated before a
+  /// rule existed holds decoys that can never be swapped, and a stack with no
+  /// digest beside it predates the check.
+  #[test]
+  fn the_stack_is_stale_until_its_digest_matches_the_workspace_config() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let config = root.path().join(".config");
+    std::fs::create_dir_all(config.join("arkham")).unwrap();
+
+    assert!(
+      stack_is_stale(state.path(), root.path()),
+      "no digest means the stack predates the check"
+    );
+    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+    assert!(!stack_is_stale(state.path(), root.path()), "an untouched config keeps the stack");
+
+    std::fs::write(config.join("arkham").join("config.toml"), "[rules.x]\nenv = \"X\"\n").unwrap();
+    assert!(
+      stack_is_stale(state.path(), root.path()),
+      "a config that appeared after generation is a change"
+    );
+    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+    assert!(!stack_is_stale(state.path(), root.path()));
+  }
+
+  /// Generation reads the `rules.d` override trees on both layers, so an
+  /// edit there changes the derived decoys and must regenerate the stack.
+  #[test]
+  fn the_stack_is_stale_when_the_rules_overrides_change() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let global = tempfile::tempdir().unwrap();
+    set_env("XDG_CONFIG_HOME", global.path());
+    let global_rules = global.path().join("arkham").join("rules.d");
+    let project_rules = root.path().join(".config").join("arkham").join("rules.d");
+
+    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+    assert!(!stack_is_stale(state.path(), root.path()), "absent rules trees are stable");
+
+    std::fs::create_dir_all(&project_rules).unwrap();
+    std::fs::write(
+      project_rules.join("10-late.toml"),
+      "[names.LATE_TOKEN]\nhosts = [\"https://late.example\"]\n",
+    )
+    .unwrap();
+    assert!(
+      stack_is_stale(state.path(), root.path()),
+      "a project rules.d file that appeared after generation is a change"
+    );
+    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+    assert!(!stack_is_stale(state.path(), root.path()));
+
+    std::fs::create_dir_all(&global_rules).unwrap();
+    std::fs::write(
+      global_rules.join("10-glob.toml"),
+      "[names.GLOB_TOKEN]\nhosts = [\"https://glob.example\"]\n",
+    )
+    .unwrap();
+    assert!(
+      stack_is_stale(state.path(), root.path()),
+      "a global rules.d file that appeared after generation is a change"
+    );
+    unset_env("XDG_CONFIG_HOME");
+  }
+
+  /// Generation reads the global layer too, so an edit there — where `[workspace]`
+  /// settings like `init` live — must regenerate the stack, not just workspace edits.
+  #[test]
+  fn the_stack_is_stale_when_the_global_config_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let global = tempfile::tempdir().unwrap();
+    set_env("XDG_CONFIG_HOME", global.path());
+    let arkham_dir = global.path().join("arkham");
+    std::fs::create_dir_all(&arkham_dir).unwrap();
+
+    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+    assert!(!stack_is_stale(state.path(), root.path()), "absent global layer is stable");
+
+    std::fs::write(arkham_dir.join("config.toml"), "[workspace]\ninit = \"/init\"\n").unwrap();
+    assert!(
+      stack_is_stale(state.path(), root.path()),
+      "a global config that appeared after generation is a change"
+    );
+    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+    assert!(!stack_is_stale(state.path(), root.path()));
+
+    std::fs::write(arkham_dir.join("config.toml"), "[workspace]\ninit = \"/init2\"\n").unwrap();
+    assert!(stack_is_stale(state.path(), root.path()), "a global config edit is a change");
+    unset_env("XDG_CONFIG_HOME");
+  }
+
+  /// A digest that matches can only be made stale by the shape: an older
+  /// shape — or none at all, which is every stack generated before the
+  /// marker existed — regenerates, so the bundled `arkham agent` cannot leave
+  /// an old wiring behind.
+  #[test]
+  fn a_stack_of_an_older_shape_is_stale() {
+    assert_eq!(stack_shape_in("# stack shape: 2\nservices:\n"), Some(2));
+    assert_eq!(stack_shape_in("services:\n"), None, "a pre-marker stack carries no shape");
+    assert_eq!(stack_shape_in("# stack shape: nope\n"), None);
+
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+
+    std::fs::write(
+      state.path().join("compose.yml"),
+      format!("# stack shape: {STACK_SHAPE}\nname: arkham\n"),
+    )
+    .unwrap();
+    assert!(
+      !stack_is_stale(state.path(), root.path()),
+      "current shape and matching digest keep the stack"
+    );
+
+    std::fs::write(state.path().join("compose.yml"), "# stack shape: 1\nname: arkham\n").unwrap();
+    assert!(stack_is_stale(state.path(), root.path()), "an older shape regenerates");
+
+    std::fs::write(state.path().join("compose.yml"), "name: arkham\n").unwrap();
+    assert!(stack_is_stale(state.path(), root.path()), "a pre-marker stack regenerates");
+  }
+
+  /// A regeneration must not switch how traffic is captured: the backend is
+  /// read back off the compose file, and the caller's default is only a
+  /// fallback.
+  #[test]
+  fn the_generated_stack_reports_its_backend() {
+    assert_eq!(
+      generated_backend("      command: [\"serve\", \"--proxy-backend\", \"tun\"]\n"),
+      Some(ProxyBackend::Tun)
+    );
+    assert_eq!(generated_backend("\"--proxy-backend\", \"ebpf\""), Some(ProxyBackend::Ebpf));
+    assert_eq!(generated_backend("\"--proxy-backend\", \"tproxy\""), Some(ProxyBackend::Tproxy));
+    assert_eq!(
+      generated_backend("command: [\"serve\"]\n"),
+      None,
+      "a stack that names no backend keeps the caller's"
+    );
+  }
+
+  /// Zero rules with nothing derivable answers every provider with a decoy:
+  /// it has to be said out loud rather than served silently. A derivable
+  /// name substitutes on its own, so it silences the warning.
+  #[test]
+  fn serving_no_rules_and_nothing_derivable_is_announced() {
+    let warning = rules_warning(&BTreeMap::new(), &[]).expect("no rules and nothing derivable is worth a warning");
+    assert!(warning.contains("no [rules.*]") && warning.contains("nothing derives"), "{warning}");
+
+    let rules = BTreeMap::from([(
+      "github".to_string(),
+      toml_edit::de::from_str::<RuleCfg>("env = \"GH_TOKEN\"\n").unwrap(),
+    )]);
+    assert!(rules_warning(&rules, &[]).is_none(), "one rule is enough not to warn");
+    assert!(
+      rules_warning(&BTreeMap::new(), &["GITEA_TOKEN".to_string()]).is_none(),
+      "a derivable name substitutes without any config rule"
+    );
+  }
+
+  /// The flags map one-to-one onto compose's and services ride at the end: a
+  /// wrong order here is a silently different log view, not an error.
+  #[test]
+  fn the_logs_command_maps_onto_compose_flags() {
+    let bare = logs_argv(&LogsArgs {
+      workspace: None,
+      follow: false,
+      no_log_prefix: false,
+      tail: "all".into(),
+      services: Vec::new(),
+    });
+    assert_eq!(bare, vec![OsString::from("logs"), OsString::from("--tail"), OsString::from("all")]);
+
+    let full = logs_argv(&LogsArgs {
+      workspace: Some(PathBuf::from("/srv/project")),
+      follow: true,
+      no_log_prefix: true,
+      tail: "10".into(),
+      services: vec!["arkham".into(), "agent".into()],
+    });
+    assert_eq!(
+      full,
+      ["logs", "--follow", "--no-log-prefix", "--tail", "10", "arkham", "agent"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>()
+    );
+  }
+}
