@@ -112,7 +112,8 @@ upstream leg is TLS. Payloads are never rewritten, so the decoy in the
 published message arrives unchanged. Scenarios 17 and 18 are gated on
 `NATS_URL`. Scenarios 19 and 20 use the same server, with a user nkey
 added beside the password user. `integration/gen-nats.sh` mints the
-seeds with `nkeys` and writes `integration/out`, which is gitignored.
+operator, accounts, and users with `nsc` and writes `integration/out`, which is gitignored.
+The fake user JWT is signed by an account the server does not preload.
 Scenarios 21 and 22 use a second `nats:2.15.1-alpine` service in
 operator mode. The account JWT is preloaded under `resolver: MEMORY`,
 so the server checks the user JWT. The client uses `nkeyAuthenticator`

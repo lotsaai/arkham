@@ -42,7 +42,7 @@ while IFS= read -r line; do
 done <<< "$started"
 
 root=$(git rev-parse --show-toplevel)
-covered="$root/integration/out/covered.json"
+covered="$root/integration/out/results/covered.json"
 if [ ! -f "$covered" ]; then
   echo "missing $covered" >&2
   exit 1

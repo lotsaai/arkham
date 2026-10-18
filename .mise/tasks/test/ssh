@@ -80,6 +80,15 @@ nats_client_log_hides_real_material() {
       return 1
     fi
   done
+  local source
+  while IFS= read -r source; do
+    case "$source" in
+      */integration/out|*/integration/out/nats|*/integration/out/nats-discovery)
+        echo "client mount exposes ${source}"
+        return 1
+        ;;
+    esac
+  done < <(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$client")
 }
 
 # Host ~/.config/nats discovery. The caller has already run certs to
@@ -312,7 +321,7 @@ for backend in $backends; do
     fi
   fi
   if [ "$code" = 0 ]; then
-    covered=integration/out/covered.json
+    covered=integration/out/results/covered.json
     if [ ! -f "$covered" ]; then
       echo "missing $covered"
       code=1

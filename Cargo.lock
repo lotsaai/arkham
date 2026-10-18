@@ -401,6 +401,7 @@ dependencies = [
  "libc",
  "nkeys",
  "pretty_assertions",
+ "regex",
  "secrecy",
  "serde",
  "serde_json",

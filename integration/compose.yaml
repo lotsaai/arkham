@@ -463,7 +463,7 @@ services:
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
-      - ./out:/out
+      - ./out/results:/out
     networks:
       server:
         ipv4_address: 10.202.0.70
@@ -545,7 +545,7 @@ services:
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
-      - ./out:/out
+      - ./out/results:/out
       - ./out/nats-discovery/guest:/opt/nats-discovered:ro
     network_mode: service:arkham
     depends_on:

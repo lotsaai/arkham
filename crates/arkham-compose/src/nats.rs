@@ -18,19 +18,27 @@
 //! Checked against the NATS CLI context document and the nsc credentials
 //! file: `context.txt`, `context/<name>.json`, the JSON fields below, and
 //! the decorated banners. `$XDG_CONFIG_HOME`, `NATS_*` overrides, `nsc://`,
-//! and a comma-separated server list are not read. No maintained crate
-//! exposes `ParseDecoratedJWT` or `ParseDecoratedNKey`. `nkeys` 0.4 parses
-//! a seed, and the banner scan below follows the Go regex `[-]{3,}`.
+//! and a comma-separated server list are not read. async-nats 0.50 keeps
+//! `parse_jwt_and_key_from_creds` private; the banner regex below is that
+//! crate's `USER_CONFIG_RE`. `nkeys` 0.4 parses a seed.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 
 use arkham_config::config::IfMissing;
 use arkham_config::grants::{NatsPlain, NatsScope, NatsSeed};
+use regex::Regex;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use url::Url;
+
+/// The credentials-file regex from async-nats 0.50 `auth_utils`. The first
+/// capture is the user JWT and the second is the nkey seed. A pattern that
+/// does not compile yields no credential.
+static USER_CONFIG_RE: LazyLock<Option<Regex>> =
+  LazyLock::new(|| Regex::new(r"\s*(?:(?:[-]{3,}.*[-]{3,}\r?\n)([\w\-.=]+)(?:\r?\n[-]{3,}.*[-]{3,}\r?\n))").ok());
 
 use crate::adapt::{BLOB_PREFIX_NATS, DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
 use crate::error::Error;
@@ -340,9 +348,11 @@ fn found_cred(doc: &NatsContext, host_home: &Path, root: &Path) -> Option<FoundC
     });
   }
   if !doc.nkey.is_empty() {
+    let path = resolve_path(&doc.nkey, host_home, root)?;
+    let seed = accepted_seed(&fs::read_to_string(&path).ok()?)?;
     return Some(FoundCred {
-      real: NatsPlain::Nkey(load_nkey_file(&doc.nkey, host_home, root)?),
-      source: resolve_path(&doc.nkey, host_home, root),
+      real: NatsPlain::Nkey(seed),
+      source: Some(path),
     });
   }
   if !doc.user_jwt.is_empty() && !doc.user_seed.is_empty() {
@@ -378,16 +388,12 @@ fn load_creds(raw: &str, host_home: &Path, root: &Path) -> Option<(String, Strin
   parsed.matches_user_jwt(&jwt).then_some((seed, jwt))
 }
 
-fn load_nkey_file(raw: &str, host_home: &Path, root: &Path) -> Option<String> {
-  let path = resolve_path(raw, host_home, root)?;
-  accepted_seed(&fs::read_to_string(path).ok()?)
-}
-
 fn load_user_seed(raw: &str, host_home: &Path, root: &Path) -> Option<String> {
   if let Some(seed) = accepted_seed(raw) {
     return Some(seed);
   }
-  load_nkey_file(raw, host_home, root)
+  let path = resolve_path(raw, host_home, root)?;
+  accepted_seed(&fs::read_to_string(path).ok()?)
 }
 
 fn load_jwt(raw: &str, host_home: &Path, root: &Path) -> Option<String> {
@@ -405,55 +411,28 @@ fn accepted_seed(text: &str) -> Option<String> {
   Some(seed)
 }
 
-/// Banner-wrapped values. The Go regex is `[-]{3,}.*[-]{3,}` around one
-/// `[\w\-.=]+` line. The first value is the JWT and the second is the seed.
-fn decorated_payloads(text: &str) -> Vec<String> {
-  let lines: Vec<&str> = text.lines().collect();
-  let mut out = Vec::new();
-  let mut index = 0;
-  while index + 2 < lines.len() {
-    if is_banner(lines[index]) && is_payload(lines[index + 1]) && is_banner(lines[index + 2]) {
-      out.push(lines[index + 1].trim().to_string());
-      index += 3;
-    } else {
-      index += 1;
-    }
-  }
-  out
-}
-
-fn is_banner(line: &str) -> bool {
-  let line = line.trim();
-  let bytes = line.as_bytes();
-  if bytes.len() < 6 || !line.starts_with('-') || !line.ends_with('-') {
-    return false;
-  }
-  let start = bytes.iter().take_while(|byte| **byte == b'-').count();
-  let end = bytes.iter().rev().take_while(|byte| **byte == b'-').count();
-  start >= 3 && end >= 3 && (start + end <= bytes.len() || start == bytes.len())
-}
-
-fn is_payload(line: &str) -> bool {
-  let line = line.trim();
-  !line.is_empty()
-    && line
-      .bytes()
-      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'='))
-}
-
 fn decorated_jwt(text: &str) -> Option<String> {
-  let payloads = decorated_payloads(text);
-  if let Some(jwt) = payloads.first() {
-    return Some(jwt.clone());
+  if let Some(re) = USER_CONFIG_RE.as_ref()
+    && let Some(matched) = re.captures_iter(text).next()
+    && let Some(group) = matched.get(1)
+  {
+    return Some(group.as_str().to_string());
   }
   let trimmed = text.trim();
-  (trimmed.lines().count() == 1 && is_payload(trimmed)).then(|| trimmed.to_string())
+  let bare = trimmed.lines().count() == 1
+    && !trimmed.is_empty()
+    && trimmed
+      .bytes()
+      .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'='));
+  bare.then(|| trimmed.to_string())
 }
 
 fn decorated_seed(text: &str) -> Option<String> {
-  let payloads = decorated_payloads(text);
-  if payloads.len() > 1 {
-    return payloads.get(1).cloned();
+  if let Some(re) = USER_CONFIG_RE.as_ref()
+    && let Some(matched) = re.captures_iter(text).nth(1)
+    && let Some(group) = matched.get(1)
+  {
+    return Some(group.as_str().to_string());
   }
   text
     .lines()
@@ -499,8 +478,12 @@ fn dial_url(raw: &str) -> Option<Url> {
 }
 
 fn auth_url(base: &Url, scheme: &str, auth: &NatsPlain, query: &[(&str, &str)]) -> Option<String> {
-  let host = base.host_str()?;
-  Some(auth.connection_string(scheme, host, base.port(), query))
+  let host = match base.host()? {
+    url::Host::Domain(host) => host.to_string(),
+    url::Host::Ipv4(addr) => addr.to_string(),
+    url::Host::Ipv6(addr) => addr.to_string(),
+  };
+  Some(auth.connection_string(scheme, &host, base.port(), query))
 }
 
 fn public_url(url: &Url) -> String {
@@ -668,16 +651,24 @@ mod tests {
   }
 
   #[test]
+  fn integration_client_does_not_mount_the_secret_tree() {
+    let yaml = include_str!("../../../integration/compose.yaml");
+    assert!(
+      !yaml.lines().any(|line| line.trim() == "- ./out:/out"),
+      "the client and smtp-direct mounts must not be the secret tree"
+    );
+    assert!(yaml.contains("- ./out/results:/out"));
+    assert!(yaml.contains("./out/nats-discovery/guest:/opt/nats-discovered:ro"));
+  }
+
+  #[test]
   fn ipv6_auth_url_is_bracketed_once() {
     let base = url::Url::parse("tls://[::1]:4222").expect("ipv6 url");
     let auth = NatsPlain::UserPass {
       user: "agent".to_string(),
       pass: "p".to_string(),
     };
-    assert_eq!(
-      auth_url(&base, "tls", &auth, &[]).expect("auth url"),
-      "tls://agent:p@[::1]:4222"
-    );
+    assert_eq!(auth_url(&base, "tls", &auth, &[]).expect("auth url"), "tls://agent:p@[::1]:4222");
   }
 
   #[test]
