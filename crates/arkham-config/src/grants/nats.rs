@@ -323,14 +323,15 @@ impl NatsPlain {
         real: SecretString::from(real),
       })),
       (Self::Nkey(fake), Self::Nkey(real)) => {
-        let fake = NatsSeed::from_seed(SecretString::from(fake))?;
+        let fake_seed = NatsSeed::from_seed(SecretString::from(fake.clone()))?;
         let real = NatsSeed::from_seed(SecretString::from(real))?;
         Ok(NatsAuth::Nkey {
           public_key: NatsPair {
-            fake: fake.public_key().to_string(),
+            fake: fake_seed.public_key().to_string(),
             real: SecretString::from(real.public_key().to_string()),
           },
           seed: real,
+          decoy_seed: SecretString::from(fake),
         })
       }
       (
@@ -343,7 +344,7 @@ impl NatsPlain {
           jwt: real_jwt,
         },
       ) => {
-        let fake = NatsSeed::from_seed(SecretString::from(fake_seed))?;
+        let fake = NatsSeed::from_seed(SecretString::from(fake_seed.clone()))?;
         check_user_jwt(&fake_jwt, fake.public_key())?;
         let real = NatsSeed::from_seed(SecretString::from(real_seed))?;
         check_user_jwt(&real_jwt, real.public_key())?;
@@ -357,6 +358,7 @@ impl NatsPlain {
             real: SecretString::from(real.public_key().to_string()),
           },
           seed: real,
+          decoy_seed: SecretString::from(fake_seed),
         })
       }
       _ => Err(NatsUriError::AuthKindMismatch),
@@ -381,20 +383,16 @@ fn decorate_creds(jwt: &str, seed: &str) -> String {
   )
 }
 
-/// Percent-encode one userinfo component the way `url` does, so a later
-/// parse decodes the same text.
+/// Unreserved characters stay literal. `%` and every other byte are encoded,
+/// so a later parse decodes the same text.
+const USERINFO_COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+  .remove(b'-')
+  .remove(b'.')
+  .remove(b'_')
+  .remove(b'~');
+
 fn encode_userinfo_component(value: &str) -> String {
-  let Ok(mut url) = Url::parse("nats://placeholder.invalid/") else {
-    return String::new();
-  };
-  if url.set_username(value).is_err() {
-    return String::new();
-  }
-  let rendered = url.as_str();
-  let Some(rest) = rendered.strip_prefix("nats://") else {
-    return String::new();
-  };
-  rest.split_once('@').map(|(encoded, _)| encoded.to_string()).unwrap_or_default()
+  percent_encoding::utf8_percent_encode(value, USERINFO_COMPONENT).to_string()
 }
 
 /// User nkey seed. The raw seed is not a CONNECT field.
@@ -438,6 +436,12 @@ impl NatsSeed {
   #[must_use]
   pub fn matches_user_jwt(&self, jwt: &str) -> bool {
     check_user_jwt(jwt, &self.public).is_ok()
+  }
+
+  /// The seed text. Redaction and the nonce signature are the callers.
+  #[must_use]
+  pub fn expose_secret(&self) -> &str {
+    self.raw.expose_secret()
   }
 
   /// Raw ed25519 signature of `message` under this seed.
@@ -535,6 +539,8 @@ pub enum NatsAuth {
     public_key: NatsPair,
     /// Real seed. It signs the upstream nonce and is not a CONNECT field.
     seed: NatsSeed,
+    /// Decoy seed. A server byte stream that carries the real seed is rewritten to this.
+    decoy_seed: SecretString,
   },
   /// Username `creds` and `seed:jwt`. CONNECT `jwt` swaps the user JWT.
   /// A present CONNECT `nkey` swaps the public key. nats.js
@@ -547,6 +553,8 @@ pub enum NatsAuth {
     public_key: NatsPair,
     /// Real seed. It signs the upstream nonce and is not a CONNECT field.
     seed: NatsSeed,
+    /// Decoy seed. A server byte stream that carries the real seed is rewritten to this.
+    decoy_seed: SecretString,
   },
 }
 
@@ -602,11 +610,24 @@ impl NatsAuth {
     }
   }
 
+  /// The signing seed and its decoy. Neither is a CONNECT field. Server
+  /// bytes that carry the real seed are rewritten to the decoy, and a
+  /// payload that carries it closes the leg.
+  #[must_use]
+  pub fn concealed(&self) -> Option<(&str, &str)> {
+    match self {
+      Self::Nkey { seed, decoy_seed, .. } | Self::UserJwt { seed, decoy_seed, .. } => {
+        Some((decoy_seed.expose_secret(), seed.expose_secret()))
+      }
+      Self::UserPass { .. } | Self::Token(_) => None,
+    }
+  }
+
   /// Nonce signature, when this method signs.
   #[must_use]
   pub fn signer(&self) -> Option<AuthSign<'_>> {
     match self {
-      Self::Nkey { public_key, seed } | Self::UserJwt { public_key, seed, .. } => Some(AuthSign {
+      Self::Nkey { public_key, seed, .. } | Self::UserJwt { public_key, seed, .. } => Some(AuthSign {
         verify: &public_key.fake,
         seed,
       }),
@@ -1169,7 +1190,13 @@ mod tests {
       let rendered = plain.connection_string("nats", "nats.internal", Some(4222), &[]);
       let scope = NatsScope::from_strings(&rendered, &rendered).expect("round trip");
       match (&plain, &scope.auth) {
-        (NatsPlain::UserPass { user, pass }, NatsAuth::UserPass { user: got_user, pass: got_pass }) => {
+        (
+          NatsPlain::UserPass { user, pass },
+          NatsAuth::UserPass {
+            user: got_user,
+            pass: got_pass,
+          },
+        ) => {
           assert_eq!(&got_user.fake, user);
           assert_eq!(got_pass.fake.as_str(), pass);
         }
@@ -1678,7 +1705,7 @@ mod tests {
 
   fn assert_nkey_round_trip(case: &SignedStrings) {
     let scope = NatsScope::from_strings(&case.fake_nkey, &case.real_nkey).expect("nkey");
-    let NatsAuth::Nkey { public_key, seed } = &scope.auth else {
+    let NatsAuth::Nkey { public_key, seed, .. } = &scope.auth else {
       panic!("nkey username is the nkey kind");
     };
     assert_eq!(public_key.fake, case.fake_public);
@@ -1721,7 +1748,7 @@ mod tests {
         ..
       }
     ));
-    let NatsAuth::UserJwt { jwt, public_key, seed } = &scope.auth else {
+    let NatsAuth::UserJwt { jwt, public_key, seed, .. } = &scope.auth else {
       panic!("creds username is the user jwt kind");
     };
     assert_eq!(jwt.fake, case.fake_jwt);

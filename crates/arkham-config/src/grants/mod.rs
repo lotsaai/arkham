@@ -693,6 +693,28 @@ impl GrantCollector {
         });
       }
     }?;
+    if let Grant::Nats { scope, .. } = &grant {
+      for existing in &self.grants {
+        let Grant::Nats {
+          credential,
+          scope: previous,
+        } = existing
+        else {
+          continue;
+        };
+        if previous.downstream != scope.downstream {
+          continue;
+        }
+        if previous.upstream != scope.upstream || previous.upstream_tls != scope.upstream_tls || previous.guest_tls != scope.guest_tls {
+          return Err(Error::NatsSharedEndpoint {
+            previous: credential.label.clone(),
+            label: label.to_string(),
+            host: scope.downstream.host.clone(),
+            port: scope.downstream.port,
+          });
+        }
+      }
+    }
     self.grants.push(grant);
     Ok(())
   }
@@ -1219,7 +1241,10 @@ mod tests {
   }
 
   fn two_nats(first: (&str, &str, &str), second: (&str, &str, &str)) -> AppConfig {
-    let mut cfg = cfg_with_db("nats://unused:unused@unused.invalid:4222", "nats://unused:unused@unused.invalid:4222");
+    let mut cfg = cfg_with_db(
+      "nats://unused:unused@unused.invalid:4222",
+      "nats://unused:unused@unused.invalid:4222",
+    );
     cfg.rules.clear();
     cfg.rules.insert(first.0.to_string(), nats_rule(first.0, first.1, first.2));
     cfg.rules.insert(second.0.to_string(), nats_rule(second.0, second.1, second.2));
@@ -1240,7 +1265,11 @@ mod tests {
   #[test]
   fn nats_grants_sharing_a_fake_endpoint_reject_a_different_guest_tls() {
     let mut cfg = two_nats(
-      ("nats_a", "nats://agent:one@nats.internal:4222", "tls://agent:one@nats.upstream:4222"),
+      (
+        "nats_a",
+        "nats://agent:one@nats.internal:4222",
+        "tls://agent:one@nats.upstream:4222",
+      ),
       ("nats_b", "nats://tok@nats.internal:4222", "tls://tok@nats.upstream:4222"),
     );
     cfg.rules.get_mut("nats_b").expect("rule").tls.insert(
@@ -1261,7 +1290,11 @@ mod tests {
   #[test]
   fn nats_grants_sharing_a_fake_endpoint_keep_distinct_auth() {
     let cfg = two_nats(
-      ("nats_a", "nats://agent:one@nats.internal:4222", "tls://agent:one@nats.upstream:4222"),
+      (
+        "nats_a",
+        "nats://agent:one@nats.internal:4222",
+        "tls://agent:one@nats.upstream:4222",
+      ),
       ("nats_b", "nats://tok@nats.internal:4222", "tls://tok@nats.upstream:4222"),
     );
     let resolved = resolve(&cfg).expect("same upstream and guest tls");

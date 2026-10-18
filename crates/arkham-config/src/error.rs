@@ -554,6 +554,18 @@ pub enum Error {
     /// Rule label.
     label: String,
   },
+  /// Two NATS grants share a fake host and port but not the dial or guest TLS.
+  #[error("rules `{previous}` and `{label}` share nats endpoint `{host}:{port}` with different upstream or guest tls")]
+  NatsSharedEndpoint {
+    /// The grant already collected for this endpoint.
+    previous: String,
+    /// The grant that disagreed.
+    label: String,
+    /// Shared fake host.
+    host: String,
+    /// Shared fake port.
+    port: u16,
+  },
   /// An AMQP rule states its upstream identity outside the connection string.
   #[error("rule `{label}`: amqp states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
   AmqpIdentity {

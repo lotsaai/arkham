@@ -632,8 +632,11 @@ fn redaction_pairs(auth: &NatsAuth) -> Vec<(String, String)> {
     .fields()
     .into_iter()
     .map(|field| (field.pair.fake.clone(), field.pair.real.expose_secret().to_string()))
-    .filter(|(fake, real)| !fake.is_empty() && !real.is_empty() && fake != real)
     .collect();
+  if let Some((fake, real)) = auth.concealed() {
+    pairs.push((fake.to_string(), real.to_string()));
+  }
+  pairs.retain(|(fake, real)| !fake.is_empty() && !real.is_empty() && fake != real);
   pairs.sort_by_key(|pair| std::cmp::Reverse(pair.1.len()));
   pairs
 }
@@ -664,10 +667,10 @@ fn apply_auth(fields: &mut Map<String, Value>, auth: &NatsAuth, nonce: Option<&[
   }
   let plan = auth.fields();
   for field in &plan {
-    match (field.presence, fields.get(field.name.as_str()).and_then(Value::as_str)) {
-      (FieldPresence::Required, Some(value)) if value == field.pair.fake => {}
+    match (field.presence, fields.get(field.name.as_str())) {
+      (FieldPresence::Required, Some(Value::String(value))) if value == &field.pair.fake => {}
       (FieldPresence::Optional, None) => {}
-      (FieldPresence::Optional, Some(value)) if value == field.pair.fake => {}
+      (FieldPresence::Optional, Some(Value::String(value))) if value == &field.pair.fake => {}
       _ => return None,
     }
   }
