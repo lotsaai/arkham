@@ -80,13 +80,10 @@ const CRLF: &[u8] = b"\r\n";
 enum NonceSlot {
   /// `server_info` has not armed this leg.
   Pending,
-  /// The opening INFO had no nonce.
   Absent,
-  /// The opening INFO's nonce.
   Ready(String),
 }
 
-/// Commands a client sends.
 #[derive(Debug, Clone, Copy, EnumIter, EnumString, IntoStaticStr)]
 #[strum(serialize_all = "UPPERCASE", ascii_case_insensitive)]
 enum ClientVerb {
@@ -663,8 +660,7 @@ fn apply_auth(fields: &mut Map<String, Value>, auth: &NatsAuth, nonce: Option<&[
   if let Some((verify, seed)) = sign {
     let nonce = nonce?;
     let sig = fields.get(<&str>::from(NatsField::Sig)).and_then(Value::as_str)?;
-    // nats-server 2.15 tries raw URL base64, then standard. nats.js 2.29 signs
-    // with `btoa`, which is the standard alphabet. The rewritten `sig` stays raw URL.
+    // nats-server 2.15 tries raw URL base64, then standard.
     let raw = decode_sig(sig)?;
     if !NatsSeed::verify(&verify, nonce, &raw) {
       return None;
@@ -684,7 +680,6 @@ fn apply_auth(fields: &mut Map<String, Value>, auth: &NatsAuth, nonce: Option<&[
   Some(())
 }
 
-/// Guest `sig` bytes. Raw URL base64 first, then standard base64.
 fn decode_sig(sig: &str) -> Option<Vec<u8>> {
   URL_SAFE_NO_PAD.decode(sig).or_else(|_err| STANDARD.decode(sig)).ok()
 }
@@ -840,7 +835,6 @@ struct InfoParse {
   depth: u32,
   key: Option<InfoKey>,
   tls: InfoTls,
-  /// First depth-1 `nonce` string. Empty is not stored.
   nonce: Option<String>,
   /// The first `nonce` field was seen, even when its value was empty.
   nonce_seen: bool,
@@ -1036,9 +1030,7 @@ struct InfoWatch {
   /// Set when an INFO line reaches LF. Taken once.
   ready: Option<InfoVerdict>,
   parse: Option<InfoParse>,
-  /// Nonce from the first INFO line that reached LF.
   nonce: Option<String>,
-  /// That first INFO line has been committed.
   opening_done: bool,
 }
 
@@ -1722,8 +1714,7 @@ mod tests {
   }
 
   /// `jwtAuthenticator` and `credsAuthenticator` in nats.js 2.29.3 return
-  /// `{jwt, nkey, sig}`. A `nkey` equal to the decoy public key is rewritten
-  /// to the real public key. A foreign `nkey` is forwarded with the line.
+  /// `{jwt, nkey, sig}`.
   #[tokio::test]
   async fn user_jwt_swaps_a_matching_nkey_and_forwards_a_foreign_one() {
     let fake = minted();

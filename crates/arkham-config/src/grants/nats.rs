@@ -966,12 +966,7 @@ struct UserJwtClaims {
 ///
 /// `jwt` 0.16 `Token::parse_unverified` reads the header and claims and does
 /// not check the account signature. This string carries the user seed, not
-/// the account key. `jwt::Error::Json` can echo a segment, so a parse failure
-/// stays a static variant.
-/// `Ok` when `jwt` is a NATS user JWT whose `sub` is `public`.
-///
-/// [`jwt::Token::parse_unverified`] reads the header and claims. It does
-/// not check the account signature.
+/// the account key.
 ///
 /// # Errors
 ///

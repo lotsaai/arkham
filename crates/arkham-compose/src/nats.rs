@@ -1,28 +1,12 @@
-//! NATS CLI context adapter. The discovery root is `~/.config/nats`:
-//! `context.txt` names the selected context, and
-//! `context/<name>.json` holds it. Credential files that context
-//! references are read here and never mounted for the guest.
+//! NATS CLI context adapter.
 //!
-//! The selected context becomes one connection-string grant. The decoy
-//! context is that document with secret-bearing values removed and the
-//! auth keys set to the decoy. Real seeds and JWTs stay in the grant
-//! fragment. Unknown keys stay on the decoy.
+//! A symlink is not canonicalized: the read follows it, and the decoy
+//! mounts at the path the context named. `guest_tls_mode` is not derived.
+//! The context describes the upstream dial, and the guest leg's mode stays
+//! on the rule `tls` table.
 //!
-//! A creds or nkey path is mounted only when it is lexically under the
-//! host home and contains no `..` segment. A symlink is not canonicalized:
-//! the read follows it, and the decoy mounts at the path the context named.
-//! A path that escapes falls back to `~/.config/nats/decoy/`. The `nkey`
-//! field is a file path. `user_seed` may be inline text. `guest_tls_mode`
-//! is not derived. The context describes the upstream dial, and the guest
-//! leg's mode stays on the rule `tls` table.
-//!
-//! Checked against the NATS CLI context document and the nsc credentials
-//! file: `context.txt`, `context/<name>.json`, and the decorated banners.
-//! `$XDG_CONFIG_HOME`, `NATS_*` overrides, `nsc://`, and a comma-separated
-//! server list are not read. async-nats 0.50 keeps
-//! `parse_jwt_and_key_from_creds` private; the banner regex below is that
-//! crate's `USER_CONFIG_RE`. `nkeys` 0.4 parses a seed. Context fields are
-//! not trimmed: a password keeps its surrounding whitespace.
+//! async-nats 0.50 keeps `parse_jwt_and_key_from_creds` private; the banner
+//! regex below is that crate's `USER_CONFIG_RE`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -46,7 +30,6 @@ use crate::adapt::{BLOB_PREFIX_NATS, DecoyFile, GRANTS_STATE_DIR, GrantFragment,
 use crate::error::Error;
 use crate::paths::{normalize, path_under_home};
 
-/// Keys removed from the guest document. Auth keys are written back from the decoy.
 const DROPPED_KEYS: &[&str] = &[
   "cert",
   "key",
@@ -272,7 +255,6 @@ fn map_context(
   }))
 }
 
-/// Real credential plus the file the context named, when it named one.
 struct FoundCred {
   real: NatsPlain,
   source: Option<PathBuf>,
@@ -378,10 +360,7 @@ fn load_user_seed(raw: &str, host_home: &Path, root: &Path) -> Option<String> {
   nkey_file(&path)
 }
 
-/// Compact user JWT, or the first regex capture when `raw` is a decorated file.
-///
-/// Go `natscontext` passes this literal to `nats.UserJWTAndSeed`. Creds files
-/// never come through here.
+/// Go `natscontext` passes this literal to `nats.UserJWTAndSeed`.
 fn load_jwt(raw: &str, host_home: &Path, root: &Path) -> Option<String> {
   let text = if let Some(path) = resolve_path(raw, host_home, root) {
     fs::read_to_string(path).ok()?
