@@ -190,6 +190,14 @@ EOF
     echo "discovered grant does not state the real nkey"
     return 1
   fi
+  # The password and nkey grants on nats:4222 trust /certs/ca.crt. Discovery
+  # names the copied CA, which is that same demo CA at another path. A shared
+  # fake endpoint has to share the upstream trust path.
+  sed -i -E 's#sslrootcert=[^&"'\''[:space:]]+#sslrootcert=/certs/ca.crt#' "$grant_toml"
+  if ! grep -q 'sslrootcert=/certs/ca.crt' "$grant_toml"; then
+    echo "discovered grant does not share the nats:4222 trust path"
+    return 1
+  fi
   env_name=$(grep -m 1 -E '^env = ' "$grant_toml" || true)
   env_name=${env_name#env = }
   env_name=${env_name#\"}
@@ -263,10 +271,10 @@ for backend in $backends; do
   $compose down --remove-orphans -v --timeout 3
   # The bind-mounted file survives `down`. A leftover from the previous
   # backend, or from an earlier run, must not satisfy this round.
-  rm -f integration/out/covered.json
+  rm -f integration/out/results/covered.json
   # Create the bind mounts as this user. Docker would otherwise create a
   # missing path as root, and the later cleanup cannot remove it.
-  mkdir -p integration/out/nats-discovery/grants integration/out/nats-discovery/guest
+  mkdir -p integration/out/results integration/out/nats-discovery/grants integration/out/nats-discovery/guest
   # Bring the stack up without the client. This is the one certs run:
   # dependents wait until it exits, and nothing below starts it again.
   services=()
