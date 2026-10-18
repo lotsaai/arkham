@@ -1550,6 +1550,33 @@ mod tests {
     assert!(!out.contains(real_sig), "{out}");
   }
 
+  #[tokio::test]
+  async fn present_non_string_nkey_is_left_unchanged() {
+    let fake = minted();
+    let real = minted();
+    let fake_jwt = user_jwt(fake.seed.public_key());
+    let real_jwt = user_jwt(real.seed.public_key());
+    let grants = jwt_grants(&fake, &real, &fake_jwt, &real_jwt);
+    let nonce = b"N0NCE";
+    let sig = sig_of(&fake.seed, nonce);
+    for nkey in ["null", "1", "{}"] {
+      let line = format!("CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":{nkey},\"sig\":\"{sig}\"}}\r\n");
+      let mut down = down(&grants, true);
+      let mut up = up(&grants);
+      arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+      let (out, hits) = feed(&mut down, line.as_bytes()).await;
+      assert_eq!(hits, 0, "{nkey}");
+      assert_eq!(text_of(out), line, "{nkey}");
+    }
+    let line = format!("CONNECT {{\"jwt\":\"{fake_jwt}\",\"sig\":\"{sig}\"}}\r\n");
+    let mut down = down(&grants, true);
+    let mut up = up(&grants);
+    arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let (out, hits) = feed(&mut down, line.as_bytes()).await;
+    assert_eq!(hits, 1);
+    assert!(text_of(out).contains(real_jwt.as_str()));
+  }
+
   /// A password grant and an nkey grant can share one host and port. The
   /// CONNECT fields pick the grant. The password grant is first here, which
   /// is the integration file order.
@@ -1768,7 +1795,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn server_lines_redact_the_real_public_key_and_jwt_and_keep_the_seed() {
+  async fn server_lines_redact_the_real_public_key_jwt_and_seed() {
     let fake = minted();
     let real = minted();
     let nkey = nkey_grants(&fake, &real);
@@ -1788,17 +1815,23 @@ mod tests {
     let mut machine = up(&nkey);
     let err = format!("-ERR '{}'\r\n", real.raw);
     let (out, hits) = feed(&mut machine, err.as_bytes()).await;
-    assert_eq!(hits, 0);
-    assert_eq!(text_of(out), err);
+    assert_eq!(hits, 1);
+    assert_eq!(text_of(out), format!("-ERR '{}'\r\n", fake.raw));
+    let mut machine = up(&jwt);
+    let err = format!("-ERR '{}'\r\n", real.raw);
+    let (out, hits) = feed(&mut machine, err.as_bytes()).await;
+    assert_eq!(hits, 1);
+    assert_eq!(text_of(out), format!("-ERR '{}'\r\n", fake.raw));
   }
 
   #[tokio::test]
-  async fn payload_with_the_real_jwt_closes_and_a_seed_payload_does_not() {
+  async fn payload_with_the_real_jwt_or_seed_closes() {
     let fake = minted();
     let real = minted();
     let fake_jwt = user_jwt(fake.seed.public_key());
     let real_jwt = user_jwt(real.seed.public_key());
     let jwt = jwt_grants(&fake, &real, &fake_jwt, &real_jwt);
+    let nkey = nkey_grants(&fake, &real);
     let mut machine = up(&jwt);
     let msg = format!("MSG orders 1 {}\r\n{real_jwt}\r\n", real_jwt.len());
     assert_eq!(feed(&mut machine, msg.as_bytes()).await.0, Out::Close);
@@ -1807,7 +1840,10 @@ mod tests {
     assert_eq!(feed(&mut machine, msg.as_bytes()).await.0, Out::Close);
     let mut machine = up(&jwt);
     let msg = format!("MSG orders 1 {}\r\n{}\r\n", real.raw.len(), real.raw);
-    assert_eq!(feed(&mut machine, msg.as_bytes()).await, (emit(&msg), 0));
+    assert_eq!(feed(&mut machine, msg.as_bytes()).await.0, Out::Close);
+    let mut machine = up(&nkey);
+    let msg = format!("MSG orders 1 {}\r\n{}\r\n", real.raw.len(), real.raw);
+    assert_eq!(feed(&mut machine, msg.as_bytes()).await.0, Out::Close);
   }
 
   #[tokio::test]

@@ -1201,6 +1201,73 @@ mod tests {
     assert!(scope.is_downstream_tls);
   }
 
+  fn nats_rule(env: &str, fake: &str, real: &str) -> RuleCfg {
+    RuleCfg {
+      env: env.to_string(),
+      value: Some(SecretString::from(fake)),
+      real: Some(SecretString::from(real)),
+      generated: false,
+      fnox_key: None,
+      allow: vec![],
+      pattern: None,
+      registry: None,
+      oauth2: None,
+      tls: BTreeMap::new(),
+      ssh: BTreeMap::new(),
+      if_missing: IfMissing::default(),
+    }
+  }
+
+  fn two_nats(first: (&str, &str, &str), second: (&str, &str, &str)) -> AppConfig {
+    let mut cfg = cfg_with_db("nats://unused:unused@unused.invalid:4222", "nats://unused:unused@unused.invalid:4222");
+    cfg.rules.clear();
+    cfg.rules.insert(first.0.to_string(), nats_rule(first.0, first.1, first.2));
+    cfg.rules.insert(second.0.to_string(), nats_rule(second.0, second.1, second.2));
+    cfg
+  }
+
+  #[test]
+  fn nats_grants_sharing_a_fake_endpoint_reject_a_different_upstream() {
+    let cfg = two_nats(
+      ("nats_a", "nats://agent:one@nats.internal:4222", "tls://agent:one@nats.one:4222"),
+      ("nats_b", "nats://other:two@nats.internal:4222", "tls://other:two@nats.two:4222"),
+    );
+    let err = resolve(&cfg).expect_err("different upstreams on one fake endpoint");
+    let text = err.to_string();
+    assert!(text.contains("nats.internal") && text.contains("4222"), "{err}");
+  }
+
+  #[test]
+  fn nats_grants_sharing_a_fake_endpoint_reject_a_different_guest_tls() {
+    let mut cfg = two_nats(
+      ("nats_a", "nats://agent:one@nats.internal:4222", "tls://agent:one@nats.upstream:4222"),
+      ("nats_b", "nats://tok@nats.internal:4222", "tls://tok@nats.upstream:4222"),
+    );
+    cfg.rules.get_mut("nats_b").expect("rule").tls.insert(
+      "nats_b".to_string(),
+      HostTlsCfg {
+        client_cert: None,
+        client_key: None,
+        root_cert: None,
+        guest_tls_mode: GuestTlsMode::Mtls,
+        guest_cert: None,
+        guest_key: None,
+      },
+    );
+    let err = resolve(&cfg).expect_err("different guest tls on one fake endpoint");
+    assert!(err.to_string().contains("nats.internal"), "{err}");
+  }
+
+  #[test]
+  fn nats_grants_sharing_a_fake_endpoint_keep_distinct_auth() {
+    let cfg = two_nats(
+      ("nats_a", "nats://agent:one@nats.internal:4222", "tls://agent:one@nats.upstream:4222"),
+      ("nats_b", "nats://tok@nats.internal:4222", "tls://tok@nats.upstream:4222"),
+    );
+    let resolved = resolve(&cfg).expect("same upstream and guest tls");
+    assert_eq!(resolved.grants.len(), 2);
+  }
+
   #[test]
   fn nats_grant_answers_for_the_nats_scheme_on_its_downstream_port() {
     let grant = redis_grant_like(

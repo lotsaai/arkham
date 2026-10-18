@@ -1147,9 +1147,37 @@ mod tests {
   use secrecy::ExposeSecret as _;
 
   use super::{
-    NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUri, NatsUriError,
+    NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsPlain, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUri,
+    NatsUriError,
   };
   use crate::grants::RootCert;
+
+  #[test]
+  fn userinfo_round_trips_a_literal_percent() {
+    let cases = [
+      NatsPlain::UserPass {
+        user: "agent".to_string(),
+        pass: "secret%41".to_string(),
+      },
+      NatsPlain::UserPass {
+        user: "a%2F".to_string(),
+        pass: "p@ss%".to_string(),
+      },
+      NatsPlain::Token("secret%41".to_string()),
+    ];
+    for plain in cases {
+      let rendered = plain.connection_string("nats", "nats.internal", Some(4222), &[]);
+      let scope = NatsScope::from_strings(&rendered, &rendered).expect("round trip");
+      match (&plain, &scope.auth) {
+        (NatsPlain::UserPass { user, pass }, NatsAuth::UserPass { user: got_user, pass: got_pass }) => {
+          assert_eq!(&got_user.fake, user);
+          assert_eq!(got_pass.fake.as_str(), pass);
+        }
+        (NatsPlain::Token(token), NatsAuth::Token(got)) => assert_eq!(&got.fake, token),
+        (plain, auth) => panic!("kind changed: {plain:?} -> {auth:?}"),
+      }
+    }
+  }
 
   #[test]
   fn username_nkey_or_creds_with_an_ordinary_password_is_userinfo() {
@@ -1585,7 +1613,7 @@ mod tests {
     }
   }
 
-  /// Account-signed user JWT, the shape `gen-nats-demo` writes and nats-server checks.
+  /// Account-signed user JWT, the shape nats-server checks.
   fn account_signed_user_jwt(user_public: &str) -> String {
     let account = nkeys::KeyPair::new_account();
     let header = serde_json::json!({ "typ": "JWT", "alg": "ed25519-nkey" });

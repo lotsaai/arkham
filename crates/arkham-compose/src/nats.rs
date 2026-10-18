@@ -652,10 +652,6 @@ mod tests {
     format!("{header}.{payload}.{}", URL_SAFE_NO_PAD.encode(b"sig"))
   }
 
-  fn creds_file(seed: &str, jwt: &str) -> String {
-    decorate_creds(jwt, seed)
-  }
-
   fn write_context(root: &Path, name: &str, body: &str) {
     fs::create_dir_all(root.join("context")).unwrap();
     fs::write(root.join("context.txt"), format!("{name}\n")).unwrap();
@@ -669,6 +665,19 @@ mod tests {
   fn rule_of(found: &AdaptedNats) -> RuleCfg {
     let doc: RulesDoc = toml::from_str(&found.adapted[0].fragment).expect("fragment");
     doc.rules.into_values().next().expect("one rule")
+  }
+
+  #[test]
+  fn ipv6_auth_url_is_bracketed_once() {
+    let base = url::Url::parse("tls://[::1]:4222").expect("ipv6 url");
+    let auth = NatsPlain::UserPass {
+      user: "agent".to_string(),
+      pass: "p".to_string(),
+    };
+    assert_eq!(
+      auth_url(&base, "tls", &auth, &[]).expect("auth url"),
+      "tls://agent:p@[::1]:4222"
+    );
   }
 
   #[test]
@@ -726,7 +735,7 @@ mod tests {
     let jwt = user_jwt(&public);
     let creds = home.path().join(".nkeys").join("user.creds");
     fs::create_dir_all(creds.parent().unwrap()).unwrap();
-    fs::write(&creds, creds_file(&seed, &jwt)).unwrap();
+    fs::write(&creds, decorate_creds(&jwt, &seed)).unwrap();
     write_context(
       &root,
       "demo",
@@ -812,7 +821,7 @@ mod tests {
     let jwt = user_jwt(&public);
     let ssh = home.path().join(".ssh");
     fs::create_dir_all(&ssh).unwrap();
-    fs::write(ssh.join("config"), creds_file(&seed, &jwt)).unwrap();
+    fs::write(ssh.join("config"), decorate_creds(&jwt, &seed)).unwrap();
     write_context(&root, "demo", r#"{"url":"nats://nats.internal:4222","creds":"../../.ssh/config"}"#);
     let found = adapted(&root, home.path());
     let containers: Vec<&str> = found.adapted[0].decoy_files.iter().map(|file| file.container.as_str()).collect();
@@ -843,7 +852,7 @@ mod tests {
     let jwt = user_jwt(&public);
     let creds = root.join("creds");
     fs::create_dir_all(&creds).unwrap();
-    fs::write(creds.join("user.creds"), creds_file(&seed, &jwt)).unwrap();
+    fs::write(creds.join("user.creds"), decorate_creds(&jwt, &seed)).unwrap();
     write_context(&root, "demo", r#"{"url":"nats://nats.internal:4222","creds":"creds/user.creds"}"#);
     let found = adapted(&root, home.path());
     let guest = found.adapted[0]
@@ -866,7 +875,7 @@ mod tests {
       .to_string();
     let jwt = user_jwt(&public);
     let outside = home.path().join("outside.creds");
-    fs::write(&outside, creds_file(&seed, &jwt)).unwrap();
+    fs::write(&outside, decorate_creds(&jwt, &seed)).unwrap();
     let creds = root.join("creds");
     fs::create_dir_all(&creds).unwrap();
     std::os::unix::fs::symlink(&outside, creds.join("link.creds")).unwrap();
@@ -1012,7 +1021,7 @@ mod tests {
       .to_string();
     let jwt = user_jwt(&public);
     let creds = outside.path().join("user.creds");
-    fs::write(&creds, creds_file(&seed, &jwt)).unwrap();
+    fs::write(&creds, decorate_creds(&jwt, &seed)).unwrap();
     write_context(
       &root,
       "demo",
