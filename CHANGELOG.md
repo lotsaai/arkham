@@ -1,8 +1,18 @@
+## [0.3.24] - 2026-10-19
+
+### 🚀 Features
+
+- *(config)* Name each context by path, protocol, and spelling (#68)
 ## [0.3.23] - 2026-10-19
 
 ### 🚀 Features
 
 - *(proxy)* Rewrite NATS nkey and user-JWT CONNECT (#60)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.23 [ci skip]
+- Release
 ## [0.3.22] - 2026-10-17
 
 ### 🚀 Features

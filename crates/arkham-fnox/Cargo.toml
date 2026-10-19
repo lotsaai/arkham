@@ -1,6 +1,6 @@
 [package]
 name = "arkham-fnox"
-version = "0.3.23"
+version = "0.3.24"
 edition = "2024"
 description = "grant-scoped MITM proxy: fnox value resolution and discovery layers"
 license = "Apache-2.0"
