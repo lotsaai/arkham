@@ -101,6 +101,7 @@ confique = { version = "0.4", features = ["toml"] }
 dashmap = "6"
 dirs = "6"
 eyre = "0.6"
+fe2o3-amqp = { version = "0.18.3", default-features = false, features = ["acceptor"] }
 fe2o3-amqp-types = "0.18.0"
 fnox-core = "1.33"
 futures = "0.3"
@@ -116,6 +117,7 @@ httparse = "1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jwt = "0.16"
+lapin = { version = "4.12.3", default-features = false, features = ["tokio"] }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-aws-lc-rs"] }
 lettre = { version = "0.11.23", default-features = false, features = ["aws-lc-rs", "smtp-transport", "tokio1", "tokio1-rustls", "webpki-roots"] }
 libc = "0.2"

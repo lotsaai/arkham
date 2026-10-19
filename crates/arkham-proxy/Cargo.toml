@@ -42,11 +42,13 @@ url = { workspace = true }
 [dev-dependencies]
 async-nats = { workspace = true }
 async-trait = { workspace = true }
+fe2o3-amqp = { workspace = true }
 futures = { workspace = true }
 h2 = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+lapin = { workspace = true }
 ldap3 = { workspace = true }
 lettre = { workspace = true }
 nkeys = { workspace = true }
