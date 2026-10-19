@@ -411,6 +411,8 @@ where
   }
 }
 
+/// Upstream→guest direction: read the upstream, feed the upstream machine,
+/// carry rewritten bytes to the guest, apply what the request pump queued.
 async fn pump_responses<G, S, M>(
   mut server: ReadHalf<S>,
   mut guest: WriteHalf<G>,
@@ -618,6 +620,8 @@ where
   }
 }
 
+/// Feed bytes already taken from the server and write what the upstream
+/// machine emits. `false` means that machine closed the relay.
 async fn write_upstream_chunk<W, M>(guest: &mut W, upstream: &mut M, bytes: &[u8]) -> Result<bool, Error>
 where
   W: AsyncWrite + Unpin,
@@ -637,6 +641,8 @@ where
   }
 }
 
+/// Apply one queued message from the request pump: a guest-bound protocol
+/// reply or a framing fact into the response machine.
 async fn apply_message<W, M>(guest: &mut W, upstream: &mut M, msg: ToResponse) -> Result<(), Error>
 where
   W: AsyncWrite + Unpin,
