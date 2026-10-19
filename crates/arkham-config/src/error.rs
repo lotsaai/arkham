@@ -3,6 +3,8 @@
 use std::io::Error as IoError;
 use std::path::PathBuf;
 
+use crate::context::{AmbientProtocol, NameFault, PathFault};
+
 use confique::Error as ConfiqueError;
 use serde_json::Error as JsonError;
 use toml::de::Error as TomlError;
@@ -636,4 +638,41 @@ pub enum Error {
     #[source]
     source: TomlSerializeError,
   },
+  /// A source path cannot identify a context.
+  #[error("source path `{}` {fault}", source.display())]
+  ContextPathInvalid {
+    /// Path the adapter passed.
+    source: PathBuf,
+    /// Why the path was rejected.
+    // The field named `source` is the path. `#[source]` on `fault` keeps thiserror from treating that path as the error source.
+    #[source]
+    fault: PathFault,
+  },
+  /// A context name cannot become a label and an env name.
+  #[error("context `{name}` in `{}` on {protocol} {fault}", source.display())]
+  ContextNameInvalid {
+    /// Path the adapter passed. Empty when a label does not decode.
+    source: PathBuf,
+    /// Protocol tag from the caller, or from the label prefix when one decodes.
+    protocol: AmbientProtocol,
+    /// Original name, or the label text when the label does not decode.
+    name: String,
+    /// Why the name was rejected.
+    // The field named `source` is the path. `#[source]` on `fault` keeps thiserror from treating that path as the error source.
+    #[source]
+    fault: NameFault,
+  },
+  /// Two different contexts share a label or a pair stem.
+  ///
+  /// The record is boxed so `Error` stays small enough to return.
+  #[error("{0}")]
+  ContextCollision(Box<crate::context::ContextCollision>),
+  /// Two contexts present the same host, port, and decoy bytes.
+  ///
+  /// The record is boxed so `Error` stays small enough to return.
+  #[error("{0}")]
+  AmbiguousContexts(Box<crate::context::AmbiguousContexts>),
+  /// A presented destination host is empty after trimming.
+  #[error("wire host is empty")]
+  WireHostEmpty,
 }
