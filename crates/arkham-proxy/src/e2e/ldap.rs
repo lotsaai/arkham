@@ -638,6 +638,69 @@ async fn ldap_bind_then_starttls_is_answered_when_upstream_is_already_tls() {
   proxy.abort();
 }
 
+/// A bind and a `StartTLS` written together, while the upstream is already
+/// TLS. The bind result comes first. The `StartTLS` is `operationsError`
+/// and is not forwarded.
+#[tokio::test]
+async fn ldap_pipelined_bind_then_starttls_is_operations_error() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let bundle_dir = tempfile::tempdir().unwrap();
+  let bundle = bundle_dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let grants = vec![ldap_grant(
+    &format!("ldap://{}:{FAKE}@localhost:{stub_port}", user(DN)),
+    &format!(
+      "ldaps://{}:{VALUE}@localhost:{stub_port}?sslrootcert={}",
+      user(DN),
+      bundle.display()
+    ),
+  )];
+  let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
+  let stub_task = tokio::spawn(async move {
+    let (conn, _) = stub.accept().await.unwrap();
+    let mut tls = acceptor.accept(conn).await.unwrap();
+    let opening = read_message(&mut tls).await;
+    assert_eq!(simple_password(&opening), VALUE.as_bytes());
+    write_bind_result(&mut tls, opening.message_id, ResultCode::Success).await;
+    let next = read_message_result(&mut tls).await;
+    assert!(next.is_err(), "pipelined starttls was forwarded");
+  });
+  let mut stream = connect_through_proxy(proxy_addr, stub_port).await;
+  let mut bytes = encode(&bind_message(1, FAKE));
+  bytes.extend(encode(&LdapMessage::new(
+    2,
+    ProtocolOp::ExtendedReq(ExtendedRequest {
+      request_name: OctetString::from_static(STARTTLS_OID),
+      request_value: None,
+    }),
+  )));
+  stream.write_all(&bytes).await.unwrap();
+  let first = tokio::time::timeout(Duration::from_secs(5), read_message(&mut stream))
+    .await
+    .expect("bind result before starttls");
+  let ProtocolOp::BindResponse(body) = first.protocol_op else {
+    panic!("pipelined starttls answered before the bind result");
+  };
+  assert_eq!(first.message_id, 1);
+  assert_eq!(body.result_code, ResultCode::Success);
+  let second = tokio::time::timeout(Duration::from_secs(5), read_message(&mut stream))
+    .await
+    .expect("starttls result");
+  let ProtocolOp::ExtendedResp(body) = second.protocol_op else {
+    panic!("starttls response");
+  };
+  assert_eq!(second.message_id, 2);
+  assert_eq!(body.result_code, ResultCode::OperationsError);
+  drop(stream);
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  proxy.abort();
+}
+
 #[tokio::test]
 async fn ldap_tls_without_sni_mints_for_the_grant_host() {
   install_crypto_provider();
