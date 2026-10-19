@@ -1,8 +1,18 @@
+## [0.3.23] - 2026-10-19
+
+### 🚀 Features
+
+- *(proxy)* Rewrite NATS nkey and user-JWT CONNECT (#60)
 ## [0.3.22] - 2026-10-17
 
 ### 🚀 Features
 
 - *(amqp)* Swap SASL PLAIN on amqp and amqps (#52)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.22 [ci skip]
+- Release
 ## [0.3.21] - 2026-10-16
 
 ### 🚀 Features
