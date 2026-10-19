@@ -17,11 +17,10 @@ use std::ops::Range;
 
 use arkham_config::grants::{Grant, Scheme};
 use rasn::prelude::OctetString;
-use rasn::types::AsnType as _;
 use rasn_ldap::{
   AbandonRequest, AddRequest, AddResponse, BindRequest, BindResponse, CompareRequest, CompareResponse, DelRequest, DelResponse,
   ExtendedResponse, LdapMessage, LdapString, ModifyDnRequest, ModifyDnResponse, ModifyRequest, ModifyResponse, ProtocolOp, ResultCode,
-  SearchRequest, SearchResultDone, UnbindRequest,
+  SearchRequest, SearchResultDone,
 };
 use secrecy::ExposeSecret as _;
 
@@ -593,7 +592,7 @@ impl Ldap {
   fn note(&mut self, class: &Class, peek: &Peek) -> Result<Option<usize>, ()> {
     let app = application_number(class.op);
     if self.down.is_some() {
-      let abandon_target = if app.is_some_and(|op| op_is::<AbandonRequest>(op)) {
+      let abandon_target = if app.is_some_and(op_is::<AbandonRequest>) {
         match abandon(peek, class)? {
           Abandon::Need(need) => return Ok(Some(need)),
           Abandon::Target(id) => Some(id),
@@ -1364,7 +1363,7 @@ mod tests {
   use super::*;
   use arkham_config::grants::{Credential, GuestTlsMode, LdapScope};
   use rasn::types::AsnType as _;
-  use rasn_ldap::{AbandonRequest, AuthenticationChoice, BindRequest, DelRequest, ExtendedResponse, SearchResultDone, UnbindRequest};
+  use rasn_ldap::{AuthenticationChoice, UnbindRequest};
   use secrecy::SecretString;
 
   const FAKE_PW: &str = "arkham_fake_ldap_pass"; // betterleaks:allow
