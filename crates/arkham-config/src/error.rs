@@ -647,7 +647,7 @@ pub enum Error {
     #[source]
     fault: PathFault,
   },
-  /// A context name cannot become a label and an env name.
+  /// A context name cannot become a label.
   #[error("context `{name}` in `{}` on {protocol} {fault}", path.display())]
   ContextNameInvalid {
     /// Path the adapter passed.
@@ -660,17 +660,11 @@ pub enum Error {
     #[source]
     fault: NameFault,
   },
-  /// A label is not one [`crate::context::identities`] would issue.
-  #[error("context label `{label}` does not decode")]
-  ContextLabelInvalid {
-    /// Text that was not an issued label.
-    label: String,
-  },
-  /// Two different contexts share a label or a pair stem.
-  #[error("{0}")]
+  /// Two different contexts share a label.
+  #[error(transparent)]
   ContextCollision(Box<crate::context::ContextCollision>),
   /// Two contexts present the same host, port, and decoy bytes.
-  #[error("{0}")]
+  #[error(transparent)]
   AmbiguousContexts(Box<crate::context::AmbiguousContexts>),
   /// A presented destination host is empty after trimming.
   #[error("wire host is empty")]

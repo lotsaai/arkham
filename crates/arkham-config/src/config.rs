@@ -236,7 +236,7 @@ fn collect_referenced_variables(value: &str, names: &mut BTreeSet<String>) {
 
 /// Env names are `[_A-Za-z][_0-9A-Za-z]*`; anything else after a `$` is not a
 /// reference.
-pub(crate) fn valid_env_name(name: &str) -> bool {
+fn valid_env_name(name: &str) -> bool {
   let mut chars = name.chars();
   let Some(first) = chars.next() else {
     return false;
