@@ -659,6 +659,46 @@ if (LDAP_URL) {
     }
   });
 
+  // The refused bind leaves the socket up. StartTLS on that same connection
+  // has to upgrade, then the decoy bind has to be accepted.
+  await retry("ldap", "ldap bind then starttls then bind swaps the decoy password", async () => {
+    const client = ldapPlain(LDAP_URL);
+    try {
+      try {
+        await client.bind(parts.dn, parts.password);
+        return false;
+      } catch (err) {
+        const text = String(err);
+        stage(`ldap pre-starttls bind error: ${text}`);
+        if (ldapCode(err) !== 13 || text.includes(LDAP_REAL)) {
+          return false;
+        }
+      }
+      await client.startTLS({ ca, rejectUnauthorized: true, servername: parts.host });
+      await client.bind(parts.dn, parts.password);
+      return true;
+    } finally {
+      await closeLdap(client);
+    }
+  });
+
+  // A search is a message boundary that is not StartTLS. The upgrade still
+  // has to happen before the decoy bind.
+  await retry("ldap", "ldap search then starttls then bind swaps the decoy password", async () => {
+    const client = ldapPlain(LDAP_URL);
+    try {
+      await client.search("", { scope: "base", filter: "(objectClass=*)" });
+      await client.startTLS({ ca, rejectUnauthorized: true, servername: parts.host });
+      await client.bind(parts.dn, parts.password);
+      return true;
+    } catch (err) {
+      stage(`ldap search then starttls error: ${String(err)}`);
+      return false;
+    } finally {
+      await closeLdap(client);
+    }
+  });
+
   await retry("ldap", "ldap starttls non-decoy password is not swapped", async () => {
     const client = ldapPlain(LDAP_URL);
     try {

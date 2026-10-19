@@ -81,6 +81,36 @@ pub(crate) trait Wire {
   }
   /// Apply a framing fact from the opposite direction (suppress next n bodies).
   fn apply_peer_note(&mut self, _n: usize) {}
+  /// Upgrade noticed at a message boundary, if the last `feed` completed one.
+  ///
+  /// `prefix` is bytes already consumed that belong to the protocol after the
+  /// upgrade. The relay stops and the caller replays them.
+  fn take_upgrade(&mut self) -> Option<UpgradeNote> {
+    None
+  }
+  /// The extended response with this id is the upgrade result.
+  fn arm_upgrade(&mut self, _id: u64) {}
+}
+
+/// One direction's upgrade, taken once from the feed that completed it.
+#[derive(Debug)]
+pub(crate) enum UpgradeNote {
+  /// The upgrade request is complete. `local` means those bytes were not emitted.
+  Request {
+    /// Message id.
+    id: u64,
+    /// Bytes after the request. They belong to the next protocol.
+    prefix: Vec<u8>,
+    /// The request was withheld because the peer is already upgraded.
+    local: bool,
+  },
+  /// The matching response is complete.
+  Response {
+    /// `true` when the peer accepted the upgrade.
+    ok: bool,
+    /// Bytes after the response. They belong to the next protocol.
+    prefix: Vec<u8>,
+  },
 }
 
 /// One needle→replacement pair for a connection direction.

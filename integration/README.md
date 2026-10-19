@@ -42,7 +42,7 @@ Topology:
 | 11 | Python `smtplib` to `mail:587`: AUTH before STARTTLS is refused; AUTH PLAIN and `SMTP.login` after STARTTLS succeed; a wrong password fails; a one-shot on the server network dials the decoy at `mail` and is refused | `[rules.smtp]`: fake `smtp://` URL; real URL says `starttls=required` and carries `sslrootcert` | docker-mailserver accepts the swapped password and the client never sees it; the decoy is refused when the dial is outside the captured namespace |
 | 12 | Same client to `mail:465` with implicit TLS | `[rules.smtps]`: fake `smtps://` URL; real URL carries `sslrootcert` | same swap on a session that is TLS from the first byte |
 | 13 | `ldapts` simple bind to `ldap:3389` before StartTLS | `[rules.ldap_plain]`: fake `ldap://` URL | 389ds refuses the bind (`confidentialityRequired`, code 13) because `nsslapd-require-secure-binds` is on. The error text does not contain the real password. Code 13 is the same for the decoy and the real password; the in-process test checks that the cleartext bytes are still the decoy |
-| 14 | Same client: StartTLS, then a simple bind with the decoy password | `[rules.ldap_plain]` | the directory accepts the bind. Arkham swapped the decoy for the real password after the upgrade |
+| 14 | Same client: StartTLS, then a simple bind with the decoy password. Two more connections on the same rule: a refused cleartext bind (code 13) and then StartTLS on that socket; a root-DSE search and then StartTLS on that socket. Each continues with the decoy bind | `[rules.ldap_plain]` | the directory accepts each protected bind. Arkham swapped the decoy for the real password after the upgrade, including when StartTLS was not the first message |
 | 15 | `ldapts` simple bind to `ldap:3636` over LDAPS with the decoy password | `[rules.ldap_tls]`: fake `ldaps://` URL; real URL carries `sslrootcert` | same swap on a leg that is TLS from the first byte |
 | 16 | StartTLS and LDAPS binds with a password that is not the decoy | the same two rules | the directory returns `invalidCredentials` (code 49). The password was not swapped, and the error text does not contain the real password |
 | 17 | `nats` client to `nats:4222` with the decoy password: TLS upgrade after INFO, subscribe, publish a payload that carries the decoy, receive it | `[rules.nats]`: fake `nats://` URL; real `tls://` URL carries `sslrootcert` | nats-server accepts the swapped password, and the message comes back with the decoy unchanged |
@@ -97,8 +97,10 @@ identity, the same way the Redis demo sets `tls-auth-clients no`. The
 trust anchor is the demo CA from `gen-certs.sh`, imported into the
 directory at bootstrap and named by `sslrootcert` on both real strings.
 `ldap://` carries that anchor because StartTLS verifies the upstream
-certificate after the upgrade. Scenarios 13–16 are gated on `LDAP_URL`
-and `LDAP_TLS_URL`.
+certificate after the upgrade. A refused bind leaves the `ldapts` socket
+open, and an anonymous root-DSE search is a different first message. Both
+then call `startTLS` on that socket and bind with the decoy. Scenarios
+13–16 are gated on `LDAP_URL` and `LDAP_TLS_URL`.
 Scenarios 17 and 18 use the official `nats:2.15.1-alpine` image and the
 `nats` npm package 2.29.3. The server requires TLS: it writes one
 cleartext INFO line, then expects a handshake on the same socket. Its only

@@ -29,7 +29,7 @@ use crate::Error;
 use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::mint::MintBucket;
-use crate::relay::{log_hits, relay_guarded};
+use crate::relay::{RelayEnd, log_hits, relay_guarded, relay_stop};
 use crate::transports::engine::{Direction, Ldap, Rewritten, Wire};
 use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
 use machine::starttls_success;
@@ -269,7 +269,13 @@ impl LdapTransport {
       First::Eof | First::Close => Ok(()),
       First::Relay(prefix) => {
         let (mut downstream, mut upstream) = ldap_pair(pump.ctx, swap);
-        relay_guarded(guest, server, &mut downstream, &mut upstream, &prefix, &[]).await
+        if !pump.upgrade_upstream {
+          downstream.hold_starttls();
+        }
+        match Box::pin(relay_stop(guest, server, &mut downstream, &mut upstream, &prefix, &[])).await? {
+          RelayEnd::Done => Ok(()),
+          RelayEnd::Upgrade(upgrade) => self.finish_starttls(upgrade, pump).await,
+        }
       }
       First::StartTls(open) => self.starttls(&open, guest, server, pump).await,
     }
@@ -283,14 +289,14 @@ impl LdapTransport {
     S: AsyncRead + AsyncWrite + Unpin,
   {
     tracing::debug!(id = open.id, prefix = open.request.len(), "ldap starttls");
-    let success = if pump.upgrade_upstream {
+    let (success, server_rest) = if pump.upgrade_upstream {
       let mut upstream = Ldap::new(pump.ctx.grants, pump.ctx.host, pump.ctx.port, Direction::Upstream, false);
       upstream.expect_starttls(open.id);
       read_starttls_result(&mut server, &mut guest, &mut upstream, pump.budget).await?
     } else {
       let bytes = starttls_success(open.id).map_err(|source| Error::LdapEncode { source })?;
       write_guest(&mut guest, &bytes).await?;
-      true
+      (true, Vec::new())
     };
     if !success {
       tracing::debug!("ldap starttls refused; closing");
@@ -305,10 +311,52 @@ impl LdapTransport {
       .await?;
     let (mut downstream, mut upstream) = ldap_pair(pump.ctx, true);
     if pump.upgrade_upstream {
-      let server_plain = self.connect_server(pump.scope, pump.scope.upstream.host.as_str(), server).await?;
+      let server_plain = self
+        .connect_server(pump.scope, pump.scope.upstream.host.as_str(), Prefixed::new(server_rest, server))
+        .await?;
       relay_guarded(guest_plain, server_plain, &mut downstream, &mut upstream, &[], &[]).await
     } else {
       relay_guarded(guest_plain, server, &mut downstream, &mut upstream, &[], &[]).await
+    }
+  }
+
+  /// The relay stopped on `StartTLS`. Finish that exchange and relay the
+  /// plaintext legs. `local` answers the request here because the server
+  /// socket is already TLS.
+  async fn finish_starttls<G, S>(&self, upgrade: crate::relay::RelayUpgrade<G, S>, pump: &Pump<'_>) -> Result<(), Error>
+  where
+    G: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+  {
+    let crate::relay::RelayUpgrade {
+      mut guest,
+      server,
+      guest_prefix,
+      server_prefix,
+      id,
+      local,
+    } = upgrade;
+    if local {
+      let Ok(id) = u32::try_from(id) else {
+        return Ok(());
+      };
+      let bytes = starttls_success(id).map_err(|source| Error::LdapEncode { source })?;
+      write_guest(&mut guest, &bytes).await?;
+    }
+    let authority = Some(pump.scope.downstream.host.as_str());
+    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, &guest_prefix, pump.budget, authority, pump.mint).await? else {
+      return Ok(());
+    };
+    let guest_plain = self
+      .accept_guest(&identity, Prefixed::new(hello_buf, guest), pump.scope.guest_tls)
+      .await?;
+    let (mut downstream, mut upstream) = ldap_pair(pump.ctx, true);
+    let server = Prefixed::new(server_prefix, server);
+    if local {
+      relay_guarded(guest_plain, server, &mut downstream, &mut upstream, &[], &[]).await
+    } else {
+      let server_plain = self.connect_server(pump.scope, pump.scope.upstream.host.as_str(), server).await?;
+      relay_guarded(guest_plain, server_plain, &mut downstream, &mut upstream, &[], &[]).await
     }
   }
 }
@@ -462,7 +510,7 @@ where
 
 /// Read the server until its `StartTLS` extended response has been forwarded.
 /// Lockstep: the guest is not read, so the following handshake stays put.
-async fn read_starttls_result<R, W>(server: &mut R, guest: &mut W, up: &mut Ldap, budget: Duration) -> Result<bool, Error>
+async fn read_starttls_result<R, W>(server: &mut R, guest: &mut W, up: &mut Ldap, budget: Duration) -> Result<(bool, Vec<u8>), Error>
 where
   R: AsyncRead + Unpin,
   W: AsyncWrite + Unpin,
@@ -483,21 +531,22 @@ where
       })?;
     let n = read_count(read).map_err(|source| Error::UpstreamRead { source })?;
     if n == 0 {
-      return Ok(false);
+      return Ok((false, Vec::new()));
     }
     let Some(chunk) = buf.get(..n) else {
-      return Ok(false);
+      return Ok((false, Vec::new()));
     };
     if !forward_up(up, chunk, guest).await? {
-      return Ok(false);
+      return Ok((false, Vec::new()));
     }
     if let Some(ok) = up.take_starttls_result() {
+      let prefix = up.take_prefix();
       let (flushed, hits) = up.feed(&[]).await;
       log_hits(&hits);
       if let Rewritten::Emit(bytes) = flushed {
         write_guest(guest, &bytes).await?;
       }
-      return Ok(ok);
+      return Ok((ok, prefix));
     }
   }
 }

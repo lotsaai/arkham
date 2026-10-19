@@ -20,7 +20,7 @@ use rasn_ldap::{ExtendedResponse, LdapMessage, LdapString, ProtocolOp, ResultCod
 use secrecy::ExposeSecret as _;
 
 use crate::transports::engine::{
-  CredentialPair, Direction, Hit, Location, Raw, Rewritten, Wire, find_new_match, needle_prefix_suffix_len, replace_bytes,
+  CredentialPair, Direction, Hit, Location, Raw, Rewritten, UpgradeNote, Wire, find_new_match, needle_prefix_suffix_len, replace_bytes,
 };
 
 /// `StartTLS` extended operation OID (RFC 4511).
@@ -59,6 +59,11 @@ pub(crate) struct Ldap {
   pending_starttls: Option<bool>,
   /// Upstream needle hold-back. Same window [`Raw`] keeps, not a frame buffer.
   held: Vec<u8>,
+  /// A `StartTLS` request is recognized and not emitted. The upstream writer
+  /// is already TLS, so the request must not be forwarded.
+  hold_starttls: bool,
+  /// The request just framed was held.
+  local_starttls: bool,
   closed: bool,
 }
 
@@ -245,8 +250,15 @@ impl Ldap {
       starttls_ok: None,
       pending_starttls: None,
       held: Vec::new(),
+      hold_starttls: false,
+      local_starttls: false,
       closed: false,
     }
+  }
+
+  /// Withhold the next `StartTLS` request. The caller answers it locally.
+  pub(crate) fn hold_starttls(&mut self) {
+    self.hold_starttls = true;
   }
 
   /// Message id of a `StartTLS` request framed by the last `feed`, once.
@@ -310,6 +322,10 @@ impl Wire for Ldap {
     if self.closed {
       return (Rewritten::Close, Vec::new());
     }
+    if self.starttls_ok.is_some() {
+      self.prefix.extend_from_slice(chunk);
+      return (Rewritten::Hold, Vec::new());
+    }
     if chunk.is_empty() {
       return self.finish();
     }
@@ -317,6 +333,10 @@ impl Wire for Ldap {
     let mut out = Vec::new();
     let mut hits = Vec::new();
     while !input.is_empty() {
+      if self.starttls_ok.is_some() {
+        self.prefix.extend_from_slice(input);
+        break;
+      }
       let before = input.len();
       if self.step(&mut input, &mut out, &mut hits).await.is_err() {
         self.closed = true;
@@ -331,6 +351,30 @@ impl Wire for Ldap {
     } else {
       (Rewritten::Emit(Cow::Owned(out)), hits)
     }
+  }
+
+  fn take_upgrade(&mut self) -> Option<UpgradeNote> {
+    if let Some(id) = self.take_starttls() {
+      return Some(UpgradeNote::Request {
+        id: u64::from(id),
+        prefix: self.take_prefix(),
+        local: std::mem::take(&mut self.local_starttls),
+      });
+    }
+    if let Some(ok) = self.take_starttls_result() {
+      return Some(UpgradeNote::Response {
+        ok,
+        prefix: self.take_prefix(),
+      });
+    }
+    None
+  }
+
+  fn arm_upgrade(&mut self, id: u64) {
+    let Ok(id) = u32::try_from(id) else {
+      return;
+    };
+    self.expect_starttls(id);
   }
 }
 
@@ -513,11 +557,15 @@ impl Ldap {
         Ok(Step::Done)
       }
       ExtParse::StartTls { id } => {
-        self.pass(&peek.buf, out, hits).await?;
+        let hold = self.hold_starttls;
+        if !hold {
+          self.pass(&peek.buf, out, hits).await?;
+        }
         if peek.left == 0 {
           self.prefix = input.to_vec();
           *input = &[];
           self.starttls = Some(id);
+          self.local_starttls = hold;
           self.phase = self.finish_message(out);
         } else {
           self.phase = Phase::Tail { left: peek.left, id };
@@ -609,13 +657,16 @@ impl Ldap {
       self.phase = Phase::Tail { left, id };
       return Ok(());
     };
-    self.pass(chunk, out, hits).await?;
+    if !self.hold_starttls {
+      self.pass(chunk, out, hits).await?;
+    }
     *input = input.get(n..).unwrap_or_default();
     let left = left.saturating_sub(n);
     if left == 0 {
       self.prefix = input.to_vec();
       *input = &[];
       self.starttls = Some(id);
+      self.local_starttls = self.hold_starttls;
       self.phase = self.finish_message(out);
     } else {
       self.phase = Phase::Tail { left, id };
@@ -1467,6 +1518,16 @@ mod tests {
       panic!("bind response");
     };
     assert_eq!(response.diagnostic_message.0, format!("rejected {FAKE_PW}"));
+  }
+
+  #[tokio::test]
+  async fn held_starttls_is_not_emitted() {
+    let frame = starttls_frame(3);
+    let mut machine = down();
+    machine.hold_starttls();
+    let out = collect(&mut machine, &frame).await;
+    assert!(out.is_empty(), "a held StartTLS request must not be forwarded");
+    assert_eq!(machine.take_starttls(), Some(3));
   }
 
   #[tokio::test]
