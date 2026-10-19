@@ -684,3 +684,83 @@ pub(crate) fn log_hits(hits: &[Hit]) {
     tracing::debug!(label = %hit.label, location = ?hit.location, "substituted");
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use std::time::Duration;
+
+  use arkham_config::grants::{Credential, Grant, LdapScope};
+  use rasn_ldap::{ExtendedRequest, LdapMessage, ProtocolOp, ResultCode};
+  use secrecy::SecretString;
+  use crate::transports::engine::{Direction, Ldap};
+
+  use super::*;
+
+  const FAKE_PW: &str = "arkham_fake_ldap_pass"; // betterleaks:allow
+  const REAL_PW: &str = "arkham_real_ldap_pass_01"; // betterleaks:allow
+
+  fn grants() -> Vec<Grant> {
+    let scope = LdapScope::from_strings(
+      &format!("ldap://cn%3Ddir:{FAKE_PW}@ldap:389"),
+      &format!("ldap://cn%3Ddir:{REAL_PW}@ldap:389"),
+    )
+    .unwrap();
+    vec![Grant::Ldap {
+      credential: Credential {
+        label: "ldap".into(),
+        fake: FAKE_PW.into(),
+        value: SecretString::from(REAL_PW),
+      },
+      scope: Box::new(scope),
+    }]
+  }
+
+  fn pair() -> (Ldap, Ldap) {
+    let grants = grants();
+    (
+      Ldap::new(&grants, "ldap", 389, Direction::Downstream, true),
+      Ldap::new(&grants, "ldap", 389, Direction::Upstream, false),
+    )
+  }
+
+  fn bind_and_starttls() -> Vec<u8> {
+    let bind = LdapMessage::new(
+      1,
+      ProtocolOp::BindRequest(rasn_ldap::BindRequest::new(
+        3,
+        rasn_ldap::LdapString::from("cn=dir"),
+        rasn_ldap::AuthenticationChoice::Simple(rasn::prelude::OctetString::from(FAKE_PW.as_bytes())),
+      )),
+    );
+    let start = LdapMessage::new(
+      2,
+      ProtocolOp::ExtendedReq(ExtendedRequest {
+        request_name: rasn::prelude::OctetString::from_static(b"1.3.6.1.4.1.1466.20037"),
+        request_value: None,
+      }),
+    );
+    let mut bytes = rasn::ber::encode(&bind).unwrap();
+    bytes.extend(rasn::ber::encode(&start).unwrap());
+    bytes
+  }
+
+  #[tokio::test]
+  async fn open_bind_refuses_starttls_before_any_bind_result() {
+    let (mut down, mut up) = pair();
+    down.hold_starttls();
+    let (guest_relay, mut guest) = tokio::io::duplex(4096);
+    let (server_relay, _server) = tokio::io::duplex(4096);
+    let relay = tokio::spawn(async move { relay_stop(guest_relay, server_relay, &mut down, &mut up, &[], &[]).await });
+    guest.write_all(&bind_and_starttls()).await.unwrap();
+    let mut buf = [0u8; 512];
+    let read = tokio::time::timeout(Duration::from_millis(500), guest.read(&mut buf)).await;
+    relay.abort();
+    let n = read.expect("operationsError before the bind result").unwrap();
+    let message: LdapMessage = rasn::ber::decode(&buf[..n]).unwrap();
+    let ProtocolOp::ExtendedResp(body) = message.protocol_op else {
+      panic!("starttls response");
+    };
+    assert_eq!(message.message_id, 2);
+    assert_eq!(body.result_code, ResultCode::OperationsError);
+  }
+}

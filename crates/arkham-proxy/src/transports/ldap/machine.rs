@@ -1824,20 +1824,27 @@ mod tests {
   #[tokio::test]
   async fn wide_message_id_is_forwarded_without_peeking() {
     let small = [0x30, 0x0a, 0x02, 0x05, 0x11, 0x22, 0x33, 0x44, 0x55, 0x42, 0x01, 0x00];
-    for mut machine in [down(), up()] {
-      let out = emit(&mut machine, &small).await;
-      assert_eq!(out, small);
-    }
+    let mut downstream = down();
+    let (rewritten, _) = downstream.feed(&small).await;
+    assert!(
+      matches!(rewritten, Rewritten::Close),
+      "a message id outside the RFC range closes the downstream leg"
+    );
+    let mut upstream = up();
+    let out = emit(&mut upstream, &small).await;
+    assert_eq!(out, small);
     // The id announces 64 KiB. Those bytes are not pulled into the peek.
     let mut huge = vec![
       0x30, 0x84, 0x00, 0x01, 0x00, 0x06, // outer content 65542
       0x02, 0x84, 0x00, 0x01, 0x00, 0x00, // integer content 65536
       0x11, 0x22, 0x33, 0x44,
     ];
-    for mut machine in [down(), up()] {
-      let out = emit(&mut machine, &huge).await;
-      assert_eq!(out, huge);
-    }
+    let mut downstream = down();
+    let (rewritten, _) = downstream.feed(&huge).await;
+    assert!(matches!(rewritten, Rewritten::Close));
+    let mut upstream = up();
+    let out = emit(&mut upstream, &huge).await;
+    assert_eq!(out, huge);
     huge.extend_from_slice(&[0x55, 0x66]);
     let split = huge.len() - 2;
     let mut machine = up();
