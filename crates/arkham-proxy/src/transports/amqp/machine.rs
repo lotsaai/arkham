@@ -2196,10 +2196,14 @@ mod tests {
   }
 
   fn transfer_on(channel: u16, handle: u32, more: bool, payload: &[u8]) -> Vec<u8> {
+    transfer_tagged(channel, handle, more, None, payload)
+  }
+
+  fn transfer_tagged(channel: u16, handle: u32, more: bool, tag: Option<&[u8]>, payload: &[u8]) -> Vec<u8> {
     let performative = serde_amqp::to_vec(&Transfer {
       handle: Handle(handle),
       delivery_id: Some(1),
-      delivery_tag: None,
+      delivery_tag: tag.map(Binary::from),
       message_format: None,
       settled: None,
       more,
@@ -3027,6 +3031,34 @@ mod tests {
     }
     assert!(closed, "the completing transfer was delivered");
     assert!(!contains(&transfer_payloads(&guest).concat(), REAL));
+  }
+
+  #[tokio::test]
+  async fn a_transfer_just_over_the_cap_keeps_a_short_payload() {
+    let tag = vec![b't'; 16_350];
+    let middle = transfer_tagged(1, 0, true, Some(&tag), b"longer");
+    assert!(
+      (16_387..=16_397).contains(&middle.len()),
+      "the frame is {} bytes",
+      middle.len()
+    );
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header_10()).await;
+    guest.extend(feed_open(&mut machine, &transfer_on(1, 0, true, b"arkham_real_amqp_pass_")).await);
+    match machine.feed(&middle).await.0 {
+      Rewritten::Emit(emitted) => guest.extend(emitted.into_owned()),
+      Rewritten::Hold => {}
+      Rewritten::Close => panic!("the short payload closed early"),
+    }
+    let last = transfer_on(1, 0, false, b"_01");
+    let mut closed = false;
+    match machine.feed(&last).await.0 {
+      Rewritten::Emit(emitted) => guest.extend(emitted.into_owned()),
+      Rewritten::Hold => {}
+      Rewritten::Close => closed = true,
+    }
+    assert!(!contains(&transfer_payloads(&guest).concat(), REAL));
+    assert!(closed, "the completing transfer was delivered");
   }
 
   #[tokio::test]
