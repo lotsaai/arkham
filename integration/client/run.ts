@@ -15,7 +15,7 @@ import { join } from "node:path";
 import amqplib from "amqplib";
 import { RedisClient } from "bun";
 import { Client } from "ldapts";
-import { connect as natsConnect, StringCodec, credsAuthenticator, nkeyAuthenticator, type Authenticator, type NatsConnection } from "nats";
+import { connect as natsConnect, credsAuthenticator, nkeyAuthenticator, type Authenticator, type NatsConnection } from "@nats-io/transport-node";
 import rhea from "rhea";
 
 const FAKE = process.env.ARKHAM_FAKE ?? "";
@@ -770,7 +770,6 @@ function openNats(raw: string, pass: string): Promise<NatsConnection> {
 
 if (NATS_URL) {
   const parts = natsParts(NATS_URL);
-  const sc = StringCodec();
   // The server's only account holds the real password, so a session that
   // authenticates with the decoy proves the swap. The payload carries the
   // decoy and must arrive unchanged: payloads are never rewritten.
@@ -780,9 +779,9 @@ if (NATS_URL) {
       const subject = "arkham.demo";
       const body = `payload keeps ${parts.pass}`;
       const sub = nc.subscribe(subject, { max: 1 });
-      nc.publish(subject, sc.encode(body));
+      nc.publish(subject, body);
       const got = await race("nats message", (async () => {
-        for await (const msg of sub) return sc.decode(msg.data);
+        for await (const msg of sub) return msg.string();
         return "";
       })());
       stage(`nats received: ${got}`);
@@ -1107,15 +1106,14 @@ function credsFile(jwt: string, seed: string): Uint8Array {
 }
 
 async function natsRoundTrip(raw: string, authenticator: Authenticator, label: string): Promise<boolean> {
-  const sc = StringCodec();
   const nc = await openNatsAuth(raw, authenticator);
   try {
     const subject = `arkham.${label}`;
     const body = `payload keeps ${label}`;
     const sub = nc.subscribe(subject, { max: 1 });
-    nc.publish(subject, sc.encode(body));
+    nc.publish(subject, body);
     const got = await race("nats message", (async () => {
-      for await (const msg of sub) return sc.decode(msg.data);
+      for await (const msg of sub) return msg.string();
       return "";
     })());
     stage(`nats ${label} received: ${got}`);

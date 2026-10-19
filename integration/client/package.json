@@ -3,9 +3,9 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@nats-io/transport-node": "3.4.0",
     "amqplib": "2.2.0",
     "ldapts": "9.2.0",
-    "nats": "2.29.3",
     "rhea": "3.0.5"
   }
 }

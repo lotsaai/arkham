@@ -102,8 +102,8 @@ certificate after the upgrade. A refused bind leaves the `ldapts` socket
 open, and an anonymous root-DSE search is a different first message. Both
 then call `startTLS` on that socket and bind with the decoy. Scenarios
 13–16 are gated on `LDAP_URL` and `LDAP_TLS_URL`.
-Scenarios 17 and 18 use the official `nats:2.15.1-alpine` image and the
-`nats` npm package 2.29.3. The server requires TLS: it writes one
+Scenarios 17 and 18 use the official `nats:2.15.1-alpine` image and
+`@nats-io/transport-node` 3.4.0. The server requires TLS: it writes one
 cleartext INFO line, then expects a handshake on the same socket. Its only
 account holds the real password, so a session that authenticates with the
 decoy proves the swap. The tls block sets no `verify`, so the server does
@@ -120,7 +120,7 @@ The fake user JWT is signed by an account the server does not preload.
 Scenarios 21 and 22 use a second `nats:2.15.1-alpine` service in
 operator mode. The account JWT is preloaded under `resolver: MEMORY`,
 so the server checks the user JWT. The client uses `nkeyAuthenticator`
-and `credsAuthenticator` from the `nats` package 2.29.3. Scenarios 19
+and `credsAuthenticator` from `@nats-io/transport-node` 3.4.0. Scenarios 19
 and 20 are gated on `NATS_NKEY_URL`. Scenarios 21 and 22 are gated on
 `NATS_JWT_URL`. Scenarios 19 and 21 write the fnox decoy into the client
 container's own `~/.config/nats` and read it back. That is not discovery:
