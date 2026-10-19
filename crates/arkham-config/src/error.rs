@@ -3,6 +3,8 @@
 use std::io::Error as IoError;
 use std::path::PathBuf;
 
+use crate::context::{AmbientProtocol, NameFault, PathFault};
+
 use confique::Error as ConfiqueError;
 use serde_json::Error as JsonError;
 use toml::de::Error as TomlError;
@@ -636,4 +638,35 @@ pub enum Error {
     #[source]
     source: TomlSerializeError,
   },
+  /// A source path cannot identify a context.
+  #[error("source path `{}` {fault}", path.display())]
+  ContextPathInvalid {
+    /// Path the adapter passed.
+    path: PathBuf,
+    /// Why the path was rejected.
+    #[source]
+    fault: PathFault,
+  },
+  /// A context name cannot become a label.
+  #[error("context `{name}` in `{}` on {protocol} {fault}", path.display())]
+  ContextNameInvalid {
+    /// Path the adapter passed.
+    path: PathBuf,
+    /// Protocol of the context.
+    protocol: AmbientProtocol,
+    /// Original name.
+    name: String,
+    /// Why the name was rejected.
+    #[source]
+    fault: NameFault,
+  },
+  /// Two different contexts share a label.
+  #[error(transparent)]
+  ContextCollision(Box<crate::context::ContextCollision>),
+  /// Two contexts present the same host, port, and decoy bytes.
+  #[error(transparent)]
+  AmbiguousContexts(Box<crate::context::AmbiguousContexts>),
+  /// A presented destination host is empty after trimming.
+  #[error("wire host is empty")]
+  WireHostEmpty,
 }

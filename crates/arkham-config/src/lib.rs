@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod context;
 mod error;
 pub mod grants;
 pub mod import;
