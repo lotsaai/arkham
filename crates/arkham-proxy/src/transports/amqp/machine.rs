@@ -2677,4 +2677,100 @@ mod tests {
     assert!(!bodies_spell_password(&guest));
     assert!(!contains(&guest, REAL));
   }
+
+  fn padded(len: usize, tail: &[u8]) -> Vec<u8> {
+    let mut payload = vec![b'z'; len];
+    let start = payload.len().saturating_sub(tail.len());
+    payload[start..].copy_from_slice(tail);
+    payload
+  }
+
+  fn assert_10_frames_within(bytes: &[u8], limit: usize) {
+    let mut rest = bytes.strip_prefix(&header_10()).unwrap_or(bytes);
+    while !rest.is_empty() {
+      assert!(rest.len() >= 8, "a 1.0 header");
+      let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
+      assert!(size <= limit, "a delivered frame exceeds the replaced frame");
+      assert!(size <= rest.len() && size >= 8, "the size stays inside the buffer");
+      rest = &rest[size..];
+    }
+  }
+
+  #[tokio::test]
+  async fn a_large_transfer_holds_its_suffix_across_a_second_large_transfer() {
+    let (prefix, rest) = password_split();
+    let first_payload = padded(super::MAX_CREDENTIAL_FRAME, prefix);
+    let mut second_payload = rest.to_vec();
+    second_payload.resize(super::MAX_CREDENTIAL_FRAME, b'q');
+    let first = transfer_on(1, 0, true, &first_payload);
+    let second = transfer_on(1, 0, false, &second_payload);
+    assert!(first.len() > super::MAX_CREDENTIAL_FRAME, "the first transfer exceeds the whole-frame cap");
+    assert!(second.len() > super::MAX_CREDENTIAL_FRAME, "the second transfer exceeds the whole-frame cap");
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header_10()).await;
+    guest.extend(feed_open(&mut machine, &first).await);
+    assert!(
+      !contains(&guest, std::str::from_utf8(prefix).unwrap()),
+      "the real prefix was delivered"
+    );
+    assert!(
+      matches!(machine.feed(&second).await.0, Rewritten::Close),
+      "the completing transfer was delivered"
+    );
+    assert!(!contains(&guest, REAL));
+  }
+
+  #[tokio::test]
+  async fn a_held_prefix_is_prepended_to_a_following_large_transfer() {
+    let (prefix, _) = password_split();
+    let filler = vec![b'q'; super::MAX_CREDENTIAL_FRAME];
+    let large = transfer_on(1, 0, false, &filler);
+    assert!(large.len() > super::MAX_CREDENTIAL_FRAME, "the transfer exceeds the whole-frame cap");
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header_10()).await;
+    guest.extend(feed_open(&mut machine, &transfer_on(1, 0, true, prefix)).await);
+    assert!(
+      !contains(&guest, std::str::from_utf8(prefix).unwrap()),
+      "the real prefix was delivered"
+    );
+    guest.extend(feed_open(&mut machine, &large).await);
+    let mut joined = Vec::new();
+    for payload in transfer_payloads(&guest) {
+      joined.extend(payload);
+    }
+    assert_eq!(joined, [prefix, filler.as_slice()].concat(), "the held prefix precedes the large payload");
+    assert_10_frames_within(&guest, large.len());
+    assert!(!contains(&guest, REAL));
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn a_full_size_final_body_stays_within_the_replaced_frame() {
+    let (prefix, _) = password_split();
+    let filler = vec![b'q'; super::MAX_CREDENTIAL_FRAME];
+    let last = body_091(&filler);
+    assert!(last.len() > super::MAX_CREDENTIAL_FRAME, "the last body fills past the whole-frame cap");
+    let body_size = u64::try_from(prefix.len() + filler.len()).unwrap();
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &content_header(1, body_size)).await;
+    guest.extend(feed_open(&mut machine, &body_091(prefix)).await);
+    assert_no_secret_prefix(&guest);
+    guest.extend(feed_open(&mut machine, &last).await);
+    let mut joined = Vec::new();
+    let mut rest = guest.as_slice();
+    while !rest.is_empty() {
+      let (next, frame) = parse_frame(rest).unwrap();
+      assert!(
+        rest.len() - next.len() <= last.len(),
+        "a delivered frame exceeds the replaced frame"
+      );
+      if let AMQPFrame::Body(_, payload) = frame {
+        joined.extend(payload);
+      }
+      rest = next;
+    }
+    assert_eq!(joined, [prefix, filler.as_slice()].concat(), "the held prefix precedes the final payload");
+    assert!(!contains(&guest, REAL));
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
 }
