@@ -2,3 +2,4 @@
 !.gitignore
 !*/
 !amqp-witness/Dockerfile
+!amqp-witness/amqp-witness.py

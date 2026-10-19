@@ -7,7 +7,8 @@
 // The first failure ends the run.
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFileSync, readlinkSync } from "node:fs";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { connect, Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
 import { homedir } from "node:os";
@@ -861,123 +862,90 @@ async function amqpScenarios(scheme: "amqp" | "amqps", raw: string) {
   });
 }
 
-type AmqpLibrary = "amqplib";
-
-type GuestBytes = {
-  readonly sent: Buffer;
-  readonly received: Buffer;
-};
-
-type BrokerBytes = {
-  readonly toBroker: Buffer;
-  readonly toClient: Buffer;
-};
-
-type AttemptDir = {
-  readonly nonce: string;
-  readonly root: string;
-};
-
-type SocketTap = {
-  readonly done: Promise<GuestBytes>;
-  finish(): void;
-  restore(): void;
-};
-
-function splicePort(): number {
-  const raw = process.env.AMQP_SPLICE_PORT;
-  if (raw === undefined || raw === "") throw new Error("AMQP_SPLICE_PORT is missing");
-  if (!/^[0-9]+$/.test(raw)) throw new Error("AMQP_SPLICE_PORT is not a port");
-  const port = Number(raw);
-  if (port < 1 || port > 65535) throw new Error("AMQP_SPLICE_PORT is not a port");
-  return port;
+function spliceFatal(why: string): never {
+  console.error(`FAIL grantless amqp 0-9-1 splices untouched: ${why}`);
+  process.exit(1);
 }
 
-function spliceDir(): string {
-  const raw = process.env.AMQP_SPLICE_DIR;
-  if (raw === undefined || raw === "") throw new Error("AMQP_SPLICE_DIR is missing");
-  return raw;
+function proxyDialed(port: number, ownFd: number): boolean {
+  let own = "";
+  let table = "";
+  try {
+    own = /socket:\[(\d+)\]/.exec(readlinkSync(`/proc/self/fd/${ownFd}`))?.[1] ?? "";
+    table = readFileSync("/proc/net/tcp", "utf8");
+  } catch {
+    return false;
+  }
+  if (own === "") return false;
+  const hex = port.toString(16).toUpperCase().padStart(4, "0");
+  for (const raw of table.split("\n")) {
+    const parts = raw.trim().split(/\s+/);
+    if (parts.length < 10 || parts[3] !== "01") continue;
+    if (parts[2]?.split(":")[1]?.toUpperCase() !== hex) continue;
+    const inode = parts[9] ?? "";
+    if (inode !== "" && inode !== "0" && inode !== own) return true;
+  }
+  return false;
 }
 
-function urlOnSplicePort(raw: string, port: number): string {
+async function witnessFile(root: string, names: readonly string[], deadline: number): Promise<{ name: string; text: string }> {
+  while (Date.now() < deadline) {
+    for (const name of names) {
+      try {
+        return { name, text: await readFile(join(root, name), "utf8") };
+      } catch (err) {
+        const missing = typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT";
+        if (!missing) throw err;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error("amqp splice witness silent");
+}
+
+async function grantlessSplice(raw: string): Promise<boolean> {
+  const port = Number(process.env.AMQP_SPLICE_PORT);
+  const dir = process.env.AMQP_SPLICE_DIR ?? "";
+  if (!port || dir === "") throw new Error("amqp splice port or dir is missing");
   const url = new URL(raw);
   url.port = String(port);
-  return url.toString();
-}
-
-function spliceHolds(guest: GuestBytes, broker: BrokerBytes): boolean {
-  if (guest.sent.length === 0 || guest.received.length === 0) return false;
-  if (broker.toBroker.length === 0 || broker.toClient.length === 0) return false;
-  return guest.sent.equals(broker.toBroker) && guest.received.equals(broker.toClient);
-}
-
-function firstMismatch(left: Buffer, right: Buffer): number {
-  const shared = Math.min(left.length, right.length);
-  for (let i = 0; i < shared; i += 1) {
-    if (left[i] !== right[i]) return i;
-  }
-  if (left.length !== right.length) return shared;
-  return -1;
-}
-
-function mismatchLine(guest: GuestBytes, broker: BrokerBytes): string {
-  const sentAt = firstMismatch(guest.sent, broker.toBroker);
-  const receivedAt = firstMismatch(guest.received, broker.toClient);
-  return `splice mismatch sent=${guest.sent.length} toBroker=${broker.toBroker.length} at=${sentAt} received=${guest.received.length} toClient=${broker.toClient.length} at=${receivedAt}`;
-}
-
-function concatChunks(chunks: readonly Buffer[]): Buffer {
-  if (chunks.length === 0) return Buffer.alloc(0);
-  return Buffer.concat(chunks);
-}
-
-function chunkCopy(data: string | Uint8Array, encoding: unknown): Buffer {
-  if (typeof data === "string") {
-    const enc = typeof encoding === "string" ? encoding as BufferEncoding : "utf8";
-    return Buffer.from(data, enc);
-  }
-  return Buffer.from(data);
-}
-
-async function armAttempt(port: number): Promise<AttemptDir> {
-  const nonce = randomBytes(16).toString("hex");
-  const root = join(spliceDir(), nonce);
-  await mkdir(root, { recursive: true });
-  const tmp = join(root, "arm.tmp");
-  await writeFile(tmp, String(port));
-  await rename(tmp, join(root, "arm"));
-  return { nonce, root };
-}
-
-function tapSplicePort(port: number): SocketTap {
+  const root = join(dir, randomBytes(8).toString("hex"));
+  await mkdir(root);
   const sent: Buffer[] = [];
   const received: Buffer[] = [];
-  const open: Socket[] = [];
+  let ownFd = -1;
+  let captured = false;
   let pending = 0;
   let finished = false;
-  let settled = false;
-  let resolveDone: (bytes: GuestBytes) => void = () => undefined;
-  const done = new Promise<GuestBytes>((resolve) => {
+  let resolveDone: () => void = () => undefined;
+  const closed = new Promise<void>((resolve) => {
     resolveDone = resolve;
   });
   const settle = () => {
-    if (!finished || pending !== 0 || settled) return;
-    settled = true;
-    resolveDone({ sent: concatChunks(sent), received: concatChunks(received) });
+    if (finished && pending === 0) resolveDone();
   };
   const original = Socket.prototype.connect;
-  const patched = function (this: Socket, ...args: unknown[]) {
+  Socket.prototype.connect = function (this: Socket, ...args: unknown[]) {
     this.prependListener("connect", () => {
       if (this.remotePort !== port) return;
       pending += 1;
-      open.push(this);
+      const sample = () => {
+        if (captured) return;
+        if (ownFd < 0) ownFd = (this as Socket & { _handle?: { fd?: number } })._handle?.fd ?? -1;
+        if (ownFd >= 0) captured = proxyDialed(port, ownFd);
+      };
       const write = this.write;
       this.write = function (this: Socket, data: string | Uint8Array, ...rest: unknown[]) {
-        sent.push(chunkCopy(data, rest[0]));
+        const copy = typeof data === "string"
+          ? Buffer.from(data, typeof rest[0] === "string" ? rest[0] as BufferEncoding : "utf8")
+          : Buffer.from(data);
+        sent.push(copy);
+        sample();
         return write.call(this, data as never, ...(rest as []));
       } as typeof this.write;
       this.on("data", (chunk: Buffer | string) => {
-        received.push(chunkCopy(chunk, undefined));
+        received.push(Buffer.from(chunk));
+        sample();
       });
       this.on("close", () => {
         pending -= 1;
@@ -985,112 +953,51 @@ function tapSplicePort(port: number): SocketTap {
       });
     });
     return original.apply(this, args as never);
-  };
-  Socket.prototype.connect = patched as typeof Socket.prototype.connect;
-  return {
-    done,
-    finish() {
-      finished = true;
-      for (const sock of open) {
-        if (sock.destroyed || sock.writableEnded) continue;
-        sock.end();
-      }
-      settle();
-    },
-    restore() {
-      Socket.prototype.connect = original;
-    },
-  };
-}
-
-async function dial(client: AmqpLibrary, url: string): Promise<void> {
-  if (client !== "amqplib") throw new Error("AMQP splice client is not amqplib");
-  const conn = await amqplib.connect(url, { timeout: ATTEMPT_TIMEOUT_MS });
-  await conn.close();
-}
-
-function isMissingFile(err: unknown): boolean {
-  return typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT";
-}
-
-async function waitForFile(path: string, deadline: number): Promise<void> {
-  while (Date.now() < deadline) {
-    try {
-      await readFile(path);
-      return;
-    } catch (err) {
-      if (!isMissingFile(err)) throw err;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  throw new Error("amqp splice listening absent");
-}
-
-function decodeDone(body: Buffer): BrokerBytes {
-  const empty = { toBroker: Buffer.alloc(0), toClient: Buffer.alloc(0) };
-  if (body.length < 1 || body[0] !== 1) return empty;
-  const first = takeFrame(body, 1);
-  if (first === null) return empty;
-  const second = takeFrame(body, first.next);
-  if (second === null || second.next !== body.length) return empty;
-  return { toBroker: Buffer.from(first.bytes), toClient: Buffer.from(second.bytes) };
-}
-
-function takeFrame(body: Buffer, offset: number): { bytes: Buffer; next: number } | null {
-  if (offset > body.length || body.length - offset < 4) return null;
-  const len = body.readUInt32BE(offset);
-  const start = offset + 4;
-  if (len > body.length - start) return null;
-  return { bytes: body.subarray(start, start + len), next: start + len };
-}
-
-async function readDone(path: string, deadline: number): Promise<BrokerBytes> {
-  const empty = { toBroker: Buffer.alloc(0), toClient: Buffer.alloc(0) };
-  while (Date.now() < deadline) {
-    try {
-      return decodeDone(await readFile(path));
-    } catch (err) {
-      if (!isMissingFile(err)) throw err;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return empty;
-}
-
-async function splicedBytesMatch(raw: string, client: AmqpLibrary): Promise<boolean> {
-  const port = splicePort();
-  const url = urlOnSplicePort(raw, port);
-  const attempt = await armAttempt(port);
-  const tap = tapSplicePort(port);
+  } as typeof Socket.prototype.connect;
   const deadline = Math.min(Date.now() + SCENARIO_BUDGET_MS, DEADLINE);
   try {
-    await waitForFile(join(attempt.root, "listening"), deadline);
+    const armed = await witnessFile(root, ["error", "listening"], deadline);
+    if (armed.name === "error") throw new Error(armed.text.trim());
+    let refusal = "login succeeded";
     try {
-      await dial(client, url);
-    } catch {
+      const conn = await amqplib.connect(url.toString(), { timeout: ATTEMPT_TIMEOUT_MS });
+      await conn.close();
+    } catch (err) {
+      refusal = err instanceof Error ? err.message : String(err);
     }
-    tap.finish();
-    const guest = await Promise.race([
-      tap.done,
-      new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error("amqp splice socket did not close")), Math.max(0, deadline - Date.now()));
-      }),
-    ]);
-    await writeFile(join(attempt.root, "closed"), "");
-    const broker = await readDone(join(attempt.root, "done"), deadline);
-    if (!spliceHolds(guest, broker)) {
-      stage(mismatchLine(guest, broker));
-      return false;
+    finished = true;
+    settle();
+    await closed;
+    await writeFile(join(root, "closed"), "");
+    const result = await witnessFile(root, ["error", "done"], deadline);
+    if (result.name === "error") throw new Error(result.text.trim());
+    const names = result.text.trim().split("\n");
+    if (names.length !== 2 || names[0] === "" || names[1] === "") throw new Error("amqp splice flow pairing failed");
+    const toBroker = await readFile(join(root, names[0]));
+    const toClient = await readFile(join(root, names[1]));
+    const guestSent = Buffer.concat(sent);
+    const guestRecv = Buffer.concat(received);
+    if (guestSent.length === 0 || guestRecv.length === 0 || toBroker.length === 0 || toClient.length === 0) {
+      throw new Error(`amqp splice empty capture sent=${guestSent.length} recv=${guestRecv.length} toBroker=${toBroker.length} toClient=${toClient.length}`);
     }
+    if (!guestSent.equals(toBroker) || !guestRecv.equals(toClient)) {
+      spliceFatal(`splice mismatch sent=${guestSent.length} toBroker=${toBroker.length} recv=${guestRecv.length} toClient=${toClient.length}`);
+    }
+    if (!refusal.includes("403") || !/ACCESS.REFUSED/.test(refusal)) spliceFatal(`refusal: ${refusal}`);
+    const pass = Buffer.from(amqpParts(raw).password);
+    const plainAt = toBroker.indexOf("PLAIN");
+    if (plainAt < 0 || toBroker.indexOf(pass) < plainAt || toBroker.includes(AMQP_REAL)) spliceFatal("Start-Ok decoy was rewritten");
+    if (!captured) spliceFatal(`proxy did not capture ${port}`);
     return true;
   } finally {
-    tap.restore();
-    await rm(attempt.root, { recursive: true, force: true });
+    Socket.prototype.connect = original;
+    await rm(root, { recursive: true, force: true });
   }
 }
 
 if (AMQP_URL) {
   await amqpScenarios("amqp", AMQP_URL);
+  await retry("", "grantless amqp 0-9-1 splices untouched", () => grantlessSplice(AMQP_URL));
 } else {
   stage("amqp scenarios skipped: no AMQP_URL");
 }
@@ -1100,9 +1007,6 @@ if (AMQP_TLS_URL) {
 } else {
   stage("amqps scenarios skipped: no AMQP_TLS_URL");
 }
-
-await retry("", "grantless amqp 0-9-1 splices untouched", () =>
-  splicedBytesMatch(AMQP_URL, "amqplib"));
 
 function natsServer(raw: string): string {
   const url = new URL(raw);

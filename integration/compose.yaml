@@ -432,7 +432,7 @@ services:
   amqp-witness:
     build:
       context: ./docker/amqp-witness
-    command: ["python3", "/srv/amqp-witness.py"]
+    command: ["python3", "/witness/amqp-witness.py"]
     environment:
       AMQP_SPLICE_PORT: *amqp-splice-port
       AMQP_SPLICE_DIR: *amqp-splice-dir
@@ -440,9 +440,8 @@ services:
       HOST_GID: ${HOST_GID:-}
     cap_add:
       - NET_RAW
-      - NET_ADMIN
     volumes:
-      - ./client:/srv:ro
+      - ./docker/amqp-witness:/witness:ro
       - ./out/results:/out
     network_mode: service:amqp
     depends_on:

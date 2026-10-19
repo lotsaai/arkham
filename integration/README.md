@@ -56,6 +56,7 @@ Topology:
 | 25 | `rhea` (AMQP 1.0) to `amqp:5672` with the decoy: SASL `PLAIN`, then `open` | `[rules.amqp_plain]` | the broker sends `open`, which it never does after a refused login |
 | 26 | Both clients to `amqp:5671` over TLS with the decoy | `[rules.amqp_tls]`: fake `amqps://` URL; real URL carries `sslrootcert` | same swaps on a guest leg that is TLS from the first byte |
 | 27 | Both clients on both rules with a password that is not the decoy | the same two rules | 0-9-1 gets `ACCESS_REFUSED` and 1.0 gets a failed SASL outcome (`amqp:unauthorized-access`). The password was not swapped, and the error text does not contain the real password |
+| 28 | `amqplib` to port 5673, which has no grant. The client bytes are compared with a tcpflow recording on the broker | no AMQP grant. The witness shares the broker network namespace, holds `NET_RAW` only, and is not mounted into the client | RabbitMQ answers `ACCESS_REFUSED` (403). Start-Ok still carries the decoy. The bytes match. A second established socket to 5673 shows the proxy dialed upstream, so a bypass cannot pass |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
@@ -149,7 +150,10 @@ through the proxy. Both real strings are `amqps://` because arkham writes
 the real password only to a TLS upstream. The cleartext-upstream case,
 where the decoy is forwarded, is the in-process test
 `amqp_cleartext_start_ok_forwards_the_decoy`. Scenarios 24–27 are gated
-on `AMQP_URL` and `AMQP_TLS_URL`.
+on `AMQP_URL` and `AMQP_TLS_URL`. Scenario 28 is gated on `AMQP_URL`.
+The broker also listens on 5673. That port is not a grant, so arkham
+splices it. An empty capture retries. A byte mismatch fails on the
+first attempt.
 
 ## Run
 
