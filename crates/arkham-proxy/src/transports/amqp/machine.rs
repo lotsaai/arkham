@@ -242,25 +242,9 @@ enum InitRewrite {
 
 enum Classified {
   AbsoluteHead(usize),
-  Hold {
-    total: usize,
-    kind: Kind,
-  },
-  Forward {
-    total: usize,
-    header: usize,
-  },
-  Message {
-    total: usize,
-  },
-  /// A 0-9-1 close larger than [`MAX_CREDENTIAL_FRAME`]. Drop held bytes, then copy the frame.
-  Drop091 {
-    total: usize,
-  },
-  Teardown {
-    total: usize,
-    code: u64,
-  },
+  Hold { total: usize, kind: Kind },
+  Forward { total: usize, header: usize },
+  Message { total: usize },
 }
 
 impl Amqp {
@@ -473,17 +457,6 @@ impl Amqp {
           self.phase = self.open_message(&buf, total, input, out)?;
           return Ok(());
         }
-        Classified::Drop091 { total } => {
-          self.forget_091(&buf);
-          self.phase = self.begin_forward(&buf, total, TYPE_CHANNEL_AND_SIZE, input, out)?;
-          return Ok(());
-        }
-        Classified::Teardown { total, code } => {
-          self.forget_10(&buf, code);
-          let header = data_offset(&buf).unwrap_or(FRAME_HEADER_10);
-          self.phase = self.begin_forward(&buf, total, header, input, out)?;
-          return Ok(());
-        }
       }
     }
   }
@@ -526,7 +499,7 @@ impl Amqp {
       && (pair == connection_close_ids() || pair == channel_close_ids())
       && total > MAX_CREDENTIAL_FRAME
     {
-      return Ok(Classified::Drop091 { total });
+      return Err(());
     }
     if total > MAX_CREDENTIAL_FRAME {
       return Ok(Classified::Forward {
@@ -578,15 +551,7 @@ impl Amqp {
     if self.up.is_some() && frame_type == FRAME_AMQP {
       return self.classify_amqp(buf, total, data_offset, forward);
     }
-    if total > MAX_CREDENTIAL_FRAME {
-      return Ok(forward);
-    }
-    let wanted = match frame_type {
-      FRAME_SASL => self.down.is_some(),
-      FRAME_AMQP => self.up.is_some(),
-      _ => false,
-    };
-    if !wanted || data_offset == total {
+    if total > MAX_CREDENTIAL_FRAME || frame_type != FRAME_SASL || self.down.is_none() || data_offset == total {
       return Ok(forward);
     }
     if buf.len() < data_offset {
@@ -599,32 +564,28 @@ impl Amqp {
     let budget = total.checked_sub(data_offset).ok_or(())?;
     let code = match descriptor_code(body, budget) {
       DescriptorRead::Code(code) => code,
-      DescriptorRead::Forward => return Ok(self.scan_or_forward(frame_type, total, forward)),
+      DescriptorRead::Forward => return Ok(forward),
       DescriptorRead::Need => {
         let need = buf.len().checked_add(1).ok_or(())?;
         if need > total {
-          return Ok(self.scan_or_forward(frame_type, total, forward));
+          return Ok(forward);
         }
         return Ok(Classified::AbsoluteHead(need));
       }
     };
-    let kind = if frame_type == FRAME_SASL && Some(code) == sasl_init_code() {
+    let kind = if Some(code) == sasl_init_code() {
       Kind::SaslInit
-    } else if frame_type == FRAME_SASL
-      && Some(code) == sasl_response_code()
-      && self.down.as_ref().is_some_and(|down| down.awaiting_response)
-    {
+    } else if Some(code) == sasl_response_code() && self.down.as_ref().is_some_and(|down| down.awaiting_response) {
       Kind::SaslResponse
-    } else if frame_type == FRAME_AMQP && (Some(code) == detach_code() || Some(code) == end_code() || Some(code) == close_code()) {
-      Kind::CloseEndDetach(code)
     } else {
-      return Ok(self.scan_or_forward(frame_type, total, forward));
+      return Ok(forward);
     };
     Ok(Classified::Hold { total, kind })
   }
 
   /// An AMQP frame with an upstream secret. A transfer that does not decode within
-  /// [`MAX_CREDENTIAL_FRAME`] closes. A teardown that does not decode is forwarded.
+  /// [`MAX_CREDENTIAL_FRAME`] closes. A decoded close, end, or detach larger than that
+  /// cap closes. A teardown that does not decode is forwarded.
   fn classify_amqp(&self, buf: &[u8], total: usize, data_offset: usize, forward: Classified) -> Result<Classified, ()> {
     if buf.len() < data_offset {
       return Ok(Classified::AbsoluteHead(data_offset));
@@ -671,7 +632,7 @@ impl Amqp {
         kind: Kind::CloseEndDetach(code),
       });
     }
-    Ok(Classified::Teardown { total, code })
+    Err(())
   }
 
   fn plain_amqp(total: usize, forward: Classified) -> Classified {
@@ -714,14 +675,6 @@ impl Amqp {
 
   fn needle_room(&self) -> usize {
     self.up.as_ref().map_or(0, |pair| pair.needle.len().saturating_sub(1))
-  }
-
-  fn scan_or_forward(&self, frame_type: u8, total: usize, forward: Classified) -> Classified {
-    if self.up.is_some() && frame_type == FRAME_AMQP && total <= MAX_CREDENTIAL_FRAME {
-      Classified::Hold { total, kind: Kind::Scan }
-    } else {
-      forward
-    }
   }
 
   fn drive_frame(
@@ -1046,7 +999,8 @@ impl Amqp {
   }
 
   /// One path for every body and transfer. Held bytes leave as their own small frame.
-  /// A continuing frame is shortened by `K` and is never larger than the frame it replaces.
+  /// A buffered frame withholds the suffix of the held bytes joined with its payload.
+  /// A streamed frame withholds needle-1. The shortened frame is never larger than the one it replaces.
   fn open_message(&mut self, buf: &[u8], total: usize, input: &mut &[u8], out: &mut Vec<u8>) -> Result<Phase, ()> {
     let opened = read_opened(self.framer, buf, total)?;
     if opened.aborted {
@@ -1060,30 +1014,47 @@ impl Amqp {
       Some(left) => (left > payload_u, left.saturating_sub(payload_u)),
       None => (opened.more_flag, 0),
     };
-    let head_len = self.needle_room().min(opened.payload_len);
-    let head = buf
-      .get(opened.payload_at..opened.payload_at.saturating_add(head_len))
-      .unwrap_or(&[]);
+    let buffered = total <= MAX_CREDENTIAL_FRAME;
+    let head_len = if buffered {
+      opened.payload_len
+    } else {
+      self.needle_room().min(opened.payload_len)
+    };
+    let Some(head) = buf.get(opened.payload_at..opened.payload_at.saturating_add(head_len)) else {
+      return Err(());
+    };
     let mut joined = held.clone();
     joined.extend_from_slice(head);
     if self.has_needle(&joined) || self.has_needle(buf) {
       return Err(());
     }
-    if !held.is_empty() {
-      Self::write_held(buf, &opened, &held, out)?;
-    }
     if !more {
+      if !held.is_empty() {
+        Self::write_held(buf, &opened, &held, out)?;
+      }
       self.store(opened.link, new_left, Vec::new());
       return self.begin_forward(buf, total, 0, input, out);
     }
-    let k = if total <= MAX_CREDENTIAL_FRAME {
-      let payload = buf
-        .get(opened.payload_at..opened.payload_at.saturating_add(opened.payload_len))
-        .ok_or(())?;
-      self.suffix(payload).min(opened.payload_len)
+    let k = if buffered {
+      let retain = self.suffix(&joined);
+      let release_at = joined.len().saturating_sub(retain);
+      if release_at <= held.len() {
+        if let Some(release) = held.get(..release_at).filter(|bytes| !bytes.is_empty()) {
+          Self::write_held(buf, &opened, release, out)?;
+        }
+        if opened.transfer.is_some() {
+          write_prefix(buf, &opened, total, opened.payload_len, out)?;
+        }
+        self.store(opened.link, new_left, joined.split_off(release_at));
+        return Ok(Phase::Head(Vec::new()));
+      }
+      retain
     } else {
       self.needle_room().min(opened.payload_len)
     };
+    if !held.is_empty() {
+      Self::write_held(buf, &opened, &held, out)?;
+    }
     if k == 0 {
       self.store(opened.link, new_left, Vec::new());
       return self.begin_forward(buf, total, 0, input, out);

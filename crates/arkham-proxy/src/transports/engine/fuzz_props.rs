@@ -1293,7 +1293,7 @@ fn amqp_oversize_performative(frame_type: u8, code: u8) -> Vec<u8> {
 
 fn amqp_oversize_clean(leg: AmqpLeg, sasl: bool, on_channel: bool) -> Vec<u8> {
   match (leg, sasl) {
-    (AmqpLeg::Up, false) => amqp_oversize_method(if on_channel { 20 } else { 10 }, if on_channel { 40 } else { 50 }),
+    (AmqpLeg::Up, false) => amqp_oversize_method(if on_channel { 20 } else { 10 }, 10),
     (AmqpLeg::Up, true) => {
       let mut out = AMQP_HEADER_10.to_vec();
       out.extend(amqp_oversize_performative(0, 0x18));
