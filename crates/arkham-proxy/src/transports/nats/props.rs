@@ -6,13 +6,16 @@
 //! that runner, draw each case with `Strategy::new_tree`, and await the case
 //! on the `#[tokio::test]` runtime.
 
+use arkham_config::grants::{Grant, NatsSeed};
+use base64::Engine as _;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::TestRunner;
+use secrecy::SecretString;
 
 use crate::transports::engine::harness::{CutPend, feed_parts};
-use crate::transports::nats::fixtures::nats_grants;
-use crate::transports::nats::machine::{MAX_COMMAND as NATS_MAX_COMMAND, Nats};
+use crate::transports::nats::fixtures::{mint_user, nats_grants};
+use crate::transports::nats::machine::{self, MAX_COMMAND as NATS_MAX_COMMAND, Nats};
 use crate::transports::nats::server_info;
 
 fn count_bytes(hay: &[u8], needle: &[u8]) -> usize {
@@ -353,8 +356,9 @@ async fn prop_nats_info_cut_leaves_the_rest_unread() {
       let expected = run_nats(NatsLeg::Up, &info, &[]).await.out;
       let mut clear_reader = CutPend::new(stream.clone(), &cuts);
       let mut clear_up = nats_leg(NatsLeg::Up);
+      let mut clear_down = nats_leg(NatsLeg::DownSwap);
       let mut clear_guest = Vec::new();
-      let err = server_info(&mut clear_reader, &mut clear_up, &mut clear_guest, true)
+      let err = server_info(&mut clear_reader, &mut clear_up, &mut clear_down, &mut clear_guest, true)
         .await
         .expect_err("cleartext INFO with tls_required must close");
       prop_assert!(
@@ -377,8 +381,11 @@ async fn prop_nats_info_cut_leaves_the_rest_unread() {
       );
       let mut reader = CutPend::new(stream, &cuts);
       let mut up = nats_leg(NatsLeg::Up);
+      let mut down = nats_leg(NatsLeg::DownSwap);
       let mut guest = Vec::new();
-      let opened = server_info(&mut reader, &mut up, &mut guest, false).await.expect("info read");
+      let opened = server_info(&mut reader, &mut up, &mut down, &mut guest, false)
+        .await
+        .expect("info read");
       let Some(mut rest) = opened else {
         return Err(TestCaseError::fail("the INFO reader closed"));
       };
@@ -484,8 +491,386 @@ async fn prop_nats_arbitrary_no_panic() {
       let _ = run_nats(leg, &data, &[cut.min(data.len())]).await;
       let mut reader = CutPend::new(data, &[cut]);
       let mut up = nats_leg(NatsLeg::Up);
-      let _ = server_info(&mut reader, &mut up, &mut Vec::new(), false).await;
+      let mut down = nats_leg(NatsLeg::DownSwap);
+      let mut guest = Vec::new();
+      let _ = server_info(&mut reader, &mut up, &mut down, &mut guest, false).await;
       Ok(())
+    },
+  )
+  .await;
+}
+
+fn prop_b64(bytes: &[u8]) -> String {
+  base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn prop_user_jwt(public: &str) -> String {
+  let header = prop_b64(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+  let payload = prop_b64(format!(r#"{{"sub":"{public}"}}"#).as_bytes());
+  format!("{header}.{payload}.{}", prop_b64(b"sig"))
+}
+
+/// Printable ASCII, including quotes and backslashes. The INFO line is JSON,
+/// so the parser has to return this exact nonce before anyone signs it.
+fn nonce_text() -> impl Strategy<Value = String> {
+  proptest::string::string_regex("[ -~]{1,24}").expect("nonce")
+}
+
+struct UserKey {
+  raw: String,
+  seed: NatsSeed,
+  public: String,
+}
+
+fn user_key(bytes: [u8; 32]) -> Result<UserKey, TestCaseError> {
+  let pair = nkeys::KeyPair::new_from_raw(nkeys::KeyPairType::User, bytes).map_err(|_source| TestCaseError::fail("user key"))?;
+  let raw = pair.seed().map_err(|_source| TestCaseError::fail("user seed"))?;
+  let public = pair.public_key();
+  let seed = NatsSeed::from_seed(SecretString::from(raw.clone())).map_err(|_source| TestCaseError::fail("parsed seed"))?;
+  Ok(UserKey { raw, seed, public })
+}
+
+fn json_quote(value: &str) -> String {
+  serde_json::to_string(value).expect("json string")
+}
+
+/// `names` in the order `rank` sorts them. Equal ranks keep the input order.
+fn order_names<'a>(names: &[&'a str], rank: &[u8]) -> Vec<&'a str> {
+  let mut indexed: Vec<(u8, usize, &str)> = names
+    .iter()
+    .enumerate()
+    .map(|(index, name)| (rank.get(index).copied().unwrap_or(0), index, *name))
+    .collect();
+  indexed.sort_by_key(|item| (item.0, item.1));
+  indexed.into_iter().map(|item| item.2).collect()
+}
+
+fn spaced_connect(verb_spaces: usize, tab: bool, json_spaces: usize, fields: &[(&str, String)]) -> Vec<u8> {
+  let gap = if tab { "\t" } else { " " }.repeat(json_spaces);
+  let body = fields
+    .iter()
+    .map(|(name, value)| format!("{gap}\"{name}\"{gap}:{gap}{value}{gap}"))
+    .collect::<Vec<_>>()
+    .join(",");
+  let verb_gap = if tab { "\t" } else { " " }.repeat(verb_spaces.max(1));
+  format!("CONNECT{verb_gap}{{{body}}}\r\n").into_bytes()
+}
+
+fn info_line(nonce: &str) -> Vec<u8> {
+  format!("INFO {{\"nonce\":{}}}\r\n", json_quote(nonce)).into_bytes()
+}
+
+async fn arm_nonce(grants: &[Grant], nonce: &str) -> Result<Nats, TestCaseError> {
+  let mut up = Nats::upstream(grants, NATS_HOST, NATS_PORT);
+  let mut down = Nats::downstream(grants, NATS_HOST, NATS_PORT, true);
+  let info = info_line(nonce);
+  let (out, _, closed) = feed_parts(&mut up, &info, &[]).await;
+  prop_assert!(!closed && out == info, "opening INFO");
+  machine::arm_opening(&mut up, &mut down);
+  Ok(down)
+}
+
+async fn arm_absent(grants: &[Grant]) -> Nats {
+  let mut up = Nats::upstream(grants, NATS_HOST, NATS_PORT);
+  let mut down = Nats::downstream(grants, NATS_HOST, NATS_PORT, true);
+  let info = b"INFO {\"server_id\":\"N1\"}\r\n";
+  let (out, _, closed) = feed_parts(&mut up, info, &[]).await;
+  assert!(!closed && out == info, "opening INFO without a nonce");
+  machine::arm_opening(&mut up, &mut down);
+  down
+}
+
+fn rewritten_sig(out: &[u8]) -> Result<Vec<u8>, TestCaseError> {
+  let text = std::str::from_utf8(out).map_err(|_source| TestCaseError::fail("connect was not utf-8"))?;
+  let start = text.find('{').ok_or_else(|| TestCaseError::fail("connect had no json"))?;
+  let end = text.rfind('}').ok_or_else(|| TestCaseError::fail("connect had no json end"))?;
+  let json = text.get(start..=end).ok_or_else(|| TestCaseError::fail("connect json span"))?;
+  let value: serde_json::Value = serde_json::from_str(json).map_err(|_source| TestCaseError::fail("connect json"))?;
+  let sig = value
+    .get("sig")
+    .and_then(serde_json::Value::as_str)
+    .ok_or_else(|| TestCaseError::fail("sig missing"))?;
+  base64::engine::general_purpose::URL_SAFE_NO_PAD
+    .decode(sig)
+    .map_err(|_source| TestCaseError::fail("sig encoding"))
+}
+
+/// A verifying CONNECT, with a generated nonce, keys, field order, and
+/// spacing. The upstream signature verifies under the real public key, and
+/// the decoy public key, decoy JWT, and decoy signature are gone.
+#[tokio::test]
+async fn prop_nats_signed_connect_is_split_stable() {
+  drive(
+    concat!(module_path!(), "::prop_nats_signed_connect_is_split_stable"),
+    (
+      any::<[u8; 32]>(),
+      any::<[u8; 32]>(),
+      nonce_text(),
+      any::<bool>(),
+      any::<bool>(),
+      any::<bool>(),
+      1usize..5,
+      any::<bool>(),
+      0usize..4,
+      proptest::collection::vec(any::<u8>(), 4),
+      nats_word(),
+      proptest::collection::vec(any::<usize>(), 0..6),
+    ),
+    |(fake_bytes, real_bytes, nonce, jwt_kind, with_nkey, lower, verb_spaces, tab, json_spaces, rank, name, cuts)| async move {
+      prop_assume!(fake_bytes != real_bytes);
+      let fake = user_key(fake_bytes)?;
+      let real = user_key(real_bytes)?;
+      let fake_jwt = prop_user_jwt(&fake.public);
+      let real_jwt = prop_user_jwt(&real.public);
+      let grants = if jwt_kind {
+        nats_grants(
+          &format!("nats://creds:{}:{fake_jwt}@{NATS_HOST}:{NATS_PORT}", fake.raw),
+          &format!("tls://creds:{}:{real_jwt}@nats.upstream:{NATS_PORT}", real.raw),
+        )
+      } else {
+        nats_grants(
+          &format!("nats://nkey:{}@{NATS_HOST}:{NATS_PORT}", fake.raw),
+          &format!("tls://nkey:{}@nats.upstream:{NATS_PORT}", real.raw),
+        )
+      };
+      let sig = prop_b64(
+        &fake
+          .seed
+          .pair
+          .sign(nonce.as_bytes())
+          .map_err(|_err| TestCaseError::fail("fake seed signs"))?,
+      );
+      let names: &[&str] = if jwt_kind && with_nkey {
+        &["jwt", "nkey", "sig", "name"]
+      } else if jwt_kind {
+        &["jwt", "sig", "name"]
+      } else {
+        &["nkey", "sig", "name"]
+      };
+      let mut fields = Vec::new();
+      for field in order_names(names, &rank) {
+        let value = match field {
+          "jwt" => json_quote(&fake_jwt),
+          "nkey" => json_quote(&fake.public),
+          "sig" => json_quote(&sig),
+          "name" => json_quote(&name),
+          _ => json_quote("false"),
+        };
+        fields.push((field, value));
+      }
+      let mut line = spaced_connect(verb_spaces, tab, json_spaces, &fields);
+      if lower && let Some(head) = line.get_mut(.."CONNECT".len()) {
+        head.make_ascii_lowercase();
+      }
+      let mut once_down = arm_nonce(&grants, &nonce).await?;
+      let mut split_down = arm_nonce(&grants, &nonce).await?;
+      let once = feed_parts(&mut once_down, &line, &[]).await;
+      let split = feed_parts(&mut split_down, &line, &nats_cuts(&cuts, &line)).await;
+      prop_assert_eq!(&once.0, &split.0);
+      prop_assert_eq!(once.1, split.1);
+      prop_assert_eq!(once.2, split.2);
+      prop_assert!(!once.2, "a verifying CONNECT closed");
+      let raw = rewritten_sig(&once.0)?;
+      prop_assert!(
+        NatsSeed::verify(&real.public, nonce.as_bytes(), &raw),
+        "the upstream signature does not verify under the real public key"
+      );
+      prop_assert!(!contains_bytes(&once.0, sig.as_bytes()), "the decoy signature stayed");
+      prop_assert!(!contains_bytes(&once.0, fake.public.as_bytes()), "the decoy public key stayed");
+      if jwt_kind {
+        prop_assert!(!contains_bytes(&once.0, fake_jwt.as_bytes()), "the decoy jwt stayed");
+        prop_assert!(contains_bytes(&once.0, real_jwt.as_bytes()), "the real jwt was not written");
+      }
+      Ok(())
+    },
+  )
+  .await;
+}
+
+/// A CONNECT that must not be rewritten stays byte-identical and gains no real material.
+#[derive(Clone, Copy, Debug)]
+enum SignedTamper {
+  BadSig,
+  ForeignNkey,
+  JwtOnNkey,
+  Pending,
+  Absent,
+  OverCap,
+}
+
+#[tokio::test]
+async fn prop_nats_tampered_signed_connect_is_forwarded() {
+  drive(
+    concat!(module_path!(), "::prop_nats_tampered_signed_connect_is_forwarded"),
+    (
+      any::<[u8; 32]>(),
+      any::<[u8; 32]>(),
+      any::<[u8; 32]>(),
+      nonce_text(),
+      any::<bool>(),
+      prop_oneof![
+        Just(SignedTamper::BadSig),
+        Just(SignedTamper::ForeignNkey),
+        Just(SignedTamper::JwtOnNkey),
+        Just(SignedTamper::Pending),
+        Just(SignedTamper::Absent),
+        Just(SignedTamper::OverCap),
+      ],
+      proptest::collection::vec(any::<usize>(), 0..6),
+    ),
+    |(fake_bytes, real_bytes, foreign_bytes, nonce, jwt_kind, tamper, cuts)| async move {
+      prop_assume!(fake_bytes != real_bytes && fake_bytes != foreign_bytes && real_bytes != foreign_bytes);
+      let fake = user_key(fake_bytes)?;
+      let real = user_key(real_bytes)?;
+      let foreign = user_key(foreign_bytes)?;
+      let fake_jwt = prop_user_jwt(&fake.public);
+      let real_jwt = prop_user_jwt(&real.public);
+      let nkey_rule = matches!(tamper, SignedTamper::JwtOnNkey) || !jwt_kind;
+      let grants = if nkey_rule {
+        nats_grants(
+          &format!("nats://nkey:{}@{NATS_HOST}:{NATS_PORT}", fake.raw),
+          &format!("tls://nkey:{}@nats.upstream:{NATS_PORT}", real.raw),
+        )
+      } else {
+        nats_grants(
+          &format!("nats://creds:{}:{fake_jwt}@{NATS_HOST}:{NATS_PORT}", fake.raw),
+          &format!("tls://creds:{}:{real_jwt}@nats.upstream:{NATS_PORT}", real.raw),
+        )
+      };
+      let mut signed_nonce = nonce.clone();
+      let mut nkey_public = fake.public.clone();
+      let mut signer = &fake.seed;
+      if matches!(tamper, SignedTamper::BadSig) {
+        signed_nonce.push('x');
+      }
+      if matches!(tamper, SignedTamper::ForeignNkey) {
+        nkey_public.clone_from(&foreign.public);
+        signer = &foreign.seed;
+      }
+      let sig = prop_b64(
+        &signer
+          .pair
+          .sign(signed_nonce.as_bytes())
+          .map_err(|_err| TestCaseError::fail("seed signs"))?,
+      );
+      let mut fields = vec![
+        ("nkey".to_string(), json_quote(&nkey_public)),
+        ("sig".to_string(), json_quote(&sig)),
+      ];
+      if !nkey_rule {
+        fields.insert(0, ("jwt".to_string(), json_quote(&fake_jwt)));
+      }
+      if matches!(tamper, SignedTamper::JwtOnNkey) {
+        fields.insert(0, ("jwt".to_string(), json_quote(&fake_jwt)));
+      }
+      if matches!(tamper, SignedTamper::OverCap) {
+        fields.push(("name".to_string(), json_quote(&"b".repeat(NATS_MAX_COMMAND))));
+      }
+      let owned: Vec<(&str, String)> = fields.iter().map(|(name, value)| (name.as_str(), value.clone())).collect();
+      let line = spaced_connect(1, false, 0, &owned);
+      if matches!(tamper, SignedTamper::OverCap) {
+        prop_assert!(line.len() > NATS_MAX_COMMAND);
+      }
+      let mut down = match tamper {
+        SignedTamper::Pending => Nats::downstream(&grants, NATS_HOST, NATS_PORT, true),
+        SignedTamper::Absent => arm_absent(&grants).await,
+        _ => arm_nonce(&grants, &nonce).await?,
+      };
+      let (out, hits, closed) = feed_parts(&mut down, &line, &nats_cuts(&cuts, &line)).await;
+      let (once, once_hits, once_closed) = feed_parts(
+        &mut match tamper {
+          SignedTamper::Pending => Nats::downstream(&grants, NATS_HOST, NATS_PORT, true),
+          SignedTamper::Absent => arm_absent(&grants).await,
+          _ => arm_nonce(&grants, &nonce).await?,
+        },
+        &line,
+        &[],
+      )
+      .await;
+      prop_assert!(!closed && !once_closed, "a forwarded CONNECT closed");
+      prop_assert_eq!(hits, 0);
+      prop_assert_eq!(once_hits, 0);
+      prop_assert_eq!(&out, &line, "a tampered CONNECT was rewritten");
+      prop_assert_eq!(&once, &line, "a tampered CONNECT was rewritten");
+      prop_assert!(!contains_bytes(&out, real.public.as_bytes()), "the real public key was written");
+      prop_assert!(!contains_bytes(&out, real_jwt.as_bytes()), "the real jwt was written");
+      Ok(())
+    },
+  )
+  .await;
+}
+
+/// Server bytes, cut anywhere, agree. Guest-bound output never carries the real seed, JWT, or public key.
+/// The user-JWT kind hides the real public key in a payload, not only the real JWT.
+#[tokio::test]
+async fn prop_nats_guest_output_hides_signed_material() {
+  let (fake_raw, fake) = mint_user();
+  let (real_raw, real) = mint_user();
+  let fake_jwt = prop_user_jwt(&fake.public);
+  let real_jwt = prop_user_jwt(&real.public);
+  let fake_public = fake.public.clone();
+  let real_public = real.public.clone();
+  let nkey = nats_grants(
+    &format!("nats://nkey:{fake_raw}@{NATS_HOST}:{NATS_PORT}"),
+    &format!("tls://nkey:{real_raw}@nats.upstream:{NATS_PORT}"),
+  );
+  let jwt = nats_grants(
+    &format!("nats://creds:{fake_raw}:{fake_jwt}@{NATS_HOST}:{NATS_PORT}"),
+    &format!("tls://creds:{real_raw}:{real_jwt}@nats.upstream:{NATS_PORT}"),
+  );
+  drive(
+    concat!(module_path!(), "::prop_nats_guest_output_hides_signed_material"),
+    (
+      any::<bool>(),
+      any::<bool>(),
+      any::<bool>(),
+      nats_word(),
+      nats_word(),
+      proptest::collection::vec(any::<usize>(), 0..6),
+    ),
+    move |(jwt_kind, payload, hide_public, pre, post, cuts)| {
+      let grants = if jwt_kind { jwt.clone() } else { nkey.clone() };
+      let real_raw = real_raw.clone();
+      let real_public = real_public.clone();
+      let real_jwt = real_jwt.clone();
+      let fake_public = fake_public.clone();
+      let fake_jwt = fake_jwt.clone();
+      async move {
+        let (secret, decoy_value) = if jwt_kind && !hide_public {
+          (real_jwt.as_str(), fake_jwt.as_str())
+        } else {
+          (real_public.as_str(), fake_public.as_str())
+        };
+        let frame = if payload {
+          let mut body = pre.into_bytes();
+          body.extend_from_slice(secret.as_bytes());
+          body.extend_from_slice(post.as_bytes());
+          nats_counted("MSG orders 1", false, &body)
+        } else {
+          format!("-ERR '{pre}{secret}{post}'\r\n").into_bytes()
+        };
+        let mut once_up = Nats::upstream(&grants, NATS_HOST, NATS_PORT);
+        let mut split_up = Nats::upstream(&grants, NATS_HOST, NATS_PORT);
+        let once = feed_parts(&mut once_up, &frame, &[]).await;
+        let split = feed_parts(&mut split_up, &frame, &nats_cuts(&cuts, &frame)).await;
+        for run in [&once, &split] {
+          prop_assert!(!contains_bytes(&run.0, real_raw.as_bytes()), "guest output carried the real seed");
+          prop_assert!(!contains_bytes(&run.0, real_jwt.as_bytes()), "guest output carried the real jwt");
+          prop_assert!(
+            !contains_bytes(&run.0, real_public.as_bytes()),
+            "guest output carried the real public key"
+          );
+        }
+        if payload {
+          prop_assert!(once.2 && split.2, "a payload holding the real value stayed open");
+        } else {
+          prop_assert_eq!(&once.0, &split.0);
+          prop_assert_eq!(once.1, split.1);
+          prop_assert!(!once.2 && !split.2, "a redacted line closed");
+          prop_assert!(contains_bytes(&once.0, decoy_value.as_bytes()), "the decoy was not written");
+        }
+        Ok(())
+      }
     },
   )
   .await;

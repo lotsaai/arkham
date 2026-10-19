@@ -1,5 +1,5 @@
 //! Ambient-source pass: the authentication sources every workspace carries —
-//! gitconfig, jj, ssh, kubectl, talosctl — mapped onto grants plus the
+//! gitconfig, jj, ssh, nats, kubectl, talosctl — mapped onto grants plus the
 //! agent's decoy twin at each tool's default path.
 
 use std::env;
@@ -12,6 +12,7 @@ use crate::expand::expand_path;
 use crate::git;
 use crate::jj;
 use crate::kube;
+use crate::nats;
 use crate::paths::{Mount, expand};
 use crate::rewrites::{RewriteCollector, RewriteOutputs};
 use crate::ssh;
@@ -50,7 +51,7 @@ pub(crate) struct DeriveInputs<'a> {
 /// declaration, like fnox's own chain — and map each onto grants plus the
 /// agent's decoy twin at the tool's default path. The gitconfig resolves
 /// from the workspace root the way `git` there resolves it; jj reads its
-/// user chain; the ssh, kubectl, and talosctl configs come from their
+/// user chain; the ssh, nats, kubectl, and talosctl configs come from their
 /// default paths. An absent source derives nothing; a present one that
 /// does not map fails closed naming the file.
 ///
@@ -102,12 +103,13 @@ pub(crate) fn derive_sources(inputs: &DeriveInputs<'_>) -> Result<RewriteOutputs
   deriver.git()?;
   deriver.jj()?;
   deriver.ssh()?;
+  deriver.nats()?;
   deriver.kube_and_talos()?;
   Ok(deriver.collector.outputs())
 }
 
 /// One workspace's ambient-source pass: the authentication sources every
-/// workspace carries — gitconfig, jj, ssh, kubectl, talosctl — map onto
+/// workspace carries — gitconfig, jj, ssh, nats, kubectl, talosctl — map onto
 /// grants plus the agent's decoy twin at the tool's default path. A source
 /// the workspace declared explicitly stays with its declaration; a present
 /// source that does not map warns, and one whose guest CA is unavailable
@@ -216,6 +218,28 @@ impl AmbientDeriver<'_> {
     }
   }
 
+  /// The selected NATS CLI context under `~/.config/nats`.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the twin output cannot be written. A context
+  /// that does not map warns and derives nothing.
+  fn nats(&mut self) -> Result<(), Error> {
+    let root = self.host_home.join(".config").join("nats");
+    let selected = root.join("context.txt");
+    if self.declared.iter().any(|path| path == &root || path.starts_with(&root)) || !selected.is_file() {
+      return Ok(());
+    }
+    match nats::adapt(&root, self.home, self.host_home) {
+      Ok(Some(found)) => self.collector.twin(found.adapted, "nats-context", &found.context_dest),
+      Ok(None) => Ok(()),
+      Err(err) => {
+        tracing::warn!(source = %root.display(), %err, "nats source skipped");
+        Ok(())
+      }
+    }
+  }
+
   /// The kubeconfig and talosconfig at their default paths, honoring a
   /// single-path `KUBECONFIG`/`TALOSCONFIG` override.
   ///
@@ -298,5 +322,347 @@ fn env_source(env_name: &str, default: &str, host_home: &Path) -> PathBuf {
       host_home.join(default)
     }
     Err(_) => host_home.join(default),
+  }
+}
+
+#[cfg(test)]
+mod moved_suite {
+
+  use std::ffi::OsString;
+  use tempfile::tempdir;
+
+  use crate::ambient::*;
+
+  use crate::expand::*;
+
+  use crate::test_support::*;
+
+  /// The automatic pass maps the default-path sources onto decoy twins at
+  /// their default container paths and mints grants, with no declaration.
+  #[test]
+  fn derive_sources_maps_default_paths_to_twins_and_grants() {
+    use arkham_config::registry::Registry;
+    use arkham_pki::ssh::SshKey;
+    use std::collections::HashMap;
+    use std::env;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    let host = tempdir().unwrap();
+    let gitconfig = host.path().join(".gitconfig");
+    fs::write(&gitconfig, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
+    let key = SshKey::generate().unwrap().to_openssh().unwrap();
+    fs::create_dir_all(host.path().join(".ssh")).unwrap();
+    fs::write(host.path().join(".ssh").join("forge"), key).unwrap();
+    fs::write(
+      host.path().join(".ssh").join("config"),
+      "Host git.internal\n\tIdentityFile ~/.ssh/forge\n",
+    )
+    .unwrap();
+    let work = tempdir().unwrap();
+    let git = work.path().join(".git");
+    fs::create_dir_all(git.join("objects")).unwrap();
+    fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+    fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::write(
+      git.join("config"),
+      "[remote \"origin\"]\n\turl = https://github.com/casualjim/arkham.git\n[remote \"internal\"]\n\turl = git@git.internal:org/repo.git\n",
+    )
+    .unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let saved: Vec<(&str, Option<OsString>)> = [
+      "KUBECONFIG",
+      "TALOSCONFIG",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_NOSYSTEM",
+      "HOME",
+      "XDG_CONFIG_HOME",
+      "JJ_CONFIG",
+    ]
+    .map(|name| (name, env::var_os(name)))
+    .to_vec();
+    unset_env("KUBECONFIG");
+    unset_env("TALOSCONFIG");
+    unset_env("JJ_CONFIG");
+    set_env("GIT_CONFIG_GLOBAL", &gitconfig);
+    set_env("GIT_CONFIG_NOSYSTEM", "1");
+    set_env("HOME", host.path());
+    set_env("XDG_CONFIG_HOME", empty_xdg.path());
+    let files = work.path().join("files");
+    let decoys = vec![Decoy {
+      env: "GITHUB_TOKEN".to_string(),
+      value: "ghp_decoy_decoy_decoy_decoy_decoy".to_string(),
+    }];
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &files,
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &decoys,
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    for (name, value) in saved {
+      match value {
+        Some(value) => set_env(name, value),
+        None => unset_env(name),
+      }
+    }
+    let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
+    for expected in [
+      "/home/eng/.gitconfig",
+      "/home/eng/.ssh/config",
+      "/home/eng/.ssh/forge",
+      "/home/eng/.ssh/known_hosts",
+    ] {
+      assert!(containers.contains(&expected.to_string()), "{expected} missing from {containers:?}");
+    }
+    assert!(
+      !containers.iter().any(|path| path.ends_with(".config/jj/config.toml")),
+      "no jj chain, no jj twin"
+    );
+    let gitconfig_mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.gitconfig"))
+      .unwrap();
+    let twin = fs::read_to_string(&gitconfig_mount.host).unwrap();
+    assert!(
+      twin.contains("helper = !sh /home/eng/.config/arkham/git-credential-arkham"),
+      "{twin}"
+    );
+    assert!(twin.contains("casualjim"), "{twin}");
+    assert!(
+      outputs.grants.iter().any(|grant| grant.fragment.contains("ssh://git.internal")),
+      "the ssh config source minted the identity grant: {:?}",
+      outputs.grants.iter().map(|grant| grant.fragment.clone()).collect::<Vec<_>>()
+    );
+  }
+
+  /// An nkey context mounts a decoy seed. The real seed stays in the grant.
+  #[test]
+  fn derive_sources_mounts_a_decoy_nkey() {
+    use arkham_config::grants::NatsSeed;
+    use secrecy::SecretString;
+
+    let host = tempdir().unwrap();
+    let nats = host.path().join(".config").join("nats");
+    fs::create_dir_all(nats.join("context")).unwrap();
+    let seed = nkeys::KeyPair::new_user().seed().unwrap();
+    let nkey = nats.join("user.nk");
+    fs::write(&nkey, format!("{seed}\n")).unwrap();
+    fs::write(nats.join("context.txt"), "demo\n").unwrap();
+    fs::write(
+      nats.join("context").join("demo.json"),
+      format!(r#"{{"url":"nats://nats.internal:4222","nkey":"{}"}}"#, nkey.display()),
+    )
+    .unwrap();
+    let derived = derive_home(host.path());
+    let guest = mounted_text(&derived.outputs, "/.config/nats/user.nk");
+    assert!(!guest.contains(&seed), "{guest}");
+    NatsSeed::from_seed(SecretString::from(guest.trim().to_string())).expect("decoy seed");
+    assert!(derived.outputs.grants.iter().any(|grant| grant.fragment.contains(&seed)));
+    assert!(!mounted_text(&derived.outputs, "context/demo.json").contains(&seed));
+  }
+
+  /// A creds context mounts a decoy file. The real seed and JWT stay in the grant.
+  #[test]
+  fn derive_sources_mounts_a_decoy_creds_file() {
+    use arkham_config::grants::NatsSeed;
+    use base64::Engine as _;
+    use secrecy::SecretString;
+
+    let host = tempdir().unwrap();
+    let nats = host.path().join(".config").join("nats");
+    let creds_dir = nats.join("creds");
+    fs::create_dir_all(creds_dir).unwrap();
+    fs::create_dir_all(nats.join("context")).unwrap();
+    let seed = nkeys::KeyPair::new_user().seed().unwrap();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public;
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"sub":"{public}"}}"#).as_bytes());
+    let jwt = format!(
+      "{header}.{payload}.{}",
+      base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"sig")
+    );
+    let creds = nats.join("creds").join("user.creds");
+    fs::write(
+      &creds,
+      format!("-----BEGIN NATS USER JWT-----\n{jwt}\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n{seed}\n------END USER NKEY SEED------\n"),
+    )
+    .unwrap();
+    fs::write(nats.join("context.txt"), "demo\n").unwrap();
+    fs::write(
+      nats.join("context").join("demo.json"),
+      r#"{"url":"nats://nats.internal:4222","creds":"creds/user.creds"}"#,
+    )
+    .unwrap();
+    let derived = derive_home(host.path());
+    let guest = mounted_text(&derived.outputs, "/.config/nats/creds/user.creds");
+    assert!(!guest.contains(&seed), "{guest}");
+    assert!(!guest.contains(&jwt), "{guest}");
+    let fragment = derived
+      .outputs
+      .grants
+      .iter()
+      .find(|grant| grant.fragment.contains(&seed))
+      .expect("grant holds the real seed");
+    assert!(fragment.fragment.contains(&jwt));
+    assert!(!mounted_text(&derived.outputs, "context/demo.json").contains(&seed));
+  }
+
+  /// The selected `~/.config/nats` context becomes one grant. The guest
+  /// mounts that context only.
+  #[test]
+  fn derive_sources_mounts_the_selected_nats_context() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    token_context(host.path());
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
+    for expected in ["/home/eng/.config/nats/context.txt", "/home/eng/.config/nats/context/demo.json"] {
+      assert!(containers.contains(&expected.to_string()), "{expected} missing from {containers:?}");
+    }
+    assert!(!containers.iter().any(|path| path.ends_with("other.json")), "{containers:?}");
+    let context = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.config/nats/context/demo.json"))
+      .unwrap();
+    let twin = fs::read_to_string(&context.host).unwrap();
+    assert!(twin.contains("app"), "{twin}");
+    assert!(!twin.contains("real-token"), "{twin}");
+    assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("real-token")));
+    assert!(!outputs.grants.iter().any(|grant| grant.fragment.contains("other-real")));
+  }
+
+  /// A declared path under `~/.config/nats` stays with that declaration.
+  #[test]
+  fn declared_nats_context_is_not_derived_again() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    let nats = token_context(host.path());
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let declared = [FileRewrite {
+      source: nats.join("context.txt"),
+      dest: "{home}/.config/nats/context.txt".to_string(),
+      envs: Vec::new(),
+      format: None,
+    }];
+    let skipped = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &declared,
+    })
+    .unwrap();
+    assert!(!skipped.mounts.iter().any(|mount| mount.container.ends_with("context/demo.json")));
+  }
+
+  /// Broken ambient sources warn and skip; the healthy ones still map.
+  #[test]
+  fn broken_ambient_sources_skip_without_failing() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+    use std::env;
+
+    let host = tempdir().unwrap();
+    let gitconfig = host.path().join(".gitconfig");
+    fs::write(&gitconfig, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
+    fs::create_dir_all(host.path().join(".ssh")).unwrap();
+    fs::write(host.path().join(".ssh").join("config"), "Include work-stuff\nMatch final all\n").unwrap();
+    fs::create_dir_all(host.path().join(".kube")).unwrap();
+    fs::write(host.path().join(".kube").join("config"), "not: [valid: yaml\n").unwrap();
+    let work = tempdir().unwrap();
+    let git = work.path().join(".git");
+    fs::create_dir_all(git.join("objects")).unwrap();
+    fs::create_dir_all(git.join("refs").join("heads")).unwrap();
+    fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    fs::write(
+      git.join("config"),
+      "[remote \"origin\"]\n\turl = https://github.com/casualjim/arkham.git\n",
+    )
+    .unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let saved: Vec<(&str, Option<OsString>)> = [
+      "KUBECONFIG",
+      "TALOSCONFIG",
+      "GIT_CONFIG_GLOBAL",
+      "GIT_CONFIG_NOSYSTEM",
+      "HOME",
+      "XDG_CONFIG_HOME",
+      "JJ_CONFIG",
+    ]
+    .map(|name| (name, env::var_os(name)))
+    .to_vec();
+    unset_env("KUBECONFIG");
+    unset_env("TALOSCONFIG");
+    unset_env("JJ_CONFIG");
+    set_env("GIT_CONFIG_GLOBAL", &gitconfig);
+    set_env("GIT_CONFIG_NOSYSTEM", "1");
+    set_env("HOME", host.path());
+    set_env("XDG_CONFIG_HOME", empty_xdg.path());
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[Decoy {
+        env: "GITHUB_TOKEN".to_string(),
+        value: "ghp_decoy_decoy_decoy_decoy_decoy".to_string(),
+      }],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    for (name, value) in saved {
+      match value {
+        Some(value) => set_env(name, value),
+        None => unset_env(name),
+      }
+    }
+    let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
+    assert!(
+      containers.contains(&"/home/eng/.gitconfig".to_string()),
+      "the healthy source still maps: {containers:?}"
+    );
+    assert!(
+      !containers.contains(&"/home/eng/.ssh/config".to_string()),
+      "the Include-only ssh config derives nothing: {containers:?}"
+    );
+    assert!(
+      !containers.contains(&"/home/eng/.kube/config".to_string()),
+      "the broken kubeconfig derives nothing: {containers:?}"
+    );
   }
 }

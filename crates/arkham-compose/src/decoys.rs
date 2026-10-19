@@ -257,3 +257,111 @@ impl Report {
 pub fn rules_command(root: Option<&Path>) -> Result<String, Error> {
   Ok(Selection::load(root)?.report().render())
 }
+
+#[cfg(test)]
+mod moved_suite {
+  use std::path::PathBuf;
+
+  use arkham_config::cli::ProxyBackend;
+
+  use crate::decoys::*;
+
+  use crate::paths::*;
+
+  use crate::test_support::*;
+
+  #[test]
+  fn rules_toml_prints_derived_rules_as_blocks() {
+    let toml = Report {
+      active: decoys(),
+      hostless: Vec::new(),
+      unregistered: Vec::new(),
+    }
+    .render();
+    assert!(toml.contains("[rules.github_token]\nenv = \"GITHUB_TOKEN\""), "{toml}");
+    assert!(toml.contains("[rules.anthropic_api_key]\nenv = \"ANTHROPIC_API_KEY\""), "{toml}");
+    assert!(!toml.contains("value ="), "{toml}");
+  }
+
+  #[test]
+  fn grants_layer_mounts_at_the_standard_config_path() {
+    let mut stack = test_stack(ProxyBackend::Ebpf);
+    stack.grants_mounts = vec![Mount {
+      host: Path::new("/state/arkham/ws/arkham/grants").to_path_buf(),
+      container: PathBuf::from("/arkham/grants"),
+      ro: true,
+    }];
+    let yaml = stack.render();
+    assert!(yaml.contains("- /state/arkham/ws/arkham/grants:/arkham/grants:ro"), "{yaml}");
+    assert!(
+      yaml.contains("- /state/arkham/ws/arkham/grants/arkham.toml:/root/.config/arkham/config.toml:ro"),
+      "the grant layer must BE the global config so rules.d resolves beside it: {yaml}"
+    );
+    assert!(!yaml.contains("ARKHAM_CONFIG"), "{yaml}");
+  }
+
+  #[test]
+  fn names_the_registry_states_no_hosts_for_split_out_of_the_active_rules() {
+    let selection = Selection {
+      fnox: None,
+      registry: generation_registry(None).unwrap(),
+    };
+    let decoys = vec![
+      Decoy {
+        env: "GITHUB_TOKEN".to_string(),
+        value: "decoy".to_string(),
+      },
+      Decoy {
+        env: "VAULT_TOKEN".to_string(),
+        value: "decoy".to_string(),
+      },
+    ];
+    let (with_hosts, hostless) = selection.split_by_hosts(decoys);
+    assert_eq!(with_hosts.len(), 1);
+    assert_eq!(with_hosts[0].env, "GITHUB_TOKEN");
+    assert_eq!(hostless.len(), 1);
+    assert_eq!(hostless[0].env, "VAULT_TOKEN");
+  }
+
+  #[test]
+  fn rules_toml_comments_out_names_the_registry_knows_without_hosts() {
+    let hostless = vec![Decoy {
+      env: "ARGO_CD_TOKEN".to_string(),
+      value: "decoy".to_string(),
+    }];
+    let toml = Report {
+      active: decoys(),
+      hostless,
+      unregistered: vec!["TAVILY_API_KEY".to_string()],
+    }
+    .render();
+    assert!(toml.contains("# [rules.argo_cd_token]"), "{toml}");
+    assert!(toml.contains("# env = \"ARGO_CD_TOKEN\""), "{toml}");
+    assert!(toml.contains("# allow = [\"https://<your-host>\"]"), "{toml}");
+    assert!(toml.contains("# TAVILY_API_KEY"), "{toml}");
+  }
+
+  #[test]
+  fn generated_decoys_follow_the_rule_pattern() {
+    let registry = arkham_config::registry::Registry::load(None).unwrap();
+    let default = registry.decoy("ANTHROPIC_API_KEY", None);
+    let rule: arkham_config::config::RuleCfg =
+      toml_edit::de::from_str("env = \"ANTHROPIC_API_KEY\"\npattern = \"sk-ant-api03-{hex:8}\"\n").unwrap();
+    let rules = BTreeMap::from([("anthropic".to_string(), rule)]);
+
+    let selection = Selection { fnox: None, registry };
+    let shaped = selection.apply_rule_patterns(
+      vec![Decoy {
+        env: "ANTHROPIC_API_KEY".to_string(),
+        value: default.clone(),
+      }],
+      &rules,
+    );
+
+    assert_eq!(
+      shaped[0].value,
+      selection.registry.decoy("ANTHROPIC_API_KEY", Some("sk-ant-api03-{hex:8}"))
+    );
+    assert_ne!(shaped[0].value, default);
+  }
+}

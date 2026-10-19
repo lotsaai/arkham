@@ -349,3 +349,78 @@ impl ExplicitRewrites<'_> {
     Ok(())
   }
 }
+
+#[cfg(test)]
+mod moved_suite {
+
+  use std::slice::from_ref;
+
+  use tempfile::tempdir;
+
+  use crate::expand::*;
+
+  use crate::rewrites::*;
+
+  /// Sources rewrite reals to decoys on disk and mount read-only at the
+  /// `{home}`-expanded dest; unknown names fail naming the name.
+  #[test]
+  fn file_rewrites_swap_reals_for_decoys_on_disk() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("npmrc");
+    fs::write(&source, "//registry.npmjs.org/:_authToken=real-secret-1\n").unwrap();
+    let rewrite = FileRewrite {
+      source: source.clone(),
+      dest: "{home}/.npmrc".to_string(),
+      envs: vec!["NPM_TOKEN".to_string()],
+      format: None,
+    };
+    let decoys = vec![Decoy {
+      env: "NPM_TOKEN".to_string(),
+      value: "decoy-9".to_string(),
+    }];
+    let env = HashMap::from([("NPM_TOKEN".to_string(), "real-secret-1".to_string())]);
+    let expander = build_expander(HashMap::new());
+    let files = dir.path().join("files");
+    let outputs = write_rewrites(&RewriteInputs {
+      files_dir: &files,
+      root: dir.path(),
+      rewrites: from_ref(&rewrite),
+      decoys: &decoys,
+      env: &env,
+      expander: &expander,
+      home: "/home/eng",
+      host_home: None,
+      kube_ca: None,
+      guests_dir: dir.path(),
+    })
+    .unwrap();
+    assert_eq!(outputs.mounts.len(), 1);
+    assert!(outputs.mounts[0].ro);
+    assert_eq!(outputs.mounts[0].container, PathBuf::from("/home/eng/.npmrc"));
+    let body = fs::read_to_string(&outputs.mounts[0].host).unwrap();
+    assert!(body.contains("decoy-9"), "{body}");
+    assert!(!body.contains("real-secret-1"), "{body}");
+    let error = write_rewrites(&RewriteInputs {
+      files_dir: &files,
+      root: dir.path(),
+      rewrites: &[FileRewrite {
+        source: source.clone(),
+        dest: "{home}/.npmrc".to_string(),
+        envs: vec!["UNKNOWN_NAME".to_string()],
+        format: None,
+      }],
+      decoys: &decoys,
+      env: &env,
+      expander: &expander,
+      home: "/home/eng",
+      host_home: None,
+      kube_ca: None,
+      guests_dir: dir.path(),
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("UNKNOWN_NAME"), "{error}");
+  }
+}

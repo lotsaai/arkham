@@ -52,6 +52,6 @@ mise run test:rust \
   && .agents/skills/add-protocol/scripts/covered.sh /tmp/arkham-test-ssh.log redis rediss
 ```
 
-`mise run test:rust` runs the unit and property tests. `covered.sh` fails when `test:ssh` skipped (no docker daemon still exits 0), when the log contains `FAILED (exit`, when a backend that started has no `passed` line, or when `integration/out/covered.json` lacks a scheme.
+`mise run test:rust` runs the unit and property tests. `covered.sh` fails when `test:ssh` skipped (no docker daemon still exits 0), when the log contains `FAILED (exit`, when a backend that started has no `passed` line, or when `integration/out/results/covered.json` lacks a scheme.
 
 Confirm the new protocol has an in-process test showing the credential before the upgrade is the decoy and the credential after the upgrade is the real secret, and a reader test showing the acceptance reply leaves the handshake bytes unread. SMTP examples: `smtp_auth_before_starttls_stays_the_decoy_and_swaps_after` and `acceptance_line_leaves_the_handshake_bytes`. LDAP examples: `ldap_cleartext_bind_forwards_the_decoy` and `ldap_starttls_then_bind_swaps_the_password`.

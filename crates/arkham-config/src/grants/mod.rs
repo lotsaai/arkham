@@ -16,7 +16,8 @@ pub use amqp::{AmqpLeg, AmqpScope, AmqpUriError};
 pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub(crate) use nats::NatsUriScheme;
 pub use nats::{
-  NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsPair, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError,
+  AuthField, AuthSign, FieldPresence, NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsField, NatsPair, NatsPlain,
+  NatsScope, NatsSeed, NatsTlsOrder, NatsTrust, NatsUpstream, NatsUriError, check_user_jwt,
 };
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
@@ -440,7 +441,7 @@ pub enum Grant {
   /// One NATS connection-string mapping: fake string to real, 1:1. The real
   /// string's spelling states whether the upstream leg is TLS.
   Nats {
-    /// The wire needles: the fake and real password or token.
+    /// The wire value this grant swaps: password, token, public key, or user JWT.
     credential: Credential,
     /// The one scope this rule maps, carrying both legs' facts.
     scope: Box<NatsScope>,
@@ -692,6 +693,31 @@ impl GrantCollector {
         });
       }
     }?;
+    if let Grant::Nats { scope, .. } = &grant {
+      for existing in &self.grants {
+        let Grant::Nats {
+          credential,
+          scope: previous,
+        } = existing
+        else {
+          continue;
+        };
+        if previous.downstream != scope.downstream {
+          continue;
+        }
+        if previous.upstream != scope.upstream
+          || !previous.upstream_tls.same_dial(&scope.upstream_tls)
+          || previous.guest_tls != scope.guest_tls
+        {
+          return Err(Error::NatsSharedEndpoint {
+            previous: credential.label.clone(),
+            label: label.to_string(),
+            host: scope.downstream.host.clone(),
+            port: scope.downstream.port,
+          });
+        }
+      }
+    }
     self.grants.push(grant);
     Ok(())
   }
@@ -870,6 +896,7 @@ mod tests {
         env: "DATABASE_URL".into(),
         value: Some(SecretString::from(fake)),
         real: Some(SecretString::from(real)),
+        generated: false,
         fnox_key: None,
         allow: vec![],
         pattern: None,
@@ -1197,6 +1224,119 @@ mod tests {
     };
     assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
     assert!(scope.is_downstream_tls);
+  }
+
+  fn nats_rule(env: &str, fake: &str, real: &str) -> RuleCfg {
+    RuleCfg {
+      env: env.to_string(),
+      value: Some(SecretString::from(fake)),
+      real: Some(SecretString::from(real)),
+      generated: false,
+      fnox_key: None,
+      allow: vec![],
+      pattern: None,
+      registry: None,
+      oauth2: None,
+      tls: BTreeMap::new(),
+      ssh: BTreeMap::new(),
+      if_missing: IfMissing::default(),
+    }
+  }
+
+  fn two_nats(first: (&str, &str, &str), second: (&str, &str, &str)) -> AppConfig {
+    let mut cfg = cfg_with_db(
+      "nats://unused:unused@unused.invalid:4222",
+      "nats://unused:unused@unused.invalid:4222",
+    );
+    cfg.rules.clear();
+    cfg.rules.insert(first.0.to_string(), nats_rule(first.0, first.1, first.2));
+    cfg.rules.insert(second.0.to_string(), nats_rule(second.0, second.1, second.2));
+    cfg
+  }
+
+  #[test]
+  fn nats_grants_sharing_a_fake_endpoint_reject_a_different_upstream() {
+    let cfg = two_nats(
+      ("nats_a", "nats://agent:one@nats.internal:4222", "tls://agent:one@nats.one:4222"),
+      ("nats_b", "nats://other:two@nats.internal:4222", "tls://other:two@nats.two:4222"),
+    );
+    let err = resolve(&cfg).expect_err("different upstreams on one fake endpoint");
+    let text = err.to_string();
+    assert!(text.contains("nats.internal") && text.contains("4222"), "{err}");
+  }
+
+  #[test]
+  fn nats_grants_sharing_a_fake_endpoint_reject_a_different_guest_tls() {
+    let mut cfg = two_nats(
+      (
+        "nats_a",
+        "nats://agent:one@nats.internal:4222",
+        "tls://agent:one@nats.upstream:4222",
+      ),
+      ("nats_b", "nats://tok@nats.internal:4222", "tls://tok@nats.upstream:4222"),
+    );
+    cfg.rules.get_mut("nats_b").expect("rule").tls.insert(
+      "nats_b".to_string(),
+      HostTlsCfg {
+        client_cert: None,
+        client_key: None,
+        root_cert: None,
+        guest_tls_mode: GuestTlsMode::Mtls,
+        guest_cert: None,
+        guest_key: None,
+      },
+    );
+    let err = resolve(&cfg).expect_err("different guest tls on one fake endpoint");
+    assert!(err.to_string().contains("nats.internal"), "{err}");
+  }
+
+  #[test]
+  fn nats_grants_sharing_a_fake_endpoint_keep_distinct_auth() {
+    let cfg = two_nats(
+      (
+        "nats_a",
+        "nats://agent:one@nats.internal:4222",
+        "tls://agent:one@nats.upstream:4222",
+      ),
+      ("nats_b", "nats://tok@nats.internal:4222", "tls://tok@nats.upstream:4222"),
+    );
+    let resolved = resolve(&cfg).expect("same upstream and guest tls");
+    assert_eq!(resolved.grants.len(), 2);
+  }
+
+  #[test]
+  fn nats_shared_endpoint_compares_ca_file_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let left = dir.path().join("copied.ca");
+    let right = dir.path().join("demo.ca");
+    let pem = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+    std::fs::write(&left, pem).unwrap();
+    std::fs::write(&right, pem).unwrap();
+    let real_a = format!("tls://agent:one@nats.upstream:4222?sslrootcert={}", left.display());
+    let real_b = format!("tls://tok@nats.upstream:4222?sslrootcert={}", right.display());
+    let cfg = two_nats(
+      ("nats_a", "nats://agent:one@nats.internal:4222", &real_a),
+      ("nats_b", "nats://tok@nats.internal:4222", &real_b),
+    );
+    let resolved = resolve(&cfg).expect("the same CA bytes are one trust anchor");
+    assert_eq!(resolved.grants.len(), 2);
+
+    std::fs::write(&right, b"-----BEGIN CERTIFICATE-----\nOTHER\n-----END CERTIFICATE-----\n").unwrap();
+    let cfg = two_nats(
+      ("nats_a", "nats://agent:one@nats.internal:4222", &real_a),
+      ("nats_b", "nats://tok@nats.internal:4222", &real_b),
+    );
+    let err = resolve(&cfg).expect_err("different CA bytes");
+    assert!(err.to_string().contains("nats.internal"), "{err}");
+
+    let missing = dir.path().join("missing.ca");
+    let real_missing = format!("tls://tok@nats.upstream:4222?sslrootcert={}", missing.display());
+    let cfg = two_nats(
+      ("nats_a", "nats://agent:one@nats.internal:4222", &real_a),
+      ("nats_b", "nats://tok@nats.internal:4222", &real_missing),
+    );
+    let err = resolve(&cfg).expect_err("an unreadable CA is not the other file");
+    assert!(err.to_string().contains("nats.internal"), "{err}");
   }
 
   #[test]
@@ -1689,6 +1829,7 @@ mod tests {
         env: "T".into(),
         value: Some(SecretString::from("value")),
         real: None,
+        generated: false,
         fnox_key: None,
         allow: entries.iter().map(|entry| (*entry).to_string()).collect(),
         pattern: None,
@@ -1723,6 +1864,7 @@ mod tests {
         env: env.to_string(),
         value: Some(SecretString::from(value)),
         real: None,
+        generated: false,
         fnox_key: None,
         allow: allow.into_iter().map(str::to_string).collect(),
         pattern: None,
@@ -2101,6 +2243,7 @@ mod tests {
         env: "T".into(),
         value: None,
         real: None,
+        generated: false,
         fnox_key: None,
         allow: entries.iter().map(|entry| (*entry).to_string()).collect(),
         pattern: None,

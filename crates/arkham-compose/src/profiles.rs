@@ -168,3 +168,267 @@ pub(crate) fn profile_mounts(
   }
   Ok(mounts)
 }
+
+#[cfg(test)]
+mod moved_suite {
+  use arkham_config::cli::ProxyBackend;
+
+  use crate::profiles::*;
+
+  use crate::stack::*;
+  use crate::test_support::*;
+
+  #[test]
+  fn shared_profile_mounts_tools_at_each_tools_default_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let shared = profiles.join("__shared__");
+    std::fs::create_dir_all(shared.join("pi")).unwrap();
+    std::fs::create_dir_all(shared.join("opencode")).unwrap();
+    std::fs::create_dir_all(shared.join("not-a-tool")).unwrap();
+    std::fs::write(shared.join("stray-file"), "x").unwrap();
+
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "__shared__", &BTreeMap::new(), "/home/eng").unwrap();
+    let rendered = rendered_mounts(&mounts);
+    assert!(
+      rendered.contains(&format!("{}:/home/eng/.config/opencode:rw", shared.join("opencode").display())),
+      "{rendered:?}"
+    );
+    assert!(
+      rendered.contains(&format!("{}:/home/eng/.pi:rw", shared.join("pi").display())),
+      "{rendered:?}"
+    );
+    assert!(!rendered.iter().any(|mount| mount.contains("not-a-tool")), "{rendered:?}");
+
+    let yaml = Stack {
+      agent: agent_paths("/home/eng/github/arkham"),
+      tool_mounts: mounts.clone(),
+      ..test_stack(ProxyBackend::Tproxy)
+    }
+    .render();
+    assert!(
+      yaml.contains(&format!("- {}:/home/eng/.pi:rw", shared.join("pi").display())),
+      "{yaml}"
+    );
+    assert!(!yaml.contains("not-a-tool"), "{yaml}");
+  }
+
+  #[test]
+  fn shared_root_is_created_when_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "__shared__", &BTreeMap::new(), "/home/eng").unwrap();
+    assert!(
+      profiles.join("__shared__").is_dir(),
+      "the base every profile inherits is always made"
+    );
+    assert!(
+      rendered_mounts(&mounts).is_empty(),
+      "unconfigured tools with no profile dir mount nothing: {mounts:?}"
+    );
+  }
+
+  #[test]
+  fn named_profile_inherits_shared_tools_it_does_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    std::fs::create_dir_all(profiles.join("__shared__").join("pi")).unwrap();
+    std::fs::create_dir_all(profiles.join("work").join("gh")).unwrap();
+
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "work", &BTreeMap::new(), "/home/eng").unwrap();
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.config/gh:rw", profiles.join("work").join("gh").display())),
+      "{mounts:?}"
+    );
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.pi:rw", profiles.join("__shared__").join("pi").display())),
+      "{mounts:?}"
+    );
+  }
+
+  #[test]
+  fn cookie_chains_inherit_grandparent_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    std::fs::create_dir_all(profiles.join("__shared__").join("pi")).unwrap();
+    std::fs::create_dir_all(profiles.join("mid").join("opencode")).unwrap();
+    std::fs::create_dir_all(profiles.join("leaf")).unwrap();
+    std::fs::write(profiles.join("mid").join("profile.toml"), "[profile]\nparent = \"__shared__\"\n").unwrap();
+    std::fs::write(profiles.join("leaf").join("profile.toml"), "[profile]\nparent = \"mid\"\n").unwrap();
+
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "leaf", &BTreeMap::new(), "/home/eng").unwrap();
+    assert!(
+      rendered_mounts(&mounts).contains(&format!(
+        "{}:/home/eng/.config/opencode:rw",
+        profiles.join("mid").join("opencode").display()
+      )),
+      "{mounts:?}"
+    );
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.pi:rw", profiles.join("__shared__").join("pi").display())),
+      "{mounts:?}"
+    );
+  }
+
+  #[test]
+  fn project_layer_beats_global_at_each_inheritance_tier() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let project = dir.path().join("ws").join(".config").join("arkham").join("profiles");
+    std::fs::create_dir_all(project.join("work").join("pi")).unwrap();
+    std::fs::create_dir_all(profiles.join("work").join("pi")).unwrap();
+    std::fs::create_dir_all(project.join("__shared__").join("opencode")).unwrap();
+    std::fs::create_dir_all(profiles.join("__shared__").join("opencode")).unwrap();
+
+    let roots = ProfileRoots {
+      project: Some(project.as_path()),
+      global: Some(profiles.as_path()),
+    };
+    let mounts = profile_mounts(&roots, "work", &BTreeMap::new(), "/home/eng").unwrap();
+    assert!(
+      rendered_mounts(&mounts).contains(&format!(
+        "{}:/home/eng/.config/opencode:rw",
+        project.join("__shared__").join("opencode").display()
+      )),
+      "{mounts:?}"
+    );
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.pi:rw", project.join("work").join("pi").display())),
+      "{mounts:?}"
+    );
+  }
+
+  #[test]
+  fn project_default_beats_global_named_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let project = dir.path().join("ws").join(".config").join("arkham").join("profiles");
+    std::fs::create_dir_all(project.join("__shared__").join("pi")).unwrap();
+    std::fs::create_dir_all(profiles.join("work").join("pi")).unwrap();
+
+    let roots = ProfileRoots {
+      project: Some(project.as_path()),
+      global: Some(profiles.as_path()),
+    };
+    let mounts = profile_mounts(&roots, "work", &BTreeMap::new(), "/home/eng").unwrap();
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.pi:rw", project.join("__shared__").join("pi").display())),
+      "{mounts:?}"
+    );
+  }
+
+  #[test]
+  fn configured_tools_extend_and_override_the_built_in_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let shared = profiles.join("__shared__");
+    std::fs::create_dir_all(shared.join("pi")).unwrap();
+    std::fs::create_dir_all(shared.join("trae")).unwrap();
+
+    let configured = BTreeMap::from([
+      (
+        "pi".to_string(),
+        ToolCfg {
+          config_dir: "{home}/.pi-alt".to_string(),
+        },
+      ),
+      (
+        "trae".to_string(),
+        ToolCfg {
+          config_dir: "{home}/.trae".to_string(),
+        },
+      ),
+    ]);
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "__shared__", &configured, "/home/eng").unwrap();
+    let rendered: Vec<String> = mounts
+      .iter()
+      .map(|entry| format!("{}:{}", entry.host.display(), entry.container.display()))
+      .collect();
+    assert!(
+      rendered.contains(&format!("{}:/home/eng/.pi-alt", shared.join("pi").display())),
+      "{rendered:?}"
+    );
+    assert!(
+      rendered.contains(&format!("{}:/home/eng/.trae", shared.join("trae").display())),
+      "{rendered:?}"
+    );
+
+    let relative = BTreeMap::from([(
+      "pi".to_string(),
+      ToolCfg {
+        config_dir: "relative/pi".to_string(),
+      },
+    )]);
+    let err = profile_mounts(&roots, "__shared__", &relative, "/home/eng").unwrap_err();
+    assert!(err.to_string().contains("absolute"), "{err:?}");
+  }
+
+  #[test]
+  fn configured_tool_names_must_be_plain_directory_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let configured = BTreeMap::from([(
+      "../escape".to_string(),
+      ToolCfg {
+        config_dir: "{home}/.escape".to_string(),
+      },
+    )]);
+    let roots = temp_roots(&profiles);
+    let err = profile_mounts(&roots, "__shared__", &configured, "/home/eng").unwrap_err();
+    assert!(err.to_string().contains("not a plain directory name"), "{err:?}");
+    assert!(
+      !profiles
+        .parent()
+        .and_then(|p| p.parent())
+        .is_some_and(|config| config.join("escape").is_dir()),
+      "the escape must not create anything outside the profiles root"
+    );
+  }
+
+  #[test]
+  fn configured_tool_is_created_under_the_selected_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    let configured = BTreeMap::from([(
+      "custom".to_string(),
+      ToolCfg {
+        config_dir: "{home}/.custom".to_string(),
+      },
+    )]);
+
+    let roots = temp_roots(&profiles);
+    let mounts = profile_mounts(&roots, "work", &configured, "/home/eng").unwrap();
+    let host = profiles.join("work").join("custom");
+    assert!(host.is_dir(), "explicit intent makes the directory");
+    assert!(
+      rendered_mounts(&mounts).contains(&format!("{}:/home/eng/.custom:rw", host.display())),
+      "{mounts:?}"
+    );
+  }
+
+  #[test]
+  fn profile_cycles_and_unknown_parents_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let profiles = temp_global(&dir);
+    for name in ["aaa", "bbb"] {
+      std::fs::create_dir_all(profiles.join(name)).unwrap();
+    }
+    std::fs::write(profiles.join("aaa").join("profile.toml"), "[profile]\nparent = \"bbb\"\n").unwrap();
+    std::fs::write(profiles.join("bbb").join("profile.toml"), "[profile]\nparent = \"aaa\"\n").unwrap();
+    std::fs::create_dir_all(profiles.join("orphan")).unwrap();
+    std::fs::write(profiles.join("orphan").join("profile.toml"), "[profile]\nparent = \"missing\"\n").unwrap();
+
+    let roots = temp_roots(&profiles);
+    let err = profile_mounts(&roots, "aaa", &BTreeMap::new(), "/home/eng").unwrap_err();
+    assert!(err.to_string().contains("cycle"), "{err:?}");
+    let err = profile_mounts(&roots, "orphan", &BTreeMap::new(), "/home/eng").unwrap_err();
+    assert!(err.to_string().contains("missing"), "{err:?}");
+    let err = profile_mounts(&roots, "../x", &BTreeMap::new(), "/home/eng").unwrap_err();
+    assert!(err.to_string().contains("plain directory name"), "{err:?}");
+  }
+}

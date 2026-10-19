@@ -274,3 +274,61 @@ impl Layout {
       .map(|dir| dir.join("fnox"))
   }
 }
+
+#[cfg(test)]
+mod moved_suite {
+
+  use crate::mounts::*;
+
+  use crate::test_support::*;
+
+  #[test]
+  fn under_home_paths_translate_into_the_container_home() {
+    let host_home = Path::new("/home/ivan");
+    assert_eq!(
+      translate(Path::new("/home/ivan/github/arkham"), Some(host_home), "/home/eng"),
+      PathBuf::from("/home/eng/github/arkham")
+    );
+    assert_eq!(translate(Path::new("/data"), Some(host_home), "/home/eng"), PathBuf::from("/data"));
+    assert_eq!(
+      translate(Path::new("/home/ivan"), Some(host_home), "/home/eng"),
+      PathBuf::from("/home/eng")
+    );
+  }
+
+  #[test]
+  fn covering_mounts_absorb_overlaps() {
+    let mounts = vec![
+      mount("/home/ivan/github/arkham", "/home/eng/github/arkham", false),
+      mount("/home/ivan/github", "/home/eng/github", false),
+      mount("/home/ivan/.config/mise", "/home/eng/.config/mise", true),
+      mount("/opt/data", "/opt/data", false),
+    ];
+    let kept = covering(mounts);
+    let hosts: Vec<String> = kept.iter().map(|m| m.host.display().to_string()).collect();
+    assert_eq!(hosts, vec!["/home/ivan/github", "/home/ivan/.config/mise", "/opt/data"], "{kept:?}");
+    assert!(kept[1].ro, "the surviving mount keeps its own mode");
+  }
+
+  #[test]
+  fn include_entries_split_their_mount_mode() {
+    assert_eq!(split_mode(Path::new("~/.config/mise:ro")), (PathBuf::from("~/.config/mise"), true));
+    assert_eq!(split_mode(Path::new("/data/cache:rw")), (PathBuf::from("/data/cache"), false));
+    assert_eq!(split_mode(Path::new("/data/cache")), (PathBuf::from("/data/cache"), false));
+  }
+
+  #[test]
+  fn tilde_and_relative_includes_expand_against_root_and_home() {
+    let root = Path::new("/home/ivan/github/arkham");
+    let host_home = Some(Path::new("/home/ivan"));
+    assert_eq!(
+      expand(Path::new("~/.config/mise"), root, host_home),
+      PathBuf::from("/home/ivan/.config/mise")
+    );
+    assert_eq!(
+      expand(Path::new("../sibling"), root, host_home),
+      PathBuf::from("/home/ivan/github/sibling")
+    );
+    assert_eq!(expand(Path::new("/opt/data"), root, host_home), PathBuf::from("/opt/data"));
+  }
+}

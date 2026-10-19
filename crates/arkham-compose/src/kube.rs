@@ -298,6 +298,8 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
       registry: false,
       allow: vec![cluster.cluster.server.clone()],
       value: Some(value),
+      real: None,
+      generated: false,
       if_missing: None,
       tls: BTreeMap::from([(cluster.cluster.server.clone(), blobs.tls)]),
       ssh: BTreeMap::new(),
@@ -743,5 +745,101 @@ users:
     fs::write(&stale, "stale").unwrap();
     write_state(&grants, &[]).unwrap();
     assert!(!stale.exists(), "removed rewrites stop granting");
+  }
+}
+
+#[cfg(test)]
+mod moved_suite {
+
+  use std::fs;
+
+  use arkham_config::config::{FileRewrite, RewriteFormat};
+  use tempfile::tempdir;
+
+  use crate::expand::*;
+
+  use crate::rewrites::*;
+
+  use crate::test_support::*;
+
+  /// Kubeconfig sources adapt with no `envs`, stated or sniffed.
+  #[test]
+  fn kube_rewrites_adapt_stated_or_sniffed() {
+    use std::collections::HashMap;
+
+    use arkham_pki::ca::CertAuthority;
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("k3s.yaml");
+    fs::write(&source, KUBE_DOC).unwrap();
+    let ca = CertAuthority::generate().unwrap();
+    let expander = build_expander(HashMap::new());
+    let files = dir.path().join("files");
+    let guests = dir.path().join("guests");
+    for format in [None, Some(RewriteFormat::Kubeconfig)] {
+      let outputs = write_rewrites(&RewriteInputs {
+        files_dir: &files,
+        root: dir.path(),
+        rewrites: &[FileRewrite {
+          source: source.clone(),
+          dest: "{home}/.kube/config".to_string(),
+          envs: Vec::new(),
+          format,
+        }],
+        decoys: &[],
+        env: &HashMap::new(),
+        expander: &expander,
+        home: "/home/eng",
+        host_home: None,
+        kube_ca: Some(&ca),
+        guests_dir: &guests,
+      })
+      .unwrap();
+      assert_eq!(outputs.mounts.len(), 1);
+      assert_eq!(outputs.grants.len(), 1);
+      assert!(
+        outputs.grants[0].fragment.contains("https://10.0.0.1:6443"),
+        "{}",
+        outputs.grants[0].fragment
+      );
+      let body = fs::read_to_string(&outputs.mounts[0].host).unwrap();
+      assert!(body.contains("current-context: k3s-local"), "{body}");
+      assert!(!body.contains("probe-token"), "no real credential survives: {body}");
+    }
+  }
+
+  /// A stated kubeconfig format on a foreign file fails closed.
+  #[test]
+  fn stated_kubeconfig_on_plain_text_is_an_error() {
+    use std::collections::HashMap;
+
+    use arkham_pki::ca::CertAuthority;
+
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("npmrc");
+    fs::write(&source, "//registry.npmjs.org/:_authToken=real-secret-1\n").unwrap();
+    let ca = CertAuthority::generate().unwrap();
+    let guests = dir.path().join("guests");
+    let expander = build_expander(HashMap::new());
+    let error = write_rewrites(&RewriteInputs {
+      files_dir: &dir.path().join("files"),
+      root: dir.path(),
+      rewrites: &[FileRewrite {
+        source,
+        dest: "{home}/.npmrc".to_string(),
+        envs: Vec::new(),
+        format: Some(RewriteFormat::Kubeconfig),
+      }],
+      decoys: &[],
+      env: &HashMap::new(),
+      expander: &expander,
+      home: "/home/eng",
+      host_home: None,
+      kube_ca: Some(&ca),
+      guests_dir: &guests,
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("does not parse as YAML"), "{error}");
   }
 }

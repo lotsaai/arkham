@@ -46,6 +46,21 @@ pub(crate) fn normalize(path: &Path) -> PathBuf {
   out
 }
 
+/// The path under `host_home`, with `\` folded to `/`. `None` when `path`
+/// is not strictly inside that home. `..` and empty segments are rejected
+/// after the caller has normalized.
+pub(crate) fn path_under_home(path: &Path, host_home: &Path) -> Option<String> {
+  let rest = path.strip_prefix(host_home).ok()?;
+  if rest.as_os_str().is_empty() {
+    return None;
+  }
+  let rel = rest.to_string_lossy().replace('\\', "/");
+  if rel.split('/').any(|part| part.is_empty() || part == "..") {
+    return None;
+  }
+  Some(rel)
+}
+
 /// Host path to container path: under-home paths translate into the
 /// container home prefix, everything else mounts at its own path.
 pub(crate) fn translate(path: &Path, host_home: Option<&Path>, home: &str) -> PathBuf {

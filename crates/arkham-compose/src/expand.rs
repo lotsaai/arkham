@@ -108,6 +108,7 @@ fn synthetic_config(names: &[String]) -> AppConfig {
             env: name.clone(),
             value: None,
             real: None,
+            generated: false,
             fnox_key: None,
             allow: vec!["https://localhost.invalid".to_string()],
             pattern: None,

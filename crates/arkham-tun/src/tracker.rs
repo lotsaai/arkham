@@ -16,9 +16,9 @@ const MAX_TCP_CONNS: usize = 256;
 const CHANNEL_CAP: usize = 32;
 const RELAY_BUF: usize = 16384;
 
-/// Task → loop messages: stream bytes, or abort (RST the guest, e.g. dial failed).
 pub(crate) enum TaskMsg {
   Data(Vec<u8>),
+  Fin,
   Abort,
 }
 
@@ -101,10 +101,12 @@ impl TcpTracker {
 
       // Task → socket: abort wins, then stream bytes, then graceful exit.
       let mut abort = false;
+      let mut fin = false;
       let mut task_gone = false;
-      while conn.write_pending.is_none() && !abort && !task_gone {
+      while conn.write_pending.is_none() && !abort && !fin && !task_gone {
         match conn.from_proxy.try_recv() {
           Ok(TaskMsg::Abort) => abort = true,
+          Ok(TaskMsg::Fin) => fin = true,
           Ok(TaskMsg::Data(data)) => {
             if socket.can_send() {
               match socket.send_slice(&data) {
@@ -150,7 +152,7 @@ impl TcpTracker {
         socket.abort();
         continue;
       }
-      if task_gone && conn.write_pending.is_none() {
+      if (fin || task_gone) && conn.write_pending.is_none() {
         socket.close();
         continue;
       }

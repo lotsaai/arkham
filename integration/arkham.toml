@@ -114,6 +114,20 @@ value = "ldaps://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3636"
 env = "NATS_URL"
 value = "nats://agent:arkham_fake_nats_pass@nats:4222"
 
+# Nkey and user JWT. The sentinels below are not seeds. `integration/gen-nats.sh`
+# copies this file to `integration/out/arkham.toml` and replaces them. Compose
+# mounts that copy. The client holds the fake seed and the fake JWT. The real
+# seed stays in the fnox value.
+[rules.nats_nkey]
+env = "NATS_NKEY_URL"
+value = "nats://nkey:SU_FAKE_USER_SEED@nats:4222"
+
+# Port 4223, not 4222. Transparent capture shortlists the NATS grant by
+# destination port before SNI, and the password grant already owns 4222.
+[rules.nats_jwt]
+env = "NATS_JWT_URL"
+value = "nats://creds:SU_FAKE_JWT_SEED:FAKE_USER_JWT@nats-jwt:4223"
+
 [rules.amqp_plain]
 env = "AMQP_URL"
 value = "amqp://agent:arkham_fake_amqp_pass@amqp:5672"

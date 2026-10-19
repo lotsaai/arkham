@@ -114,6 +114,7 @@ http-body-util = "0.1"
 httparse = "1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+jwt = "0.16"
 libc = "0.2"
 memchr = "2"
 miette = { version = "7", features = ["fancy"] }
@@ -121,6 +122,7 @@ mimalloc = "0.1"
 netlink-packet-core = "0.9"
 netlink-packet-netfilter = "0.4"
 netlink-sys = "0.8"
+nkeys = "0.4.5"
 percent-encoding = "2.3"
 pgwire = { version = "0.41", default-features = false }
 pretty_assertions = "1"
@@ -130,6 +132,7 @@ rand = "0.8"
 rasn = { version = "0.29.0", default-features = false, features = ["std"] }
 rasn-ldap = "0.29.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+regex = "1"
 rtnetlink = "0.23.0"
 russh = { version = "0.56", default-features = false, features = ["aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }

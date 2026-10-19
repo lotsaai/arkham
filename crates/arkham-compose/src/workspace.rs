@@ -114,3 +114,47 @@ impl Workspace {
     Selection::load(Some(self.root()))
   }
 }
+
+#[cfg(test)]
+mod moved_suite {
+
+  use std::fs;
+  use std::path::Path;
+
+  use tempfile::tempdir;
+
+  use crate::confine::*;
+
+  /// Home prefixes move to the container home; URLs, relative paths, and
+  /// off-home absolutes stay intact.
+  #[test]
+  fn mise_rewrite_translates_home_paths_only() {
+    let home = Path::new("/home/ivan");
+    let rewritten = rewrite_mise_toml(
+      "[tools]\nnode = \"22\"\n[env]\nTOKEN_FILE = \"/home/ivan/.npmrc\"\nURL = \"https://example.com/x\"\nREL = \"./bin/tool\"\nOTHER = \"/etc/hosts\"\nTILDE = \"~/.config/mise\"\nLIST = [\"/home/ivan/a\", \"b\"]\n",
+      Some(home),
+      "/home/eng",
+    )
+    .unwrap();
+    assert!(rewritten.contains("/home/eng/.npmrc"), "{rewritten}");
+    assert!(rewritten.contains("https://example.com/x"), "{rewritten}");
+    assert!(rewritten.contains("./bin/tool"), "{rewritten}");
+    assert!(rewritten.contains("/etc/hosts"), "{rewritten}");
+    assert!(rewritten.contains("/home/eng/.config/mise"), "{rewritten}");
+    assert!(rewritten.contains("/home/eng/a"), "{rewritten}");
+  }
+
+  /// The agent file is created once from the local file and never
+  /// overwritten; without the mise pair nothing happens.
+  #[test]
+  fn mise_agent_file_is_created_once_and_never_overwritten() {
+    let dir = tempdir().unwrap();
+    assert!(!ensure_mise_agent(dir.path(), "/home/eng").unwrap());
+    fs::write(dir.path().join("mise.toml"), "[tools]\n").unwrap();
+    fs::write(dir.path().join("mise.local.toml"), "[env]\nA = \"1\"\n").unwrap();
+    assert!(ensure_mise_agent(dir.path(), "/home/eng").unwrap());
+    fs::write(dir.path().join("mise.agent.toml"), "edited").unwrap();
+    assert!(!ensure_mise_agent(dir.path(), "/home/eng").unwrap());
+    assert_eq!(fs::read_to_string(dir.path().join("mise.agent.toml")).unwrap(), "edited");
+  }
+}

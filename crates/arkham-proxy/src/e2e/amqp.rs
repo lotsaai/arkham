@@ -215,6 +215,7 @@ fn mtls_grants(fake: &str, real: &str) -> Result<Vec<Grant>, Box<arkham_config::
       env: "AMQP_URL".into(),
       value: Some(SecretString::from(fake)),
       real: Some(SecretString::from(real)),
+      generated: false,
       fnox_key: None,
       allow: Vec::new(),
       pattern: None,

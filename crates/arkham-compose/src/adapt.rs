@@ -5,6 +5,7 @@
 
 use arkham_config::config::{HostSshCfg, HostTlsCfg, IfMissing};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 #[cfg(unix)]
 use std::fs::Permissions;
@@ -62,9 +63,18 @@ pub(crate) struct GrantFragment {
   /// Allow entries the derived rule grants.
   pub(crate) allow: Vec<String>,
   /// Real credential, held inline. Absent for kinds whose secret is key
-  /// material in `ssh` rather than a wire value.
+  /// material in `ssh` rather than a wire value. Connection-string rules
+  /// put the fake string here.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) value: Option<String>,
+  /// Connection-string rules: the real string, stated beside the fake
+  /// `value`. Absent for token and ssh rules. [`Debug`] redacts it.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub(crate) real: Option<Redacted>,
+  /// `true` on a fragment this adapter wrote. Fnox keeps a stated `real`
+  /// only when this is set and fnox has no value for the rule.
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub(crate) generated: bool,
   /// What the rule does without a fnox value. Absent keeps the default.
   #[serde(skip_serializing_if = "Option::is_none")]
   pub(crate) if_missing: Option<IfMissing>,
@@ -74,6 +84,18 @@ pub(crate) struct GrantFragment {
   /// Per-entry SSH key material.
   #[serde(skip_serializing_if = "BTreeMap::is_empty")]
   pub(crate) ssh: BTreeMap<String, HostSshCfg>,
+}
+
+/// A real credential that serializes into the grant fragment and prints as
+/// `redacted`.
+#[derive(Serialize)]
+#[serde(transparent)]
+pub(crate) struct Redacted(pub(crate) String);
+
+impl fmt::Debug for Redacted {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.write_str("redacted")
+  }
 }
 
 /// Serialize one grant fragment under `[rules.{label}]`, with the generation
@@ -173,6 +195,27 @@ pub(crate) fn rewrite_label(source: &Path, name: &str) -> Result<String, Error> 
   Ok(format!("{}-{}-{}", path_slug, clean(&stem), clean(name)))
 }
 
+/// Blob-name prefixes the adapters write. [`write_state`] deletes a file
+/// with one of these prefixes when the current adapt did not write it.
+pub(crate) const BLOB_PREFIX_KUBE: &str = "kube-";
+/// Talos client material.
+pub(crate) const BLOB_PREFIX_TALOS: &str = "talos-";
+/// SSH identity material.
+pub(crate) const BLOB_PREFIX_SSH: &str = "ssh-";
+/// Git identity material.
+pub(crate) const BLOB_PREFIX_GIT: &str = "git-";
+/// NATS client certificate, key, and CA.
+pub(crate) const BLOB_PREFIX_NATS: &str = "nats-";
+
+/// Every adapter blob prefix, in the order the writers name files.
+pub(crate) const ADAPTER_BLOB_PREFIXES: &[&str] = &[
+  BLOB_PREFIX_KUBE,
+  BLOB_PREFIX_TALOS,
+  BLOB_PREFIX_SSH,
+  BLOB_PREFIX_GIT,
+  BLOB_PREFIX_NATS,
+];
+
 /// Write the grant layer: the grant fragments concatenated into the marker
 /// global config, plus the blobs under `rules.d`, pruning stale adapter blobs
 /// so a removed rewrite stops granting. The arkham service mounts the marker
@@ -204,10 +247,7 @@ pub(crate) fn write_state(state_dir: &Path, adapted: &[RewriteAdapted]) -> Resul
     }
   }
   write_secret(&marker, toml.as_bytes())?;
-  let stale = |name: &str| {
-    (name.starts_with("kube-") || name.starts_with("talos-") || name.starts_with("ssh-") || name.starts_with("git-"))
-      && !current.contains(name)
-  };
+  let stale = |name: &str| ADAPTER_BLOB_PREFIXES.iter().any(|prefix| name.starts_with(prefix)) && !current.contains(name);
   for entry in fs::read_dir(&rules_dir).map_err(|source| Error::ReadFile {
     path: rules_dir.clone(),
     source,
@@ -247,6 +287,25 @@ mod tests {
   use super::*;
 
   #[test]
+  fn grant_fragment_debug_redacts_the_real_string() {
+    let marker = "ZZZ-REAL-MARKER";
+    let fragment = GrantFragment {
+      env: "NATS_CONTEXT".to_string(),
+      registry: false,
+      allow: Vec::new(),
+      value: Some("nats://fake@nats.internal:4222".to_string()),
+      real: Some(Redacted(format!("nats://{marker}@nats.internal:4222"))),
+      generated: true,
+      if_missing: None,
+      tls: BTreeMap::new(),
+      ssh: BTreeMap::new(),
+    };
+    let rendered = format!("{fragment:?}");
+    assert!(rendered.contains("redacted"), "{rendered}");
+    assert!(!rendered.contains(marker), "{rendered}");
+  }
+
+  #[test]
   fn sniff_picks_kubeconfig_over_talos_on_shared_markers() {
     assert_eq!(
       sniff(b"context: c\ncontexts:\n  c:\n    endpoints:\n      - 10.0.0.1\n"),
@@ -277,6 +336,33 @@ mod tests {
     fs::write(&stale_other, "stale").unwrap();
     write_state(&state, &[]).unwrap();
     assert!(!stale_talos.exists(), "removed talos rewrites stop granting");
+    assert!(stale_other.exists(), "non-adapter blobs are untouched");
+  }
+
+  #[test]
+  fn write_state_prunes_a_removed_nats_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("grants");
+    let adapted = RewriteAdapted {
+      fragment: "[rules.x]\n".to_string(),
+      decoy: String::new(),
+      materialized: vec![("kube-a.crt".to_string(), b"a".to_vec())],
+      decoy_files: Vec::new(),
+    };
+    write_state(&state, &[adapted]).unwrap();
+    let rules = state.join("rules.d");
+    let stale_key = rules.join("nats-old.key");
+    let stale_crt = rules.join("nats-old.crt");
+    let stale_ca = rules.join("nats-old.ca");
+    let stale_other = rules.join("other.crt");
+    fs::write(&stale_key, "stale").unwrap();
+    fs::write(&stale_crt, "stale").unwrap();
+    fs::write(&stale_ca, "stale").unwrap();
+    fs::write(&stale_other, "stale").unwrap();
+    write_state(&state, &[]).unwrap();
+    assert!(!stale_key.exists(), "a removed nats context drops its client key");
+    assert!(!stale_crt.exists(), "a removed nats context drops its client cert");
+    assert!(!stale_ca.exists(), "a removed nats context drops its ca");
     assert!(stale_other.exists(), "non-adapter blobs are untouched");
   }
 }
