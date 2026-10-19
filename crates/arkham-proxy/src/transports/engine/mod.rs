@@ -92,6 +92,10 @@ pub(crate) trait Wire {
   }
   /// The extended response with this id is the upgrade result.
   fn arm_upgrade(&mut self, _id: u64) {}
+  /// Release `id`, or a parked one, when this direction is between messages.
+  fn release_handoff(&mut self, id: Option<u64>) -> Option<u64> {
+    id
+  }
   /// Decide a withheld upgrade once the request pump has handed the id over.
   ///
   /// The default proceeds. A protocol that still has work in flight refuses.
@@ -105,8 +109,8 @@ pub(crate) trait Wire {
 pub(crate) enum PeerFact {
   /// HEAD requests whose response bodies are suppressed.
   Heads(usize),
-  /// A client operation is waiting for a final response.
-  Open(u32),
+  /// A client operation waiting for a final response. `false` cannot be abandoned.
+  Open(u32, bool),
   /// An abandon names that operation. It gets no response of its own.
   Abandon(u32),
 }

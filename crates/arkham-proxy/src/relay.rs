@@ -1,12 +1,7 @@
 //! Bidirectional pump through two wire directions.
 //!
-//! Each direction runs as its own pump future: a blocked guest-bound write
-//! never stalls the reading of upstream bytes, and the other way around. The
-//! request pump talks to the response pump over one FIFO channel (protocol
-//! replies, framing facts, and the request direction's terminal intent —
-//! ordering inside the channel replaces any select priority). The response
-//! pump ends the request pump through a oneshot. An upgrade decision is a
-//! separate signal, so a refusal can leave the relay running.
+//! One FIFO carries replies, framing facts, and terminal intent. A separate
+//! signal carries the upgrade decision, so a refusal can leave the relay running.
 
 use std::io::{Error as IoError, ErrorKind};
 
@@ -100,8 +95,7 @@ where
   S: AsyncRead + AsyncWrite + Unpin,
   M: Wire,
 {
-  // The upgrade state stays on the heap. Inlining it here would sit in
-  // every protocol's relay future.
+  // The upgrade state stays on the heap so it stays out of every protocol's relay future.
   match Box::pin(relay_stop(guest, server, downstream, upstream, first, upstream_first)).await? {
     RelayEnd::Done | RelayEnd::Upgrade(_) => Ok(()),
   }
@@ -128,8 +122,7 @@ where
   let (server_read, server_write) = split(server);
   let (to_responses_tx, to_responses_rx) = mpsc::unbounded_channel();
   let (responses_done_tx, responses_done_rx) = oneshot::channel();
-  // One slot. The request pump waits before the next decision, so a refusal
-  // cannot sit in front of a later approval.
+  // One slot. The request pump waits, so a refusal cannot sit ahead of a later approval.
   let (upgrade_tx, upgrade_rx) = mpsc::channel(1);
   let (requests, responses) = tokio::join!(
     pump_requests(
@@ -173,9 +166,7 @@ where
       id,
       local,
     })),
-    // Both directions finished, or only one of them stopped on the upgrade.
-    // The halves come from one `split`, so a single side cannot put them
-    // back together. The sockets close with the relay.
+    // One side cannot rejoin a `split`. The sockets close with the relay.
     _ => Ok(RelayEnd::Done),
   }
 }
@@ -209,74 +200,54 @@ where
   let mut buf = vec![0u8; 32 * 1024];
   let mut replay = Vec::new();
   loop {
-    if !replay.is_empty() {
-      let bytes = std::mem::take(&mut replay);
-      match feed_guest(&mut server, downstream, &responses, &mut responses_done, &mut upgrade_rx, &bytes).await? {
-        UpgradeWait::Stay => {}
-        UpgradeWait::Replay(next) => replay = next,
-        UpgradeWait::Done => return Ok(RequestEnd::Done),
-        UpgradeWait::Proceed { prefix, id, local } => {
-          return Ok(RequestEnd::Upgrade {
-            read: guest,
-            write: server,
-            prefix,
-            id,
-            local,
-          });
+    let waited = if replay.is_empty() {
+      tokio::select! {
+        _ = &mut responses_done => return Ok(RequestEnd::Done),
+        result = guest.read(&mut buf) => {
+          // rustls surfaces a peer FIN without close_notify as UnexpectedEof;
+          // for a relay that is a normal end-of-stream, not an error.
+          let result = match result {
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(0),
+            other => other,
+          };
+          match result {
+            Ok(0) => {
+              let (rewritten, hits) = downstream.feed(&[]).await;
+              hand_over(&responses, downstream);
+              log_hits(&hits);
+              if let Rewritten::Emit(flushed) = rewritten {
+                write_or_stopped(&mut server, &flushed, &mut responses_done, |source| request_flush_error(&responses, source)).await?;
+              }
+              // Upstream may already have closed its write side; a failed
+              // shutdown must not abort the relay — keep draining the
+              // response direction.
+              let _ = server.shutdown().await;
+              return Ok(RequestEnd::Done);
+            }
+            Ok(n) => feed_guest(&mut server, downstream, &responses, &mut responses_done, &mut upgrade_rx, &buf[..n]).await?,
+            Err(err) => {
+              end_requests(&responses);
+              return Err(Error::GuestRead { source: err });
+            }
+          }
         }
       }
-      continue;
-    }
-    tokio::select! {
-      _ = &mut responses_done => return Ok(RequestEnd::Done),
-      result = guest.read(&mut buf) => {
-        // rustls surfaces a peer FIN without close_notify as UnexpectedEof;
-        // for a relay that is a normal end-of-stream, not an error.
-        let result = match result {
-          Err(err) if err.kind() == ErrorKind::UnexpectedEof => Ok(0),
-          other => other,
-        };
-        match result {
-          Ok(0) => {
-            let (rewritten, hits) = downstream.feed(&[]).await;
-            hand_over(&responses, downstream);
-            log_hits(&hits);
-            if let Rewritten::Emit(flushed) = rewritten {
-              write_or_stopped(
-                &mut server,
-                &flushed,
-                &mut responses_done,
-                |source| request_flush_error(&responses, source),
-              )
-              .await?;
-            }
-            // Upstream may already have closed its write side; a failed
-            // shutdown must not abort the relay — keep draining the
-            // response direction.
-            let _ = server.shutdown().await;
-            return Ok(RequestEnd::Done);
-          }
-          Ok(n) => {
-            match feed_guest(&mut server, downstream, &responses, &mut responses_done, &mut upgrade_rx, &buf[..n]).await? {
-              UpgradeWait::Stay => {}
-              UpgradeWait::Replay(next) => replay = next,
-              UpgradeWait::Done => return Ok(RequestEnd::Done),
-              UpgradeWait::Proceed { prefix, id, local } => {
-                return Ok(RequestEnd::Upgrade {
-                  read: guest,
-                  write: server,
-                  prefix,
-                  id,
-                  local,
-                });
-              }
-            }
-          }
-          Err(err) => {
-            end_requests(&responses);
-            return Err(Error::GuestRead { source: err });
-          }
-        }
+    } else {
+      let bytes = std::mem::take(&mut replay);
+      feed_guest(&mut server, downstream, &responses, &mut responses_done, &mut upgrade_rx, &bytes).await?
+    };
+    match waited {
+      UpgradeWait::Stay => {}
+      UpgradeWait::Replay(next) => replay = next,
+      UpgradeWait::Done => return Ok(RequestEnd::Done),
+      UpgradeWait::Proceed { prefix, id, local } => {
+        return Ok(RequestEnd::Upgrade {
+          read: guest,
+          write: server,
+          prefix,
+          id,
+          local,
+        });
       }
     }
   }
@@ -378,19 +349,26 @@ where
     end_requests(responses);
     return Ok(UpgradeWait::Done);
   };
-  let _ = responses.send(if local {
-    ToResponse::Handoff(id)
-  } else {
-    ToResponse::ArmUpgrade(id)
-  });
-  if let Rewritten::Emit(out) = rewritten {
-    if write_or_stopped(server, out, responses_done, |source| request_chunk_error(responses, source))
-      .await?
-      .is_none()
+  // Local path writes first, so a pending write cannot lose the upgrade.
+  for before in [true, false] {
+    if before == local
+      && let Rewritten::Emit(out) = rewritten
+      && write_or_stopped(server, out, responses_done, |source| request_chunk_error(responses, source))
+        .await?
+        .is_none()
     {
       return Ok(UpgradeWait::Done);
     }
-    server.flush().await.map_err(|source| request_flush_error(responses, source))?;
+    if before == local && matches!(rewritten, Rewritten::Emit(_)) {
+      server.flush().await.map_err(|source| request_flush_error(responses, source))?;
+    }
+    if before {
+      let _ = responses.send(if local {
+        ToResponse::Handoff(id)
+      } else {
+        ToResponse::ArmUpgrade(id)
+      });
+    }
   }
   // Reading the guest stops here. That lockstep is what the upgrade needs.
   // A later StartTLS in this relay can still be approved, so the signal is
@@ -443,7 +421,7 @@ where
     tokio::select! {
       msg = requests.recv(), if requests_open => match msg {
         Some(ToResponse::RequestsEnded) => break Ok(None),
-        Some(ToResponse::Handoff(id)) => match answer_handoff(&mut guest, upstream, &upgrade_tx, id).await? {
+        Some(ToResponse::Handoff(id)) => match answer_handoff(&mut guest, upstream, &upgrade_tx, Some(id)).await? {
           ChunkStep::Stay => {}
           ChunkStep::Stop => break Ok(None),
           ChunkStep::Upgrade(prefix) => break Ok(Some(prefix)),
@@ -562,10 +540,10 @@ where
   match rewritten {
     // A scan that cannot rewrite the chunk closes rather than forward it.
     Rewritten::Close => Ok(ChunkStep::Stop),
-    Rewritten::Hold => Ok(ChunkStep::Stay),
+    Rewritten::Hold => answer_handoff(guest, upstream, upgrade_tx, None).await,
     Rewritten::Emit(out) => {
       write_guest_chunk(guest, &out).await?;
-      Ok(ChunkStep::Stay)
+      answer_handoff(guest, upstream, upgrade_tx, None).await
     }
   }
 }
@@ -601,11 +579,14 @@ where
 }
 
 /// A withheld upgrade. Outstanding work is `operationsError` now; an empty set upgrades.
-async fn answer_handoff<W, M>(guest: &mut W, upstream: &mut M, upgrade_tx: &mpsc::Sender<bool>, id: u64) -> Result<ChunkStep, Error>
+async fn answer_handoff<W, M>(guest: &mut W, upstream: &mut M, upgrade_tx: &mpsc::Sender<bool>, id: Option<u64>) -> Result<ChunkStep, Error>
 where
   W: AsyncWrite + Unpin,
   M: Wire,
 {
+  let Some(id) = upstream.release_handoff(id) else {
+    return Ok(ChunkStep::Stay);
+  };
   match upstream.local_upgrade(id) {
     LocalUpgrade::Proceed => {
       let _ = upgrade_tx.try_send(true);
@@ -678,7 +659,7 @@ where
   while let Ok(msg) = requests.try_recv() {
     match msg {
       ToResponse::RequestsEnded => return Ok(ChunkStep::Stop),
-      ToResponse::Handoff(id) => return answer_handoff(guest, upstream, upgrade_tx, id).await,
+      ToResponse::Handoff(id) => return answer_handoff(guest, upstream, upgrade_tx, Some(id)).await,
       ToResponse::ArmUpgrade(id) => {
         *armed = true;
         upstream.arm_upgrade(id);
@@ -892,7 +873,7 @@ mod tests {
     let (decoded, after) = decode_one(&stream);
     assert_eq!(decoded, rasn::ber::decode(&entry).unwrap());
     let (refusal, leftover) = decode_one(after);
-    assert!(leftover.is_empty());
+    assert_eq!(leftover, &b""[..]);
     let ProtocolOp::ExtendedResp(body) = refusal.protocol_op else {
       panic!("starttls response");
     };
@@ -931,12 +912,12 @@ mod tests {
     };
     assert!(upgrade.local);
     assert_eq!(upgrade.id, 3);
-    let mut got = vec![0u8; entry.len()];
+    let mut got = vec![0u8; entry.len() - split];
     tokio::time::timeout(Duration::from_secs(1), guest.read_exact(&mut got))
       .await
-      .expect("full entry")
+      .expect("entry tail")
       .unwrap();
-    assert_eq!(got, entry);
+    assert_eq!(got, entry[split..]);
   }
 
   #[tokio::test]
@@ -1046,11 +1027,7 @@ mod tests {
   }
 
   impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for StallWrite<T> {
-    fn poll_write(
-      self: std::pin::Pin<&mut Self>,
-      cx: &mut std::task::Context<'_>,
-      buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
+    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
       let this = self.get_mut();
       if !this.released.load(std::sync::atomic::Ordering::SeqCst) {
         this.stalled.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1076,16 +1053,8 @@ mod tests {
     let (guest_relay, mut guest) = tokio::io::duplex(4096);
     let (server_relay, _server) = tokio::io::duplex(4096);
     let relay = tokio::spawn(async move { relay_stop(guest_relay, server_relay, &mut down, &mut up, &[], &[]).await });
-    let bind = LdapMessage::new(
-      1,
-      ProtocolOp::BindRequest(rasn_ldap::BindRequest::new(
-        3,
-        rasn_ldap::LdapString::from("cn=dir"),
-        rasn_ldap::AuthenticationChoice::Simple(rasn::prelude::OctetString::from(FAKE_PW.as_bytes())),
-      )),
-    );
     let abandon = LdapMessage::new(2, ProtocolOp::AbandonRequest(rasn_ldap::AbandonRequest(1)));
-    let mut bytes = rasn::ber::encode(&bind).unwrap();
+    let mut bytes = search_bytes(1);
     bytes.extend(rasn::ber::encode(&abandon).unwrap());
     bytes.extend(starttls(3));
     guest.write_all(&bytes).await.unwrap();

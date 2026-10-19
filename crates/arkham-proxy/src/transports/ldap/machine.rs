@@ -73,6 +73,7 @@ pub(crate) struct Ldap {
   hold_starttls: bool,
   /// The request just framed was held.
   local_starttls: bool,
+  handoff: Option<u64>,
   closed: bool,
 }
 
@@ -99,8 +100,8 @@ struct Up {
   expect_id: Option<u32>,
   /// Final response whose message is not finished yet.
   clear_id: Option<u32>,
-  /// Client operations still waiting for a final response.
-  open: Vec<u32>,
+  /// Client operations still waiting for a final response. The flag is abandonable.
+  open: Vec<(u32, bool)>,
   /// The session is already TLS. A further `StartTLS` is `operationsError`.
   blocked: bool,
 }
@@ -276,6 +277,7 @@ impl Ldap {
       held: Vec::new(),
       hold_starttls: false,
       local_starttls: false,
+      handoff: None,
       closed: false,
     }
   }
@@ -317,16 +319,6 @@ impl Ldap {
   /// stays pending through `responseName` so the caller keeps reading.
   pub(crate) fn take_starttls_result(&mut self) -> Option<bool> {
     self.starttls_ok.take()
-  }
-
-  /// Bytes sitting in the cursor. A closed leg reports none.
-  #[cfg(test)]
-  fn peek_buf_len(&self) -> usize {
-    match &self.phase {
-      Phase::Peek(peek) => peek.buf.len(),
-      Phase::Head(buf) => buf.len(),
-      Phase::Forward(_) | Phase::Tail { .. } => 0,
-    }
   }
 
   /// Message id and unread control bytes after a recognized `StartTLS` OID.
@@ -428,10 +420,16 @@ impl Wire for Ldap {
       return;
     };
     match fact {
-      PeerFact::Open(id) => track(&mut up.open, id),
-      PeerFact::Abandon(id) => up.open.retain(|open| *open != id),
+      PeerFact::Open(id, abandonable) => track(&mut up.open, id, abandonable),
+      PeerFact::Abandon(id) => up.open.retain(|(open, abandonable)| *open != id || !*abandonable),
       PeerFact::Heads(_) => {}
     }
+  }
+
+  fn release_handoff(&mut self, id: Option<u64>) -> Option<u64> {
+    self.handoff = id.or(self.handoff.take());
+    let ready = self.held.is_empty() && matches!(&self.phase, Phase::Head(buf) if buf.is_empty());
+    ready.then(|| self.handoff.take()).flatten()
   }
 
   fn local_upgrade(&mut self, id: u64) -> LocalUpgrade {
@@ -617,7 +615,8 @@ impl Ldap {
       if let Some(id) = abandon_target {
         down.notes.push_back(PeerFact::Abandon(id));
       } else if app.is_some_and(expects_result) {
-        down.notes.push_back(PeerFact::Open(class.id));
+        let abandonable = !app.is_some_and(op_is::<BindRequest>);
+        down.notes.push_back(PeerFact::Open(class.id, abandonable));
       }
       return Ok(None);
     }
@@ -669,7 +668,7 @@ impl Ldap {
         if let Some(down) = self.down.as_mut()
           && let Some(id) = down.msg_id.take()
         {
-          down.notes.push_back(PeerFact::Open(id));
+          down.notes.push_back(PeerFact::Open(id, true));
         }
         self.phase = self.release(std::mem::take(&mut peek.buf), peek.left, out, hits).await?;
         Ok(Step::Done)
@@ -694,9 +693,9 @@ impl Ldap {
 
   /// Redact a diagnostic that carries the real password, and record `StartTLS`.
   async fn result(&mut self, peek: &mut Peek, out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Result<Step, ()> {
-    let Some(up) = self.up.as_ref() else {
+    if self.up.is_none() {
       return Err(());
-    };
+    }
     match try_result(&peek.buf, peek.header)? {
       ResultParse::Need(need) => Ok(Step::Need(need)),
       ResultParse::Skip => {
@@ -704,13 +703,19 @@ impl Ldap {
         Ok(Step::Done)
       }
       ResultParse::Ready(cut) => {
-        if cut.extended && up.expect_id == Some(cut.id) {
-          let ok = result_ok(&peek.buf, &cut)?;
+        let code = result_code(&peek.buf, &cut)?;
+        if cut.extended && self.up.as_ref().is_some_and(|up| up.expect_id == Some(cut.id)) {
           // `responseName` may still be unread. Publish once the message ends.
-          self.pending_starttls = Some(ok);
+          self.pending_starttls = Some(code == 0);
           if let Some(up) = self.up.as_mut() {
             up.expect_id = None;
           }
+        }
+        if !cut.extended
+          && code == ResultCode::SaslBindInProgress as u32
+          && let Some(up) = self.up.as_mut()
+        {
+          up.clear_id = up.clear_id.filter(|open| *open != cut.id);
         }
         let diagnostic = peek.buf.get(cut.diagnostic.clone()).ok_or(())?;
         let secret = self.up.as_ref().map(|up| up.pair.needle.clone()).ok_or(())?;
@@ -766,7 +771,7 @@ impl Ldap {
     if let Some(up) = self.up.as_mut()
       && let Some(id) = up.clear_id.take()
     {
-      up.open.retain(|open| *open != id);
+      up.open.retain(|(open, _)| *open != id);
     }
     out.extend(std::mem::take(&mut self.held));
     Phase::Head(Vec::new())
@@ -1101,15 +1106,15 @@ fn try_result(buf: &[u8], header: usize) -> Result<ResultParse, ()> {
   }))
 }
 
-/// `true` when the enumerated result code is success.
-fn result_ok(buf: &[u8], cut: &ResultCut) -> Result<bool, ()> {
+/// Enumerated result code already parsed for this response.
+fn result_code(buf: &[u8], cut: &ResultCut) -> Result<u32, ()> {
   let Some(code) = read_tl(buf, cut.response_at)? else {
     return Err(());
   };
   let start = cut.response_at.checked_add(code.header).ok_or(())?;
   let end = start.checked_add(code.content_len).ok_or(())?;
   let bytes = buf.get(start..end).ok_or(())?;
-  Ok(parse_uint(bytes)? == 0)
+  parse_uint(bytes)
 }
 
 /// Rebuild a simple bind with the real password and, when the DN matches
@@ -1315,9 +1320,9 @@ fn is_final(op: u8) -> bool {
     || op_is::<ExtendedResponse>(op)
 }
 
-fn track(open: &mut Vec<u32>, id: u32) {
-  if !open.contains(&id) {
-    open.push(id);
+fn track(open: &mut Vec<(u32, bool)>, id: u32, abandonable: bool) {
+  if !open.iter().any(|(open, _)| *open == id) {
+    open.push((id, abandonable));
   }
 }
 
@@ -1333,13 +1338,13 @@ fn abandon(peek: &Peek, class: &Class) -> Result<Abandon, ()> {
     TlWait::Need(need) => return Ok(Abandon::Need(need)),
     TlWait::Ready(tl) => tl,
   };
+  if tl.content_len > 4 {
+    return Err(());
+  }
   let start = class.op_at.checked_add(tl.header).ok_or(())?;
   let end = start.checked_add(tl.content_len).ok_or(())?;
   if peek.buf.len() < end {
     return Ok(Abandon::Need(end));
-  }
-  if tl.content_len > 4 {
-    return Err(());
   }
   let bytes = peek.buf.get(start..end).ok_or(())?;
   let target = parse_uint(bytes)?;
@@ -1373,10 +1378,16 @@ mod tests {
   use super::*;
   use arkham_config::grants::{Credential, GuestTlsMode, LdapScope};
   use rasn::types::AsnType as _;
-  use rasn_ldap::{
-    AuthenticationChoice, Filter, SearchRequestDerefAliases, SearchRequestScope, UnbindRequest,
-  };
+  use rasn_ldap::{AuthenticationChoice, Filter, SearchRequestDerefAliases, SearchRequestScope, UnbindRequest};
   use secrecy::SecretString;
+
+  fn peek_len(ldap: &Ldap) -> usize {
+    match &ldap.phase {
+      Phase::Peek(peek) => peek.buf.len(),
+      Phase::Head(buf) => buf.len(),
+      Phase::Forward(_) | Phase::Tail { .. } => 0,
+    }
+  }
 
   const FAKE_PW: &str = "arkham_fake_ldap_pass"; // betterleaks:allow
   const REAL_PW: &str = "arkham_real_ldap_pass_01"; // betterleaks:allow
@@ -1884,7 +1895,7 @@ mod tests {
     while let Some(fact) = downstream.take_peer_note() {
       facts.push(fact);
     }
-    assert_eq!(facts, vec![PeerFact::Open(1), PeerFact::Abandon(1)]);
+    assert_eq!(facts, vec![PeerFact::Open(1, false), PeerFact::Abandon(1)]);
     let mut upstream = up();
     for fact in facts {
       upstream.apply_peer_note(fact);
@@ -1943,10 +1954,10 @@ mod tests {
         matches!(rewritten, Rewritten::Close),
         "a {content_len}-byte abandon id closes before the body"
       );
-      assert_eq!(downstream.peek_buf_len(), 0, "peek stays empty");
+      assert_eq!(peek_len(&downstream), 0, "peek stays empty");
       let (rewritten, _) = downstream.feed(&body).await;
       assert!(matches!(rewritten, Rewritten::Close));
-      assert_eq!(downstream.peek_buf_len(), 0, "the body is not pulled into the peek");
+      assert_eq!(peek_len(&downstream), 0, "the body is not pulled into the peek");
     }
   }
 
@@ -1981,7 +1992,7 @@ mod tests {
   #[tokio::test]
   async fn outstanding_bind_refuses_the_local_upgrade() {
     let mut upstream = up();
-    upstream.apply_peer_note(PeerFact::Open(1));
+    upstream.apply_peer_note(PeerFact::Open(1, false));
     let LocalUpgrade::Refuse(bytes) = upstream.local_upgrade(2) else {
       panic!("operationsError");
     };

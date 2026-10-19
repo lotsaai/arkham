@@ -315,8 +315,7 @@ impl LdapTransport {
   }
 
   /// The relay stopped on `StartTLS`. Finish that exchange and relay the
-  /// plaintext legs. The late guest hello uses the same handshake budget as
-  /// the opening.
+  /// plaintext legs. `pump.budget` bounds the `ClientHello` read.
   async fn finish_starttls<G, S>(&self, upgrade: crate::relay::RelayUpgrade<G, S>, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -345,8 +344,8 @@ impl LdapTransport {
   }
 
   /// Accept the guest TLS leg once, then relay. `local` writes the success
-  /// here because the server socket is already TLS. The guest `ClientHello`
-  /// uses `pump.budget`.
+  /// here because the server socket is already TLS. `pump.budget` bounds the
+  /// `ClientHello` read.
   async fn protect<G, S>(&self, mut guest: G, server: S, accept: Accept<'_>, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
