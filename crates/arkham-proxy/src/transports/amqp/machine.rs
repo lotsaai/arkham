@@ -2018,7 +2018,7 @@ mod tests {
   use amq_protocol::types::{AMQPValue, FieldTable};
   use arkham_config::grants::{AmqpScope, Credential, Grant};
   use fe2o3_amqp_types::definitions::{Handle, MAJOR, MINOR, REVISION};
-  use fe2o3_amqp_types::performatives::{Detach, Transfer};
+  use fe2o3_amqp_types::performatives::{Close, Detach, Transfer};
   use fe2o3_amqp_types::primitives::{Binary, Symbol};
   use fe2o3_amqp_types::sasl::SaslInit;
   use secrecy::SecretString;
@@ -3014,6 +3014,79 @@ mod tests {
     assert!(
       matches!(machine.feed(&[]).await.0, Rewritten::Close),
       "a held prefix was flushed at end of stream"
+    );
+  }
+
+  #[tokio::test]
+  async fn a_three_way_split_never_spells_the_password() {
+    let parts: [&[u8]; 3] = [b"arkham_real_amqp_pass_", b"longer", b"_01"];
+    let body_size = parts.iter().map(|part| part.len()).sum::<usize>();
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &content_header(1, u64::try_from(body_size).unwrap())).await;
+    let mut closed = false;
+    for part in parts {
+      match machine.feed(&body_091(part)).await.0 {
+        Rewritten::Emit(emitted) => guest.extend(emitted.into_owned()),
+        Rewritten::Hold => {}
+        Rewritten::Close => {
+          closed = true;
+          break;
+        }
+      }
+    }
+    assert!(closed, "the completing body was delivered");
+    assert!(!contains(&body_payloads(&guest).concat(), REAL));
+  }
+
+  #[tokio::test]
+  async fn a_three_way_transfer_split_never_spells_the_password() {
+    let parts: [(&[u8], bool); 3] = [(b"arkham_real_amqp_pass_", true), (b"longer", true), (b"_01", false)];
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header_10()).await;
+    let mut closed = false;
+    for (part, more) in parts {
+      match machine.feed(&transfer_on(1, 0, more, part)).await.0 {
+        Rewritten::Emit(emitted) => guest.extend(emitted.into_owned()),
+        Rewritten::Hold => {}
+        Rewritten::Close => {
+          closed = true;
+          break;
+        }
+      }
+    }
+    assert!(closed, "the completing transfer was delivered");
+    assert!(!contains(&transfer_payloads(&guest).concat(), REAL));
+  }
+
+  #[tokio::test]
+  async fn a_zero_length_middle_frame_never_spells_the_password() {
+    let (prefix, rest) = password_split();
+    let body_size = u64::try_from(prefix.len() + rest.len()).unwrap();
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &content_header(1, body_size)).await;
+    guest.extend(feed_open(&mut machine, &body_091(prefix)).await);
+    guest.extend(feed_open(&mut machine, &body_091(&[])).await);
+    assert!(
+      matches!(machine.feed(&body_091(rest)).await.0, Rewritten::Close),
+      "the completing body was delivered"
+    );
+    assert!(!contains(&body_payloads(&guest).concat(), REAL));
+  }
+
+  #[tokio::test]
+  async fn a_large_close_closes_the_connection() {
+    let performative = serde_amqp::to_vec(&Close { error: None }).unwrap();
+    let total = super::MAX_CREDENTIAL_FRAME.saturating_add(1);
+    let mut frame = Vec::with_capacity(total);
+    frame.extend(u32::try_from(total).unwrap().to_be_bytes());
+    frame.extend([2, 0, 0, 0]);
+    frame.extend(performative);
+    frame.resize(total, b'b');
+    let mut machine = up();
+    let _guest = feed_open(&mut machine, &header_10()).await;
+    assert!(
+      matches!(machine.feed(&frame).await.0, Rewritten::Close),
+      "a close larger than 16 KiB was forwarded"
     );
   }
 
