@@ -5,7 +5,8 @@ use super::*;
 use arkham_config::grants::LdapScope;
 use rasn::prelude::OctetString;
 use rasn_ldap::{
-  AuthenticationChoice, BindRequest, BindResponse, ExtendedRequest, ExtendedResponse, LdapMessage, LdapString, ProtocolOp, ResultCode,
+  AuthenticationChoice, BindRequest, BindResponse, ExtendedRequest, ExtendedResponse, Filter, LdapMessage, LdapResult, LdapString, ProtocolOp,
+  ResultCode, SearchRequest, SearchRequestDerefAliases, SearchRequestScope, SearchResultDone,
 };
 use secrecy::ExposeSecret as _;
 
@@ -196,6 +197,176 @@ async fn ldap_starttls_then_bind_swaps_the_password() {
   drop(tls);
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   proxy.abort();
+}
+
+/// What the guest sends before `StartTLS` on the same connection.
+#[derive(Clone, Copy)]
+enum BeforeStartTls {
+  /// A simple bind. The cleartext upstream must see the decoy.
+  Bind,
+  /// A base-object search. The directory answers, then the guest upgrades.
+  Search,
+}
+
+async fn late_starttls_then_protected_bind(before: BeforeStartTls) {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let bundle_dir = tempfile::tempdir().unwrap();
+  let bundle = bundle_dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let grants = vec![ldap_grant(
+    &format!("ldap://{}:{FAKE}@localhost:{stub_port}", user(DN)),
+    &format!("ldap://{}:{VALUE}@localhost:{stub_port}?sslrootcert={}", user(DN), bundle.display()),
+  )];
+  let state = test_state_with(grants, &ca);
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+  let stub_task = tokio::spawn(async move {
+    let (mut conn, _) = stub.accept().await.unwrap();
+    let opening = read_message(&mut conn).await;
+    match before {
+      BeforeStartTls::Bind => {
+        assert_eq!(simple_password(&opening), FAKE.as_bytes(), "cleartext bind must keep the decoy");
+        let response = LdapMessage::new(
+          opening.message_id,
+          ProtocolOp::BindResponse(BindResponse::new(
+            ResultCode::InvalidCredentials,
+            LdapString::from(""),
+            LdapString::from(""),
+            None,
+            None,
+          )),
+        );
+        conn.write_all(&encode(&response)).await.unwrap();
+      }
+      BeforeStartTls::Search => {
+        let ProtocolOp::SearchRequest(_) = &opening.protocol_op else {
+          panic!("search request");
+        };
+        let response = LdapMessage::new(
+          opening.message_id,
+          ProtocolOp::SearchResDone(SearchResultDone(LdapResult::new(
+            ResultCode::Success,
+            LdapString::from(""),
+            LdapString::from(""),
+          ))),
+        );
+        conn.write_all(&encode(&response)).await.unwrap();
+      }
+    }
+    let request = read_message(&mut conn).await;
+    let ProtocolOp::ExtendedReq(extended) = &request.protocol_op else {
+      panic!("starttls after the first operation");
+    };
+    assert_eq!(extended.request_name.as_ref(), STARTTLS_OID);
+    let response = LdapMessage::new(
+      request.message_id,
+      ProtocolOp::ExtendedResp(ExtendedResponse {
+        result_code: ResultCode::Success,
+        matched_dn: LdapString::from(""),
+        diagnostic_message: LdapString::from(""),
+        referral: None,
+        response_name: Some(OctetString::from_static(STARTTLS_OID)),
+        response_value: None,
+      }),
+    );
+    conn.write_all(&encode(&response)).await.unwrap();
+    let mut tls = acceptor.accept(conn).await.unwrap();
+    let bind = read_message(&mut tls).await;
+    assert_eq!(simple_password(&bind), VALUE.as_bytes(), "protected bind must carry the real password");
+    let ok = LdapMessage::new(
+      bind.message_id,
+      ProtocolOp::BindResponse(BindResponse::new(
+        ResultCode::Success,
+        LdapString::from(""),
+        LdapString::from(""),
+        None,
+        None,
+      )),
+    );
+    tls.write_all(&encode(&ok)).await.unwrap();
+  });
+  let mut stream = connect_through_proxy(proxy_addr, stub_port).await;
+  match before {
+    BeforeStartTls::Bind => stream.write_all(&encode(&bind_message(1, FAKE))).await.unwrap(),
+    BeforeStartTls::Search => {
+      let search = LdapMessage::new(
+        1,
+        ProtocolOp::SearchRequest(SearchRequest::new(
+          LdapString::from(""),
+          SearchRequestScope::BaseObject,
+          SearchRequestDerefAliases::NeverDerefAliases,
+          0,
+          0,
+          false,
+          Filter::Present(LdapString::from("objectClass")),
+          Vec::new(),
+        )),
+      );
+      stream.write_all(&encode(&search)).await.unwrap();
+    }
+  }
+  let opened = read_message(&mut stream).await;
+  match before {
+    BeforeStartTls::Bind => {
+      let ProtocolOp::BindResponse(body) = opened.protocol_op else {
+        panic!("bind response");
+      };
+      assert_eq!(body.result_code, ResultCode::InvalidCredentials);
+    }
+    BeforeStartTls::Search => {
+      let ProtocolOp::SearchResDone(SearchResultDone(body)) = opened.protocol_op else {
+        panic!("search done");
+      };
+      assert_eq!(body.result_code, ResultCode::Success);
+    }
+  }
+  let start = LdapMessage::new(
+    2,
+    ProtocolOp::ExtendedReq(ExtendedRequest {
+      request_name: OctetString::from_static(STARTTLS_OID),
+      request_value: None,
+    }),
+  );
+  stream.write_all(&encode(&start)).await.unwrap();
+  let started = read_message(&mut stream).await;
+  let ProtocolOp::ExtendedResp(body) = &started.protocol_op else {
+    panic!("starttls response");
+  };
+  assert_eq!(body.result_code, ResultCode::Success);
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(ca.cert_der().clone()).unwrap();
+  let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+  let name = ServerName::try_from("localhost".to_string()).unwrap();
+  let mut tls = tokio::time::timeout(
+    Duration::from_secs(5),
+    TlsConnector::from(Arc::new(config)).connect(name, stream),
+  )
+  .await
+  .expect("starttls after the first operation upgrades")
+  .expect("guest handshake");
+  tls.write_all(&encode(&bind_message(3, FAKE))).await.unwrap();
+  let response = read_message(&mut tls).await;
+  let ProtocolOp::BindResponse(body) = response.protocol_op else {
+    panic!("bind response");
+  };
+  assert_eq!(body.result_code, ResultCode::Success);
+  drop(tls);
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  proxy.abort();
+}
+
+#[tokio::test]
+async fn ldap_bind_then_starttls_then_protected_bind_swaps_the_password() {
+  late_starttls_then_protected_bind(BeforeStartTls::Bind).await;
+}
+
+#[tokio::test]
+async fn ldap_search_then_starttls_then_protected_bind_swaps_the_password() {
+  late_starttls_then_protected_bind(BeforeStartTls::Search).await;
 }
 
 #[tokio::test]

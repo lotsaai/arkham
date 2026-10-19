@@ -1470,6 +1470,20 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn starttls_response_parks_the_following_handshake() {
+    let response = starttls_success(4).unwrap();
+    let mut frame = response.clone();
+    let handshake = [0x16, 0x03, 0x03];
+    frame.extend_from_slice(&handshake);
+    let mut machine = up();
+    machine.expect_starttls(4);
+    let out = emit(&mut machine, &frame).await;
+    assert_eq!(out, response);
+    assert_eq!(machine.take_starttls_result(), Some(true));
+    assert_eq!(machine.take_prefix(), handshake);
+  }
+
+  #[tokio::test]
   async fn starttls_success_is_reported() {
     let frame = {
       let message = LdapMessage::new(
