@@ -1,2 +1,4 @@
 *
 !.gitignore
+!*/
+!amqp-witness/Dockerfile

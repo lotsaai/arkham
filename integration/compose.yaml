@@ -13,6 +13,8 @@ name: arkham-integration
 # One value for smtp-direct and the client. Unset keeps the demo decoy.
 # An empty value skips the direct dial and the client SMTP scenario.
 x-smtp-url: &smtp-url "${SMTP_URL-smtp://agent%40demo.test:arkham_fake_smtp_pass@mail:587}" # nosemgrep: deterministic demo decoy, not a credential
+x-amqp-splice-port: &amqp-splice-port "5673"
+x-amqp-splice-dir: &amqp-splice-dir "/out/amqp-splice"
 
 services:
   certs:
@@ -399,6 +401,7 @@ services:
         default_user = svc
         default_pass = arkham_real_amqp_pass_longer_01
         listeners.tcp.default = 5672
+        listeners.tcp.ungranted = 5673
         listeners.ssl.default = 5671
         ssl_options.certfile = /certs/amqp.crt
         ssl_options.keyfile = /tmp/amqp.key
@@ -425,6 +428,32 @@ services:
     depends_on:
       certs:
         condition: service_completed_successfully
+
+  amqp-witness:
+    build:
+      context: ./docker/amqp-witness
+    command: ["python3", "/srv/amqp-witness.py"]
+    environment:
+      AMQP_SPLICE_PORT: *amqp-splice-port
+      AMQP_SPLICE_DIR: *amqp-splice-dir
+      HOST_UID: ${HOST_UID:-}
+      HOST_GID: ${HOST_GID:-}
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - ./client:/srv:ro
+      - ./out/results:/out
+    network_mode: service:amqp
+    depends_on:
+      amqp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -f \"$$AMQP_SPLICE_DIR/ready\" && command -v tcpflow >/dev/null"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 40s
 
   # Decoy AUTH straight at the mail server, from a network namespace the
   # capture rules do not cover. Not the client: that container is the
@@ -541,6 +570,8 @@ services:
       NATS_DISCOVERED: ${NATS_DISCOVERED:-}
       AMQP_URL: amqp://agent:arkham_fake_amqp_pass@amqp:5672 # nosemgrep: deterministic demo decoy, not a credential
       AMQP_TLS_URL: amqps://agent:arkham_fake_amqp_pass@amqp:5671 # nosemgrep: deterministic demo decoy, not a credential
+      AMQP_SPLICE_PORT: *amqp-splice-port
+      AMQP_SPLICE_DIR: *amqp-splice-dir
       SSH_DST: 10.202.0.40
     volumes:
       - ./client:/srv:ro
@@ -570,6 +601,8 @@ services:
       nats-jwt:
         condition: service_healthy
       amqp:
+        condition: service_healthy
+      amqp-witness:
         condition: service_healthy
 
 networks:
