@@ -12,6 +12,7 @@
 //! the leg.
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use arkham_config::grants::{Grant, Scheme};
@@ -40,6 +41,12 @@ const EXTENDED_RESPONSE_TAG: u8 = 0x78;
 
 /// Context-specific primitive 0: simple password, or an extended-request name.
 const CONTEXT_0: u8 = 0x80;
+
+/// Application number of `UnbindRequest`. It has no response.
+const UNBIND_OP: u8 = 2;
+
+/// Application number of `AbandonRequest`. It names another message and has no response.
+const ABANDON_OP: u8 = 16;
 
 /// One LDAP direction leg.
 pub(crate) struct Ldap {
@@ -76,6 +83,18 @@ struct Down {
   label: String,
   /// Rewrite a matching simple bind. False while the upstream writer is cleartext.
   swap: bool,
+  /// Message ids forwarded and still waiting for a final response.
+  open: Vec<u32>,
+  /// `StartTLS` id to answer with `operationsError` once `open` is empty.
+  pending_refusal: Option<u32>,
+  /// Guest-bound `operationsError` results, in the order they were decided.
+  reply: VecDeque<Vec<u8>>,
+  /// The session is already TLS. A further `StartTLS` is `operationsError`.
+  protected: bool,
+  /// A message id wider than four bytes is outstanding and cannot be named.
+  opaque: bool,
+  /// Message id of the request currently being classified.
+  msg_id: Option<u32>,
 }
 
 /// Upstream redaction state.
@@ -84,6 +103,10 @@ struct Up {
   pair: CredentialPair,
   /// Message id whose extended response is the `StartTLS` result.
   expect_id: Option<u32>,
+  /// Final response whose message is not finished yet.
+  clear_id: Option<u32>,
+  /// Finished final-response ids, waiting for [`Wire::take_peer_note`].
+  settled: Vec<u32>,
 }
 
 /// Where the cursor is. `Peek` holds only the credential or `StartTLS` bytes
@@ -94,10 +117,12 @@ enum Phase {
   Peek(Peek),
   /// `left` body bytes still belong to the current message.
   Forward(usize),
-  /// `left` bytes finish the `StartTLS` message; anything after is the handshake.
+  /// `left` bytes finish the `StartTLS` message. `discard` keeps what follows
+  /// as LDAP. Otherwise it is the handshake.
   Tail {
     left: usize,
     id: u32,
+    discard: bool,
   },
 }
 
@@ -217,6 +242,12 @@ impl Ldap {
           upstream_dn: scope.upstream.dn.clone(),
           label: grant.credential().map(|credential| credential.label.clone()).unwrap_or_default(),
           swap,
+          open: Vec::new(),
+          pending_refusal: None,
+          reply: VecDeque::new(),
+          protected: false,
+          opaque: false,
+          msg_id: None,
         })
       })
     } else {
@@ -235,6 +266,8 @@ impl Ldap {
             label,
           },
           expect_id: None,
+          clear_id: None,
+          settled: Vec::new(),
         })
       })
     } else {
@@ -256,9 +289,18 @@ impl Ldap {
     }
   }
 
-  /// Withhold the next `StartTLS` request. The caller answers it locally.
+  /// Withhold the next `StartTLS` request. The caller answers it locally
+  /// when nothing is outstanding. An outstanding operation is `operationsError`.
   pub(crate) fn hold_starttls(&mut self) {
     self.hold_starttls = true;
+  }
+
+  /// The session is already TLS. A `StartTLS` here is `operationsError`.
+  pub(crate) fn seal_starttls(&mut self) {
+    self.hold_starttls = true;
+    if let Some(down) = self.down.as_mut() {
+      down.protected = true;
+    }
   }
 
   /// Message id of a `StartTLS` request framed by the last `feed`, once.
@@ -290,7 +332,7 @@ impl Ldap {
   /// The opening streams those bytes and does not store them.
   pub(crate) fn starttls_tail(&self) -> Option<(u32, usize)> {
     match self.phase {
-      Phase::Tail { left, id } => Some((id, left)),
+      Phase::Tail { left, id, .. } => Some((id, left)),
       Phase::Head(_) | Phase::Peek(_) | Phase::Forward(_) => None,
     }
   }
@@ -303,14 +345,20 @@ impl Ldap {
 ///
 /// Returns the encoder error when the fixed success message cannot be encoded.
 pub(crate) fn starttls_success(id: u32) -> Result<Vec<u8>, rasn::error::EncodeError> {
+  extended_result(id, ResultCode::Success, true)
+}
+
+/// Extended response for `id`. `named` attaches the `StartTLS` OID, which a
+/// success carries and an `operationsError` does not.
+fn extended_result(id: u32, code: ResultCode, named: bool) -> Result<Vec<u8>, rasn::error::EncodeError> {
   let message = LdapMessage::new(
     id,
     ProtocolOp::ExtendedResp(ExtendedResponse {
-      result_code: ResultCode::Success,
+      result_code: code,
       matched_dn: LdapString::from(""),
       diagnostic_message: LdapString::from(""),
       referral: None,
-      response_name: Some(OctetString::from_static(STARTTLS_OID)),
+      response_name: named.then(|| OctetString::from_static(STARTTLS_OID)),
       response_value: None,
     }),
   );
@@ -370,6 +418,29 @@ impl Wire for Ldap {
     None
   }
 
+  fn take_reply(&mut self) -> Option<Vec<u8>> {
+    self.down.as_mut().and_then(|down| down.reply.pop_front())
+  }
+
+  fn take_peer_note(&mut self) -> usize {
+    let Some(id) = self.up.as_mut().and_then(|up| up.settled.pop()) else {
+      return 0;
+    };
+    usize::try_from(id).unwrap_or(0)
+  }
+
+  fn apply_peer_note(&mut self, n: usize) {
+    let Ok(id) = u32::try_from(n) else {
+      return;
+    };
+    if let Some(down) = self.down.as_mut() {
+      down.open.retain(|open| *open != id);
+    }
+    if self.queue_refusal().is_err() {
+      self.closed = true;
+    }
+  }
+
   fn arm_upgrade(&mut self, id: u64) {
     let Ok(id) = u32::try_from(id) else {
       return;
@@ -405,7 +476,7 @@ impl Ldap {
         self.phase = self.forward_rest(left, input, out, hits).await?;
         Ok(())
       }
-      Phase::Tail { left, id } => self.drive_tail(left, id, input, out, hits).await,
+      Phase::Tail { left, id, discard } => self.drive_tail(left, id, discard, input, out, hits).await,
     }
   }
 
@@ -488,7 +559,12 @@ impl Ldap {
   fn classify(&mut self, peek: &mut Peek) -> Result<ClassAct, ()> {
     let class = match classify_op(&peek.buf, peek.header)? {
       Classified::Need(need) => return Ok(ClassAct::Need(need)),
-      Classified::Wide => return Ok(ClassAct::Forward),
+      Classified::Wide => {
+        if let Some(down) = self.down.as_mut() {
+          down.opaque = true;
+        }
+        return Ok(ClassAct::Forward);
+      }
       Classified::NotInteger => {
         if self.down.is_some() {
           return Err(());
@@ -504,6 +580,9 @@ impl Ldap {
     {
       return Err(());
     }
+    if let Some(need) = self.note(&class, peek)? {
+      return Ok(ClassAct::Need(need));
+    }
     if self.down.as_ref().is_some_and(|down| down.swap) && class.op == BIND_REQUEST_TAG {
       peek.kind = Kind::Bind;
     } else if self.down.is_some() && class.op == EXTENDED_REQUEST_TAG {
@@ -514,6 +593,50 @@ impl Ldap {
       return Ok(ClassAct::Forward);
     }
     Ok(ClassAct::Continue)
+  }
+
+  /// Record a client operation, drop an abandon target, or remember a final
+  /// response id. `Some` is the peek length an abandon body still needs.
+  fn note(&mut self, class: &Class, peek: &Peek) -> Result<Option<usize>, ()> {
+    let app = application_number(class.op);
+    if let Some(down) = self.down.as_mut() {
+      down.msg_id = Some(class.id);
+      return match app {
+        Some(UNBIND_OP) => Ok(None),
+        Some(ABANDON_OP) => abandon(down, peek, class),
+        Some(op) if expects_result(op) => {
+          track(&mut down.open, class.id);
+          Ok(None)
+        }
+        _ => Ok(None),
+      };
+    }
+    if let Some(up) = self.up.as_mut()
+      && app.is_some_and(is_final)
+    {
+      up.clear_id = Some(class.id);
+    }
+    Ok(None)
+  }
+
+  /// Queue `operationsError` once nothing named is still outstanding.
+  fn queue_refusal(&mut self) -> Result<(), ()> {
+    let Some(down) = self.down.as_mut() else {
+      return Ok(());
+    };
+    if !down.open.is_empty() {
+      return Ok(());
+    }
+    let Some(id) = down.pending_refusal.take() else {
+      return Ok(());
+    };
+    match extended_result(id, ResultCode::OperationsError, false) {
+      Ok(bytes) => {
+        down.reply.push_back(bytes);
+        Ok(())
+      }
+      Err(_) => Err(()),
+    }
   }
 
   /// Emit a matching simple bind, or hand any other bind to the countdown.
@@ -553,22 +676,44 @@ impl Ldap {
     match try_ext(&peek.buf, peek.header)? {
       ExtParse::Need(need) => Ok(Step::Need(need)),
       ExtParse::Skip => {
+        if let Some(down) = self.down.as_mut()
+          && let Some(id) = down.msg_id.take()
+        {
+          track(&mut down.open, id);
+        }
         self.phase = self.release(std::mem::take(&mut peek.buf), peek.left, out, hits).await?;
         Ok(Step::Done)
       }
       ExtParse::StartTls { id } => {
-        let hold = self.hold_starttls;
-        if !hold {
+        let refuse = self.hold_starttls
+          && self
+            .down
+            .as_ref()
+            .is_some_and(|down| down.protected || !down.open.is_empty() || down.opaque);
+        let hold = self.hold_starttls && !refuse;
+        if refuse {
+          if let Some(down) = self.down.as_mut() {
+            down.pending_refusal = Some(id);
+          }
+          self.queue_refusal()?;
+        }
+        if !hold && !refuse {
           self.pass(&peek.buf, out, hits).await?;
         }
         if peek.left == 0 {
-          self.prefix = input.to_vec();
-          *input = &[];
-          self.starttls = Some(id);
-          self.local_starttls = hold;
+          if !refuse {
+            self.prefix = input.to_vec();
+            *input = &[];
+            self.starttls = Some(id);
+            self.local_starttls = hold;
+          }
           self.phase = self.finish_message(out);
         } else {
-          self.phase = Phase::Tail { left: peek.left, id };
+          self.phase = Phase::Tail {
+            left: peek.left,
+            id,
+            discard: refuse,
+          };
         }
         Ok(Step::Done)
       }
@@ -646,15 +791,28 @@ impl Ldap {
     if let Some(ok) = self.pending_starttls.take() {
       self.starttls_ok = Some(ok);
     }
+    if let Some(up) = self.up.as_mut()
+      && let Some(id) = up.clear_id.take()
+    {
+      up.settled.push(id);
+    }
     out.extend(std::mem::take(&mut self.held));
     Phase::Head(Vec::new())
   }
 
   /// Finish a `StartTLS` message, then park the handshake bytes.
-  async fn drive_tail(&mut self, left: usize, id: u32, input: &mut &[u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Result<(), ()> {
+  async fn drive_tail(
+    &mut self,
+    left: usize,
+    id: u32,
+    discard: bool,
+    input: &mut &[u8],
+    out: &mut Vec<u8>,
+    hits: &mut Vec<Hit>,
+  ) -> Result<(), ()> {
     let n = left.min(input.len());
     let Some(chunk) = input.get(..n) else {
-      self.phase = Phase::Tail { left, id };
+      self.phase = Phase::Tail { left, id, discard };
       return Ok(());
     };
     if !self.hold_starttls {
@@ -663,13 +821,15 @@ impl Ldap {
     *input = input.get(n..).unwrap_or_default();
     let left = left.saturating_sub(n);
     if left == 0 {
-      self.prefix = input.to_vec();
-      *input = &[];
-      self.starttls = Some(id);
-      self.local_starttls = self.hold_starttls;
+      if !discard {
+        self.prefix = input.to_vec();
+        *input = &[];
+        self.starttls = Some(id);
+        self.local_starttls = self.hold_starttls;
+      }
       self.phase = self.finish_message(out);
     } else {
-      self.phase = Phase::Tail { left, id };
+      self.phase = Phase::Tail { left, id, discard };
     }
     Ok(())
   }
@@ -754,6 +914,8 @@ fn header_view(buf: &[u8]) -> Result<Option<(usize, usize)>, ()> {
 struct Class {
   id: u32,
   op: u8,
+  /// Index of the `protocolOp` tag in the peek buffer.
+  op_at: usize,
 }
 
 /// Message id plus the operation tag, or a reason to keep reading.
@@ -797,6 +959,7 @@ fn classify_op(buf: &[u8], header: usize) -> Result<Classified, ()> {
   Ok(Classified::Op(Class {
     id: parse_uint(bytes)?,
     op,
+    op_at,
   }))
 }
 
@@ -1149,6 +1312,53 @@ fn write_len(out: &mut Vec<u8>, len: usize) -> Result<(), ()> {
   out.push(0x80 | octets);
   out.extend_from_slice(rest);
   Ok(())
+}
+
+/// Low-tag application number. High-tag-number form is not an LDAP operation.
+fn application_number(tag: u8) -> Option<u8> {
+  if tag & 0xc0 != 0x40 || tag & 0x1f == 0x1f {
+    return None;
+  }
+  Some(tag & 0x1f)
+}
+
+/// Client operations that have a final response. Unbind, abandon, and extended
+/// requests are not in this set.
+fn expects_result(op: u8) -> bool {
+  matches!(op, 0 | 3 | 6 | 8 | 10 | 12 | 14)
+}
+
+/// Final result messages. Search entries and intermediate responses are not.
+fn is_final(op: u8) -> bool {
+  matches!(op, 1 | 5 | 7 | 9 | 11 | 13 | 15 | 24)
+}
+
+fn track(open: &mut Vec<u32>, id: u32) {
+  if !open.contains(&id) {
+    open.push(id);
+  }
+}
+
+/// Remove the operation `AbandonRequest` names. A wide target cannot be named,
+/// so the leg treats an unnamed operation as still outstanding.
+fn abandon(down: &mut Down, peek: &Peek, class: &Class) -> Result<Option<usize>, ()> {
+  let tl = match take_tl(&peek.buf, class.op_at)? {
+    TlWait::Need(need) => return Ok(Some(need)),
+    TlWait::Ready(tl) => tl,
+  };
+  let start = class.op_at.checked_add(tl.header).ok_or(())?;
+  let end = start.checked_add(tl.content_len).ok_or(())?;
+  if peek.buf.len() < end {
+    return Ok(Some(end));
+  }
+  if tl.content_len > 4 {
+    down.opaque = true;
+    return Ok(None);
+  }
+  let bytes = peek.buf.get(start..end).ok_or(())?;
+  let target = parse_uint(bytes)?;
+  down.open.retain(|id| *id != target);
+  Ok(None)
 }
 
 fn parse_uint(bytes: &[u8]) -> Result<u32, ()> {

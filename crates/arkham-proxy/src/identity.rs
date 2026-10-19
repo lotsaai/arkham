@@ -226,13 +226,14 @@ fn unnamed(buf: Vec<u8>) -> Option<Hello> {
 pub(crate) async fn read_client_hello<G: AsyncRead + Unpin>(
   guest: &mut G,
   initial: &[u8],
-  budget: Duration,
+  budget: Option<Duration>,
 ) -> Result<Option<Hello>, Error> {
   let mut buf = initial.to_vec();
   let mut chunk = [0u8; 4096];
   // Total pre-auth budget: per-read timeouts re-arm, so a dripping client
   // could otherwise hold this task indefinitely one byte at a time.
-  let deadline = tokio::time::Instant::now() + budget;
+  // `None` is the relay's own read: no added deadline.
+  let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
   loop {
     // SNI first: a hello completing exactly at the size cutoff still counts.
     if let Some((sni, hello)) = hello_sni(&buf) {
@@ -244,17 +245,20 @@ pub(crate) async fn read_client_hello<G: AsyncRead + Unpin>(
       return Ok(unnamed(buf));
     }
     let over_cap = buf.len() > MAX_HELLO;
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if over_cap || remaining.is_zero() {
+    let remaining = deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
+    if over_cap || remaining.is_some_and(|left| left.is_zero()) {
       // Bytes that opened as a TLS record but never completed: no SNI to
       // name the peer with, so the caller falls back to its authority.
       return Ok(unnamed(buf));
     }
-    let read = tokio::time::timeout(remaining, guest.read(&mut chunk)).await;
-    let Ok(n) = read else {
-      return Ok(unnamed(buf));
+    let read = match remaining {
+      Some(left) => match tokio::time::timeout(left, guest.read(&mut chunk)).await {
+        Ok(read) => read,
+        Err(_elapsed) => return Ok(unnamed(buf)),
+      },
+      None => guest.read(&mut chunk).await,
     };
-    let n = n?;
+    let n = read?;
     if n == 0 {
       return Ok(unnamed(buf));
     }
@@ -518,7 +522,7 @@ mod tests {
       0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00, 0x00, 0x07, 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04,
     ]);
     let start = Instant::now();
-    let read = read_client_hello(&mut &*hello, &[], Duration::from_secs(30)).await.unwrap();
+    let read = read_client_hello(&mut &*hello, &[], Some(Duration::from_secs(30))).await.unwrap();
     assert!(matches!(read, Some(Hello::Unnamed { .. })), "an SNI-less hello resolves unnamed");
     assert!(start.elapsed() < Duration::from_secs(5), "no budget burn: {:?}", start.elapsed());
   }

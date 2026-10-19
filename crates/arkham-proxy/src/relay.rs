@@ -4,8 +4,9 @@
 //! never stalls the reading of upstream bytes, and the other way around. The
 //! request pump talks to the response pump over one FIFO channel (protocol
 //! replies, framing facts, and the request direction's terminal intent —
-//! ordering inside the channel replaces any select priority), and the
-//! response pump ends the request pump through a oneshot completion signal.
+//! ordering inside the channel replaces any select priority). Finished
+//! response ids travel back on a second FIFO into [`Wire::apply_peer_note`].
+//! The response pump ends the request pump through a oneshot.
 
 use std::io::{Error as IoError, ErrorKind};
 
@@ -82,11 +83,16 @@ enum ResponseEnd<G, S> {
   },
 }
 
-/// What `drain_requests` found at the head of the channel.
-enum Drained {
-  Continue,
-  Ended,
-  Handoff,
+/// Request pump's ends of the two FIFOs.
+struct RequestLinks {
+  responses: mpsc::UnboundedSender<ToResponse>,
+  settled: mpsc::UnboundedReceiver<usize>,
+}
+
+/// Response pump's ends of the two FIFOs.
+struct ResponseLinks {
+  requests: mpsc::UnboundedReceiver<ToResponse>,
+  settled: mpsc::UnboundedSender<usize>,
 }
 
 /// Bidirectional relay through the two directions' wire formats. Guest FIN
@@ -135,12 +141,16 @@ where
   let (to_responses_tx, to_responses_rx) = mpsc::unbounded_channel();
   let (responses_done_tx, responses_done_rx) = oneshot::channel();
   let (upgrade_tx, upgrade_rx) = oneshot::channel();
+  let (settled_tx, settled_rx) = mpsc::unbounded_channel();
   let (requests, responses) = tokio::join!(
     pump_requests(
       guest_read,
       server_write,
       downstream,
-      to_responses_tx,
+      RequestLinks {
+        responses: to_responses_tx,
+        settled: settled_rx
+      },
       responses_done_rx,
       upgrade_rx,
       first,
@@ -149,7 +159,10 @@ where
       server_read,
       guest_write,
       upstream,
-      to_responses_rx,
+      ResponseLinks {
+        requests: to_responses_rx,
+        settled: settled_tx
+      },
       responses_done_tx,
       upgrade_tx,
       upstream_first,
@@ -184,20 +197,15 @@ where
   }
 }
 
-/// Tell the response pump the request direction ended the relay. A closed
-/// channel means it already ended itself; the relay is closing either way.
 fn end_requests(responses: &mpsc::UnboundedSender<ToResponse>) {
   let _ = responses.send(ToResponse::RequestsEnded);
 }
 
-/// Guest→upstream direction: read the guest, feed the downstream machine,
-/// carry rewritten bytes upstream, hand replies and framing facts to the
-/// response pump.
 async fn pump_requests<G, S, M>(
   mut guest: ReadHalf<G>,
   mut server: WriteHalf<S>,
   downstream: &mut M,
-  responses: mpsc::UnboundedSender<ToResponse>,
+  mut links: RequestLinks,
   mut responses_done: oneshot::Receiver<()>,
   upgrade_rx: oneshot::Receiver<bool>,
   first: &[u8],
@@ -207,13 +215,21 @@ where
   S: AsyncRead + AsyncWrite + Unpin,
   M: Wire,
 {
-  if !first.is_empty() && !pump_first(&mut server, downstream, &responses, &mut responses_done, first).await? {
+  if !first.is_empty() && !pump_first(&mut server, downstream, &links.responses, &mut responses_done, first).await? {
     return Ok(RequestEnd::Done);
   }
   let mut buf = vec![0u8; 32 * 1024];
+  let mut settled_open = true;
   loop {
     tokio::select! {
       _ = &mut responses_done => return Ok(RequestEnd::Done),
+      note = links.settled.recv(), if settled_open => match note {
+        Some(id) => {
+          downstream.apply_peer_note(id);
+          hand_over(&links.responses, downstream);
+        }
+        None => settled_open = false,
+      },
       result = guest.read(&mut buf) => {
         // rustls surfaces a peer FIN without close_notify as UnexpectedEof;
         // for a relay that is a normal end-of-stream, not an error.
@@ -224,14 +240,14 @@ where
         match result {
           Ok(0) => {
             let (rewritten, hits) = downstream.feed(&[]).await;
-            hand_over(&responses, downstream);
+            hand_over(&links.responses, downstream);
             log_hits(&hits);
             if let Rewritten::Emit(flushed) = rewritten {
               write_or_stopped(
                 &mut server,
                 &flushed,
                 &mut responses_done,
-                |source| request_flush_error(&responses, source),
+                |source| request_flush_error(&links.responses, source),
               )
               .await?;
             }
@@ -243,64 +259,27 @@ where
           }
           Ok(n) => {
             let (rewritten, hits) = downstream.feed(&buf[..n]).await;
-            hand_over(&responses, downstream);
+            hand_over(&links.responses, downstream);
             log_hits(&hits);
-            if let Some(UpgradeNote::Request { id, prefix, local }) = downstream.take_upgrade() {
-              let _ = responses.send(if local {
-                ToResponse::Handoff
-              } else {
-                ToResponse::ArmUpgrade(id)
-              });
-              if let Rewritten::Emit(out) = &rewritten {
-                if write_or_stopped(&mut server, out, &mut responses_done, |source| request_chunk_error(&responses, source))
-                  .await?
-                  .is_none()
-                {
-                  return Ok(RequestEnd::Done);
-                }
-                server
-                  .flush()
-                  .await
-                  .map_err(|source| request_flush_error(&responses, source))?;
-              }
-              if local {
-                return Ok(RequestEnd::Upgrade {
-                  read: guest,
-                  write: server,
-                  prefix,
-                  id,
-                  local: true,
-                });
-              }
-              let ok = upgrade_rx.await.unwrap_or(false);
-              if !ok {
-                let _ = server.shutdown().await;
-                return Ok(RequestEnd::Done);
-              }
-              return Ok(RequestEnd::Upgrade {
-                read: guest,
-                write: server,
-                prefix,
-                id,
-                local: false,
-              });
+            if let Some(note) = downstream.take_upgrade() {
+              return request_upgrade(guest, server, &links.responses, &mut responses_done, upgrade_rx, &rewritten, note).await;
             }
             match rewritten {
               Rewritten::Close => {
-                end_requests(&responses);
+                end_requests(&links.responses);
                 return Ok(RequestEnd::Done);
               }
               Rewritten::Hold => {}
               Rewritten::Emit(out) => {
                 write_or_stopped(&mut server, &out, &mut responses_done, |source| {
-                  request_chunk_error(&responses, source)
+                  request_chunk_error(&links.responses, source)
                 })
                 .await?;
               }
             }
           }
           Err(err) => {
-            end_requests(&responses);
+            end_requests(&links.responses);
             return Err(Error::GuestRead { source: err });
           }
         }
@@ -309,9 +288,6 @@ where
   }
 }
 
-/// Feed the replayed first bytes downstream and carry the first chunk
-/// upstream. Returns `false` when the downstream direction already ended the
-/// relay.
 async fn pump_first<W, M>(
   server: &mut W,
   downstream: &mut M,
@@ -340,13 +316,53 @@ where
   }
 }
 
-/// Upstream→guest direction: read the upstream, feed the upstream machine,
-/// carry rewritten bytes to the guest, apply what the request pump queued.
+/// Stop reading the guest. A dropped `upgrade_rx` (close, read error, refusal) ends the relay.
+async fn request_upgrade<G, S>(
+  guest: ReadHalf<G>,
+  mut server: WriteHalf<S>,
+  responses: &mpsc::UnboundedSender<ToResponse>,
+  responses_done: &mut oneshot::Receiver<()>,
+  upgrade_rx: oneshot::Receiver<bool>,
+  rewritten: &Rewritten<'_>,
+  note: UpgradeNote,
+) -> Result<RequestEnd<G, S>, Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  let UpgradeNote::Request { id, prefix, local } = note else {
+    end_requests(responses);
+    return Ok(RequestEnd::Done);
+  };
+  let _ = responses.send(if local { ToResponse::Handoff } else { ToResponse::ArmUpgrade(id) });
+  if let Rewritten::Emit(out) = rewritten {
+    if write_or_stopped(&mut server, out, responses_done, |source| request_chunk_error(responses, source))
+      .await?
+      .is_none()
+    {
+      return Ok(RequestEnd::Done);
+    }
+    server.flush().await.map_err(|source| request_flush_error(responses, source))?;
+  }
+  // Reading the guest stops here. That lockstep is what the upgrade needs.
+  if !local && !upgrade_rx.await.unwrap_or(false) {
+    let _ = server.shutdown().await;
+    return Ok(RequestEnd::Done);
+  }
+  Ok(RequestEnd::Upgrade {
+    read: guest,
+    write: server,
+    prefix,
+    id,
+    local,
+  })
+}
+
 async fn pump_responses<G, S, M>(
   mut server: ReadHalf<S>,
   mut guest: WriteHalf<G>,
   upstream: &mut M,
-  mut requests: mpsc::UnboundedReceiver<ToResponse>,
+  mut links: ResponseLinks,
   responses_done: oneshot::Sender<()>,
   upgrade_tx: oneshot::Sender<bool>,
   upstream_first: &[u8],
@@ -358,25 +374,23 @@ where
 {
   let mut upgrade_tx = Some(upgrade_tx);
   let mut armed = false;
-  if !upstream_first.is_empty() && !write_upstream_chunk(&mut guest, upstream, upstream_first).await? {
-    let _ = responses_done.send(());
-    guest.flush().await.map_err(|source| Error::FinalGuestFlush { source })?;
-    let _ = guest.shutdown().await;
-    return Ok(ResponseEnd::Done);
+  if !upstream_first.is_empty() {
+    let open = write_upstream_chunk(&mut guest, upstream, upstream_first).await?;
+    publish_settled(upstream, &links.settled);
+    if !open {
+      let _ = responses_done.send(());
+      guest.flush().await.map_err(|source| Error::FinalGuestFlush { source })?;
+      let _ = guest.shutdown().await;
+      return Ok(ResponseEnd::Done);
+    }
   }
   let mut buf = vec![0u8; 32 * 1024];
   let mut requests_open = true;
-  let outcome = loop {
+  let upgrade = loop {
     tokio::select! {
-      msg = requests.recv(), if requests_open => match msg {
-        Some(ToResponse::RequestsEnded) => break Ok(ResponseEnd::Done),
-        Some(ToResponse::Handoff) => {
-          return Ok(ResponseEnd::Upgrade {
-            read: server,
-            write: guest,
-            prefix: Vec::new(),
-          });
-        }
+      msg = links.requests.recv(), if requests_open => match msg {
+        Some(ToResponse::RequestsEnded) => break Ok(None),
+        Some(ToResponse::Handoff) => break Ok(Some(Vec::new())),
         Some(ToResponse::ArmUpgrade(id)) => {
           armed = true;
           upstream.arm_upgrade(id);
@@ -392,86 +406,90 @@ where
           other => other,
         };
         match result {
-          Ok(0) => {
-            // Replies queued before the request direction shut down must
-            // reach the guest before the relay ends.
-            match drain_requests(&mut guest, upstream, &mut requests, &mut armed).await? {
-              Drained::Ended => break Ok(ResponseEnd::Done),
-              Drained::Handoff => {
-                return Ok(ResponseEnd::Upgrade {
-                  read: server,
-                  write: guest,
-                  prefix: Vec::new(),
-                });
-              }
-              Drained::Continue => {}
-            }
-            let (rewritten, hits) = upstream.feed(&[]).await;
-            log_hits(&hits);
-            break match rewritten {
-              Rewritten::Close | Rewritten::Hold => Ok(ResponseEnd::Done),
-              Rewritten::Emit(flushed) => {
-                guest.write_all(&flushed).await.map_err(|source| Error::ResponseFlushToGuest { source })?;
-                Ok(ResponseEnd::Done)
-              }
-            };
-          }
-          Ok(n) => match on_upstream_chunk(&mut guest, upstream, &mut requests, &mut armed, &mut upgrade_tx, &buf[..n]).await? {
+          Ok(0) => break upstream_end(&mut guest, upstream, &mut links.requests, &mut armed, &links.settled).await,
+          Ok(n) => match on_upstream_chunk(
+            &mut guest,
+            upstream,
+            &mut links.requests,
+            &mut armed,
+            &mut upgrade_tx,
+            &links.settled,
+            &buf[..n],
+          )
+          .await?
+          {
             ChunkStep::Stay => {}
-            ChunkStep::Stop => break Ok(ResponseEnd::Done),
-            ChunkStep::Handoff => {
-              return Ok(ResponseEnd::Upgrade {
-                read: server,
-                write: guest,
-                prefix: Vec::new(),
-              });
-            }
-            ChunkStep::Upgraded(prefix) => {
-              return Ok(ResponseEnd::Upgrade {
-                read: server,
-                write: guest,
-                prefix,
-              });
-            }
+            ChunkStep::Stop => break Ok(None),
+            ChunkStep::Upgrade(prefix) => break Ok(Some(prefix)),
           },
           Err(err) => break Err(Error::UpstreamRead { source: err }),
         }
       }
     }
   };
+  if let Ok(Some(prefix)) = upgrade {
+    return Ok(ResponseEnd::Upgrade {
+      read: server,
+      write: guest,
+      prefix,
+    });
+  }
   if armed && let Some(tx) = upgrade_tx.take() {
     let _ = tx.send(false);
   }
   let _ = responses_done.send(());
-  match outcome {
-    Ok(ResponseEnd::Done) => {
+  match upgrade {
+    Ok(_) => {
       guest.flush().await.map_err(|source| Error::FinalGuestFlush { source })?;
       let _ = guest.shutdown().await;
       Ok(ResponseEnd::Done)
     }
-    Ok(up) => Ok(up),
     Err(err) => Err(err),
   }
 }
 
-/// What one upstream chunk did to the response pump.
 enum ChunkStep {
   Stay,
   Stop,
-  Handoff,
-  Upgraded(Vec<u8>),
+  Upgrade(Vec<u8>),
 }
 
-/// Drain queued request-pump notes, then feed one upstream chunk.
-///
-/// A handoff still writes bytes this read already took. An upgrade result
-/// is written before the caller returns the sockets.
+async fn upstream_end<G, M>(
+  guest: &mut WriteHalf<G>,
+  upstream: &mut M,
+  requests: &mut mpsc::UnboundedReceiver<ToResponse>,
+  armed: &mut bool,
+  settled: &mpsc::UnboundedSender<usize>,
+) -> Result<Option<Vec<u8>>, Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+  M: Wire,
+{
+  match drain_requests(guest, upstream, requests, armed).await? {
+    ChunkStep::Stop => return Ok(None),
+    ChunkStep::Upgrade(prefix) => return Ok(Some(prefix)),
+    ChunkStep::Stay => {}
+  }
+  let (rewritten, hits) = upstream.feed(&[]).await;
+  log_hits(&hits);
+  publish_settled(upstream, settled);
+  if let Rewritten::Emit(flushed) = rewritten {
+    guest
+      .write_all(&flushed)
+      .await
+      .map_err(|source| Error::ResponseFlushToGuest { source })?;
+  }
+  Ok(None)
+}
+
+/// Drain queued notes, then feed one upstream chunk. A handoff still writes bytes this read took.
 async fn on_upstream_chunk<G, M>(
   guest: &mut WriteHalf<G>,
   upstream: &mut M,
   requests: &mut mpsc::UnboundedReceiver<ToResponse>,
   armed: &mut bool,
   upgrade_tx: &mut Option<oneshot::Sender<bool>>,
+  settled: &mpsc::UnboundedSender<usize>,
   chunk: &[u8],
 ) -> Result<ChunkStep, Error>
 where
@@ -479,47 +497,47 @@ where
   M: Wire,
 {
   let drained = drain_requests(guest, upstream, requests, armed).await?;
-  if matches!(drained, Drained::Ended) {
+  if matches!(drained, ChunkStep::Stop) {
     return Ok(ChunkStep::Stop);
   }
   let (rewritten, hits) = upstream.feed(chunk).await;
   log_hits(&hits);
-  if matches!(drained, Drained::Handoff) {
+  let step = if let ChunkStep::Upgrade(prefix) = drained {
     if let Rewritten::Emit(out) = &rewritten {
-      guest
-        .write_all(out)
-        .await
-        .map_err(|source| Error::ResponseChunkToGuest { source })?;
-      guest.flush().await.map_err(|source| Error::GuestFlush { source })?;
+      write_guest_chunk(guest, out).await?;
     }
-    return Ok(ChunkStep::Handoff);
-  }
-  if let Some(note) = upstream.take_upgrade() {
-    return Ok(match response_upgrade(guest, &rewritten, upgrade_tx, note).await? {
-      Some(prefix) => ChunkStep::Upgraded(prefix),
+    ChunkStep::Upgrade(prefix)
+  } else if let Some(note) = upstream.take_upgrade() {
+    match response_upgrade(guest, &rewritten, upgrade_tx, note).await? {
+      Some(prefix) => ChunkStep::Upgrade(prefix),
       None => ChunkStep::Stop,
-    });
-  }
-  match rewritten {
-    // A scan that cannot rewrite the chunk closes rather than forward it.
-    Rewritten::Close => Ok(ChunkStep::Stop),
-    Rewritten::Hold => Ok(ChunkStep::Stay),
-    Rewritten::Emit(out) => {
-      guest
-        .write_all(&out)
-        .await
-        .map_err(|source| Error::ResponseChunkToGuest { source })?;
-      guest.flush().await.map_err(|source| Error::GuestFlush { source })?;
-      Ok(ChunkStep::Stay)
     }
-  }
+  } else {
+    match rewritten {
+      // A scan that cannot rewrite the chunk closes rather than forward it.
+      Rewritten::Close => ChunkStep::Stop,
+      Rewritten::Hold => ChunkStep::Stay,
+      Rewritten::Emit(out) => {
+        write_guest_chunk(guest, &out).await?;
+        ChunkStep::Stay
+      }
+    }
+  };
+  // Response bytes are on the guest before the id drops out of the outstanding set.
+  publish_settled(upstream, settled);
+  Ok(step)
 }
 
-/// Write a completed upgrade result to the guest and wake the request pump.
-///
-/// `Some` is the unread tail after a successful result. `None` is a refusal,
-/// or a note this direction does not handle. The result frame is still in
-/// `rewritten` and has to reach the guest before either handshake starts.
+async fn write_guest_chunk(guest: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> Result<(), Error> {
+  guest
+    .write_all(bytes)
+    .await
+    .map_err(|source| Error::ResponseChunkToGuest { source })?;
+  guest.flush().await.map_err(|source| Error::GuestFlush { source })?;
+  Ok(())
+}
+
+/// Write an upgrade result and wake the request pump. `Some` is the unread tail.
 async fn response_upgrade<W>(
   guest: &mut W,
   rewritten: &Rewritten<'_>,
@@ -536,11 +554,7 @@ where
     return Ok(None);
   };
   if let Rewritten::Emit(out) = rewritten {
-    guest
-      .write_all(out)
-      .await
-      .map_err(|source| Error::ResponseChunkToGuest { source })?;
-    guest.flush().await.map_err(|source| Error::GuestFlush { source })?;
+    write_guest_chunk(guest, out).await?;
   }
   if let Some(tx) = upgrade_tx.take() {
     let _ = tx.send(ok);
@@ -548,8 +562,6 @@ where
   Ok(ok.then_some(prefix))
 }
 
-/// Feed bytes already taken from the server and write what the upstream
-/// machine emits. `false` means that machine closed the relay.
 async fn write_upstream_chunk<W, M>(guest: &mut W, upstream: &mut M, bytes: &[u8]) -> Result<bool, Error>
 where
   W: AsyncWrite + Unpin,
@@ -562,19 +574,13 @@ where
     Rewritten::Hold => Ok(true),
     Rewritten::Emit(out) => {
       if !out.is_empty() {
-        guest
-          .write_all(&out)
-          .await
-          .map_err(|source| Error::ResponseChunkToGuest { source })?;
-        guest.flush().await.map_err(|source| Error::GuestFlush { source })?;
+        write_guest_chunk(guest, &out).await?;
       }
       Ok(true)
     }
   }
 }
 
-/// Apply one queued message from the request pump: a guest-bound protocol
-/// reply or a framing fact into the response machine.
 async fn apply_message<W, M>(guest: &mut W, upstream: &mut M, msg: ToResponse) -> Result<(), Error>
 where
   W: AsyncWrite + Unpin,
@@ -595,25 +601,21 @@ where
   Ok(())
 }
 
-/// Apply everything the request pump queued.
-///
-/// `Ended` stops the relay. `Handoff` stops after the caller has delivered
-/// any bytes already pulled off the socket. `armed` records an upgrade id
-/// so a later refusal can wake the request pump.
+/// Apply queued request-pump notes. `Upgrade` is a handoff the caller still writes through.
 async fn drain_requests<W, M>(
   guest: &mut W,
   upstream: &mut M,
   requests: &mut mpsc::UnboundedReceiver<ToResponse>,
   armed: &mut bool,
-) -> Result<Drained, Error>
+) -> Result<ChunkStep, Error>
 where
   W: AsyncWrite + Unpin,
   M: Wire,
 {
   while let Ok(msg) = requests.try_recv() {
     match msg {
-      ToResponse::RequestsEnded => return Ok(Drained::Ended),
-      ToResponse::Handoff => return Ok(Drained::Handoff),
+      ToResponse::RequestsEnded => return Ok(ChunkStep::Stop),
+      ToResponse::Handoff => return Ok(ChunkStep::Upgrade(Vec::new())),
       ToResponse::ArmUpgrade(id) => {
         *armed = true;
         upstream.arm_upgrade(id);
@@ -621,12 +623,17 @@ where
       other => apply_message(guest, upstream, other).await?,
     }
   }
-  Ok(Drained::Continue)
+  Ok(ChunkStep::Stay)
 }
 
-/// Hand the response pump a queued protocol reply and any framing fact. A
-/// closed channel means the response direction already ended; the relay is
-/// closing, so dropping the reply is correct.
+fn publish_settled<M: Wire>(upstream: &mut M, settled: &mpsc::UnboundedSender<usize>) {
+  let mut note = upstream.take_peer_note();
+  while note != 0 {
+    let _ = settled.send(note);
+    note = upstream.take_peer_note();
+  }
+}
+
 fn hand_over<M: Wire>(responses: &mpsc::UnboundedSender<ToResponse>, downstream: &mut M) {
   if let Some(reply) = downstream.take_reply() {
     let _ = responses.send(ToResponse::Reply(reply));
@@ -637,9 +644,7 @@ fn hand_over<M: Wire>(responses: &mpsc::UnboundedSender<ToResponse>, downstream:
   }
 }
 
-/// Write that abandons the direction when the response direction ended: a
-/// half-finished write is fine, the connection is closing anyway. `None`
-/// means stopped before completion.
+/// `None` when the response direction ended mid-write. The connection is closing.
 async fn write_or_stopped<W, F>(
   sink: &mut W,
   bytes: &[u8],
@@ -659,22 +664,16 @@ where
   }
 }
 
-/// Terminal intent rides with the error: the response pump must learn the
-/// relay ended even when the request pump unwinds early.
 fn request_flush_error(responses: &mpsc::UnboundedSender<ToResponse>, source: IoError) -> Error {
   end_requests(responses);
   Error::RequestFlushToUpstream { source }
 }
 
-/// Terminal intent rides with the error: the response pump must learn the
-/// relay ended even when the request pump unwinds early.
 fn request_chunk_error(responses: &mpsc::UnboundedSender<ToResponse>, source: IoError) -> Error {
   end_requests(responses);
   Error::RequestChunkToUpstream { source }
 }
 
-/// Terminal intent rides with the error: the response pump must learn the
-/// relay ended even when the request pump unwinds early.
 fn request_head_error(responses: &mpsc::UnboundedSender<ToResponse>, source: IoError) -> Error {
   end_requests(responses);
   Error::RequestHeadToUpstream { source }

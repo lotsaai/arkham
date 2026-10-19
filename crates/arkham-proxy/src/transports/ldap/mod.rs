@@ -26,7 +26,7 @@ use arkham_pki::ca::CertAuthority;
 use super::PairCtx;
 use super::{ServeStream, TlsHalves, Transport};
 use crate::Error;
-use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening};
+use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening, read_guest_tls};
 use crate::identity::CandidateParams;
 use crate::mint::MintBucket;
 use crate::relay::{RelayEnd, log_hits, relay_guarded, relay_stop};
@@ -282,7 +282,7 @@ impl LdapTransport {
   }
 
   /// Forward one `StartTLS` exchange, or answer it locally when the upstream
-  /// leg is already TLS, then hand both plaintext legs to [`relay_guarded`].
+  /// leg is already TLS, then hand both plaintext legs to [`relay`].
   async fn starttls<G, S>(&self, open: &StartTlsOpen, mut guest: G, mut server: S, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -294,71 +294,98 @@ impl LdapTransport {
       upstream.expect_starttls(open.id);
       read_starttls_result(&mut server, &mut guest, &mut upstream, pump.budget).await?
     } else {
-      let bytes = starttls_success(open.id).map_err(|source| Error::LdapEncode { source })?;
-      write_guest(&mut guest, &bytes).await?;
       (true, Vec::new())
     };
     if !success {
       tracing::debug!("ldap starttls refused; closing");
       return Ok(());
     }
-    let authority = Some(pump.scope.downstream.host.as_str());
-    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, &open.handshake, pump.budget, authority, pump.mint).await? else {
-      return Ok(());
-    };
-    let guest_plain = self
-      .accept_guest(&identity, Prefixed::new(hello_buf, guest), pump.scope.guest_tls)
-      .await?;
-    let (mut downstream, mut upstream) = ldap_pair(pump.ctx, true);
-    if pump.upgrade_upstream {
-      let server_plain = self
-        .connect_server(pump.scope, pump.scope.upstream.host.as_str(), Prefixed::new(server_rest, server))
-        .await?;
-      relay_guarded(guest_plain, server_plain, &mut downstream, &mut upstream, &[], &[]).await
-    } else {
-      relay_guarded(guest_plain, server, &mut downstream, &mut upstream, &[], &[]).await
-    }
+    Box::pin(self.protect(
+      guest,
+      server,
+      Accept {
+        guest_prefix: &open.handshake,
+        server_prefix: server_rest,
+        id: u64::from(open.id),
+        local: !pump.upgrade_upstream,
+        hello_budget: Some(pump.budget),
+      },
+      pump,
+    ))
+    .await
   }
 
   /// The relay stopped on `StartTLS`. Finish that exchange and relay the
-  /// plaintext legs. `local` answers the request here because the server
-  /// socket is already TLS.
+  /// plaintext legs. The late guest hello has no deadline.
   async fn finish_starttls<G, S>(&self, upgrade: crate::relay::RelayUpgrade<G, S>, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
     let crate::relay::RelayUpgrade {
-      mut guest,
+      guest,
       server,
       guest_prefix,
       server_prefix,
       id,
       local,
     } = upgrade;
-    if local {
-      let Ok(id) = u32::try_from(id) else {
+    Box::pin(self.protect(
+      guest,
+      server,
+      Accept {
+        guest_prefix: &guest_prefix,
+        server_prefix,
+        id,
+        local,
+        hello_budget: None,
+      },
+      pump,
+    ))
+    .await
+  }
+
+  /// Accept the guest TLS leg once, then relay. `local` writes the success
+  /// here because the server socket is already TLS. `hello_budget` `None`
+  /// reads the `ClientHello` with no deadline.
+  async fn protect<G, S>(&self, mut guest: G, server: S, accept: Accept<'_>, pump: &Pump<'_>) -> Result<(), Error>
+  where
+    G: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+  {
+    if accept.local {
+      let Ok(id) = u32::try_from(accept.id) else {
         return Ok(());
       };
       let bytes = starttls_success(id).map_err(|source| Error::LdapEncode { source })?;
       write_guest(&mut guest, &bytes).await?;
     }
     let authority = Some(pump.scope.downstream.host.as_str());
-    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, &guest_prefix, pump.budget, authority, pump.mint).await? else {
+    let Some((hello_buf, identity, _)) = read_guest_tls(&mut guest, accept.guest_prefix, accept.hello_budget, authority, pump.mint).await?
+    else {
       return Ok(());
     };
     let guest_plain = self
       .accept_guest(&identity, Prefixed::new(hello_buf, guest), pump.scope.guest_tls)
       .await?;
-    let (mut downstream, mut upstream) = ldap_pair(pump.ctx, true);
-    let server = Prefixed::new(server_prefix, server);
-    if local {
-      relay_guarded(guest_plain, server, &mut downstream, &mut upstream, &[], &[]).await
+    let server = Prefixed::new(accept.server_prefix, server);
+    if accept.local {
+      relay(guest_plain, server, pump.ctx, true).await
     } else {
       let server_plain = self.connect_server(pump.scope, pump.scope.upstream.host.as_str(), server).await?;
-      relay_guarded(guest_plain, server_plain, &mut downstream, &mut upstream, &[], &[]).await
+      relay(guest_plain, server_plain, pump.ctx, true).await
     }
   }
+}
+
+/// Bytes already read around one `StartTLS`, plus whether this side answers it.
+struct Accept<'a> {
+  guest_prefix: &'a [u8],
+  server_prefix: Vec<u8>,
+  id: u64,
+  local: bool,
+  /// `None` waits for the guest `ClientHello` with no deadline.
+  hello_budget: Option<Duration>,
 }
 
 /// What the first cleartext message was.
@@ -592,13 +619,17 @@ where
   Ok(())
 }
 
-/// Pump one settled pair. `swap` is set only when `server` is already TLS.
+/// Pump one settled pair. `swap` is set only when `server` is already TLS,
+/// and a further `StartTLS` on that session is `operationsError`.
 async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>, swap: bool) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
 {
   let (mut downstream, mut upstream) = ldap_pair(ctx, swap);
+  if swap {
+    downstream.seal_starttls();
+  }
   relay_guarded(guest, server, &mut downstream, &mut upstream, &[], &[]).await
 }
 

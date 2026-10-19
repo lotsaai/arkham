@@ -64,9 +64,10 @@ pub(crate) enum Rewritten<'a> {
 }
 
 /// One direction's credential rewrite, framed by its protocol. Feeding an
-/// empty chunk flushes held bytes at stream end. `take_peer_note` carries
-/// request-level framing facts to the opposite direction (HEAD requests
-/// suppress response bodies); only HTTP-family formats use it today.
+/// empty chunk flushes held bytes at stream end. `take_peer_note` carries a
+/// framing fact to the opposite direction. HTTP uses it so a HEAD request
+/// suppresses the response body. LDAP uses it so a finished response id
+/// drops out of the downstream outstanding set.
 pub(crate) trait Wire {
   /// Process one chunk; empty input flushes held bytes at stream EOF.
   /// Async because the plugin hook awaits.
