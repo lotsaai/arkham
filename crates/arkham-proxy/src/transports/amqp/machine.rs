@@ -144,7 +144,8 @@ pub(crate) struct Amqp {
   up: Option<CredentialPair>,
   framer: Framer,
   phase: Phase,
-  held: Vec<u8>,
+  overlap: PayloadOverlap,
+  overlap_channel: Option<u16>,
   closed: bool,
 }
 
@@ -170,8 +171,25 @@ enum Phase {
   Header(Vec<u8>),
   Head(Vec<u8>),
   Frame { buf: Vec<u8>, total: usize, kind: Kind },
-  Forward(usize),
+  Forward(Forward),
   Opaque,
+}
+
+struct Forward {
+  left: usize,
+  skip: usize,
+  end: usize,
+}
+
+struct PayloadOverlap {
+  bytes: Vec<u8>,
+  sent: usize,
+}
+
+struct Parts<'a> {
+  header: &'a [u8],
+  payload: &'a [u8],
+  end: &'a [u8],
 }
 
 #[derive(Clone, Copy)]
@@ -192,7 +210,63 @@ enum InitRewrite {
 enum Classified {
   AbsoluteHead(usize),
   Hold { total: usize, kind: Kind },
-  Forward { total: usize },
+  Forward { total: usize, header: usize },
+}
+
+impl PayloadOverlap {
+  fn new() -> Self {
+    Self {
+      bytes: Vec::new(),
+      sent: 0,
+    }
+  }
+
+  fn is_empty(&self) -> bool {
+    self.bytes.is_empty()
+  }
+
+  fn scan(&mut self, payload: &[u8], pair: &CredentialPair, out: &mut Vec<u8>) -> Result<(), ()> {
+    let mut combined = std::mem::take(&mut self.bytes);
+    let old_sent = std::mem::replace(&mut self.sent, 0);
+    combined.extend_from_slice(payload);
+    if find_new_match(&combined, &pair.needle, 0) {
+      return Err(());
+    }
+    let bound = pair.needle.len().saturating_sub(1);
+    let hold = needle_prefix_suffix_len(&combined, std::slice::from_ref(pair), bound);
+    let emit_end = combined.len().saturating_sub(hold);
+    let emit_start = old_sent.min(emit_end);
+    let Some(fresh) = combined.get(emit_start..emit_end) else {
+      return Err(());
+    };
+    out.extend_from_slice(fresh);
+    self.bytes = combined.split_off(emit_end);
+    self.sent = old_sent.saturating_sub(emit_end);
+    Ok(())
+  }
+
+  fn commit_frame(&mut self, out: &mut Vec<u8>) {
+    let Some(tail) = self.bytes.get(self.sent..) else {
+      return;
+    };
+    out.extend_from_slice(tail);
+    self.sent = self.bytes.len();
+  }
+
+  fn flush_unsent(&mut self, out: &mut Vec<u8>) {
+    self.commit_frame(out);
+    self.bytes.clear();
+    self.sent = 0;
+  }
+
+  fn discard_if_sent(&mut self) -> Result<(), ()> {
+    if self.sent != self.bytes.len() {
+      return Err(());
+    }
+    self.bytes.clear();
+    self.sent = 0;
+    Ok(())
+  }
 }
 
 impl Amqp {
@@ -230,7 +304,8 @@ impl Amqp {
       up,
       framer: Framer::V091,
       phase,
-      held: Vec::new(),
+      overlap: PayloadOverlap::new(),
+      overlap_channel: None,
       closed: false,
     }
   }
@@ -280,7 +355,8 @@ impl Amqp {
       self.closed = true;
       return (Rewritten::Close, Vec::new());
     }
-    let flushed = std::mem::take(&mut self.held);
+    let mut flushed = Vec::new();
+    self.overlap.flush_unsent(&mut flushed);
     if flushed.is_empty() {
       (Rewritten::Hold, Vec::new())
     } else {
@@ -293,8 +369,8 @@ impl Amqp {
       Phase::Header(buf) => self.drive_header(buf, input, out, hits),
       Phase::Head(buf) => self.drive_head(buf, input, out, hits),
       Phase::Frame { buf, total, kind } => self.drive_frame(buf, total, kind, input, out, hits),
-      Phase::Forward(left) => {
-        self.phase = self.forward_rest(left, input, out)?;
+      Phase::Forward(fwd) => {
+        self.phase = self.forward_rest(fwd, input, out)?;
         Ok(())
       }
       Phase::Opaque => self.opaque(input, out),
@@ -303,7 +379,7 @@ impl Amqp {
 
   fn opaque(&mut self, input: &mut &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
     self.phase = Phase::Opaque;
-    self.pass(input, out)?;
+    self.emit_payload(input, out)?;
     *input = &[];
     Ok(())
   }
@@ -325,7 +401,7 @@ impl Amqp {
       self.phase = Phase::Header(buf);
       return Ok(());
     }
-    self.pass(&buf, out)?;
+    out.extend_from_slice(&buf);
     self.phase = match header_framer(self.down.is_some(), &buf) {
       Some(framer) => {
         self.framer = framer;
@@ -356,10 +432,8 @@ impl Amqp {
           take(&mut buf, need, input);
         }
         Classified::Hold { total, kind } => return self.drive_frame(buf, total, kind, input, out, hits),
-        Classified::Forward { total } => {
-          self.pass(&buf, out)?;
-          let left = total.checked_sub(buf.len()).ok_or(())?;
-          self.phase = self.forward_rest(left, &mut &[][..], out)?;
+        Classified::Forward { total, header } => {
+          self.phase = self.begin_forward(&buf, total, header, input, out)?;
           return Ok(());
         }
       }
@@ -382,10 +456,16 @@ impl Amqp {
       .and_then(|len| len.checked_add(1))
       .ok_or(())?;
     if total > MAX_CREDENTIAL_FRAME {
-      return Ok(Classified::Forward { total });
+      return Ok(Classified::Forward {
+        total,
+        header: TYPE_CHANNEL_AND_SIZE,
+      });
     }
     if buf.first() != Some(&FRAME_METHOD) || size < CLASS_AND_METHOD_IDS {
-      return Ok(Classified::Forward { total });
+      return Ok(Classified::Forward {
+        total,
+        header: TYPE_CHANNEL_AND_SIZE,
+      });
     }
     let method_head = TYPE_CHANNEL_AND_SIZE + CLASS_AND_METHOD_IDS;
     let Some(payload) = buf.get(TYPE_CHANNEL_AND_SIZE..) else {
@@ -400,7 +480,10 @@ impl Amqp {
     } else if (pair == connection_close_ids() || pair == channel_close_ids()) && self.up.is_some() {
       Kind::Close091
     } else {
-      return Ok(Classified::Forward { total });
+      return Ok(Classified::Forward {
+        total,
+        header: TYPE_CHANNEL_AND_SIZE,
+      });
     };
     Ok(Classified::Hold { total, kind })
   }
@@ -419,10 +502,13 @@ impl Amqp {
     if data_offset < FRAME_HEADER_10 || data_offset > total {
       return Err(());
     }
+    let forward = Classified::Forward {
+      total,
+      header: data_offset,
+    };
     if total > MAX_CREDENTIAL_FRAME {
-      return Ok(Classified::Forward { total });
+      return Ok(forward);
     }
-    let forward = Classified::Forward { total };
     let wanted = match frame_type {
       FRAME_SASL => self.down.is_some(),
       FRAME_AMQP => self.up.is_some(),
@@ -475,9 +561,11 @@ impl Amqp {
     hits: &mut Vec<Hit>,
   ) -> Result<(), ()> {
     if total > MAX_CREDENTIAL_FRAME {
-      self.pass(&buf, out)?;
-      let left = total.checked_sub(buf.len()).ok_or(())?;
-      self.phase = self.forward_rest(left, input, out)?;
+      let header = match self.framer {
+        Framer::V091 => TYPE_CHANNEL_AND_SIZE,
+        Framer::V10 { .. } => data_offset(&buf)?,
+      };
+      self.phase = self.begin_forward(&buf, total, header, input, out)?;
       return Ok(());
     }
     take(&mut buf, total, input);
@@ -491,7 +579,7 @@ impl Amqp {
     match kind {
       Kind::StartOk => {
         let rewritten = self.start_ok(&buf, hits)?;
-        self.pass(rewritten.as_deref().unwrap_or(&buf), out)?;
+        out.extend_from_slice(rewritten.as_deref().unwrap_or(&buf));
         self.phase = Phase::Opaque;
       }
       Kind::SaslInit => {
@@ -501,23 +589,23 @@ impl Amqp {
           InitRewrite::Rewritten(frame) => frame,
           InitRewrite::Unchanged | InitRewrite::AwaitResponse => buf,
         };
-        self.pass(&frame, out)?;
+        out.extend_from_slice(&frame);
         self.phase = if await_response { Phase::Head(Vec::new()) } else { Phase::Opaque };
       }
       Kind::SaslResponse => {
         let rewritten = self.sasl_response(&buf, hits)?;
-        self.pass(rewritten.as_deref().unwrap_or(&buf), out)?;
+        out.extend_from_slice(rewritten.as_deref().unwrap_or(&buf));
         self.phase = Phase::Opaque;
       }
       Kind::Close091 => {
         let redacted = self.close_091(&buf, hits)?;
-        self.pass(redacted.as_deref().unwrap_or(&buf), out)?;
-        self.phase = self.finish_frame(out);
+        self.emit_frame(redacted.as_deref().unwrap_or(&buf), out)?;
+        self.phase = Phase::Head(Vec::new());
       }
       Kind::CloseEndDetach(code) => {
         let redacted = self.error_10(&buf, code, hits)?;
-        self.pass(redacted.as_deref().unwrap_or(&buf), out)?;
-        self.phase = self.finish_frame(out);
+        self.emit_frame(redacted.as_deref().unwrap_or(&buf), out)?;
+        self.phase = Phase::Head(Vec::new());
       }
     }
     Ok(())
@@ -635,43 +723,137 @@ impl Amqp {
     Ok(Some(frame))
   }
 
-  fn forward_rest(&mut self, left: usize, input: &mut &[u8], out: &mut Vec<u8>) -> Result<Phase, ()> {
-    if left == 0 {
-      return Ok(self.finish_frame(out));
+  fn frame_end_len(&self) -> usize {
+    match self.framer {
+      Framer::V091 => 1,
+      Framer::V10 { .. } => 0,
     }
-    let n = left.min(input.len());
-    let chunk = input.get(..n).ok_or(())?;
-    let left = left.saturating_sub(n);
-    if left == 0 && self.framer == Framer::V091 && chunk.last() != Some(&FRAME_END) {
-      return Err(());
-    }
-    self.pass(chunk, out)?;
-    *input = input.get(n..).unwrap_or_default();
-    Ok(if left == 0 { self.finish_frame(out) } else { Phase::Forward(left) })
   }
 
-  fn finish_frame(&mut self, out: &mut Vec<u8>) -> Phase {
-    out.extend(std::mem::take(&mut self.held));
-    Phase::Head(Vec::new())
+  fn channel_id(&self, header: &[u8]) -> Option<u16> {
+    let start: usize = match self.framer {
+      Framer::V091 => 1,
+      Framer::V10 { .. } => 6,
+    };
+    let end = start.checked_add(2)?;
+    let bytes = header.get(start..end)?;
+    let array = <[u8; 2]>::try_from(bytes).ok()?;
+    Some(u16::from_be_bytes(array))
   }
 
-  fn pass(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
+  fn note_channel(&mut self, channel: u16, payload_len: usize) -> Result<(), ()> {
+    if payload_len == 0 {
+      return Ok(());
+    }
+    if self.overlap.is_empty() || self.overlap_channel == Some(channel) {
+      self.overlap_channel = Some(channel);
+      return Ok(());
+    }
+    self.overlap.discard_if_sent()?;
+    self.overlap_channel = Some(channel);
+    Ok(())
+  }
+
+  fn emit_payload(&mut self, payload: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
     let Some(pair) = self.up.as_ref().filter(|pair| !pair.needle.is_empty()) else {
-      out.extend_from_slice(data);
+      out.extend_from_slice(payload);
       return Ok(());
     };
-    let mut combined = std::mem::take(&mut self.held);
-    combined.extend_from_slice(data);
-    if find_new_match(&combined, &pair.needle, 0) {
-      return Err(());
+    self.overlap.scan(payload, pair, out)
+  }
+
+  fn parts<'a>(&self, frame: &'a [u8]) -> Result<Parts<'a>, ()> {
+    match self.framer {
+      Framer::V091 => {
+        let header = frame.get(..TYPE_CHANNEL_AND_SIZE).ok_or(())?;
+        let end_at = frame.len().checked_sub(1).ok_or(())?;
+        if end_at < TYPE_CHANNEL_AND_SIZE {
+          return Err(());
+        }
+        let end = frame.get(end_at..).ok_or(())?;
+        if end.first() != Some(&FRAME_END) {
+          return Err(());
+        }
+        let payload = frame.get(TYPE_CHANNEL_AND_SIZE..end_at).ok_or(())?;
+        Ok(Parts { header, payload, end })
+      }
+      Framer::V10 { .. } => {
+        let header_len = data_offset(frame)?;
+        if header_len < FRAME_HEADER_10 || header_len > frame.len() {
+          return Err(());
+        }
+        let header = frame.get(..header_len).ok_or(())?;
+        let payload = frame.get(header_len..).ok_or(())?;
+        Ok(Parts { header, payload, end: &[] })
+      }
     }
-    let tail = pair.needle.len().saturating_sub(1);
-    let hold = needle_prefix_suffix_len(&combined, std::slice::from_ref(pair), tail);
-    let emit = combined.len().saturating_sub(hold);
-    let head = combined.get(..emit).ok_or(())?;
-    out.extend_from_slice(head);
-    self.held = combined.split_off(emit);
+  }
+
+  fn emit_frame(&mut self, frame: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
+    let parts = self.parts(frame)?;
+    out.extend_from_slice(parts.header);
+    if let Some(channel) = self.channel_id(parts.header) {
+      self.note_channel(channel, parts.payload.len())?;
+    }
+    self.emit_payload(parts.payload, out)?;
+    self.overlap.commit_frame(out);
+    out.extend_from_slice(parts.end);
     Ok(())
+  }
+
+  fn begin_forward(&mut self, buf: &[u8], total: usize, header: usize, input: &mut &[u8], out: &mut Vec<u8>) -> Result<Phase, ()> {
+    let end = self.frame_end_len();
+    let copied = buf.get(..header).unwrap_or(buf);
+    out.extend_from_slice(copied);
+    let skip = header.saturating_sub(buf.len());
+    let left = total.checked_sub(buf.len()).ok_or(())?;
+    let payload_len = total.saturating_sub(header).saturating_sub(end);
+    if let Some(channel) = self.channel_id(buf) {
+      self.note_channel(channel, payload_len)?;
+    }
+    let early = buf.get(header..).unwrap_or_default();
+    self.emit_payload(early, out)?;
+    self.forward_rest(Forward { left, skip, end }, input, out)
+  }
+
+  fn forward_rest(&mut self, mut fwd: Forward, input: &mut &[u8], out: &mut Vec<u8>) -> Result<Phase, ()> {
+    while fwd.left > 0 && !input.is_empty() {
+      if fwd.skip > 0 {
+        let n = fwd.skip.min(input.len()).min(fwd.left);
+        let chunk = input.get(..n).ok_or(())?;
+        out.extend_from_slice(chunk);
+        *input = input.get(n..).ok_or(())?;
+        fwd.skip = fwd.skip.saturating_sub(n);
+        fwd.left = fwd.left.saturating_sub(n);
+        continue;
+      }
+      let payload_left = fwd.left.saturating_sub(fwd.end);
+      if payload_left > 0 {
+        let n = payload_left.min(input.len());
+        let chunk = input.get(..n).ok_or(())?;
+        self.emit_payload(chunk, out)?;
+        *input = input.get(n..).ok_or(())?;
+        fwd.left = fwd.left.saturating_sub(n);
+        continue;
+      }
+      let Some((&byte, rest)) = input.split_first() else {
+        break;
+      };
+      if byte != FRAME_END {
+        return Err(());
+      }
+      self.overlap.commit_frame(out);
+      out.push(byte);
+      *input = rest;
+      fwd.left = fwd.left.saturating_sub(1);
+      fwd.end = fwd.end.saturating_sub(1);
+    }
+    if fwd.left == 0 {
+      self.overlap.commit_frame(out);
+      Ok(Phase::Head(Vec::new()))
+    } else {
+      Ok(Phase::Forward(fwd))
+    }
   }
 }
 
@@ -1208,6 +1390,7 @@ mod tests {
   use amq_protocol::types::parsing::parse_id;
   use amq_protocol::types::{AMQPValue, FieldTable};
   use arkham_config::grants::{AmqpScope, Credential, Grant};
+  use fe2o3_amqp_types::definitions::{MAJOR, MINOR, REVISION};
   use fe2o3_amqp_types::primitives::{Binary, Symbol};
   use fe2o3_amqp_types::sasl::SaslInit;
   use secrecy::SecretString;
@@ -1330,6 +1513,69 @@ mod tests {
 
   fn contains(haystack: &[u8], needle: &str) -> bool {
     haystack.windows(needle.len()).any(|window| window == needle.as_bytes())
+  }
+
+  fn password_split() -> (&'static [u8], &'static [u8]) {
+    let prefix = "arkham_real_amqp_pass_";
+    let rest = "longer_01";
+    assert_eq!(prefix.len(), 22, "prefix length");
+    assert_eq!(format!("{prefix}{rest}"), REAL);
+    (prefix.as_bytes(), rest.as_bytes())
+  }
+
+  fn body_091(payload: &[u8]) -> Vec<u8> {
+    encode_frame(&AMQPFrame::Body(1, payload.to_vec()))
+  }
+
+  fn header_10() -> [u8; 8] {
+    let mut bytes = *b"AMQP\x00\x00\x00\x00";
+    bytes[5] = MAJOR;
+    bytes[6] = MINOR;
+    bytes[7] = REVISION;
+    bytes
+  }
+
+  fn frame_10(payload: &[u8]) -> Vec<u8> {
+    let mut bytes = u32::try_from(payload.len().saturating_add(8)).unwrap().to_be_bytes().to_vec();
+    bytes.extend([2, 0, 0, 0]);
+    bytes.extend_from_slice(payload);
+    bytes
+  }
+
+  fn bodies_spell_password(bytes: &[u8]) -> bool {
+    let mut payloads = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+      let Ok((next, frame)) = parse_frame(rest) else {
+        break;
+      };
+      if next.len() >= rest.len() {
+        break;
+      }
+      if let AMQPFrame::Body(_, payload) = frame {
+        payloads.push(payload);
+      }
+      rest = next;
+    }
+    let password = REAL.as_bytes();
+    for start in 0..payloads.len() {
+      let mut joined = Vec::new();
+      for payload in payloads.iter().skip(start) {
+        joined.extend_from_slice(payload);
+        if joined.as_slice() == password {
+          return true;
+        }
+      }
+    }
+    false
+  }
+
+  async fn emit_open(machine: &mut Amqp, chunk: &[u8]) -> Vec<u8> {
+    match machine.feed(chunk).await.0 {
+      Rewritten::Emit(emitted) => emitted.into_owned(),
+      Rewritten::Hold => panic!("expected the frame to be emitted while the machine stays open"),
+      Rewritten::Close => panic!("expected the frame to be emitted while the machine stays open"),
+    }
   }
 
   fn method_ids_on_the_wire(frame: &[u8]) -> (u16, u16) {
@@ -1520,5 +1766,96 @@ mod tests {
       assert!(!mechanism.swaps(), "{name}");
     }
     "SCRAM-SHA-256".parse::<SaslMechanism>().unwrap_err();
+  }
+
+  #[tokio::test]
+  async fn body_frames_split_across_two_reads_close_before_the_second_payload() {
+    let (prefix, rest) = password_split();
+    let frame_a = body_091(prefix);
+    let frame_b = body_091(rest);
+    let mut machine = up();
+    let emitted = emit_open(&mut machine, &frame_a).await;
+    assert_eq!(emitted, frame_a, "frame A is delivered whole");
+    let mut guest = emitted;
+    let second = machine.feed(&frame_b).await.0;
+    let closed = matches!(second, Rewritten::Close);
+    if let Rewritten::Emit(bytes) = &second {
+      guest.extend_from_slice(bytes);
+    }
+    assert!(
+      closed,
+      "both frames were emitted and the machine stayed open (bodies spell the password: {})",
+      bodies_spell_password(&guest)
+    );
+    assert!(!contains(&guest, REAL), "guest bytes contain the password");
+    assert!(!bodies_spell_password(&guest), "body payloads concatenate to the password");
+  }
+
+  #[tokio::test]
+  async fn body_frames_cut_inside_the_second_header_close() {
+    let (prefix, rest) = password_split();
+    let frame_a = body_091(prefix);
+    let frame_b = body_091(rest);
+    let mut wire = frame_a.clone();
+    wire.extend_from_slice(&frame_b);
+    let cut = frame_a.len().saturating_add(7);
+    let (head, tail) = wire.split_at(cut);
+    let mut machine = up();
+    let emitted = emit_open(&mut machine, head).await;
+    assert_eq!(emitted, head, "bytes before the second payload are delivered");
+    let mut guest = emitted;
+    let second = machine.feed(tail).await.0;
+    let closed = matches!(second, Rewritten::Close);
+    if let Rewritten::Emit(bytes) = &second {
+      guest.extend_from_slice(bytes);
+    }
+    assert!(
+      closed,
+      "both frames were emitted and the machine stayed open (bodies spell the password: {})",
+      bodies_spell_password(&guest)
+    );
+    assert!(!contains(&guest, REAL), "guest bytes contain the password");
+    assert!(
+      !bodies_spell_password(&guest),
+      "body payloads returned before close concatenate to the password"
+    );
+  }
+
+  #[tokio::test]
+  async fn body_frames_that_do_not_continue_the_password_stay_open() {
+    let (prefix, _) = password_split();
+    let frame_a = body_091(prefix);
+    let frame_b = body_091(b"bbbb");
+    let mut machine = up();
+    let emitted_a = emit_open(&mut machine, &frame_a).await;
+    assert_eq!(emitted_a, frame_a);
+    let emitted_b = emit_open(&mut machine, &frame_b).await;
+    assert_eq!(emitted_b, frame_b);
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn body_frames_split_across_two_reads_close_before_the_second_payload_on_1_0() {
+    let (prefix, rest) = password_split();
+    let frame_a = frame_10(prefix);
+    let frame_b = frame_10(rest);
+    let mut machine = up();
+    let header = emit_open(&mut machine, &header_10()).await;
+    assert_eq!(header, header_10());
+    let emitted = emit_open(&mut machine, &frame_a).await;
+    assert_eq!(emitted, frame_a, "frame A is delivered whole");
+    let mut guest = emitted;
+    let second = machine.feed(&frame_b).await.0;
+    let closed = matches!(second, Rewritten::Close);
+    if let Rewritten::Emit(bytes) = &second {
+      guest.extend_from_slice(bytes);
+    }
+    assert!(
+      closed,
+      "both frames were emitted and the machine stayed open (guest contains the password: {})",
+      contains(&guest, REAL)
+    );
+    assert!(!contains(&guest, REAL), "guest bytes contain the password");
+    assert_eq!(&guest[8..], prefix, "the delivered payload is only the prefix");
   }
 }
