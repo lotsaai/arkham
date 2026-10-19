@@ -1573,8 +1573,9 @@ mod tests {
   async fn emit_open(machine: &mut Amqp, chunk: &[u8]) -> Vec<u8> {
     match machine.feed(chunk).await.0 {
       Rewritten::Emit(emitted) => emitted.into_owned(),
-      Rewritten::Hold => panic!("expected the frame to be emitted while the machine stays open"),
-      Rewritten::Close => panic!("expected the frame to be emitted while the machine stays open"),
+      Rewritten::Hold | Rewritten::Close => {
+        panic!("expected the frame to be emitted while the machine stays open")
+      }
     }
   }
 
