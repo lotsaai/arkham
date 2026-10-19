@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc f5d61a5c2fd90ec04b48fe250ee31225e10b68d0b2a3ec6a265d2b3161128ddb # shrinks to leg = DownSwap, first = [48, 7, 2, 5, 0, 0, 0, 0, 0], second = None, cuts = []
