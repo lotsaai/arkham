@@ -509,6 +509,8 @@ mod pg_tls {
     assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
     // A cleartext guest greeting settles the guest leg; the arm then asks
     // the silent upstream for TLS and must hit the 1s budget.
+    // Eight zero bytes are not an SSLRequest, a TLS record, or a startup.
+    // tokio-postgres never writes that opening, so this guest stays a raw write.
     guest.write_all(&[0u8; 8]).await.unwrap();
     let result = tokio::time::timeout(Duration::from_secs(3), async {
       let mut buf = [0u8; 1];
@@ -610,13 +612,15 @@ mod pg_tls {
     let mut head = [0u8; 19];
     guest.read_exact(&mut head).await.unwrap();
     assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
-    // A real cleartext startup: length 23, protocol 3.0, user stubuser.
-    let mut startup = Vec::new();
-    startup.extend(23u32.to_be_bytes());
-    startup.extend(196_608u32.to_be_bytes());
-    startup.extend(b"user\0stubuser\0\0");
-    guest.write_all(&startup).await.unwrap();
-    let upstream_first8 = seen.await.unwrap();
+    let config: tokio_postgres::Config = format!("host=localhost port={spy_port} user=stubuser dbname=stubdb sslmode=disable")
+      .parse()
+      .unwrap();
+    let opened = config.connect_raw(guest, tokio_postgres::NoTls).await;
+    let upstream_first8 = tokio::time::timeout(Duration::from_secs(5), seen)
+      .await
+      .expect("the spy must see the opening")
+      .unwrap();
+    assert!(opened.is_err(), "the spy closes after the startup, so the session cannot finish");
     assert_ne!(
       &upstream_first8[4..8],
       &pgwire::messages::startup::SslRequest::BODY_MAGIC_NUMBER.to_be_bytes(),
@@ -656,24 +660,21 @@ mod pg_tls {
     let mut head = [0u8; 19];
     guest.read_exact(&mut head).await.unwrap();
     assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
-    // libpq's escalation shape: SSLRequest, one 'S' answer, then TLS.
-    let mut request = Vec::new();
-    request.extend(8u32.to_be_bytes());
-    request.extend(pgwire::messages::startup::SslRequest::BODY_MAGIC_NUMBER.to_be_bytes());
-    guest.write_all(&request).await.unwrap();
-    let mut answer = [0u8; 1];
-    guest.read_exact(&mut answer).await.unwrap();
-    assert_eq!(answer[0], b'S');
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.cert_der().clone()).unwrap();
-    let connector = TlsConnector::from(guest_client_config(roots, Alpn::None));
-    let result = connector
-      .connect(rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap(), guest)
-      .await;
-    // The spy never answers its SSLRequest, so the arm fails closed — but
-    // the escalation ask is already on record.
-    assert!(result.is_err(), "the silent upstream must close the leg");
-    let upstream_first8 = seen.await.unwrap();
+    let mut connector = PgTls {
+      connector: TlsConnector::from(guest_client_config(roots, Alpn::None)),
+    };
+    let tls = connector.make_tls_connect("localhost").unwrap();
+    let config: tokio_postgres::Config = format!("host=localhost port={spy_port} user=stubuser dbname=stubdb sslmode=require")
+      .parse()
+      .unwrap();
+    let opened = config.connect_raw(guest, tls).await;
+    let upstream_first8 = tokio::time::timeout(Duration::from_secs(5), seen)
+      .await
+      .expect("the spy must see the opening")
+      .unwrap();
+    assert!(opened.is_err(), "the silent upstream must close the leg");
     assert_eq!(
       &upstream_first8[4..8],
       &pgwire::messages::startup::SslRequest::BODY_MAGIC_NUMBER.to_be_bytes(),
