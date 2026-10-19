@@ -639,37 +639,37 @@ pub enum Error {
     source: TomlSerializeError,
   },
   /// A source path cannot identify a context.
-  #[error("source path `{}` {fault}", source.display())]
+  #[error("source path `{}` {fault}", path.display())]
   ContextPathInvalid {
     /// Path the adapter passed.
-    source: PathBuf,
+    path: PathBuf,
     /// Why the path was rejected.
-    // The field named `source` is the path. `#[source]` on `fault` keeps thiserror from treating that path as the error source.
     #[source]
     fault: PathFault,
   },
   /// A context name cannot become a label and an env name.
-  #[error("context `{name}` in `{}` on {protocol} {fault}", source.display())]
+  #[error("context `{name}` in `{}` on {protocol} {fault}", path.display())]
   ContextNameInvalid {
-    /// Path the adapter passed. Empty when a label does not decode.
-    source: PathBuf,
-    /// Protocol tag from the caller, or from the label prefix when one decodes.
+    /// Path the adapter passed.
+    path: PathBuf,
+    /// Protocol of the context.
     protocol: AmbientProtocol,
-    /// Original name, or the label text when the label does not decode.
+    /// Original name.
     name: String,
     /// Why the name was rejected.
-    // The field named `source` is the path. `#[source]` on `fault` keeps thiserror from treating that path as the error source.
     #[source]
     fault: NameFault,
   },
+  /// A label is not one [`crate::context::identities`] would issue.
+  #[error("context label `{label}` does not decode")]
+  ContextLabelInvalid {
+    /// Text that was not an issued label.
+    label: String,
+  },
   /// Two different contexts share a label or a pair stem.
-  ///
-  /// The record is boxed so `Error` stays small enough to return.
   #[error("{0}")]
   ContextCollision(Box<crate::context::ContextCollision>),
   /// Two contexts present the same host, port, and decoy bytes.
-  ///
-  /// The record is boxed so `Error` stays small enough to return.
   #[error("{0}")]
   AmbiguousContexts(Box<crate::context::AmbiguousContexts>),
   /// A presented destination host is empty after trimming.

@@ -18,9 +18,6 @@ use crate::error::Error;
 const MAX_LABEL_LEN: usize = 240;
 
 /// Protocol tag stored in a context label.
-///
-/// Kubernetes has two tags so a user and a cluster can share a display name.
-/// Callers name the subject they grant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AmbientProtocol {
   /// Bearer and client certificate for one kube user. Tag `kube-user`.
@@ -134,7 +131,7 @@ pub struct ContextRef<'a> {
 
 /// Label, env, and decoy for one subject.
 ///
-/// Fields are private. Equality is label equality.
+/// Equality is label equality.
 #[derive(Clone)]
 pub struct ContextIdentity {
   protocol: AmbientProtocol,
@@ -214,37 +211,34 @@ impl ContextIdentity {
   /// # Errors
   ///
   /// Returns [`Error::ContextPathInvalid`] or [`Error::ContextNameInvalid`]
-  /// with the decoded path and name when those pieces exist. A label that
-  /// does not decode, or whose spelling is not the lowercase label
-  /// `identities` would issue, returns [`Error::ContextNameInvalid`] with an
-  /// empty source path, [`NameFault::EnvInvalid`], and `name` set to the
-  /// label text. When the prefix is not a known tag, `protocol` is
-  /// [`AmbientProtocol::KubernetesUser`].
+  /// when the label decodes to a path or name that [`identities`] rejects.
+  /// Returns [`Error::ContextLabelInvalid`] when the text is not the
+  /// lowercase label [`identities`] would issue.
   pub fn from_label(label: &str) -> Result<Self, Error> {
     let Some((tag, hex_body)) = label.split_once("--") else {
-      return Err(undecoded(label, None));
+      return Err(rejected_label(label));
     };
     let Some(protocol) = AmbientProtocol::from_tag(tag) else {
-      return Err(undecoded(label, None));
+      return Err(rejected_label(label));
     };
     let Ok(bytes) = hex::decode(hex_body) else {
-      return Err(undecoded(label, Some(protocol)));
+      return Err(rejected_label(label));
     };
     let Ok(text) = str::from_utf8(&bytes) else {
-      return Err(undecoded(label, Some(protocol)));
+      return Err(rejected_label(label));
     };
     let mut fields = text.split('\u{001f}');
     let embedded = fields.next();
     let path = fields.next();
     let name = fields.next();
     if fields.next().is_some() {
-      return Err(undecoded(label, Some(protocol)));
+      return Err(rejected_label(label));
     }
     let (Some(embedded), Some(path), Some(name)) = (embedded, path, name) else {
-      return Err(undecoded(label, Some(protocol)));
+      return Err(rejected_label(label));
     };
     if embedded != tag {
-      return Err(undecoded(label, Some(protocol)));
+      return Err(rejected_label(label));
     }
     let mut built = identities(&[ContextRef {
       source: Path::new(path),
@@ -257,7 +251,7 @@ impl ContextIdentity {
     {
       return Ok(identity);
     }
-    Err(undecoded(label, Some(protocol)))
+    Err(rejected_label(label))
   }
 }
 
@@ -311,7 +305,7 @@ pub struct Presented<'a> {
   pub identity: &'a ContextIdentity,
   /// Destination host. [`require_distinct`] trims it and lowercases ASCII.
   pub host: &'a str,
-  /// Destination port. The caller supplies it.
+  /// Destination port.
   pub port: u16,
   /// Decoy bytes the guest presents. An empty slice still hashes.
   pub decoy: &'a [u8],
@@ -329,8 +323,6 @@ pub struct AmbiguousParty {
 }
 
 /// Both contexts that share a label or a pair stem.
-///
-/// [`Error::ContextCollision`](crate::Error::ContextCollision) boxes this record.
 #[derive(Debug)]
 pub struct ContextCollision {
   /// Protocol of the earlier context.
@@ -366,7 +358,6 @@ impl fmt::Display for ContextCollision {
 
 /// Contexts that present the same host, port, and decoy bytes.
 ///
-/// [`Error::AmbiguousContexts`](crate::Error::AmbiguousContexts) boxes this record.
 /// `left` is the first context after sorting by source display, name, and tag.
 /// `also` holds the third and later contexts.
 #[derive(Debug)]
@@ -576,19 +567,19 @@ fn build_identity(source: &Path, protocol: AmbientProtocol, name: &str) -> Resul
 fn path_text(source: &Path) -> Result<&str, Error> {
   if source.as_os_str().is_empty() {
     return Err(Error::ContextPathInvalid {
-      source: source.to_path_buf(),
+      path: source.to_path_buf(),
       fault: PathFault::Empty,
     });
   }
   let Some(path) = source.to_str() else {
     return Err(Error::ContextPathInvalid {
-      source: source.to_path_buf(),
+      path: source.to_path_buf(),
       fault: PathFault::NotUnicode,
     });
   };
   if path.contains('\u{001f}') {
     return Err(Error::ContextPathInvalid {
-      source: source.to_path_buf(),
+      path: source.to_path_buf(),
       fault: PathFault::UnitSeparator,
     });
   }
@@ -597,7 +588,7 @@ fn path_text(source: &Path) -> Result<&str, Error> {
 
 fn name_error(source: &Path, protocol: AmbientProtocol, name: &str, fault: NameFault) -> Error {
   Error::ContextNameInvalid {
-    source: source.to_path_buf(),
+    path: source.to_path_buf(),
     protocol,
     name: name.to_string(),
     fault,
@@ -670,17 +661,8 @@ fn compare_presented(left: &ContextIdentity, right: &ContextIdentity) -> Orderin
   left.protocol.tag().cmp(right.protocol.tag())
 }
 
-fn undecoded(label: &str, protocol: Option<AmbientProtocol>) -> Error {
-  let protocol = match protocol {
-    Some(protocol) => protocol,
-    None => AmbientProtocol::KubernetesUser,
-  };
-  Error::ContextNameInvalid {
-    source: PathBuf::new(),
-    protocol,
-    name: label.to_string(),
-    fault: NameFault::EnvInvalid,
-  }
+fn rejected_label(label: &str) -> Error {
+  Error::ContextLabelInvalid { label: label.to_string() }
 }
 
 #[cfg(test)]
@@ -870,12 +852,12 @@ mod tests {
     .unwrap_err();
     match err {
       Error::ContextNameInvalid {
-        source,
+        path: got,
         protocol,
         name,
         fault,
       } => {
-        assert_eq!(source.as_path(), path);
+        assert_eq!(got.as_path(), path);
         assert_eq!(protocol, AmbientProtocol::Talos);
         assert_eq!(name, "");
         assert_eq!(fault, NameFault::Empty);
@@ -896,9 +878,12 @@ mod tests {
     .unwrap_err();
     match err {
       Error::ContextNameInvalid {
-        source, name: got, fault, ..
+        path: got_path,
+        name: got,
+        fault,
+        ..
       } => {
-        assert_eq!(source.as_path(), path);
+        assert_eq!(got_path.as_path(), path);
         assert_eq!(got, name);
         assert_eq!(fault, NameFault::UnitSeparator);
       }
@@ -916,8 +901,8 @@ mod tests {
     }])
     .unwrap_err();
     match err {
-      Error::ContextPathInvalid { source, fault } => {
-        assert_eq!(source.as_path(), path);
+      Error::ContextPathInvalid { path: got, fault } => {
+        assert_eq!(got.as_path(), path);
         assert_eq!(fault, PathFault::Empty);
       }
       other => panic!("expected an empty path, got {other}"),
@@ -934,8 +919,8 @@ mod tests {
     }])
     .unwrap_err();
     match err {
-      Error::ContextPathInvalid { source, fault } => {
-        assert_eq!(source.as_path(), path);
+      Error::ContextPathInvalid { path: got, fault } => {
+        assert_eq!(got.as_path(), path);
         assert_eq!(fault, PathFault::UnitSeparator);
       }
       other => panic!("expected a unit separator in the path, got {other}"),
@@ -952,8 +937,8 @@ mod tests {
     }])
     .unwrap_err();
     match err {
-      Error::ContextPathInvalid { source, fault } => {
-        assert_eq!(source.as_path(), path);
+      Error::ContextPathInvalid { path: got, fault } => {
+        assert_eq!(got.as_path(), path);
         assert_eq!(fault, PathFault::NotUnicode);
       }
       other => panic!("expected a non-unicode path, got {other}"),
@@ -1263,9 +1248,8 @@ mod tests {
     let label = format!("ssh--{}", hex_body.to_ascii_uppercase());
     let err = ContextIdentity::from_label(&label).unwrap_err();
     match err {
-      Error::ContextNameInvalid { name, fault, .. } => {
-        assert_eq!(name, label);
-        assert_eq!(fault, NameFault::EnvInvalid);
+      Error::ContextLabelInvalid { label: got } => {
+        assert_eq!(got, label);
       }
       other => panic!("expected a rejected label, got {other}"),
     }
@@ -1276,16 +1260,8 @@ mod tests {
     let label = "ssh--7373681f2f686f";
     let err = ContextIdentity::from_label(label).unwrap_err();
     match err {
-      Error::ContextNameInvalid {
-        source,
-        protocol,
-        name,
-        fault,
-      } => {
-        assert!(source.as_os_str().is_empty());
-        assert_eq!(name, label);
-        assert_eq!(protocol, AmbientProtocol::Ssh);
-        assert_eq!(fault, NameFault::EnvInvalid);
+      Error::ContextLabelInvalid { label: got } => {
+        assert_eq!(got, label);
       }
       other => panic!("expected a rejected label, got {other}"),
     }
