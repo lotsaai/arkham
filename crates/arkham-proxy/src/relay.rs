@@ -861,6 +861,215 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn split_entry_gets_operations_error_after_the_whole_entry() {
+    let (entry, split) = big_entry();
+    let (mut down, mut up) = pair();
+    down.hold_starttls();
+    let (guest_relay, mut guest) = tokio::io::duplex(64 * 1024);
+    let (server_relay, mut server) = tokio::io::duplex(64 * 1024);
+    let relay = tokio::spawn(async move { relay_stop(guest_relay, server_relay, &mut down, &mut up, &[], &[]).await });
+    guest.write_all(&search_bytes(1)).await.unwrap();
+    server.write_all(&entry[..split]).await.unwrap();
+    let mut first = vec![0u8; split];
+    tokio::time::timeout(Duration::from_secs(1), guest.read_exact(&mut first))
+      .await
+      .expect("entry prefix")
+      .unwrap();
+    assert_eq!(first, entry[..split]);
+    guest.write_all(&starttls(2)).await.unwrap();
+    let mut early = [0u8; 64];
+    let early = tokio::time::timeout(Duration::from_millis(200), guest.read(&mut early)).await;
+    assert!(early.is_err(), "operationsError landed inside the entry");
+    server.write_all(&entry[split..]).await.unwrap();
+    let mut rest = vec![0u8; entry.len() - split + 256];
+    let n = tokio::time::timeout(Duration::from_secs(1), guest.read(&mut rest))
+      .await
+      .expect("entry tail")
+      .unwrap();
+    relay.abort();
+    let mut stream = entry[..split].to_vec();
+    stream.extend_from_slice(&rest[..n]);
+    let (decoded, after) = decode_one(&stream);
+    assert_eq!(decoded, rasn::ber::decode(&entry).unwrap());
+    let (refusal, leftover) = decode_one(after);
+    assert!(leftover.is_empty());
+    let ProtocolOp::ExtendedResp(body) = refusal.protocol_op else {
+      panic!("starttls response");
+    };
+    assert_eq!(refusal.message_id, 2);
+    assert_eq!(body.result_code, ResultCode::OperationsError);
+  }
+
+  #[tokio::test]
+  async fn split_entry_delays_the_upgrade_until_its_last_byte() {
+    let (entry, split) = big_entry();
+    let (mut down, mut up) = pair();
+    down.hold_starttls();
+    let (guest_relay, mut guest) = tokio::io::duplex(64 * 1024);
+    let (server_relay, mut server) = tokio::io::duplex(64 * 1024);
+    let mut relay = tokio::spawn(async move { relay_stop(guest_relay, server_relay, &mut down, &mut up, &[], &[]).await });
+    guest.write_all(&search_bytes(1)).await.unwrap();
+    server.write_all(&entry[..split]).await.unwrap();
+    let mut first = vec![0u8; split];
+    tokio::time::timeout(Duration::from_secs(1), guest.read_exact(&mut first))
+      .await
+      .expect("entry prefix")
+      .unwrap();
+    let mut abandon = rasn::ber::encode(&LdapMessage::new(2, ProtocolOp::AbandonRequest(rasn_ldap::AbandonRequest(1)))).unwrap();
+    abandon.extend(starttls(3));
+    guest.write_all(&abandon).await.unwrap();
+    let early = tokio::time::timeout(Duration::from_millis(200), &mut relay).await;
+    assert!(early.is_err(), "upgraded inside the entry");
+    server.write_all(&entry[split..]).await.unwrap();
+    let end = tokio::time::timeout(Duration::from_secs(1), relay)
+      .await
+      .expect("upgrade after the entry")
+      .unwrap()
+      .unwrap();
+    let RelayEnd::Upgrade(upgrade) = end else {
+      panic!("upgrade");
+    };
+    assert!(upgrade.local);
+    assert_eq!(upgrade.id, 3);
+    let mut got = vec![0u8; entry.len()];
+    tokio::time::timeout(Duration::from_secs(1), guest.read_exact(&mut got))
+      .await
+      .expect("full entry")
+      .unwrap();
+    assert_eq!(got, entry);
+  }
+
+  #[tokio::test]
+  async fn backpressured_prefix_still_upgrades() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let (mut down, mut up) = pair();
+    down.hold_starttls();
+    let (guest_relay, mut guest) = tokio::io::duplex(4096);
+    let (server_relay, mut server) = tokio::io::duplex(4096);
+    let released = Arc::new(AtomicBool::new(false));
+    let stalled = Arc::new(AtomicBool::new(false));
+    let slot = Arc::new(Mutex::new(None));
+    let stalled_server = StallWrite {
+      inner: server_relay,
+      released: Arc::clone(&released),
+      stalled: Arc::clone(&stalled),
+      slot: Arc::clone(&slot),
+    };
+    let relay = tokio::spawn(async move { relay_stop(guest_relay, stalled_server, &mut down, &mut up, &[], &[]).await });
+    let release = tokio::spawn(async move {
+      while !stalled.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+      }
+      for _ in 0..8 {
+        tokio::task::yield_now().await;
+      }
+      released.store(true, Ordering::SeqCst);
+      if let Some(waker) = slot.lock().unwrap().take() {
+        waker.wake();
+      }
+    });
+    let mut bytes = search_bytes(1);
+    bytes.extend(rasn::ber::encode(&LdapMessage::new(2, ProtocolOp::AbandonRequest(rasn_ldap::AbandonRequest(1)))).unwrap());
+    bytes.extend(starttls(3));
+    guest.write_all(&bytes).await.unwrap();
+    let end = tokio::time::timeout(Duration::from_secs(2), relay)
+      .await
+      .expect("upgrade")
+      .unwrap()
+      .unwrap();
+    release.abort();
+    let RelayEnd::Upgrade(upgrade) = end else {
+      panic!("upgrade");
+    };
+    assert!(upgrade.local);
+    assert_eq!(upgrade.id, 3);
+    let mut got = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(1), server.read(&mut got))
+      .await
+      .expect("prefix written")
+      .unwrap();
+    assert!(n > 0);
+  }
+
+  fn search_bytes(id: u32) -> Vec<u8> {
+    rasn::ber::encode(&LdapMessage::new(
+      id,
+      ProtocolOp::SearchRequest(rasn_ldap::SearchRequest::new(
+        rasn_ldap::LdapString::from(""),
+        rasn_ldap::SearchRequestScope::BaseObject,
+        rasn_ldap::SearchRequestDerefAliases::NeverDerefAliases,
+        0,
+        0,
+        false,
+        rasn_ldap::Filter::Present(rasn_ldap::LdapString::from("objectClass")),
+        Vec::new(),
+      )),
+    ))
+    .unwrap()
+  }
+
+  fn big_entry() -> (Vec<u8>, usize) {
+    let entry = rasn_ldap::SearchResultEntry::new(
+      rasn_ldap::LdapString::from("cn=a"),
+      vec![rasn_ldap::PartialAttribute::new(
+        rasn_ldap::LdapString::from("cn"),
+        vec![rasn::prelude::OctetString::from(vec![b'x'; 2048])].into(),
+      )],
+    );
+    let bytes = rasn::ber::encode(&LdapMessage::new(1, ProtocolOp::SearchResEntry(entry))).unwrap();
+    (bytes, 64)
+  }
+
+  fn decode_one(bytes: &[u8]) -> (LdapMessage, &[u8]) {
+    let message: LdapMessage = rasn::ber::decode(bytes).unwrap();
+    let encoded = rasn::ber::encode(&message).unwrap();
+    (message, bytes.get(encoded.len()..).unwrap_or_default())
+  }
+
+  struct StallWrite<T> {
+    inner: T,
+    released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stalled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    slot: std::sync::Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+  }
+
+  impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for StallWrite<T> {
+    fn poll_read(
+      self: std::pin::Pin<&mut Self>,
+      cx: &mut std::task::Context<'_>,
+      buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+      std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+  }
+
+  impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for StallWrite<T> {
+    fn poll_write(
+      self: std::pin::Pin<&mut Self>,
+      cx: &mut std::task::Context<'_>,
+      buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+      let this = self.get_mut();
+      if !this.released.load(std::sync::atomic::Ordering::SeqCst) {
+        this.stalled.store(true, std::sync::atomic::Ordering::SeqCst);
+        *this.slot.lock().unwrap() = Some(cx.waker().clone());
+        return std::task::Poll::Pending;
+      }
+      std::pin::Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+      std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+      std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+  }
+
+  #[tokio::test]
   async fn abandon_lets_the_following_starttls_hand_off() {
     let (mut down, mut up) = pair();
     down.hold_starttls();

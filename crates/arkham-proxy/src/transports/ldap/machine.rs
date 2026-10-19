@@ -319,6 +319,16 @@ impl Ldap {
     self.starttls_ok.take()
   }
 
+  /// Bytes sitting in the cursor. A closed leg reports none.
+  #[cfg(test)]
+  fn peek_buf_len(&self) -> usize {
+    match &self.phase {
+      Phase::Peek(peek) => peek.buf.len(),
+      Phase::Head(buf) => buf.len(),
+      Phase::Forward(_) | Phase::Tail { .. } => 0,
+    }
+  }
+
   /// Message id and unread control bytes after a recognized `StartTLS` OID.
   /// The opening streams those bytes and does not store them.
   pub(crate) fn starttls_tail(&self) -> Option<(u32, usize)> {
@@ -1363,7 +1373,9 @@ mod tests {
   use super::*;
   use arkham_config::grants::{Credential, GuestTlsMode, LdapScope};
   use rasn::types::AsnType as _;
-  use rasn_ldap::{AuthenticationChoice, UnbindRequest};
+  use rasn_ldap::{
+    AuthenticationChoice, Filter, SearchRequestDerefAliases, SearchRequestScope, UnbindRequest,
+  };
   use secrecy::SecretString;
 
   const FAKE_PW: &str = "arkham_fake_ldap_pass"; // betterleaks:allow
@@ -1863,7 +1875,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn abandon_clears_the_outstanding_bind() {
+  async fn abandon_does_not_clear_an_outstanding_bind() {
     let mut downstream = down();
     let mut bytes = bind_frame(1, DN, "other-password");
     bytes.extend(rasn::ber::encode(&LdapMessage::new(2, ProtocolOp::AbandonRequest(AbandonRequest(1)))).unwrap());
@@ -1877,7 +1889,93 @@ mod tests {
     for fact in facts {
       upstream.apply_peer_note(fact);
     }
+    assert!(
+      matches!(upstream.local_upgrade(3), LocalUpgrade::Refuse(_)),
+      "a bind cannot be abandoned"
+    );
+  }
+
+  #[tokio::test]
+  async fn search_abandon_lets_the_following_starttls_proceed() {
+    let mut downstream = down();
+    let mut bytes = rasn::ber::encode(&search_message(1)).unwrap();
+    bytes.extend(rasn::ber::encode(&LdapMessage::new(2, ProtocolOp::AbandonRequest(AbandonRequest(1)))).unwrap());
+    let _ = downstream.feed(&bytes).await;
+    let mut upstream = up();
+    while let Some(fact) = downstream.take_peer_note() {
+      upstream.apply_peer_note(fact);
+    }
     assert!(matches!(upstream.local_upgrade(3), LocalUpgrade::Proceed));
+  }
+
+  #[tokio::test]
+  async fn sasl_bind_in_progress_refuses_starttls() {
+    let mut downstream = down();
+    let _ = downstream.feed(&bind_frame(1, DN, "other-password")).await;
+    let mut upstream = up();
+    while let Some(fact) = downstream.take_peer_note() {
+      upstream.apply_peer_note(fact);
+    }
+    let response = LdapMessage::new(
+      1,
+      ProtocolOp::BindResponse(BindResponse::new(
+        ResultCode::SaslBindInProgress,
+        LdapString::from(""),
+        LdapString::from(""),
+        None,
+        None,
+      )),
+    );
+    let _ = upstream.feed(&rasn::ber::encode(&response).unwrap()).await;
+    assert!(
+      matches!(upstream.local_upgrade(2), LocalUpgrade::Refuse(_)),
+      "StartTLS during SASL is operationsError"
+    );
+  }
+
+  #[tokio::test]
+  async fn wide_abandon_closes_before_the_body() {
+    for content_len in [5usize, 8 * 1024] {
+      let (head, body) = abandon_declared(content_len);
+      let mut downstream = down();
+      let (rewritten, _) = downstream.feed(&head).await;
+      assert!(
+        matches!(rewritten, Rewritten::Close),
+        "a {content_len}-byte abandon id closes before the body"
+      );
+      assert_eq!(downstream.peek_buf_len(), 0, "peek stays empty");
+      let (rewritten, _) = downstream.feed(&body).await;
+      assert!(matches!(rewritten, Rewritten::Close));
+      assert_eq!(downstream.peek_buf_len(), 0, "the body is not pulled into the peek");
+    }
+  }
+
+  fn abandon_declared(content_len: usize) -> (Vec<u8>, Vec<u8>) {
+    let mut op = vec![0x50];
+    write_len(&mut op, content_len).unwrap();
+    let seq_content = 3 + op.len() + content_len;
+    let mut head = Vec::new();
+    head.push(0x30);
+    write_len(&mut head, seq_content).unwrap();
+    head.extend_from_slice(&[0x02, 0x01, 0x01]);
+    head.extend_from_slice(&op);
+    (head, vec![0x11; content_len])
+  }
+
+  fn search_message(id: u32) -> LdapMessage {
+    LdapMessage::new(
+      id,
+      ProtocolOp::SearchRequest(SearchRequest::new(
+        LdapString::from(""),
+        SearchRequestScope::BaseObject,
+        SearchRequestDerefAliases::NeverDerefAliases,
+        0,
+        0,
+        false,
+        Filter::Present(LdapString::from("objectClass")),
+        Vec::new(),
+      )),
+    )
   }
 
   #[tokio::test]
