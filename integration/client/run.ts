@@ -93,17 +93,6 @@ function exchange(sock: Socket | TLSSocket, payload: string): Promise<string> {
   }));
 }
 
-async function readAll(sock: Socket | TLSSocket): Promise<string> {
-  return race("http reply", new Promise<string>((resolve, reject) => {
-    let buf = "";
-    sock.on("data", (c: Buffer) => {
-      buf += c.toString();
-    });
-    sock.once("end", () => resolve(buf));
-    sock.once("error", reject);
-  }));
-}
-
 const covered = new Set<string>();
 
 async function once(scheme: string, what: string, fn: () => Promise<boolean>) {
@@ -155,36 +144,29 @@ async function retry(scheme: string, what: string, fn: () => Promise<boolean>) {
 
 const ca = await readFile(`${CERT_DIR}/ca.crt`);
 
-// 1. https:// grant, HTTP over MITM TLS: server must see the real bearer;
-//    the redacted body comes back carrying the fake.
 await retry("https", "https mitm substitutes request and redacts response", async () => {
-  const tls = await tlsTo("api", 8443, ca);
-  stage("http request sent");
-  tls.write(`GET /echo HTTP/1.1\r\nHost: api\r\nAuthorization: Bearer ${FAKE}\r\nConnection: close\r\n\r\n`);
-  const resp = await readAll(tls);
-  tls.destroy();
-  const status = resp.split("\r\n", 1)[0];
-  const body = resp.split("\r\n\r\n", 2)[1] ?? "";
-  stage(`http reply: ${JSON.stringify({ status, body })}`);
-  return status === "HTTP/1.1 200 OK" && body === `token:${FAKE}\n`;
+  const resp = await race(
+    "https echo",
+    fetch("https://api:8443/echo", {
+      headers: { authorization: `Bearer ${FAKE}` },
+      tls: { ca },
+    }),
+  );
+  const body = await race("https echo body", resp.text());
+  stage(`http reply: ${JSON.stringify({ status: resp.status, body })}`);
+  return resp.status === 200 && body === `token:${FAKE}\n`;
 });
 
-// 2. http:// grant, cleartext HTTP through transparent capture: server must
-//    see the real bearer; the redacted body comes back carrying the fake.
 await retry("http", "http mitm substitutes request and redacts response", async () => {
-  stage("http api:8000 connecting");
-  const sock = await race("http api:8000 connect", new Promise<Socket>((resolve, reject) => {
-    const s = connect(8000, "api");
-    s.once("connect", () => resolve(s));
-    s.once("error", reject);
-  }));
-  sock.write(`GET /echo HTTP/1.1\r\nHost: api\r\nAuthorization: Bearer ${FAKE}\r\nConnection: close\r\n\r\n`);
-  const resp = await readAll(sock);
-  sock.destroy();
-  const status = resp.split("\r\n", 1)[0];
-  const body = resp.split("\r\n\r\n", 2)[1] ?? "";
-  stage(`http reply: ${JSON.stringify({ status, body })}`);
-  return status === "HTTP/1.1 200 OK" && body === `token:${FAKE}\n`;
+  const resp = await race(
+    "http echo",
+    fetch("http://api:8000/echo", {
+      headers: { authorization: `Bearer ${FAKE}` },
+    }),
+  );
+  const body = await race("http echo body", resp.text());
+  stage(`http reply: ${JSON.stringify({ status: resp.status, body })}`);
+  return resp.status === 200 && body === `token:${FAKE}\n`;
 });
 
 // 3. tcp:// grant, cleartext raw stream: opaque substitution both ways.
