@@ -2,12 +2,14 @@
 
 import os
 import re
+import select
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 _FLOW_NAME = re.compile(
@@ -29,36 +31,94 @@ def pack(to_broker: bytes, to_client: bytes) -> bytes:
     )
 
 
-def streams_from_tcpflow(flow_dir: str, port: int) -> tuple[bytes, bytes] | None:
-    to_broker: list[bytes] = []
-    to_client: list[bytes] = []
+def list_names(flow_dir: str) -> list[str]:
     try:
-        names = os.listdir(flow_dir)
+        return os.listdir(flow_dir)
     except FileNotFoundError:
-        return None
-    for name in names:
+        return []
+
+
+def pair_of(flow_dir: str, port: int) -> tuple[str, str] | None:
+    to_broker: list[str] = []
+    to_client: list[str] = []
+    for name in list_names(flow_dir):
         parsed = _FLOW_NAME.fullmatch(name)
         if parsed is None:
             continue
         src_port = int(parsed.group("sp"))
         dst_port = int(parsed.group("dp"))
-        with open(os.path.join(flow_dir, name), "rb") as handle:
-            payload = handle.read()
         if src_port == port and dst_port == port:
             return None
         if dst_port == port:
-            to_broker.append(payload)
+            to_broker.append(name)
         elif src_port == port:
-            to_client.append(payload)
+            to_client.append(name)
         else:
             return None
     if len(to_broker) != 1 or len(to_client) != 1:
-        print(
-            f"amqp splice tcpflow unpaired files={sorted(names)} broker={len(to_broker)} client={len(to_client)}",
-            file=sys.stderr,
-        )
         return None
     return to_broker[0], to_client[0]
+
+
+def read_pair(flow_dir: str, pair: tuple[str, str]) -> tuple[bytes, bytes] | None:
+    try:
+        with open(os.path.join(flow_dir, pair[0]), "rb") as handle:
+            to_broker = handle.read()
+        with open(os.path.join(flow_dir, pair[1]), "rb") as handle:
+            to_client = handle.read()
+    except OSError:
+        return None
+    if to_broker == b"" or to_client == b"":
+        return None
+    return to_broker, to_client
+
+
+def wait_for_pair(flow_dir: str, port: int, timeout: float) -> tuple[str, str] | None:
+    deadline = time.monotonic() + timeout
+    last: tuple[str, str, int, int] | None = None
+    while time.monotonic() < deadline:
+        pair = pair_of(flow_dir, port)
+        if pair is None:
+            last = None
+            time.sleep(0.05)
+            continue
+        try:
+            sizes = (
+                os.path.getsize(os.path.join(flow_dir, pair[0])),
+                os.path.getsize(os.path.join(flow_dir, pair[1])),
+            )
+        except OSError:
+            last = None
+            time.sleep(0.05)
+            continue
+        seen = (pair[0], pair[1], sizes[0], sizes[1])
+        if sizes[0] > 0 and sizes[1] > 0 and last == seen:
+            return pair
+        last = seen
+        time.sleep(0.05)
+    return None
+
+
+def describe(flow_dir: str) -> str:
+    parts: list[str] = []
+    for name in sorted(list_names(flow_dir)):
+        path = os.path.join(flow_dir, name)
+        try:
+            parts.append(f"{name}:{os.path.getsize(path)}")
+        except OSError:
+            parts.append(name)
+    return ",".join(parts)
+
+
+def capture_iface() -> str | None:
+    try:
+        names = [name for name in os.listdir("/sys/class/net") if name != "lo"]
+    except FileNotFoundError:
+        return None
+    if len(names) != 1:
+        print(f"amqp splice capture iface is not one device: {names}", file=sys.stderr)
+        return None
+    return names[0]
 
 
 def next_armed(root: str) -> str | None:
@@ -96,13 +156,35 @@ def publish(attempt: str, body: bytes) -> None:
     os.replace(tmp, final)
 
 
-def flow_alive(proc: subprocess.Popen[bytes]) -> bool:
-    deadline = time.monotonic() + 0.2
+def wait_for_listening(proc: subprocess.Popen[bytes]) -> bool:
+    stderr = proc.stderr
+    if stderr is None:
+        return False
+    fd = stderr.fileno()
+    deadline = time.monotonic() + 5
+    buf = ""
     while time.monotonic() < deadline:
-        if proc.poll() is not None:
+        remaining = deadline - time.monotonic()
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
             return False
-        time.sleep(0.05)
-    return proc.poll() is None
+        chunk = os.read(fd, 4096)
+        if chunk == b"":
+            return False
+        buf += chunk.decode("utf-8", "replace")
+        if "listening on " in buf:
+            return True
+    return False
+
+
+def drain(fd: int) -> None:
+    while True:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            return
+        if chunk == b"":
+            return
 
 
 def stop_flow(proc: subprocess.Popen[bytes]) -> None:
@@ -135,27 +217,39 @@ def capture_one(attempt: str, port: int, port_text: str) -> None:
         signal_listening(attempt)
         publish(attempt, pack(b"", b""))
         return
+    iface = capture_iface()
+    if iface is None:
+        signal_listening(attempt)
+        publish(attempt, pack(b"", b""))
+        return
     flow_dir = tempfile.mkdtemp(prefix="amqp-splice-")
     proc: subprocess.Popen[bytes] | None = None
     try:
         proc = subprocess.Popen(
-            ["tcpflow", "-i", "any", "-o", flow_dir, "tcp", "port", str(port)],
+            ["tcpflow", "-i", iface, "-o", flow_dir, "tcp", "port", str(port)],
             stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
-        if not flow_alive(proc):
+        if proc.stderr is None or not wait_for_listening(proc):
+            print("amqp splice tcpflow produced no listening line", file=sys.stderr)
             signal_listening(attempt)
             publish(attempt, pack(b"", b""))
             return
+        threading.Thread(target=drain, args=(proc.stderr.fileno(),), daemon=True).start()
         signal_listening(attempt)
         if not wait_for_closed(attempt):
             return
+        pair = wait_for_pair(flow_dir, port, 3.0)
+        streams = None if pair is None else read_pair(flow_dir, pair)
         stop_flow(proc)
         proc = None
         if not os.path.isdir(attempt):
             return
-        streams = streams_from_tcpflow(flow_dir, port)
-        body = pack(b"", b"") if streams is None else pack(streams[0], streams[1])
-        publish(attempt, body)
+        if streams is None:
+            print(f"amqp splice tcpflow missed the client flow files={describe(flow_dir)}", file=sys.stderr)
+            publish(attempt, pack(b"", b""))
+            return
+        publish(attempt, pack(streams[0], streams[1]))
     finally:
         if proc is not None:
             stop_flow(proc)
