@@ -5,9 +5,8 @@
 // replies). Hard bounds everywhere: 5s per network await, 20s per scenario
 // except the NATS scenarios, which run once, and 90s for the whole run.
 // The first failure ends the run.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { readFileSync, readlinkSync } from "node:fs";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { connect, Socket } from "node:net";
 import { connect as tlsConnect, type TLSSocket } from "node:tls";
@@ -867,23 +866,16 @@ function spliceFatal(why: string): never {
   process.exit(1);
 }
 
-function proxyDialed(port: number, ownFd: number): boolean {
-  let own = "";
-  let table = "";
-  try {
-    own = /socket:\[(\d+)\]/.exec(readlinkSync(`/proc/self/fd/${ownFd}`))?.[1] ?? "";
-    table = readFileSync("/proc/net/tcp", "utf8");
-  } catch {
-    return false;
-  }
-  if (own === "") return false;
-  const hex = port.toString(16).toUpperCase().padStart(4, "0");
-  for (const raw of table.split("\n")) {
-    const parts = raw.trim().split(/\s+/);
-    if (parts.length < 10 || parts[3] !== "01") continue;
-    if (parts[2]?.split(":")[1]?.toUpperCase() !== hex) continue;
-    const inode = parts[9] ?? "";
-    if (inode !== "" && inode !== "0" && inode !== own) return true;
+function proxyDialed(port: number, localPort: number): boolean {
+  const proc = spawnSync("ss", ["-Htn", "state", "established", `( dport = :${port} )`], { encoding: "utf8" });
+  if (proc.status !== 0 || typeof proc.stdout !== "string") return false;
+  for (const raw of proc.stdout.split("\n")) {
+    const local = raw.trim().split(/\s+/)[2];
+    if (local === undefined || local === "") continue;
+    const colon = local.lastIndexOf(":");
+    if (colon < 0) continue;
+    const parsed = Number(local.slice(colon + 1));
+    if (parsed > 0 && parsed !== localPort) return true;
   }
   return false;
 }
@@ -913,7 +905,6 @@ async function grantlessSplice(raw: string): Promise<boolean> {
   await mkdir(root);
   const sent: Buffer[] = [];
   const received: Buffer[] = [];
-  let ownFd = -1;
   let captured = false;
   let pending = 0;
   let finished = false;
@@ -924,15 +915,16 @@ async function grantlessSplice(raw: string): Promise<boolean> {
   const settle = () => {
     if (finished && pending === 0) resolveDone();
   };
+  // amqplib exposes no socket, so the bytes it sends are only visible here.
   const original = Socket.prototype.connect;
   Socket.prototype.connect = function (this: Socket, ...args: unknown[]) {
     this.prependListener("connect", () => {
       if (this.remotePort !== port) return;
       pending += 1;
+      const guestPort = this.localPort ?? 0;
       const sample = () => {
-        if (captured) return;
-        if (ownFd < 0) ownFd = (this as Socket & { _handle?: { fd?: number } })._handle?.fd ?? -1;
-        if (ownFd >= 0) captured = proxyDialed(port, ownFd);
+        if (captured || guestPort <= 0) return;
+        captured = proxyDialed(port, guestPort);
       };
       const write = this.write;
       this.write = function (this: Socket, data: string | Uint8Array, ...rest: unknown[]) {
@@ -971,16 +963,19 @@ async function grantlessSplice(raw: string): Promise<boolean> {
     settle();
     await closed;
     await writeFile(join(root, "closed"), "");
-    const result = await witnessFile(root, ["error", "done"], deadline).catch((err: unknown) => {
+    const result = await witnessFile(root, ["error", "empty", "done"], deadline).catch((err: unknown) => {
       spliceFatal(err instanceof Error ? err.message : String(err));
     });
     if (result.name === "error") spliceFatal(result.text.trim());
+    const guestSent = Buffer.concat(sent);
+    const guestRecv = Buffer.concat(received);
+    if (result.name === "empty") {
+      throw new Error(`amqp splice empty capture sent=${guestSent.length} recv=${guestRecv.length} ${result.text.trim()}`);
+    }
     const names = result.text.trim().split("\n");
     if (names.length !== 2 || names[0] === "" || names[1] === "") spliceFatal("amqp splice flow pairing failed");
     const toBroker = await readFile(join(root, names[0]));
     const toClient = await readFile(join(root, names[1]));
-    const guestSent = Buffer.concat(sent);
-    const guestRecv = Buffer.concat(received);
     if (guestSent.length === 0 || guestRecv.length === 0 || toBroker.length === 0 || toClient.length === 0) {
       throw new Error(`amqp splice empty capture sent=${guestSent.length} recv=${guestRecv.length} toBroker=${toBroker.length} toClient=${toClient.length}`);
     }

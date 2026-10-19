@@ -28,24 +28,49 @@ def iface() -> str:
     return names[0]
 
 
-def flows(directory: str, port: int) -> tuple[str, str] | None:
-    to_broker: list[str] = []
-    to_client: list[str] = []
+def outcome(attempt: str, port: int) -> tuple[str, str]:
+    to_broker: list[tuple[str, int]] = []
+    to_client: list[tuple[str, int]] = []
     try:
-        names = os.listdir(directory)
+        names = os.listdir(attempt)
     except FileNotFoundError:
-        return None
+        return "empty", "toBroker=0 toClient=0\n"
     for name in names:
         parsed = _FLOW.fullmatch(name)
         if parsed is None:
             continue
+        try:
+            size = os.path.getsize(os.path.join(attempt, name))
+        except OSError:
+            size = 0
         if int(parsed.group("dp")) == port:
-            to_broker.append(name)
+            to_broker.append((name, size))
         elif int(parsed.group("sp")) == port:
-            to_client.append(name)
-    if len(to_broker) != 1 or len(to_client) != 1:
+            to_client.append((name, size))
+    if len(to_broker) > 1 or len(to_client) > 1:
+        return "error", "amqp splice flow pairing failed\n"
+    broker_size = to_broker[0][1] if len(to_broker) == 1 else 0
+    client_size = to_client[0][1] if len(to_client) == 1 else 0
+    if len(to_broker) == 1 and len(to_client) == 1 and broker_size > 0 and client_size > 0:
+        return "done", f"{to_broker[0][0]}\n{to_client[0][0]}\n"
+    return "empty", f"toBroker={broker_size} toClient={client_size}\n"
+
+
+def flow_snapshot(attempt: str) -> tuple[tuple[str, int], ...] | None:
+    rows: list[tuple[str, int]] = []
+    try:
+        names = sorted(os.listdir(attempt))
+    except FileNotFoundError:
         return None
-    return to_broker[0], to_client[0]
+    for name in names:
+        if _FLOW.fullmatch(name) is None:
+            continue
+        try:
+            size = os.path.getsize(os.path.join(attempt, name))
+        except OSError:
+            return None
+        rows.append((name, size))
+    return tuple(rows)
 
 
 def drain(proc: subprocess.Popen[bytes], timeout: float) -> bytes:
@@ -89,46 +114,31 @@ def capture(attempt: str, port: int, dev: str) -> None:
             note(os.path.join(attempt, "error"), "amqp splice tcpflow not listening\n")
             return
         note(os.path.join(attempt, "listening"), "")
-        end = time.monotonic() + 20
-        last: tuple[str, str, int, int] | None = None
-        stable = 0
-        found: tuple[str, str] | None = None
-        while time.monotonic() < end and os.path.isdir(attempt):
+        closed = os.path.join(attempt, "closed")
+        wait_closed = time.monotonic() + 15
+        while time.monotonic() < wait_closed and os.path.isdir(attempt) and not os.path.isfile(closed):
             drain(proc, 0)
-            if not os.path.isfile(os.path.join(attempt, "closed")):
-                time.sleep(0.05)
-                continue
-            seen = flows(attempt, port)
-            if seen is None:
-                last = None
-                stable = 0
-                time.sleep(0.05)
-                continue
-            try:
-                sizes = (
-                    os.path.getsize(os.path.join(attempt, seen[0])),
-                    os.path.getsize(os.path.join(attempt, seen[1])),
-                )
-            except OSError:
-                last = None
-                stable = 0
-                time.sleep(0.05)
-                continue
-            current = (seen[0], seen[1], sizes[0], sizes[1])
-            if sizes[0] > 0 and sizes[1] > 0 and current == last:
+            time.sleep(0.05)
+        if not os.path.isfile(closed):
+            return
+        deadline = time.monotonic() + 3
+        last: tuple[tuple[str, int], ...] | None = None
+        stable = 0
+        while time.monotonic() < deadline and os.path.isdir(attempt):
+            drain(proc, 0)
+            current = flow_snapshot(attempt)
+            if current is not None and current == last:
                 stable += 1
                 if stable >= 3:
-                    found = seen
                     break
             else:
                 last = current
                 stable = 0
             time.sleep(0.05)
-        if found is None:
-            if os.path.isdir(attempt):
-                note(os.path.join(attempt, "error"), "amqp splice flow pairing failed\n")
+        if not os.path.isdir(attempt):
             return
-        note(os.path.join(attempt, "done"), f"{found[0]}\n{found[1]}\n")
+        kind, text = outcome(attempt, port)
+        note(os.path.join(attempt, kind), text)
     finally:
         stop(proc)
 

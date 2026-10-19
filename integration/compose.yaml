@@ -438,8 +438,13 @@ services:
       AMQP_SPLICE_DIR: *amqp-splice-dir
       HOST_UID: ${HOST_UID:-}
       HOST_GID: ${HOST_GID:-}
+    cap_drop:
+      - ALL
     cap_add:
       - NET_RAW
+      - CHOWN
+      # The results bind mount is owned by the host user, so root cannot create the splice directory without this.
+      - DAC_OVERRIDE
     volumes:
       - ./docker/amqp-witness:/witness:ro
       - ./out/results:/out
@@ -514,7 +519,7 @@ services:
       - -c
       - |
         set -euo pipefail
-        apt-get update -qq && apt-get install -qq -y openssh-client python3
+        apt-get update -qq && apt-get install -qq -y openssh-client python3 iproute2
         mkdir -p /opt/client
         cp /srv/package.json /srv/run.ts /opt/client/
         (cd /opt/client && bun install)
