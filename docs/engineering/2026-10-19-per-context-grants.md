@@ -16,7 +16,7 @@ The canonical bytes are the protocol tag, U+001F, the path, U+001F, and the name
 
 For source `/home/ivan/.ssh/config`, protocol `Ssh`, and name `git`, the label and the pair stem are `ssh-13786934f8941a5f07bb7b5b084cc9e8`. The env is `SSH_13786934F8941A5F07BB7B5B084CC9E8`.
 
-`require_distinct` trims the host and stores the ASCII lowercase form. An empty host after trimming is `WireHostEmpty`. Brackets stay on the host. The port is the caller's port. The group key is that host, that port, and the SHA-256 of the decoy bytes, including the hash of an empty slice. The same identity repeated is success. The same identity on two destinations is success. Two different identities on one key return `AmbiguousContexts`. The parties are sorted by path, name, and tag. The message lists them with commas and omits the decoy bytes. Two different refs that share a label return `ContextCollision`.
+`require_distinct` trims the host and stores the ASCII lowercase form. An empty host after trimming is `WireHostEmpty`. Brackets stay on the host. The port is the caller's port. The group key is that host, that port, and the decoy bytes. Two empty slices compare equal. The same identity repeated is success. The same identity on two destinations is success. Two different identities on one key return `AmbiguousContexts`. The parties are sorted by path, name, and tag. The message lists them with commas and omits the decoy bytes. Two different refs that share a label return `ContextCollision`.
 
 `secret()` does not consult the registry. An env built this way can still contain a bundled `contains` needle, so a later call to `Registry::template` can pick a bundled pattern. That gap is #71.
 
@@ -68,7 +68,7 @@ stateDiagram-v2
 
 `Error::NatsSharedEndpoint` stays the dial and TLS clash. `AmbiguousContexts` is the separate case of two decoys that present the same bytes.
 
-A cleartext `nats` upstream uses `Policy::Forward` and writes no real credential. Two cleartext contexts on one host and port cannot be told apart on the upstream leg. #64 calls `require_distinct` with an empty decoy for those contexts and writes neither grant. One cleartext context on that endpoint stays forward.
+A cleartext `nats` upstream uses `Policy::Forward` and writes no real credential. There is nothing to select and nothing to protect, including when two cleartext contexts share a host and port. Both forward. `require_distinct` is not called for them.
 
 In `/home/eng/.config/nats`, contexts `demo` and `Demo` both use tls on host `nats.example` port 4222. The passwords differ because the identities differ. A CONNECT that carries one password selects that context. When both contexts were given the same decoy CONNECT bytes, `require_distinct` names both.
 

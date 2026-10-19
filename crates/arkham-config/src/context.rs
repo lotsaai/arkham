@@ -131,7 +131,7 @@ pub struct Presented<'a> {
   pub host: &'a str,
   /// Destination port.
   pub port: u16,
-  /// Decoy bytes the guest presents. An empty slice still hashes.
+  /// Decoy bytes the guest presents. An empty slice still compares.
   pub decoy: &'a [u8],
 }
 
@@ -154,18 +154,17 @@ impl fmt::Display for AmbiguousParty {
 
 /// Two or more contexts that share a label. `parties` is sorted by path, name, and tag.
 #[derive(Debug, thiserror::Error)]
-#[error("contexts {listed} share `{shared}`")]
+#[error("contexts {} share `{shared}`", join_parties(&self.parties))]
 pub struct ContextCollision {
   /// Contexts that share the label. At least two.
   pub parties: Vec<AmbiguousParty>,
   /// Shared label.
   pub shared: String,
-  listed: String,
 }
 
 /// Contexts that present the same host, port, and decoy bytes. `parties` is sorted by path, name, and tag.
 #[derive(Debug, thiserror::Error)]
-#[error("contexts {listed} at {host}:{port} are indistinguishable")]
+#[error("contexts {} at {host}:{port} are indistinguishable", join_parties(&self.parties))]
 pub struct AmbiguousContexts {
   /// Contexts in the group. At least two.
   pub parties: Vec<AmbiguousParty>,
@@ -173,7 +172,6 @@ pub struct AmbiguousContexts {
   pub host: String,
   /// Destination port the caller supplied.
   pub port: u16,
-  listed: String,
 }
 
 /// Labels and decoy seeds for `refs`, in input order. A repeated path, protocol, and name keeps the first record.
@@ -202,14 +200,13 @@ pub fn identities(refs: &[ContextRef<'_>]) -> Result<Vec<ContextIdentity>, Error
 ///
 /// Returns [`Error::WireHostEmpty`] or [`Error::AmbiguousContexts`]. The same identity repeated is success. Ports are not defaulted.
 pub fn require_distinct(presented: &[Presented<'_>]) -> Result<(), Error> {
-  let mut groups: BTreeMap<(String, u16, [u8; 32]), Vec<&ContextIdentity>> = BTreeMap::new();
+  let mut groups: BTreeMap<(String, u16, &[u8]), Vec<&ContextIdentity>> = BTreeMap::new();
   for item in presented {
     let host = item.host.trim().to_ascii_lowercase();
     if host.is_empty() {
       return Err(Error::WireHostEmpty);
     }
-    let mark: [u8; 32] = Sha256::digest(item.decoy).into();
-    let group = groups.entry((host, item.port, mark)).or_default();
+    let group = groups.entry((host, item.port, item.decoy)).or_default();
     if group
       .iter()
       .any(|existing| same_subject(existing, item.identity.protocol, &item.identity.source, &item.identity.name))
@@ -223,13 +220,7 @@ pub fn require_distinct(presented: &[Presented<'_>]) -> Result<(), Error> {
       continue;
     }
     let parties = parties_from(group);
-    let listed = join_parties(&parties);
-    return Err(Error::AmbiguousContexts(Box::new(AmbiguousContexts {
-      parties,
-      host,
-      port,
-      listed,
-    })));
+    return Err(Error::AmbiguousContexts(Box::new(AmbiguousContexts { parties, host, port })));
   }
   Ok(())
 }
@@ -241,11 +232,9 @@ fn ensure_distinct(built: &[ContextIdentity]) -> Result<(), Error> {
         continue;
       }
       let parties = parties_from([previous, identity]);
-      let listed = join_parties(&parties);
       return Err(Error::ContextCollision(Box::new(ContextCollision {
         parties,
         shared: identity.label.clone(),
-        listed,
       })));
     }
   }
@@ -578,6 +567,27 @@ mod tests {
       "contexts `prod` (/home/ivan/.kube/config, kube-user), `staging` (/home/ivan/.kube/config, kube-user) share `kube-user-shared`";
     assert_eq!(forward.to_string(), expected);
     assert_eq!(reverse.to_string(), expected);
+  }
+
+  #[test]
+  fn different_decoy_bytes_on_one_destination_are_ok() {
+    let git = one(SSH_SOURCE, AmbientProtocol::Ssh, "git");
+    let other = one(SSH_SOURCE, AmbientProtocol::Ssh, "git.example");
+    require_distinct(&[
+      Presented {
+        identity: &git,
+        host: "github.com",
+        port: 22,
+        decoy: b"key-a",
+      },
+      Presented {
+        identity: &other,
+        host: "github.com",
+        port: 22,
+        decoy: b"key-b",
+      },
+    ])
+    .unwrap();
   }
 
   #[test]
