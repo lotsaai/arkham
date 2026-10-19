@@ -390,6 +390,12 @@ pub enum Error {
   /// An AMQP TLS handshake exceeded the configured budget.
   #[error("amqp handshake timed out")]
   AmqpHandshakeTimeout,
+  /// A secret does not fit the smallest frame either peer can negotiate.
+  #[error("amqp secret of {len} bytes exceeds the minimum frame")]
+  AmqpSecretTooLong {
+    /// Secret length in bytes.
+    len: usize,
+  },
   /// An SMTP TLS handshake exceeded the configured budget.
   #[error("smtp handshake timed out")]
   SmtpHandshakeTimeout,

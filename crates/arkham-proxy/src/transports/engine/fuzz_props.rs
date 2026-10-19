@@ -1206,6 +1206,7 @@ fn amqp_leg(leg: AmqpLeg) -> Amqp {
     AmqpLeg::DownClear => Amqp::new(&grants, "mq", 5672, Direction::Downstream, false),
     AmqpLeg::Up => Amqp::new(&grants, "mq", 5672, Direction::Upstream, false),
   }
+  .expect("secret fits")
 }
 
 fn run_amqp(leg: AmqpLeg, data: &[u8], cuts: &[usize]) -> (Vec<u8>, bool) {
