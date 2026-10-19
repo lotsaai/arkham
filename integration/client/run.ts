@@ -906,7 +906,7 @@ async function witnessFile(root: string, names: readonly string[], deadline: num
 async function grantlessSplice(raw: string): Promise<boolean> {
   const port = Number(process.env.AMQP_SPLICE_PORT);
   const dir = process.env.AMQP_SPLICE_DIR ?? "";
-  if (!port || dir === "") throw new Error("amqp splice port or dir is missing");
+  if (!port || dir === "") spliceFatal("amqp splice port or dir is missing");
   const url = new URL(raw);
   url.port = String(port);
   const root = join(dir, randomBytes(8).toString("hex"));
@@ -956,8 +956,10 @@ async function grantlessSplice(raw: string): Promise<boolean> {
   } as typeof Socket.prototype.connect;
   const deadline = Math.min(Date.now() + SCENARIO_BUDGET_MS, DEADLINE);
   try {
-    const armed = await witnessFile(root, ["error", "listening"], deadline);
-    if (armed.name === "error") throw new Error(armed.text.trim());
+    const armed = await witnessFile(root, ["error", "listening"], deadline).catch((err: unknown) => {
+      spliceFatal(err instanceof Error ? err.message : String(err));
+    });
+    if (armed.name === "error") spliceFatal(armed.text.trim());
     let refusal = "login succeeded";
     try {
       const conn = await amqplib.connect(url.toString(), { timeout: ATTEMPT_TIMEOUT_MS });
@@ -969,10 +971,12 @@ async function grantlessSplice(raw: string): Promise<boolean> {
     settle();
     await closed;
     await writeFile(join(root, "closed"), "");
-    const result = await witnessFile(root, ["error", "done"], deadline);
-    if (result.name === "error") throw new Error(result.text.trim());
+    const result = await witnessFile(root, ["error", "done"], deadline).catch((err: unknown) => {
+      spliceFatal(err instanceof Error ? err.message : String(err));
+    });
+    if (result.name === "error") spliceFatal(result.text.trim());
     const names = result.text.trim().split("\n");
-    if (names.length !== 2 || names[0] === "" || names[1] === "") throw new Error("amqp splice flow pairing failed");
+    if (names.length !== 2 || names[0] === "" || names[1] === "") spliceFatal("amqp splice flow pairing failed");
     const toBroker = await readFile(join(root, names[0]));
     const toClient = await readFile(join(root, names[1]));
     const guestSent = Buffer.concat(sent);
