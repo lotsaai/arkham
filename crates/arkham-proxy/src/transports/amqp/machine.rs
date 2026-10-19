@@ -2106,7 +2106,7 @@ mod tests {
   use amq_protocol::types::{AMQPValue, FieldTable};
   use arkham_config::grants::{AmqpScope, Credential, Grant};
   use fe2o3_amqp_types::definitions::{Handle, MAJOR, MINOR, REVISION};
-  use fe2o3_amqp_types::performatives::Transfer;
+  use fe2o3_amqp_types::performatives::{Detach, Transfer};
   use fe2o3_amqp_types::primitives::{Binary, Symbol};
   use fe2o3_amqp_types::sasl::SaslInit;
   use secrecy::SecretString;
@@ -2267,6 +2267,35 @@ mod tests {
         heartbeat: 60,
       })),
     ))
+  }
+
+  fn channel_close(channel: u16) -> Vec<u8> {
+    encode_frame(&AMQPFrame::Method(
+      channel,
+      AMQPClass::Channel(channel::AMQPMethod::Close(channel::Close {
+        reply_code: 200,
+        reply_text: "ok".into(),
+        class_id: 0,
+        method_id: 0,
+      })),
+    ))
+  }
+
+  fn detach_frame(channel: u16, handle: u32) -> Vec<u8> {
+    let performative = serde_amqp::to_vec(&Detach {
+      handle: Handle(handle),
+      closed: true,
+      error: None,
+    })
+    .unwrap();
+    let size = 8 + performative.len();
+    let mut frame = Vec::with_capacity(size);
+    frame.extend(u32::try_from(size).unwrap().to_be_bytes());
+    frame.push(2);
+    frame.push(0);
+    frame.extend(channel.to_be_bytes());
+    frame.extend(performative);
+    frame
   }
 
   fn ack(channel: u16) -> Vec<u8> {
@@ -2990,5 +3019,73 @@ mod tests {
     );
     assert!(!contains(&guest, REAL));
     assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn detach_then_handle_reuse_drops_the_held_prefix() {
+    let (prefix, _) = password_split();
+    let fresh = b"bbbb";
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header_10()).await;
+    guest.extend(feed_open(&mut machine, &transfer_on(1, 7, true, prefix)).await);
+    assert!(
+      !contains(&guest, std::str::from_utf8(prefix).unwrap()),
+      "the real prefix was delivered"
+    );
+    guest.extend(feed_open(&mut machine, &detach_frame(1, 7)).await);
+    guest.extend(feed_open(&mut machine, &transfer_on(1, 7, false, fresh)).await);
+    let payloads = transfer_payloads(&guest);
+    assert!(
+      payloads.iter().any(|payload| payload.as_slice() == fresh),
+      "the reused handle delivers its own payload"
+    );
+    assert!(
+      !payloads.iter().any(|payload| payload.windows(prefix.len()).any(|window| window == prefix)),
+      "bytes from the detached delivery were prepended"
+    );
+    assert!(!contains(&guest, REAL));
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn channel_close_mid_body_lets_the_channel_reopen() {
+    let (prefix, rest) = password_split();
+    let again = b"bbbb";
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &content_header(1, u64::try_from(prefix.len() + rest.len()).unwrap())).await;
+    guest.extend(feed_open(&mut machine, &body_091(prefix)).await);
+    assert!(
+      !contains(&guest, std::str::from_utf8(prefix).unwrap()),
+      "the real prefix was delivered"
+    );
+    guest.extend(feed_open(&mut machine, &channel_close(1)).await);
+    guest.extend(feed_open(&mut machine, &content_header(1, u64::try_from(again.len()).unwrap())).await);
+    guest.extend(feed_open(&mut machine, &body_091(again)).await);
+    let payloads = body_payloads(&guest);
+    assert_eq!(payloads.last().map(Vec::as_slice), Some(again.as_slice()));
+    assert!(
+      !payloads.iter().any(|payload| payload.windows(prefix.len()).any(|window| window == prefix)),
+      "the closed channel's prefix was prepended"
+    );
+    assert!(!contains(&guest, REAL));
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn a_transfer_performative_past_the_cap_closes() {
+    let mut body = vec![0x00, 0x53, 0x14];
+    body.resize(super::MAX_CREDENTIAL_FRAME.saturating_add(64), 0xa0);
+    let total = 8usize.saturating_add(body.len());
+    let mut frame = Vec::with_capacity(total);
+    frame.extend(u32::try_from(total).unwrap().to_be_bytes());
+    frame.extend([2, 0, 0, 1]);
+    frame.extend(body);
+    assert!(frame.len() > super::MAX_CREDENTIAL_FRAME, "the performative exceeds the cap");
+    let mut machine = up();
+    let _guest = feed_open(&mut machine, &header_10()).await;
+    assert!(
+      matches!(machine.feed(&frame).await.0, Rewritten::Close),
+      "an undecodable transfer was forwarded"
+    );
   }
 }
