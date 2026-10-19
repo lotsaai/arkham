@@ -1981,7 +1981,9 @@ mod tests {
   use amq_protocol::types::{AMQPValue, FieldTable};
   use arkham_config::grants::{AmqpScope, Credential, Grant};
   use fe2o3_amqp_types::definitions::{Handle, MAJOR, MINOR, REVISION};
-  use fe2o3_amqp_types::performatives::{Close, Detach, Transfer};
+  use fe2o3_amqp_types::definitions::Error as AmqpError;
+  use fe2o3_amqp_types::messaging::{DeliveryState, Rejected};
+  use fe2o3_amqp_types::performatives::{Close, Detach, MaxFrameSize, Open, Transfer};
   use fe2o3_amqp_types::primitives::{Binary, Symbol};
   use fe2o3_amqp_types::sasl::SaslInit;
   use secrecy::SecretString;
@@ -2019,6 +2021,23 @@ mod tests {
 
   fn up() -> Amqp {
     Amqp::new(&grants("amqps"), "mq", 5672, Direction::Upstream, false).expect("secret fits")
+  }
+
+  fn up_password(real: &str) -> Amqp {
+    let scope = AmqpScope::from_strings(
+      &format!("amqp://agent:{FAKE}@mq:5672"),
+      &format!("amqps://svc:{real}@mq:5672"),
+    )
+    .unwrap();
+    let grants = vec![Grant::Amqp {
+      credential: Credential {
+        label: "amqp".into(),
+        fake: FAKE.into(),
+        value: SecretString::from(real.to_owned()),
+      },
+      scope: Box::new(scope),
+    }];
+    Amqp::new(&grants, "mq", 5672, Direction::Upstream, false).expect("secret fits")
   }
 
   fn encode_frame(frame: &AMQPFrame) -> Vec<u8> {
@@ -2131,6 +2150,71 @@ mod tests {
         properties: AMQPProperties::default(),
       },
     ))
+  }
+
+  fn open_frame(max_frame_size: u32) -> Vec<u8> {
+    let performative = serde_amqp::to_vec(&Open {
+      container_id: "mq".into(),
+      hostname: None,
+      max_frame_size: MaxFrameSize(max_frame_size),
+      channel_max: Default::default(),
+      idle_time_out: None,
+      outgoing_locales: None,
+      incoming_locales: None,
+      offered_capabilities: None,
+      desired_capabilities: None,
+      properties: None,
+    })
+    .unwrap();
+    frame_10(0, 2, &performative, &[])
+  }
+
+  fn wide_transfer(channel: u16, more: bool, payload: &[u8]) -> Vec<u8> {
+    let description = "e".repeat(200);
+    let performative = serde_amqp::to_vec(&Transfer {
+      handle: Handle(0),
+      delivery_id: Some(2),
+      delivery_tag: None,
+      message_format: None,
+      settled: None,
+      more,
+      rcv_settle_mode: None,
+      state: Some(DeliveryState::Rejected(Rejected {
+        error: Some(AmqpError {
+          condition: fe2o3_amqp_types::definitions::AmqpError::InternalError.into(),
+          description: Some(description),
+          info: None::<Box<_>>,
+        }),
+      })),
+      resume: false,
+      aborted: false,
+      batchable: false,
+    })
+    .unwrap();
+    frame_10(channel, 128, &performative, payload)
+  }
+
+  fn frame_10(channel: u16, doff: u8, performative: &[u8], payload: &[u8]) -> Vec<u8> {
+    let at = usize::from(doff).saturating_mul(4);
+    let size = at + performative.len() + payload.len();
+    let mut frame = vec![0; at];
+    frame[..4].copy_from_slice(&u32::try_from(size).unwrap().to_be_bytes());
+    frame[4] = doff;
+    frame.extend_from_slice(performative);
+    frame.extend_from_slice(payload);
+    frame[6..8].copy_from_slice(&channel.to_be_bytes());
+    frame
+  }
+
+  fn frame_is_transfer(frame: &[u8]) -> bool {
+    let at = usize::from(frame.get(4).copied().unwrap_or(0)).saturating_mul(4);
+    let Some(body) = frame.get(at..) else {
+      return false;
+    };
+    let Ok(len) = super::consume_value(body, super::PERFORMATIVE_NESTING) else {
+      return false;
+    };
+    body.get(..len).is_some_and(|encoded| serde_amqp::from_slice::<Transfer>(encoded).is_ok())
   }
 
   fn tune(frame_max: u32) -> Vec<u8> {
@@ -3023,6 +3107,112 @@ mod tests {
     }
     assert!(closed, "the completing transfer was delivered");
     assert!(!contains(&transfer_payloads(&guest).concat(), REAL));
+  }
+
+  #[tokio::test]
+  async fn a_released_prefix_does_not_add_a_transfer() {
+    let (prefix, _) = password_split();
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header_10()).await;
+    guest.extend(feed_open(&mut machine, &transfer(1, true, prefix)).await);
+    guest.extend(feed_open(&mut machine, &transfer(1, false, b"bbbb")).await);
+    assert_eq!(
+      transfer_payloads(&guest).len(),
+      2,
+      "the guest saw a different number of transfers than the server sent"
+    );
+    assert_eq!(transfer_payloads(&guest).concat(), [prefix, b"bbbb"].concat());
+    assert!(!contains(&guest, REAL));
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn a_wide_transfer_stays_inside_the_negotiated_max() {
+    let (prefix, _) = password_split();
+    let max = 4_096usize;
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header_10()).await;
+    guest.extend(feed_open(&mut machine, &open_frame(u32::try_from(max).unwrap())).await);
+    guest.extend(feed_open(&mut machine, &transfer(1, true, prefix)).await);
+    let wide = wide_transfer(1, false, b"bbbb");
+    assert!(wide.len() > super::MIN_FRAME_10 && wide.len() <= max, "frame is {}", wide.len());
+    match machine.feed(&wide).await.0 {
+      Rewritten::Emit(emitted) => guest.extend(emitted.into_owned()),
+      Rewritten::Hold => {}
+      Rewritten::Close => panic!("a frame inside max-frame-size closed the connection"),
+    }
+    let mut rest = guest.strip_prefix(header_10().as_slice()).unwrap_or(&guest);
+    let mut transfers = 0usize;
+    while rest.len() >= 8 {
+      let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
+      assert!(size <= max, "an emitted frame is {size} bytes");
+      assert!(size <= rest.len() && size >= 8);
+      let frame = &rest[..size];
+      let at = usize::from(frame[4]).saturating_mul(4);
+      if serde_amqp::from_slice::<Transfer>(&frame[at..]).is_ok() || frame_is_transfer(frame) {
+        transfers += 1;
+      }
+      rest = &rest[size..];
+    }
+    assert_eq!(transfers, 2, "the guest saw a different number of transfers than the server sent");
+    assert!(!contains(&guest, REAL));
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn a_released_body_stays_inside_the_negotiated_frame_max() {
+    let real = format!("{}uniq", "z".repeat(70));
+    let mut machine = up_password(&real);
+    let frame_max = 64u32;
+    let mut guest = feed_open(&mut machine, &tune(frame_max)).await;
+    guest.extend(feed_open(&mut machine, &content_header(1, 74)).await);
+    guest.extend(feed_open(&mut machine, &body_091(&vec![b'z'; 50])).await);
+    guest.extend(feed_open(&mut machine, &body_091(&vec![b'z'; 20])).await);
+    guest.extend(feed_open(&mut machine, &body_091(b"bbbb")).await);
+    let limit = usize::try_from(frame_max).unwrap();
+    let mut rest = guest.as_slice();
+    while !rest.is_empty() {
+      let (next, _) = parse_frame(rest).unwrap();
+      assert!(rest.len() - next.len() <= limit, "a delivered frame exceeds frame-max");
+      rest = next;
+    }
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn held_bytes_over_the_budget_close() {
+    let real = "p".repeat(449);
+    let mut machine = up_password(&real);
+    let held = real.as_bytes()[..448].to_vec();
+    let _ = feed_open(&mut machine, &header_10()).await;
+    let mut closed = false;
+    for handle in 0..40u32 {
+      match machine.feed(&transfer_on(1, handle, true, &held)).await.0 {
+        Rewritten::Close => {
+          closed = true;
+          break;
+        }
+        Rewritten::Emit(_) | Rewritten::Hold => {}
+      }
+    }
+    assert!(closed, "the carry map kept the held bytes");
+  }
+
+  #[tokio::test]
+  async fn too_many_carry_entries_close() {
+    let mut machine = up();
+    let _ = feed_open(&mut machine, &header_10()).await;
+    let mut closed = false;
+    for handle in 0..33u32 {
+      match machine.feed(&transfer_on(1, handle, true, b"a")).await.0 {
+        Rewritten::Close => {
+          closed = true;
+          break;
+        }
+        Rewritten::Emit(_) | Rewritten::Hold => {}
+      }
+    }
+    assert!(closed, "the carry map kept every link");
   }
 
   #[tokio::test]
