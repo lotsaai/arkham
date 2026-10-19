@@ -26,7 +26,7 @@ use arkham_pki::ca::CertAuthority;
 use super::PairCtx;
 use super::{ServeStream, TlsHalves, Transport};
 use crate::Error;
-use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening, read_guest_tls};
+use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::mint::MintBucket;
 use crate::relay::{RelayEnd, log_hits, relay_guarded, relay_stop};
@@ -308,7 +308,6 @@ impl LdapTransport {
         server_prefix: server_rest,
         id: u64::from(open.id),
         local: !pump.upgrade_upstream,
-        hello_budget: Some(pump.budget),
       },
       pump,
     ))
@@ -316,7 +315,8 @@ impl LdapTransport {
   }
 
   /// The relay stopped on `StartTLS`. Finish that exchange and relay the
-  /// plaintext legs. The late guest hello has no deadline.
+  /// plaintext legs. The late guest hello uses the same handshake budget as
+  /// the opening.
   async fn finish_starttls<G, S>(&self, upgrade: crate::relay::RelayUpgrade<G, S>, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -338,7 +338,6 @@ impl LdapTransport {
         server_prefix,
         id,
         local,
-        hello_budget: None,
       },
       pump,
     ))
@@ -346,8 +345,8 @@ impl LdapTransport {
   }
 
   /// Accept the guest TLS leg once, then relay. `local` writes the success
-  /// here because the server socket is already TLS. `hello_budget` `None`
-  /// reads the `ClientHello` with no deadline.
+  /// here because the server socket is already TLS. The guest `ClientHello`
+  /// uses `pump.budget`.
   async fn protect<G, S>(&self, mut guest: G, server: S, accept: Accept<'_>, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -361,7 +360,7 @@ impl LdapTransport {
       write_guest(&mut guest, &bytes).await?;
     }
     let authority = Some(pump.scope.downstream.host.as_str());
-    let Some((hello_buf, identity, _)) = read_guest_tls(&mut guest, accept.guest_prefix, accept.hello_budget, authority, pump.mint).await?
+    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, accept.guest_prefix, pump.budget, authority, pump.mint).await?
     else {
       return Ok(());
     };
@@ -384,8 +383,6 @@ struct Accept<'a> {
   server_prefix: Vec<u8>,
   id: u64,
   local: bool,
-  /// `None` waits for the guest `ClientHello` with no deadline.
-  hello_budget: Option<Duration>,
 }
 
 /// What the first cleartext message was.
@@ -628,7 +625,8 @@ where
 {
   let (mut downstream, mut upstream) = ldap_pair(ctx, swap);
   if swap {
-    downstream.seal_starttls();
+    downstream.hold_starttls();
+    upstream.block_starttls();
   }
   relay_guarded(guest, server, &mut downstream, &mut upstream, &[], &[]).await
 }

@@ -306,22 +306,7 @@ pub(crate) async fn guest_tls_opening<G>(
 where
   G: AsyncRead + AsyncWrite + Unpin,
 {
-  read_guest_tls(guest, initial, Some(budget), host, mint).await
-}
-
-/// [`guest_tls_opening`] with an optional hello deadline. `None` waits for
-/// the hello or EOF. The size cap is unchanged.
-pub(crate) async fn read_guest_tls<G>(
-  guest: &mut G,
-  initial: &[u8],
-  budget: Option<std::time::Duration>,
-  host: Option<&str>,
-  mint: &MintBucket,
-) -> Result<Option<(Vec<u8>, String, String)>, Error>
-where
-  G: AsyncRead + AsyncWrite + Unpin,
-{
-  let Some(read) = Box::pin(read_client_hello(guest, initial, budget)).await? else {
+  let Some(read) = read_client_hello(guest, initial, budget).await? else {
     return Ok(None);
   };
   let (hello_buf, sni) = match read {

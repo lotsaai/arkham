@@ -59,7 +59,7 @@ impl Transport for HttpsTransport {
       ..
     } = params;
     let budget = Duration::from_secs(snapshot.proxy.handshake_timeout_secs);
-    let Some(read) = read_client_hello(&mut guest, initial, Some(budget)).await? else {
+    let Some(read) = read_client_hello(&mut guest, initial, budget).await? else {
       return Ok(());
     };
     let (buf, sni, parsed) = match read {

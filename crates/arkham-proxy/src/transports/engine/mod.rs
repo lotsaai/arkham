@@ -65,9 +65,10 @@ pub(crate) enum Rewritten<'a> {
 
 /// One direction's credential rewrite, framed by its protocol. Feeding an
 /// empty chunk flushes held bytes at stream end. `take_peer_note` carries a
-/// framing fact to the opposite direction. HTTP uses it so a HEAD request
-/// suppresses the response body. LDAP uses it so a finished response id
-/// drops out of the downstream outstanding set.
+/// framing fact to the opposite direction. HTTP uses [`PeerFact::Heads`] so a
+/// HEAD request suppresses the response body. LDAP uses [`PeerFact::Open`]
+/// and [`PeerFact::Abandon`] so the upstream machine knows which client
+/// operations still expect a response.
 pub(crate) trait Wire {
   /// Process one chunk; empty input flushes held bytes at stream EOF.
   /// Async because the plugin hook awaits.
@@ -76,12 +77,12 @@ pub(crate) trait Wire {
   fn take_reply(&mut self) -> Option<Vec<u8>> {
     None
   }
-  /// Framing fact for the opposite direction (request heads seen).
-  fn take_peer_note(&mut self) -> usize {
-    0
+  /// Framing fact for the opposite direction, if the last chunk queued one.
+  fn take_peer_note(&mut self) -> Option<PeerFact> {
+    None
   }
-  /// Apply a framing fact from the opposite direction (suppress next n bodies).
-  fn apply_peer_note(&mut self, _n: usize) {}
+  /// Apply a framing fact from the opposite direction.
+  fn apply_peer_note(&mut self, _fact: PeerFact) {}
   /// Upgrade noticed at a message boundary, if the last `feed` completed one.
   ///
   /// `prefix` is bytes already consumed that belong to the protocol after the
@@ -91,6 +92,34 @@ pub(crate) trait Wire {
   }
   /// The extended response with this id is the upgrade result.
   fn arm_upgrade(&mut self, _id: u64) {}
+  /// Decide a withheld upgrade once the request pump has handed the id over.
+  ///
+  /// The default proceeds. A protocol that still has work in flight refuses.
+  fn local_upgrade(&mut self, _id: u64) -> LocalUpgrade {
+    LocalUpgrade::Proceed
+  }
+}
+
+/// Framing fact on the request→response channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerFact {
+  /// HEAD requests whose response bodies are suppressed.
+  Heads(usize),
+  /// A client operation is waiting for a final response.
+  Open(u32),
+  /// An abandon names that operation. It gets no response of its own.
+  Abandon(u32),
+}
+
+/// What the response pump does with a withheld upgrade.
+#[derive(Debug)]
+pub(crate) enum LocalUpgrade {
+  /// Stop the relay and hand both sockets to the handshake.
+  Proceed,
+  /// Write these bytes to the guest and keep relaying.
+  Refuse(Vec<u8>),
+  /// End the relay.
+  Close,
 }
 
 /// One direction's upgrade, taken once from the feed that completed it.

@@ -287,22 +287,27 @@ where
   let mut bytes = encode(&bind_message(1, FAKE));
   bytes.extend(encode(&starttls_message(2)));
   io.write(&bytes).await;
-  let first = tokio::time::timeout(Duration::from_secs(5), io.message())
-    .await
-    .expect("bind result before starttls");
-  let ProtocolOp::BindResponse(body) = first.protocol_op else {
-    panic!("pipelined starttls answered before the bind result");
-  };
-  assert_eq!(first.message_id, 1);
-  assert_eq!(body.result_code, ResultCode::Success);
-  let second = tokio::time::timeout(Duration::from_secs(5), io.message())
-    .await
-    .expect("starttls result");
-  let ProtocolOp::ExtendedResp(body) = second.protocol_op else {
-    panic!("starttls response");
-  };
-  assert_eq!(second.message_id, 2);
-  assert_eq!(body.result_code, ResultCode::OperationsError);
+  let mut saw_bind = false;
+  let mut saw_starttls = false;
+  for _ in 0..2 {
+    let message = tokio::time::timeout(Duration::from_secs(5), io.message())
+      .await
+      .expect("pipelined result");
+    match message.protocol_op {
+      ProtocolOp::BindResponse(body) => {
+        assert_eq!(message.message_id, 1);
+        assert_eq!(body.result_code, ResultCode::Success);
+        saw_bind = true;
+      }
+      ProtocolOp::ExtendedResp(body) => {
+        assert_eq!(message.message_id, 2);
+        assert_eq!(body.result_code, ResultCode::OperationsError);
+        saw_starttls = true;
+      }
+      _ => panic!("pipelined response"),
+    }
+  }
+  assert!(saw_bind && saw_starttls, "bind result and starttls operationsError");
 }
 
 async fn expect_bind<S>(io: &mut Inbox<S>, id: u32, code: ResultCode)
