@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use arkham_config::grants::NatsSeed;
 use base64::Engine as _;
 
+use futures::StreamExt;
+
 use super::*;
 use crate::transports::nats::fixtures::{mint_user, nats_grants};
 
@@ -70,19 +72,6 @@ impl NatsStub {
     };
     nats_grants(&format!("nats://agent:{FAKE}@localhost:{port}"), &real)
   }
-
-  /// A guest TLS client that trusts the proxy's CA.
-  fn guest_connector(&self, sni: bool) -> TlsConnector {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(self.ca.cert_der().clone()).unwrap();
-    let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-    config.enable_sni = sni;
-    TlsConnector::from(Arc::new(config))
-  }
-}
-
-fn connect_line(pass: &str) -> String {
-  format!("CONNECT {{\"verbose\":false,\"user\":\"agent\",\"pass\":\"{pass}\",\"name\":\"e2e\"}}\r\n")
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -201,9 +190,23 @@ async fn nats_tls_server_leg_swaps_connect_after_the_upgrade() {
     let mut tls = acceptor.accept(conn).await.unwrap();
     expect_connect(&mut tls, VALUE, FAKE).await;
     assert_eq!(read_line(&mut tls).await, b"PING\r\n");
-    tls.write_all(b"+OK\r\n").await.unwrap();
+    tls.write_all(b"PONG\r\n").await.unwrap();
     tls.flush().await.unwrap();
-    assert_eq!(read_line(&mut tls).await, b"PUB orders 5\r\n");
+    assert_eq!(read_line(&mut tls).await, b"SUB orders 1\r\n");
+    tls.write_all(b"MSG orders 1 5\r\nhello\r\n").await.unwrap();
+    tls.flush().await.unwrap();
+    // The handler's first ping interval tick is immediate, so PING can
+    // arrive before PUB. A server answers it.
+    let publish = loop {
+      let line = read_line(&mut tls).await;
+      if line == b"PING\r\n" {
+        tls.write_all(b"PONG\r\n").await.unwrap();
+        tls.flush().await.unwrap();
+        continue;
+      }
+      break line;
+    };
+    assert_eq!(publish, b"PUB orders 5\r\n");
     assert_eq!(read_line(&mut tls).await, b"hello\r\n");
     tls
       .write_all(format!("-ERR 'Authorization Violation for {VALUE}'\r\n").as_bytes())
@@ -226,6 +229,12 @@ async fn nats_tls_server_leg_swaps_connect_after_the_upgrade() {
     .connect(guest_url(splice))
     .await
     .expect("tls connect");
+  let mut subscription = client.subscribe("orders").await.unwrap();
+  let message = tokio::time::timeout(Duration::from_secs(5), subscription.next())
+    .await
+    .expect("server MSG")
+    .expect("subscription");
+  assert_eq!(message.payload.as_ref(), b"hello");
   client.publish("orders", "hello".into()).await.unwrap();
   client.flush().await.unwrap();
   let event = tokio::time::timeout(Duration::from_secs(5), async {
@@ -247,40 +256,39 @@ async fn nats_tls_server_leg_swaps_connect_after_the_upgrade() {
 
 /// Transparent capture has no CONNECT authority. A guest that starts TLS
 /// after INFO without SNI is served a leaf for the grant host.
-/// async-nats always puts the dialed host in the `ClientHello` SNI, and this
-/// test turns SNI off so the proxy mints for the grant host.
 #[tokio::test]
 async fn nats_tls_guest_without_sni_mints_for_the_grant_host() {
   let stub = nats_stub().await;
+  let mut client_config = guest_tls_config(&stub.ca);
+  client_config.enable_sni = false;
   let state = test_state_with(stub.grants(ServerLeg::AfterInfo), &stub.ca);
   let snapshot = state.snapshot();
   let port = stub.port;
-  let connector = stub.guest_connector(false);
   let NatsStub { listener, acceptor, .. } = stub;
   let stub_task = tokio::spawn(async move {
     let (mut conn, _) = listener.accept().await.unwrap();
     conn.write_all(INFO).await.unwrap();
     let mut tls = acceptor.accept(conn).await.unwrap();
     expect_connect(&mut tls, VALUE, FAKE).await;
-    tls.write_all(b"+OK\r\n").await.unwrap();
+    assert_eq!(read_line(&mut tls).await, b"PING\r\n");
+    tls.write_all(b"PONG\r\n").await.unwrap();
     tls.flush().await.unwrap();
   });
-  let (guest, mut client_end) = tokio::io::duplex(64 * 1024);
+  let (guest, client_end) = tokio::io::duplex(64 * 1024);
   let serve = tokio::spawn({
     let state = Arc::clone(&state);
     let snapshot = Arc::clone(&snapshot);
     async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", port, "127.0.0.1").await }
   });
-  assert_eq!(read_line(&mut client_end).await, INFO);
-  let name = ServerName::try_from("localhost".to_string()).unwrap();
-  let mut tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, client_end))
+  let splice = splice_guest(client_end).await;
+  let client = async_nats::ConnectOptions::with_user_and_password("agent".to_string(), FAKE.to_string())
+    .require_tls(true)
+    .tls_client_config(client_config)
+    .connect(guest_url(splice))
     .await
-    .unwrap()
-    .unwrap();
-  tls.write_all(connect_line(FAKE).as_bytes()).await.unwrap();
-  assert_eq!(read_line(&mut tls).await, b"+OK\r\n");
-  drop(tls);
+    .expect("no-SNI connect");
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  drop(client);
   serve.await.unwrap().unwrap();
 }
 

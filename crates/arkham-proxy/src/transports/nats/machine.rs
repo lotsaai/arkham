@@ -1581,16 +1581,6 @@ mod tests {
       assert_eq!(hits, 0, "{nkey}");
       assert_eq!(text_of(out), line, "{nkey}");
     }
-    let null_line = format!("CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":null,\"sig\":\"{sig}\"}}\r\n");
-    let mut null_down = down(&grants, true);
-    let mut null_up = up(&grants);
-    arm_info(&mut null_up, &mut null_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
-    let (null_out, null_hits) = feed(&mut null_down, null_line.as_bytes()).await;
-    assert_eq!(null_hits, 1);
-    let null_out = text_of(null_out);
-    assert!(null_out.contains(real_jwt.as_str()), "{null_out}");
-    let parsed: serde_json::Value = serde_json::from_str(null_out.trim().strip_prefix("CONNECT").expect("verb").trim()).expect("json");
-    assert!(parsed.get("nkey").is_none(), "{null_out}");
     let line = format!("CONNECT {{\"jwt\":\"{fake_jwt}\",\"sig\":\"{sig}\"}}\r\n");
     let mut down = down(&grants, true);
     let mut up = up(&grants);
@@ -1598,6 +1588,26 @@ mod tests {
     let (out, hits) = feed(&mut down, line.as_bytes()).await;
     assert_eq!(hits, 1);
     assert!(text_of(out).contains(real_jwt.as_str()));
+  }
+
+  #[tokio::test]
+  async fn null_nkey_is_treated_as_absent() {
+    let fake = minted();
+    let real = minted();
+    let fake_jwt = user_jwt(fake.seed.public.as_str());
+    let real_jwt = user_jwt(real.seed.public.as_str());
+    let grants = jwt_grants(&fake, &real, &fake_jwt, &real_jwt);
+    let sig = sig_of(&fake.seed, b"N0NCE");
+    let line = format!("CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":null,\"sig\":\"{sig}\"}}\r\n");
+    let mut down = down(&grants, true);
+    let mut up = up(&grants);
+    arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let (out, hits) = feed(&mut down, line.as_bytes()).await;
+    assert_eq!(hits, 1);
+    let out = text_of(out);
+    assert!(out.contains(real_jwt.as_str()), "{out}");
+    let parsed: serde_json::Value = serde_json::from_str(out.trim().strip_prefix("CONNECT").expect("verb").trim()).expect("json");
+    assert!(parsed.get("nkey").is_none(), "{out}");
   }
 
   /// A password grant and an nkey grant can share one host and port. The
