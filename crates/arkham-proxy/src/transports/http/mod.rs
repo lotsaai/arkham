@@ -223,11 +223,12 @@ pub(crate) struct SubstitutionService {
 
 /// The trust bundle every hit names.
 ///
-/// Two paths are one bundle when they hold the same certificates. A hit
-/// with a bundle and a hit without one are different bundles.
+/// Equal paths are one bundle and are not read again. Two different paths
+/// are one bundle when they hold the same certificates. A hit with a bundle
+/// and a hit without one are different bundles.
 fn shared_root(hits: &[(Grant, EndpointScope)], host: &str, port: u16) -> Result<Option<std::path::PathBuf>, Error> {
   let mut missing = false;
-  let mut chosen: Option<(std::path::PathBuf, Vec<Vec<u8>>)> = None;
+  let mut chosen: Option<std::path::PathBuf> = None;
   for (_, scope) in hits {
     let Some(path) = &scope.root_cert else {
       if chosen.is_some() {
@@ -239,15 +240,20 @@ fn shared_root(hits: &[(Grant, EndpointScope)], host: &str, port: u16) -> Result
     if missing {
       return Err(split_trust(host, port));
     }
-    let mut anchors: Vec<Vec<u8>> = trust_anchors(path)?.into_iter().map(|cert| cert.as_ref().to_vec()).collect();
-    anchors.sort_unstable();
     match &chosen {
-      None => chosen = Some((path.clone(), anchors)),
-      Some((_, seen)) if seen == &anchors => {}
+      None => chosen = Some(path.clone()),
+      Some(seen) if seen == path => {}
+      Some(seen) if anchor_bytes(seen)? == anchor_bytes(path)? => {}
       Some(_) => return Err(split_trust(host, port)),
     }
   }
-  Ok(chosen.map(|(path, _)| path))
+  Ok(chosen)
+}
+
+fn anchor_bytes(path: &std::path::Path) -> Result<Vec<Vec<u8>>, Error> {
+  let mut anchors: Vec<Vec<u8>> = trust_anchors(path)?.into_iter().map(|cert| cert.as_ref().to_vec()).collect();
+  anchors.sort_unstable();
+  Ok(anchors)
 }
 
 fn split_trust(host: &str, port: u16) -> Error {
