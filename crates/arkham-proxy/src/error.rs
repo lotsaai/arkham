@@ -396,6 +396,14 @@ pub enum Error {
     /// Secret length in bytes.
     len: usize,
   },
+  /// A guest Open cannot reserve the withheld prefix and stay above the minimum frame size.
+  #[error("amqp open max-frame-size {offered} cannot reserve {room} bytes")]
+  AmqpFrameMax {
+    /// Maximum the guest offered.
+    offered: u32,
+    /// Bytes withheld from a later frame.
+    room: usize,
+  },
   /// Retained AMQP payload exceeded the connection carry budget.
   #[error("amqp carry holds {bytes} bytes across {entries} links")]
   AmqpCarryBudget {

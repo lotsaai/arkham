@@ -3827,79 +3827,120 @@ mod tests {
     assert!(matches!(server.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
   }
 
+  fn hold_room() -> usize {
+    REAL.len().saturating_sub(1)
+  }
+
+  fn forwarded_open_max(bytes: &[u8]) -> u32 {
+    let header = header_10();
+    let at = bytes
+      .windows(header.len())
+      .position(|window| window == header.as_slice())
+      .expect("amqp header");
+    let rest = &bytes[at + header.len()..];
+    let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
+    let frame = &rest[..size];
+    let open: Open = serde_amqp::from_slice(&frame[8..]).expect("open");
+    u32::try_from(usize::from(open.max_frame_size)).unwrap()
+  }
+
+  fn frame_of_len(more: bool, total: usize) -> (Vec<u8>, Vec<u8>) {
+    let empty = transfer(1, more, b"");
+    assert!(total > empty.len(), "frame of {total} cannot hold a performative of {}", empty.len());
+    let payload = vec![b'q'; total - empty.len()];
+    (transfer(1, more, &payload), payload)
+  }
+
+  fn assert_frames_within(bytes: &[u8], limit: usize) {
+    let mut rest = bytes.strip_prefix(header_10().as_slice()).unwrap_or(bytes);
+    while rest.len() >= 8 {
+      let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
+      assert!(
+        size <= limit && size <= rest.len() && size >= 8,
+        "a frame of {size} bytes exceeds the guest max-frame-size {limit}"
+      );
+      rest = &rest[size..];
+    }
+  }
+
+  async fn forward_open(max: u32) -> Vec<u8> {
+    let mut guest_side = down(true);
+    let mut client = sasl_init("PLAIN", Some(plain("agent", FAKE)));
+    client.extend(header_10());
+    client.extend(open_frame(max));
+    feed_open(&mut guest_side, &client).await
+  }
+
   #[tokio::test]
-  async fn a_guest_max_frame_size_bounds_a_frame_the_server_open_would_allow() {
+  async fn a_guest_open_is_lowered_by_the_withheld_prefix() {
+    let room = u32::try_from(hold_room()).unwrap();
+    for offered in [542u32, 4_096] {
+      let forwarded = forward_open(offered).await;
+      assert_eq!(
+        forwarded_open_max(&forwarded),
+        offered - room,
+        "open {offered} was not lowered by the withheld prefix"
+      );
+    }
+  }
+
+  #[tokio::test]
+  async fn a_guest_open_below_the_minimum_after_the_prefix_closes() {
     let mut guest_side = down(true);
     let mut client = sasl_init("PLAIN", Some(plain("agent", FAKE)));
     client.extend(header_10());
     client.extend(open_frame(512));
-    let _ = feed_open(&mut guest_side, &client).await;
-    let mut server = up();
-    let note = hand_guest_limit(&mut guest_side, &mut server);
-    assert!(note > 0, "the guest open never reached the response leg");
-    let mut guest = feed_open(&mut server, &header_10()).await;
-    guest.extend(feed_open(&mut server, &open_frame(8_192)).await);
-    let (prefix, _) = password_split();
-    guest.extend(feed_open(&mut server, &transfer(1, true, prefix)).await);
-    let wide = wide_transfer(1, false, b"bbbb");
-    assert!(wide.len() > 512, "the fixture is {} bytes", wide.len());
-    match server.feed(&wide).await.0 {
-      Rewritten::Close => {}
-      Rewritten::Emit(emitted) => {
-        guest.extend(emitted.into_owned());
-        let mut rest = guest.strip_prefix(&header_10()).unwrap_or(&guest);
-        while !rest.is_empty() {
-          let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
-          assert!(
-            size <= 512 && size <= rest.len() && size >= 8,
-            "a frame of {size} bytes exceeds the guest max-frame-size"
-          );
-          rest = &rest[size..];
-        }
-      }
-      Rewritten::Hold => panic!("the wide transfer was held"),
-    }
-    assert!(!contains(&guest, REAL));
+    assert!(
+      matches!(guest_side.feed(&client).await.0, Rewritten::Close),
+      "an open of 512 was forwarded"
+    );
+    assert!(
+      matches!(guest_side.close_reason(), Some(crate::Error::AmqpFrameMax { offered: 512, .. })),
+      "the close was not the open headroom failure"
+    );
   }
 
   #[tokio::test]
   async fn a_near_max_release_stays_inside_the_guest_open() {
-    let guest_max = 4_096usize;
-    let mut guest_side = down(true);
-    let mut client = sasl_init("PLAIN", Some(plain("agent", FAKE)));
-    client.extend(header_10());
-    client.extend(open_frame(u32::try_from(guest_max).unwrap()));
-    let _ = feed_open(&mut guest_side, &client).await;
-    let mut server = up();
-    let note = hand_guest_limit(&mut guest_side, &mut server);
-    assert_eq!(note, guest_max, "the guest open never reached the response leg");
-    let mut guest = feed_open(&mut server, &header_10()).await;
-    guest.extend(feed_open(&mut server, &open_frame(1_048_576)).await);
+    let guest_max = 4_096u32;
+    let room = u32::try_from(hold_room()).unwrap();
+    let lowered = guest_max - room;
+    let forwarded = forward_open(guest_max).await;
+    assert_eq!(forwarded_open_max(&forwarded), lowered);
     let (prefix, _) = password_split();
+    let mut server = up();
+    let mut guest = feed_open(&mut server, &header_10()).await;
     guest.extend(feed_open(&mut server, &transfer(1, true, prefix)).await);
-    let empty = transfer(1, false, b"");
-    let payload = vec![b'q'; guest_max.saturating_sub(empty.len()).saturating_sub(6)];
-    let near = transfer(1, false, &payload);
-    assert!(near.len() <= guest_max, "the server frame is {} bytes", near.len());
-    assert!(
-      near.len().saturating_add(prefix.len()) > guest_max,
-      "the released prefix still fits in the guest maximum"
-    );
-    match server.feed(&near).await.0 {
-      Rewritten::Close => {}
-      Rewritten::Emit(emitted) => guest.extend(emitted.into_owned()),
-      Rewritten::Hold => panic!("the near-max transfer was held"),
-    }
-    let mut rest = guest.strip_prefix(&header_10()).unwrap_or(&guest);
-    while rest.len() >= 8 {
-      let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
-      assert!(
-        size <= guest_max && size <= rest.len() && size >= 8,
-        "a frame of {size} bytes exceeds the guest max-frame-size"
-      );
-      rest = &rest[size..];
-    }
+    let (near, payload) = frame_of_len(false, usize::try_from(lowered).unwrap());
+    assert_eq!(near.len(), usize::try_from(lowered).unwrap());
+    guest.extend(feed_open(&mut server, &near).await);
+    assert_frames_within(&guest, usize::try_from(guest_max).unwrap());
+    assert_eq!(transfer_payloads(&guest).concat(), [prefix, payload.as_slice()].concat());
     assert!(!contains(&guest, REAL));
+    assert!(matches!(server.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn a_streamed_message_filling_the_guest_max_stays_open_without_a_secret() {
+    let guest_max = 32_768u32;
+    let room = u32::try_from(hold_room()).unwrap();
+    let lowered = guest_max - room;
+    let forwarded = forward_open(guest_max).await;
+    assert_eq!(forwarded_open_max(&forwarded), lowered);
+    let (big, big_payload) = frame_of_len(true, super::MAX_CREDENTIAL_FRAME + 64);
+    assert!(big.len() > super::MAX_CREDENTIAL_FRAME);
+    let (fin, fin_payload) = frame_of_len(false, usize::try_from(lowered).unwrap());
+    let mut server = up();
+    let mut guest = feed_open(&mut server, &header_10()).await;
+    guest.extend(feed_open(&mut server, &big).await);
+    guest.extend(feed_open(&mut server, &fin).await);
+    assert_frames_within(&guest, usize::try_from(guest_max).unwrap());
+    assert_eq!(
+      transfer_payloads(&guest).concat(),
+      [big_payload.as_slice(), fin_payload.as_slice()].concat()
+    );
+    assert!(!contains(&guest, REAL));
+    assert!(matches!(server.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
   }
 
   #[tokio::test]
