@@ -104,12 +104,6 @@ jobs:
     needs: image
     runs-on: ubuntu-latest
     steps:
-      # The Dockerfile lives in the repository, not in the release tarball, so
-      # the job needs a checkout to hand it to buildx with --file.
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
       - name: Resolve tag
         run: echo "TAG=${{ fromJson(inputs.plan).announcement_tag }}" >> "$GITHUB_ENV"
 
