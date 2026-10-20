@@ -115,14 +115,9 @@ async fn ldap_cleartext_bind_forwards_the_decoy() {
     );
     conn.write_all(&encode(&response)).await.unwrap();
   });
-  let mut stream = connect_through_proxy(fx.proxy_addr, fx.stub_port).await;
-  stream.write_all(&encode(&bind_message(1, FAKE))).await.unwrap();
-  let response = read_message(&mut stream).await;
-  let ProtocolOp::BindResponse(body) = response.protocol_op else {
-    panic!("bind response");
-  };
-  assert_eq!(body.result_code, ResultCode::InvalidCredentials);
-  drop(stream);
+  let stream = connect_through_proxy(fx.proxy_addr, fx.stub_port).await;
+  let result = ldap3_bind(stream, Ldap3Open::Clear, FAKE).await;
+  assert_eq!(result.rc, ResultCode::InvalidCredentials as u32, "{result}");
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   fx.proxy.abort();
 }
@@ -162,7 +157,13 @@ async fn ldap_flow(flow: Flow) {
   )];
   let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
   let stub_task = tokio::spawn(async move { serve_flow(stub, acceptor, flow).await });
-  drive_guest(connect_through_proxy(proxy_addr, stub_port).await, flow, &ca).await;
+  let stream = connect_through_proxy(proxy_addr, stub_port).await;
+  if matches!(flow, Flow::StartTlsFirst) {
+    let result = ldap3_bind(stream, Ldap3Open::StartTls(&ca), FAKE).await;
+    result.success().expect("protected bind");
+  } else {
+    drive_guest(stream, flow, &ca).await;
+  }
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   proxy.abort();
 }
@@ -242,8 +243,10 @@ where
     drive_pipelined(&mut io).await;
     return;
   }
-  let start_id = if matches!(flow, Flow::StartTlsFirst) { 1 } else { 2 };
+  let start_id = 2;
   match flow {
+    Flow::StartTlsFirst => panic!("ldap3 drives starttls before the bind"),
+    Flow::Pipelined => panic!("pipelined bind returns before the upgrade"),
     Flow::SearchThenStartTls => {
       io.write(&encode(&search_message(1))).await;
       let opened = io.message().await;
@@ -254,7 +257,6 @@ where
     }
     Flow::BindThenStartTls => expect_bind(&mut io, 1, ResultCode::InvalidCredentials).await,
     Flow::AlreadyTls | Flow::SecondStartTls => expect_bind(&mut io, 1, ResultCode::Success).await,
-    Flow::StartTlsFirst | Flow::Pipelined => {}
   }
   io.write(&encode(&starttls_message(start_id))).await;
   let started = tokio::time::timeout(Duration::from_secs(5), io.message())
@@ -444,42 +446,98 @@ async fn ldap_starttls_then_bind_swaps_the_password() {
   ldap_flow(Flow::StartTlsFirst).await;
 }
 
+/// `ldap3` upgrades during connect and cannot bind before that, so this guest stays
+/// on the byte path.
 #[tokio::test]
 async fn ldap_bind_then_starttls_then_protected_bind_swaps_the_password() {
   ldap_flow(Flow::BindThenStartTls).await;
 }
 
+/// `ldap3` upgrades during connect and cannot search before that, so this guest stays
+/// on the byte path.
 #[tokio::test]
 async fn ldap_search_then_starttls_then_protected_bind_swaps_the_password() {
   ldap_flow(Flow::SearchThenStartTls).await;
 }
 
+/// `ldap3` upgrades during connect and cannot bind before that, so this guest stays
+/// on the byte path.
 #[tokio::test]
 async fn ldap_bind_then_starttls_is_answered_when_upstream_is_already_tls() {
   ldap_flow(Flow::AlreadyTls).await;
 }
 
+/// `ldap3` cannot put a bind and `StartTLS` in one write before reading either
+/// result, so this guest stays on the byte path.
 #[tokio::test]
 async fn ldap_pipelined_bind_then_starttls_is_operations_error() {
   ldap_flow(Flow::Pipelined).await;
 }
 
+/// The guest binds in the clear, upgrades, and only then sends `StartTLS`
+/// again. `ldap3` performs the first `StartTLS` while opening the socket,
+/// before any bind, so this sequence stays on the byte path.
 #[tokio::test]
 async fn ldap_second_starttls_on_a_tls_session_is_operations_error() {
   ldap_flow(Flow::SecondStartTls).await;
 }
 
-fn guest_connector(ca: &CertAuthority, present: bool) -> TlsConnector {
+enum Ldap3Open<'a> {
+  Clear,
+  StartTls(&'a CertAuthority),
+  Ldaps { ca: &'a CertAuthority, sni: bool },
+}
+
+fn guest_config(ca: &CertAuthority, present: bool) -> rustls::ClientConfig {
   let mut roots = rustls::RootCertStore::empty();
   roots.add(ca.cert_der().clone()).unwrap();
   let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
-  let config = if present {
+  if present {
     let (chain, key) = arkham_pki::ca::generate_client_pair(ca, "guest").unwrap();
     builder.with_client_auth_cert(chain, key).unwrap()
   } else {
     builder.with_no_client_auth()
+  }
+}
+
+fn guest_connector(ca: &CertAuthority, present: bool) -> TlsConnector {
+  TlsConnector::from(Arc::new(guest_config(ca, present)))
+}
+
+async fn ldap3_bind(stream: TcpStream, open: Ldap3Open<'_>, password: &str) -> ldap3::LdapResult {
+  let bind = async {
+    let std_stream = stream.into_std().expect("ldap3 takes a std stream");
+    let mut settings = ldap3::LdapConnSettings::new().set_std_stream(ldap3::StdStream::Tcp(std_stream));
+    let url = match open {
+      Ldap3Open::Clear => "ldap://localhost",
+      Ldap3Open::StartTls(ca) => {
+        settings = settings.set_starttls(true).set_config(Arc::new(guest_config(ca, false)));
+        "ldap://localhost"
+      }
+      Ldap3Open::Ldaps { ca, sni } => {
+        let mut config = guest_config(ca, false);
+        config.enable_sni = sni;
+        settings = settings.set_config(Arc::new(config));
+        "ldaps://localhost"
+      }
+    };
+    let (conn, mut ldap) = ldap3::LdapConnAsync::with_settings(settings, url).await.expect("ldap3 open");
+    tokio::spawn(async move {
+      let _ = conn.drive().await;
+    });
+    ldap.simple_bind(DN, password).await.expect("ldap3 bind")
   };
-  TlsConnector::from(Arc::new(config))
+  tokio::time::timeout(Duration::from_secs(10), bind)
+    .await
+    .expect("ldap3 bind timed out")
+}
+
+async fn answer_ldaps_bind(stub: TcpListener, acceptor: TlsAcceptor) {
+  let (conn, _) = stub.accept().await.unwrap();
+  let mut tls = acceptor.accept(conn).await.unwrap();
+  let bind = read_message(&mut tls).await;
+  assert_eq!(simple_password(&bind), VALUE.as_bytes());
+  write_bind_result(&mut tls, bind.message_id, ResultCode::Success).await;
 }
 
 /// Cleartext bind, then `StartTLS`, then a protected bind. `Ok` is the
@@ -527,6 +585,9 @@ async fn bind_then_starttls_bind(proxy_addr: SocketAddr, stub_port: u16, connect
 /// completes the protected bind and the upstream sees the real password.
 /// A guest with no certificate is refused at the handshake, after it has
 /// already seen the `StartTLS` success, and the upstream never starts TLS.
+///
+/// `ldap3` selects client authentication when it opens the connection, and
+/// it cannot `StartTLS` after a bind, so this guest stays on the byte path.
 #[tokio::test]
 async fn ldap_bind_then_starttls_enforces_guest_mtls() {
   install_crypto_provider();
@@ -623,6 +684,34 @@ async fn ldap_bind_then_starttls_enforces_guest_mtls() {
 }
 
 #[tokio::test]
+async fn ldap_ldaps_bind_swaps_the_password() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
+  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let bundle_dir = tempfile::tempdir().unwrap();
+  let bundle = bundle_dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let grants = vec![ldap_grant(
+    &format!("ldaps://{}:{FAKE}@localhost:{stub_port}", user(DN)),
+    &format!(
+      "ldaps://{}:{VALUE}@localhost:{stub_port}?sslrootcert={}",
+      user(DN),
+      bundle.display()
+    ),
+  )];
+  let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
+  let stub_task = tokio::spawn(async move { answer_ldaps_bind(stub, acceptor).await });
+  let stream = connect_through_proxy(proxy_addr, stub_port).await;
+  let result = ldap3_bind(stream, Ldap3Open::Ldaps { ca: &ca, sni: true }, FAKE).await;
+  result.success().expect("ldaps bind");
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  proxy.abort();
+}
+
+#[tokio::test]
 async fn ldap_tls_without_sni_mints_for_the_grant_host() {
   install_crypto_provider();
   let ca = CertAuthority::generate().unwrap();
@@ -643,48 +732,20 @@ async fn ldap_tls_without_sni_mints_for_the_grant_host() {
   )];
   let state = test_state_with(grants, &ca);
   let snapshot = state.snapshot();
-  let stub_task = tokio::spawn(async move {
-    let (conn, _) = stub.accept().await.unwrap();
-    let mut tls = acceptor.accept(conn).await.unwrap();
-    let bind = read_message(&mut tls).await;
-    assert_eq!(simple_password(&bind), VALUE.as_bytes());
-    let ok = LdapMessage::new(
-      bind.message_id,
-      ProtocolOp::BindResponse(BindResponse::new(
-        ResultCode::Success,
-        LdapString::from(""),
-        LdapString::from(""),
-        None,
-        None,
-      )),
-    );
-    tls.write_all(&encode(&ok)).await.unwrap();
-  });
-  let (guest, client_end) = tokio::io::duplex(64 * 1024);
+  let stub_task = tokio::spawn(async move { answer_ldaps_bind(stub, acceptor).await });
+  let ingress = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let ingress_addr = local_addr(&ingress);
   let serve = tokio::spawn({
     let state = Arc::clone(&state);
     let snapshot = Arc::clone(&snapshot);
-    async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await }
+    async move {
+      let (guest, _) = ingress.accept().await.unwrap();
+      serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await
+    }
   });
-  let mut roots = rustls::RootCertStore::empty();
-  roots.add(ca.cert_der().clone()).unwrap();
-  let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-  config.enable_sni = false;
-  let name = ServerName::try_from("localhost".to_string()).unwrap();
-  let mut tls = tokio::time::timeout(
-    Duration::from_secs(10),
-    TlsConnector::from(Arc::new(config)).connect(name, client_end),
-  )
-  .await
-  .unwrap()
-  .unwrap();
-  tls.write_all(&encode(&bind_message(1, FAKE))).await.unwrap();
-  let response = read_message(&mut tls).await;
-  let ProtocolOp::BindResponse(body) = response.protocol_op else {
-    panic!("bind response");
-  };
-  assert_eq!(body.result_code, ResultCode::Success);
-  drop(tls);
+  let stream = TcpStream::connect(ingress_addr).await.unwrap();
+  let result = ldap3_bind(stream, Ldap3Open::Ldaps { ca: &ca, sni: false }, FAKE).await;
+  result.success().expect("ldaps bind without sni");
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   serve.await.unwrap().unwrap();
 }
