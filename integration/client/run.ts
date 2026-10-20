@@ -770,6 +770,10 @@ function openNats(raw: string, pass: string): Promise<NatsConnection> {
 
 if (NATS_URL) {
   const parts = natsParts(NATS_URL);
+  // The server's only account holds the real password, so a session that
+  // authenticates with the decoy proves the swap. The published body carries
+  // the decoy, and msg.string() must return that same body. Payloads are
+  // never rewritten.
   await once("nats", "nats tls CONNECT swaps the decoy password; publish and receive", async () => {
     const nc = await openNats(NATS_URL, parts.pass);
     try {
