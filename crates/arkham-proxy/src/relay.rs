@@ -350,24 +350,29 @@ where
     return Ok(UpgradeWait::Done);
   };
   // Local path writes first, so a pending write cannot lose the upgrade.
-  for before in [true, false] {
-    if before == local
-      && let Rewritten::Emit(out) = rewritten
+  if local {
+    if let Rewritten::Emit(out) = rewritten
       && write_or_stopped(server, out, responses_done, |source| request_chunk_error(responses, source))
         .await?
         .is_none()
     {
       return Ok(UpgradeWait::Done);
     }
-    if before == local && matches!(rewritten, Rewritten::Emit(_)) {
+    if matches!(rewritten, Rewritten::Emit(_)) {
       server.flush().await.map_err(|source| request_flush_error(responses, source))?;
     }
-    if before {
-      let _ = responses.send(if local {
-        ToResponse::Handoff(id)
-      } else {
-        ToResponse::ArmUpgrade(id)
-      });
+    let _ = responses.send(ToResponse::Handoff(id));
+  } else {
+    let _ = responses.send(ToResponse::ArmUpgrade(id));
+    if let Rewritten::Emit(out) = rewritten
+      && write_or_stopped(server, out, responses_done, |source| request_chunk_error(responses, source))
+        .await?
+        .is_none()
+    {
+      return Ok(UpgradeWait::Done);
+    }
+    if matches!(rewritten, Rewritten::Emit(_)) {
+      server.flush().await.map_err(|source| request_flush_error(responses, source))?;
     }
   }
   // Reading the guest stops here. That lockstep is what the upgrade needs.
@@ -935,16 +940,9 @@ mod tests {
     requests_tx.send(ToResponse::Handoff(3)).unwrap();
     let (upgrade_tx, mut upgrade_rx) = tokio::sync::mpsc::channel(1);
     let mut armed = false;
-    let step = on_upstream_chunk(
-      &mut guest_write,
-      &mut up,
-      &mut requests,
-      &mut armed,
-      &upgrade_tx,
-      &entry[..split],
-    )
-    .await
-    .unwrap();
+    let step = on_upstream_chunk(&mut guest_write, &mut up, &mut requests, &mut armed, &upgrade_tx, &entry[..split])
+      .await
+      .unwrap();
     match step {
       ChunkStep::Stay => {}
       ChunkStep::Upgrade(_) => panic!("handoff upgraded before the entry finished"),
@@ -957,16 +955,9 @@ mod tests {
       .expect("entry prefix")
       .unwrap();
     assert_eq!(got, entry[..split]);
-    let step = on_upstream_chunk(
-      &mut guest_write,
-      &mut up,
-      &mut requests,
-      &mut armed,
-      &upgrade_tx,
-      &entry[split..],
-    )
-    .await
-    .unwrap();
+    let step = on_upstream_chunk(&mut guest_write, &mut up, &mut requests, &mut armed, &upgrade_tx, &entry[split..])
+      .await
+      .unwrap();
     match step {
       ChunkStep::Upgrade(prefix) => assert!(prefix.is_empty(), "local handoff carries no unread tail"),
       ChunkStep::Stay => panic!("upgrade never followed the entry"),
