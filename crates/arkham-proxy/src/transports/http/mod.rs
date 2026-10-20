@@ -26,7 +26,9 @@ use rama::net::tls::ApplicationProtocol;
 use super::PairCtx;
 use super::{ServeStream, Transport};
 use crate::Error;
-use crate::connection::{GuestIo, HttpsCandidate, Prefixed, client_auth_policy, dial_marked, guest_leaf_der, optional_client_auth_policy};
+use crate::connection::{
+  GuestIo, HttpsCandidate, Prefixed, client_auth_policy, dial_marked, guest_leaf_der, optional_client_auth_policy, trust_anchors,
+};
 use crate::identity::{CandidateParams, Hello, read_client_hello, read_http_head};
 use crate::into_box_error;
 use crate::mint::MintHandle;
@@ -219,18 +221,40 @@ pub(crate) struct SubstitutionService {
   mint: Option<MintHandle>,
 }
 
-/// The trust bundle every hit names, or an error when they disagree.
+/// The trust bundle every hit names.
+///
+/// Two paths are one bundle when they hold the same certificates. A hit
+/// with a bundle and a hit without one are different bundles.
 fn shared_root(hits: &[(Grant, EndpointScope)], host: &str, port: u16) -> Result<Option<std::path::PathBuf>, Error> {
-  let Some((_, first)) = hits.first() else {
-    return Ok(None);
-  };
-  if hits.iter().any(|(_, scope)| scope.root_cert != first.root_cert) {
-    return Err(Error::SplitTrustBundle {
-      host: host.to_string(),
-      port,
-    });
+  let mut missing = false;
+  let mut chosen: Option<(std::path::PathBuf, Vec<Vec<u8>>)> = None;
+  for (_, scope) in hits {
+    let Some(path) = &scope.root_cert else {
+      if chosen.is_some() {
+        return Err(split_trust(host, port));
+      }
+      missing = true;
+      continue;
+    };
+    if missing {
+      return Err(split_trust(host, port));
+    }
+    let mut anchors: Vec<Vec<u8>> = trust_anchors(path)?.into_iter().map(|cert| cert.as_ref().to_vec()).collect();
+    anchors.sort_unstable();
+    match &chosen {
+      None => chosen = Some((path.clone(), anchors)),
+      Some((_, seen)) if seen == &anchors => {}
+      Some(_) => return Err(split_trust(host, port)),
+    }
   }
-  Ok(first.root_cert.clone())
+  Ok(chosen.map(|(path, _)| path))
+}
+
+fn split_trust(host: &str, port: u16) -> Error {
+  Error::SplitTrustBundle {
+    host: host.to_string(),
+    port,
+  }
 }
 
 fn https_candidates(hits: &[(Grant, EndpointScope)]) -> Result<Vec<HttpsCandidate>, Error> {
@@ -416,3 +440,59 @@ pub(crate) fn raw_tls_pair(ctx: &PairCtx<'_>) -> (Raw, Raw) {
 /// not a request head, so the reader stops instead of buffering an unbounded
 /// drip.
 pub(crate) const MAX_HEAD: usize = 64 * 1024;
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use arkham_config::grants::{Credential, GuestTlsMode};
+  use arkham_pki::ca::CertAuthority;
+  use secrecy::SecretString;
+
+  fn hit(port: u16, root: Option<std::path::PathBuf>) -> (Grant, EndpointScope) {
+    let grant = Grant::Token {
+      credential: Credential {
+        label: "user".into(),
+        fake: "fake".into(),
+        value: SecretString::from("real".to_string()),
+      },
+      allow: Vec::new(),
+      pattern: None,
+      oauth2: None,
+    };
+    let scope = EndpointScope {
+      scheme: Scheme::Https,
+      host: "127.0.0.1".parse().unwrap(),
+      port,
+      client_cert: None,
+      client_key: None,
+      root_cert: root,
+      guest_tls: GuestTlsMode::Tls,
+    };
+    (grant, scope)
+  }
+
+  #[test]
+  fn same_certificates_at_two_paths_are_one_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = CertAuthority::generate().unwrap();
+    let first = dir.path().join("a.pem");
+    let second = dir.path().join("b.pem");
+    std::fs::write(&first, ca.cert_pem()).unwrap();
+    std::fs::write(&second, ca.cert_pem()).unwrap();
+    let hits = vec![hit(6443, Some(first.clone())), hit(6443, Some(second))];
+    let chosen = shared_root(&hits, "127.0.0.1", 6443).expect("identical certificates agree");
+    assert_eq!(chosen.as_deref(), Some(first.as_path()));
+  }
+
+  #[test]
+  fn different_certificates_are_a_split_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("a.pem");
+    let second = dir.path().join("b.pem");
+    std::fs::write(&first, CertAuthority::generate().unwrap().cert_pem()).unwrap();
+    std::fs::write(&second, CertAuthority::generate().unwrap().cert_pem()).unwrap();
+    let hits = vec![hit(6443, Some(first)), hit(6443, Some(second))];
+    let err = shared_root(&hits, "127.0.0.1", 6443).expect_err("different certificates disagree");
+    assert!(matches!(err, Error::SplitTrustBundle { port: 6443, .. }), "{err}");
+  }
+}

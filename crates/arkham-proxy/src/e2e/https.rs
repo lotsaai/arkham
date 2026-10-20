@@ -1031,3 +1031,191 @@ async fn http2_real_client_and_server_round_trip_split_data() {
   stub_result.unwrap().unwrap().unwrap();
   proxy.abort();
 }
+
+struct SharedPairs {
+  client_cert: std::path::PathBuf,
+  client_key: std::path::PathBuf,
+  bundle: std::path::PathBuf,
+  bearer_bundle: std::path::PathBuf,
+  expected_leaf: rustls::pki_types::CertificateDer<'static>,
+  guest_pem: std::path::PathBuf,
+  guest_key: std::path::PathBuf,
+}
+
+/// Certificate grant files plus a second copy of the same CA. The two bundle
+/// paths are how a declared kubeconfig and an ambient one name one cluster.
+fn shared_pairs(ca: &CertAuthority, dir: &std::path::Path) -> SharedPairs {
+  use arkham_pki::ca::{generate_client_pair, load_or_generate_client_pair};
+  use rama::crypto::pem::PemEncode as _;
+
+  let (upstream_chain, upstream_key) = generate_client_pair(ca, "upstream-user").unwrap();
+  let mut upstream_pem = Vec::new();
+  for cert in &upstream_chain {
+    upstream_pem.extend_from_slice(cert.to_pem().as_bytes());
+  }
+  let client_cert = dir.join("kube-user-shared.client.crt");
+  let client_key = dir.join("kube-user-shared.client.key");
+  std::fs::write(&client_cert, &upstream_pem).unwrap();
+  std::fs::write(&client_key, upstream_key.to_pem()).unwrap();
+  let (guest_pem, guest_key) = load_or_generate_client_pair(ca, dir, "kube-user-shared").unwrap();
+  std::fs::copy(&guest_pem, dir.join("kube-user-shared.guest.crt")).unwrap();
+  let bundle = dir.join("ca.pem");
+  let bearer_bundle = dir.join("ca-bearer.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  std::fs::write(&bearer_bundle, ca.cert_pem()).unwrap();
+  SharedPairs {
+    client_cert,
+    client_key,
+    bundle,
+    bearer_bundle,
+    expected_leaf: upstream_chain.into_iter().next().unwrap(),
+    guest_pem,
+    guest_key,
+  }
+}
+
+fn https_scope(
+  port: u16,
+  guest_tls: GuestTlsMode,
+  cert: Option<std::path::PathBuf>,
+  key: Option<std::path::PathBuf>,
+  root: std::path::PathBuf,
+) -> EndpointScope {
+  EndpointScope {
+    scheme: Scheme::Https,
+    host: "localhost".parse().unwrap(),
+    port,
+    client_cert: cert,
+    client_key: key,
+    root_cert: Some(root),
+    guest_tls,
+  }
+}
+
+fn https_grant(label: &str, fake: &str, value: &str, scope: EndpointScope) -> Grant {
+  Grant::Token {
+    credential: Credential {
+      label: label.into(),
+      fake: fake.into(),
+      value: secrecy::SecretString::from(value.to_string()),
+    },
+    allow: vec![scope],
+    pattern: None,
+    oauth2: None,
+  }
+}
+
+fn guest_connector(ca: &CertAuthority, guest_pem: &std::path::Path, guest_key: &std::path::Path) -> TlsConnector {
+  use rustls::pki_types::pem::PemObject as _;
+  use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+  let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(guest_pem)
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+  let key = PrivateKeyDer::from_pem_file(guest_key).unwrap();
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(ca.cert_der().clone()).unwrap();
+  let mut config = rustls::ClientConfig::builder()
+    .with_root_certificates(roots)
+    .with_client_auth_cert(chain, key)
+    .unwrap();
+  config.alpn_protocols = vec![b"http/1.1".to_vec()];
+  TlsConnector::from(Arc::new(config))
+}
+
+/// Two https grants share a destination and name the same CA from different
+/// files. The presented guest certificate selects the certificate grant, and
+/// upstream sees that grant's client pair.
+#[tokio::test]
+async fn https_shared_destination_selects_the_presented_guest_cert() {
+  use arkham_pki::ca::generate_domain_pair;
+
+  const CERT_FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const CERT_VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const BEARER_FAKE: &str = "ghp_cccccccccccccccccccccccccccccccccccccccc";
+  const BEARER_VALUE: &str = "ghp_dddddddddddddddddddddddddddddddddddddddd";
+
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let pairs = shared_pairs(&ca, dir.path());
+
+  let (server_chain, server_key) = generate_domain_pair(&ca, "localhost").unwrap();
+  let mut trust = rustls::RootCertStore::empty();
+  trust.add(ca.cert_der().clone()).unwrap();
+  let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(trust))
+    .allow_unauthenticated()
+    .build()
+    .unwrap();
+  let server_config = Arc::new(
+    rustls::ServerConfig::builder()
+      .with_client_cert_verifier(verifier)
+      .with_single_cert(server_chain, server_key)
+      .unwrap(),
+  );
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = stub.local_addr().unwrap().port();
+  let expected_leaf = pairs.expected_leaf.clone();
+  let stub_task = tokio::spawn(async move {
+    let (stream, _) = stub.accept().await.unwrap();
+    let mut tls = TlsAcceptor::from(server_config).accept(stream).await.unwrap();
+    let peer = tls.get_ref().1.peer_certificates().and_then(|certs| certs.first().cloned());
+    let head = read_head_from(&mut tls).await;
+    tls.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await.unwrap();
+    (peer, head)
+  });
+
+  let grants = vec![
+    https_grant(
+      "cert-user",
+      CERT_FAKE,
+      CERT_VALUE,
+      https_scope(
+        stub_port,
+        GuestTlsMode::Mtls,
+        Some(pairs.client_cert),
+        Some(pairs.client_key),
+        pairs.bundle,
+      ),
+    ),
+    https_grant(
+      "bearer-user",
+      BEARER_FAKE,
+      BEARER_VALUE,
+      https_scope(stub_port, GuestTlsMode::Tls, None, None, pairs.bearer_bundle),
+    ),
+  ];
+  let state = test_state_with_plugins(grants, Vec::new(), &ca);
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+  let connector = guest_connector(&ca, &pairs.guest_pem, &pairs.guest_key);
+
+  let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
+  guest
+    .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\n\r\n").as_bytes())
+    .await
+    .unwrap();
+  let mut ok = [0u8; 19];
+  guest.read_exact(&mut ok).await.unwrap();
+  assert_eq!(&ok, b"HTTP/1.1 200 OK\r\n\r\n");
+  let mut tls = connector
+    .connect(ServerName::try_from("localhost".to_string()).unwrap(), guest)
+    .await
+    .unwrap();
+  tls.write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n").await.unwrap();
+  let head = read_head_from(&mut tls).await;
+  assert!(head.starts_with(b"HTTP/1.1 200 OK"), "{}", head.escape_ascii());
+  let (peer, upstream_head) = stub_task.await.unwrap();
+  assert_eq!(
+    peer.as_ref(),
+    Some(&expected_leaf),
+    "upstream sees the certificate grant's client pair"
+  );
+  assert!(
+    !upstream_head
+      .windows(BEARER_VALUE.len())
+      .any(|window| window == BEARER_VALUE.as_bytes()),
+    "the bearer grant's secret must not ride a certificate-selected connection"
+  );
+  proxy.abort();
+}
