@@ -396,6 +396,14 @@ pub enum Error {
     /// Secret length in bytes.
     len: usize,
   },
+  /// Retained AMQP payload exceeded the connection carry budget.
+  #[error("amqp carry holds {bytes} bytes across {entries} links")]
+  AmqpCarryBudget {
+    /// Total retained bytes.
+    bytes: usize,
+    /// Carry-map entries.
+    entries: usize,
+  },
   /// An SMTP TLS handshake exceeded the configured budget.
   #[error("smtp handshake timed out")]
   SmtpHandshakeTimeout,
