@@ -34,13 +34,13 @@ Across files, a later load's pattern overrides an earlier one regardless of tier
 
 ```sh
 arkham fake DEMO_TOKEN
-# fd0c437df7ae3abca3e37d89840b4503
+# f92b2afa339693227aa209aac3eb48f9
 
 arkham fake GH_TOKEN
 # ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142
 
 arkham fake GH_TOKEN --pattern 'acme_{base62:24}'
-# acme_yEXyMj1JqiTfFyxNXaoXx6n2
+# acme_7iJkET9b91ka42q9RKzEH6co
 ```
 
 `--pattern` overrides the registry for that invocation only.

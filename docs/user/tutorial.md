@@ -36,7 +36,7 @@ arkham fake DEMO_TOKEN
 ```
 
 ```
-fd0c437df7ae3abca3e37d89840b4503
+f92b2afa339693227aa209aac3eb48f9
 ```
 
 A decoy is deterministic for its env name, so the same name always yields the same value. Keep this one handy; you will paste it into a request in a moment.
@@ -93,13 +93,13 @@ In a third terminal:
 
 ```sh
 curl -x http://127.0.0.1:8080 http://127.0.0.1:8000/ \
-  -H 'Authorization: Bearer fd0c437df7ae3abca3e37d89840b4503'
+  -H 'Authorization: Bearer f92b2afa339693227aa209aac3eb48f9'
 ```
 
 The response body is what the client saw:
 
 ```
-upstream saw: Bearer fd0c437df7ae3abca3e37d89840b4503
+upstream saw: Bearer f92b2afa339693227aa209aac3eb48f9
 ```
 
 Now check what the upstream actually received:
@@ -121,7 +121,7 @@ Send the same request to a different port, one no allow entry covers:
 ```sh
 python3 -m http.server 8001 &
 curl -x http://127.0.0.1:8080 http://127.0.0.1:8001/ \
-  -H 'Authorization: Bearer fd0c437df7ae3abca3e37d89840b4503'
+  -H 'Authorization: Bearer f92b2afa339693227aa209aac3eb48f9'
 ```
 
 The proxy log records a splice, not a substitution, and the request carries the decoy untouched. A token exfiltrated this way is the decoy, useless outside the granted host.
@@ -151,14 +151,14 @@ Restart `arkham serve`, then:
 
 ```sh
 curl -x http://127.0.0.1:8080 https://example.com/ \
-  -H 'Authorization: Bearer fd0c437df7ae3abca3e37d89840b4503'
+  -H 'Authorization: Bearer f92b2afa339693227aa209aac3eb48f9'
 ```
 
 curl reports a certificate verification failure: the client does not yet trust arkham's CA. Retry with the CA trusted for this one command:
 
 ```sh
 curl --cacert ca.crt -x http://127.0.0.1:8080 https://example.com/ \
-  -H 'Authorization: Bearer fd0c437df7ae3abca3e37d89840b4503'
+  -H 'Authorization: Bearer f92b2afa339693227aa209aac3eb48f9'
 ```
 
 The request now completes. arkham terminated the TLS connection, substituted the header, and redacted any occurrence of the real value in the response back to the decoy.

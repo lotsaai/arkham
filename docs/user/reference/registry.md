@@ -42,17 +42,17 @@ token_url = "https://auth.example.com/oauth/token"
 authorize_url = "https://auth.example.com/authorize"  # authorization_code only
 refresh_url = "https://auth.example.com/refresh"    # optional
 rotates_refresh = false                            # optional, default false
-token_fields = []                                  # optional, default = RFC 6749 set
+token_fields = []
 ```
 
 | Field | Meaning |
 | --- | --- |
 | `flow` | Which flow the issuer runs. Decides the expected response fields: `authorization_code` (and any flow with `rotates_refresh = true`) also mints `refresh_token`. |
 | `token_url` | Token endpoint. Its authority is granted like `hosts`, so the endpoint is MITM'd. |
-| `authorize_url` | Authorize endpoint (`authorization_code` only; required there). Its authority is granted like `hosts`. A headless browser the agent drives reaches the authorize leg through the proxy, and the `code` in the redirect is minted the same way tokens are. |
+| `authorize_url` | Authorize endpoint (`authorization_code` only; required there). Its authority is granted like `hosts`. |
 | `refresh_url` | Refresh endpoint when it differs from `token_url`. |
 | `rotates_refresh` | `true` when the issuer issues a new `refresh_token` on every refresh (RFC 6749 §6). Each rotated value mints its own decoy. |
-| `token_fields` | Response body fields to mint. Default follows the flow; override only for deviant envelopes (e.g. a wrapped `{"data": {...}}` body). |
+| `token_fields` | Top-level JSON field names to mint. An empty list uses the flow default. |
 
 The flow block overrides across layers like the other fields: `replace = true` discards an earlier layer's flow, and a later file's flow wins. A rule's own `oauth2` block (in `arkham.toml`) overrides the registry's.
 
