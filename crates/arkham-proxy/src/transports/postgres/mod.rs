@@ -217,23 +217,23 @@ impl Transport for PostgresTransport {
     let upstream_name = scope.upstream.host.as_str();
     let postgres = &state.postgres;
     match (guest_tls, accepted) {
-      (None, false) => relay(Prefixed::new(guest_head, guest), upstream, &ctx, budget).await,
+      (None, false) => relay(Prefixed::new(guest_head, guest), upstream, &ctx, scope, budget).await,
       (Some((hello_buf, identity)), false) => {
         let plain = postgres
           .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
           .await?;
-        relay(plain, upstream, &ctx, budget).await
+        relay(plain, upstream, &ctx, scope, budget).await
       }
       (None, true) => {
         let plain = postgres.connect_server(scope, upstream_name, upstream).await?;
-        relay(Prefixed::new(guest_head, guest), plain, &ctx, budget).await
+        relay(Prefixed::new(guest_head, guest), plain, &ctx, scope, budget).await
       }
       (Some((hello_buf, identity)), true) => {
         let guest_plain = postgres
           .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
           .await?;
         let server_plain = postgres.connect_server(scope, upstream_name, upstream).await?;
-        relay(guest_plain, server_plain, &ctx, budget).await
+        relay(guest_plain, server_plain, &ctx, scope, budget).await
       }
     }
   }
@@ -241,13 +241,13 @@ impl Transport for PostgresTransport {
 
 /// Pump one settled pair: both legs are plaintext by the time this runs,
 /// whichever transports carried them there.
-async fn relay<G, S>(mut guest: G, mut server: S, ctx: &PairCtx<'_>, budget: Duration) -> Result<(), Error>
+async fn relay<G, S>(mut guest: G, mut server: S, ctx: &PairCtx<'_>, scope: &PostgresScope, budget: Duration) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
 {
   let (mut downstream_machine, mut upstream_machine) = postgres_pair(ctx);
-  let auth::Prelude::Relay(tail) = auth::settle(&mut guest, &mut server, &mut downstream_machine, ctx, budget).await? else {
+  let auth::Prelude::Relay(tail) = auth::settle(&mut guest, &mut server, &mut downstream_machine, scope, budget).await? else {
     return Ok(());
   };
   relay_guarded(guest, server, &mut downstream_machine, &mut upstream_machine, &[], &tail).await

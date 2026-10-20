@@ -11,9 +11,10 @@ use pgwire::messages::{DecodeContext, Message as _, PgWireBackendMessage, PgWire
 use secrecy::ExposeSecret as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
+use arkham_config::grants::PostgresScope;
+
 use super::machine::{MAX_GREETING, Postgres};
 use crate::Error;
-use crate::transports::PairCtx;
 use crate::transports::engine::{Rewritten, Wire as _};
 
 /// Outcome of the authentication prelude.
@@ -26,6 +27,9 @@ pub(super) enum Prelude {
 
 /// Finish authentication before the byte relay.
 ///
+/// `scope` is the postgres grant already matched for this connection, so
+/// SCRAM still terminates when the captured host is an address.
+///
 /// # Errors
 ///
 /// Returns an error when a frame exceeds the greeting cap, a read times out,
@@ -34,7 +38,7 @@ pub(super) async fn settle<G, S>(
   guest: &mut G,
   server: &mut S,
   downstream: &mut Postgres,
-  ctx: &PairCtx<'_>,
+  scope: &PostgresScope,
   budget: Duration,
 ) -> Result<Prelude, Error>
 where
@@ -55,13 +59,14 @@ where
         if !mechanisms.iter().any(|mechanism| mechanism == SCRAM_SHA_256_METHOD) {
           return Ok(Prelude::Relay(snapshot));
         }
-        let Some((fake, real)) = leg_passwords(ctx) else {
-          return Ok(Prelude::Relay(snapshot));
-        };
-        let Some(user) = scram_user(&startup, ctx) else {
+        let (fake, real) = leg_passwords(scope);
+        let Some(user) = scram_user(&startup, scope) else {
           return Ok(Prelude::Relay(snapshot));
         };
         return run_scram(guest, &mut server_frames, budget, &user, &fake, &real).await;
+      }
+      Some(message @ (PgWireBackendMessage::NoticeResponse(_) | PgWireBackendMessage::NegotiateProtocolVersion(_))) => {
+        write_backend(guest, &message).await?;
       }
       Some(_) => return Ok(Prelude::Relay(snapshot)),
       None => {
@@ -121,7 +126,7 @@ where
     GuestProof::Refused => return Ok(Prelude::Close),
     GuestProof::Proved(verifier) => verifier,
   };
-  let Some(tail) = prove_upstream(server, user, real).await? else {
+  let Some(tail) = prove_upstream(guest, server, user, real).await? else {
     write_backend(guest, &auth_failed()).await?;
     return Ok(Prelude::Close);
   };
@@ -199,8 +204,9 @@ where
   }
 }
 
-async fn prove_upstream<S>(server: &mut Frames<&mut S>, user: &str, real: &str) -> Result<Option<Vec<u8>>, Error>
+async fn prove_upstream<G, S>(guest: &mut G, server: &mut Frames<&mut S>, user: &str, real: &str) -> Result<Option<Vec<u8>>, Error>
 where
+  G: AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
 {
   let client = ScramClientAuth::new(user.to_owned(), real.to_owned());
@@ -213,8 +219,14 @@ where
       )),
     ))
     .await?;
-  let Some(PgWireBackendMessage::Authentication(Authentication::SASLContinue(continue_data))) = server.next_backend().await? else {
-    return Ok(None);
+  let continue_data = loop {
+    match server.next_backend().await? {
+      Some(PgWireBackendMessage::Authentication(Authentication::SASLContinue(data))) => break data,
+      Some(message @ (PgWireBackendMessage::NoticeResponse(_) | PgWireBackendMessage::NegotiateProtocolVersion(_))) => {
+        write_backend(guest, &message).await?;
+      }
+      _ => return Ok(None),
+    }
   };
   let (client_final, waiting_final) = waiting_server.build_client_final(&continue_data).map_err(scram_err)?;
   server
@@ -234,7 +246,15 @@ where
       Some(PgWireBackendMessage::Authentication(_)) => {
         return Err(scram_err(short("postgres authentication message is not scram")));
       }
-      Some(PgWireBackendMessage::ErrorResponse(_)) | None => return Ok(None),
+      Some(PgWireBackendMessage::ErrorResponse(message)) => {
+        if !saw_final {
+          return Ok(None);
+        }
+        tail.extend(encode_backend(&PgWireBackendMessage::ErrorResponse(message))?);
+        tail.extend_from_slice(&server.buf);
+        break;
+      }
+      None => return Ok(None),
       Some(PgWireBackendMessage::ReadyForQuery(message)) => {
         tail.extend(encode_backend(&PgWireBackendMessage::ReadyForQuery(message))?);
         tail.extend_from_slice(&server.buf);
@@ -246,12 +266,11 @@ where
   Ok(saw_final.then_some(tail))
 }
 
-fn scram_user(startup: &[u8], ctx: &PairCtx<'_>) -> Option<String> {
+fn scram_user(startup: &[u8], scope: &PostgresScope) -> Option<String> {
   let parsed = startup_user(startup).filter(|user| !user.is_empty());
   if parsed.is_some() {
     return parsed;
   }
-  let scope = ctx.grants.iter().find_map(|grant| grant.postgres(Some(ctx.host), ctx.port))?;
   scope
     .upstream
     .user
@@ -267,12 +286,11 @@ fn startup_user(startup: &[u8]) -> Option<String> {
   decoded.parameters.get("user").filter(|user| !user.is_empty()).cloned()
 }
 
-fn leg_passwords(ctx: &PairCtx<'_>) -> Option<(String, String)> {
-  let scope = ctx.grants.iter().find_map(|grant| grant.postgres(Some(ctx.host), ctx.port))?;
-  Some((
+fn leg_passwords(scope: &PostgresScope) -> (String, String) {
+  (
     scope.downstream.password.expose_secret().to_owned(),
     scope.upstream.password.expose_secret().to_owned(),
-  ))
+  )
 }
 
 fn auth_failed() -> PgWireBackendMessage {
@@ -417,13 +435,16 @@ mod tests {
   use std::sync::OnceLock;
   use std::time::Instant;
 
-  use arkham_config::grants::{Credential, Grant, PostgresScope};
+  use arkham_config::grants::{Credential, Grant};
   use arkham_plugin::Registry;
   use pgwire::api::auth::sasl::SCRAM_SHA_256_PLUS_METHOD;
+  use pgwire::messages::response::{NoticeResponse, ReadyForQuery, TransactionStatus};
+  use pgwire::messages::startup::NegotiateProtocolVersion;
   use secrecy::SecretString;
   use tokio::io::duplex;
 
   use super::*;
+  use crate::transports::PairCtx;
   use crate::transports::engine::Direction;
 
   const FAKE: &str = "arkham_fake_pg_pass"; // betterleaks:allow
@@ -484,26 +505,27 @@ mod tests {
     encode_backend(message).expect("backend message encodes")
   }
 
-  async fn read_backend<R>(reader: &mut R) -> PgWireBackendMessage
+  async fn read_backend<R>(reader: &mut R, buf: &mut BytesMut) -> PgWireBackendMessage
   where
     R: AsyncRead + Unpin,
   {
-    read_decoded(reader, DecodeContext::default(), PgWireBackendMessage::decode)
+    read_decoded(reader, buf, DecodeContext::default(), PgWireBackendMessage::decode)
       .await
       .expect("backend message")
   }
 
-  async fn read_frontend<R>(reader: &mut R) -> PgWireFrontendMessage
+  async fn read_frontend<R>(reader: &mut R, buf: &mut BytesMut) -> PgWireFrontendMessage
   where
     R: AsyncRead + Unpin,
   {
-    read_decoded(reader, password_ctx(), PgWireFrontendMessage::decode)
+    read_decoded(reader, buf, password_ctx(), PgWireFrontendMessage::decode)
       .await
       .expect("frontend message")
   }
 
   async fn read_decoded<R, T, E>(
     reader: &mut R,
+    buf: &mut BytesMut,
     ctx: DecodeContext,
     decode: impl Fn(&mut BytesMut, &DecodeContext) -> Result<Option<T>, E>,
   ) -> Option<T>
@@ -511,10 +533,9 @@ mod tests {
     R: AsyncRead + Unpin,
     E: std::fmt::Debug,
   {
-    let mut buf = BytesMut::new();
     let mut tmp = [0u8; 1024];
     loop {
-      if let Some(message) = decode(&mut buf, &ctx).expect("frame decodes") {
+      if let Some(message) = decode(buf, &ctx).expect("frame decodes") {
         return Some(message);
       }
       let read = reader.read(&mut tmp).await.expect("read");
@@ -525,13 +546,13 @@ mod tests {
     }
   }
 
-  async fn prove_decoy<G>(guest: &mut G, startup: &[u8])
+  async fn prove_decoy<G>(guest: &mut G, startup: &[u8], buf: &mut BytesMut)
   where
     G: AsyncRead + AsyncWrite + Unpin,
   {
     guest.write_all(startup).await.expect("startup");
     guest.flush().await.expect("startup flush");
-    let PgWireBackendMessage::Authentication(Authentication::SASL(mechanisms)) = read_backend(guest).await else {
+    let PgWireBackendMessage::Authentication(Authentication::SASL(mechanisms)) = read_backend(guest, buf).await else {
       panic!("guest offer");
     };
     assert!(mechanisms.iter().any(|mechanism| mechanism == SCRAM_SHA_256_METHOD));
@@ -544,7 +565,7 @@ mod tests {
     )));
     guest.write_all(&encode_message(&initial)).await.expect("client first write");
     guest.flush().await.expect("client first flush");
-    let PgWireBackendMessage::Authentication(Authentication::SASLContinue(data)) = read_backend(guest).await else {
+    let PgWireBackendMessage::Authentication(Authentication::SASLContinue(data)) = read_backend(guest, buf).await else {
       panic!("guest continue");
     };
     let (client_final, _) = waiting.build_client_final(&data).expect("client final");
@@ -573,8 +594,9 @@ mod tests {
     let (server_peer, mut server) = duplex(64 * 1024);
     let startup = startup_message(Some("app"));
     let guest_task = tokio::spawn(async move {
-      prove_decoy(&mut guest, &startup).await;
-      read_backend(&mut guest).await
+      let mut buf = BytesMut::new();
+      prove_decoy(&mut guest, &startup, &mut buf).await;
+      read_backend(&mut guest, &mut buf).await
     });
     let server_task = tokio::spawn(async move {
       let () = read_startup(&mut server).await;
@@ -583,7 +605,8 @@ mod tests {
       ])));
       server.write_all(&offer).await.expect("offer");
       server.flush().await.expect("offer flush");
-      let _ = read_frontend(&mut server).await;
+      let mut buf = BytesMut::new();
+      let _ = read_frontend(&mut server, &mut buf).await;
       let refusal = backend(&PgWireBackendMessage::ErrorResponse(ErrorResponse::new(vec![
         (b'S', "FATAL".into()),
         (b'C', "28P01".into()),
@@ -601,10 +624,11 @@ mod tests {
       plugins,
       mint: None,
     };
+    let scope = matched(&grants);
     let mut downstream = Postgres::new(&grants, ctx.host, ctx.port, Direction::Downstream);
     let mut guest_peer = guest_peer;
     let mut server_peer = server_peer;
-    let outcome = settle(&mut guest_peer, &mut server_peer, &mut downstream, &ctx, Duration::from_secs(2))
+    let outcome = settle(&mut guest_peer, &mut server_peer, &mut downstream, scope, Duration::from_secs(2))
       .await
       .expect("upstream refusal closes");
     assert!(matches!(outcome, Prelude::Close));
@@ -647,15 +671,6 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn scram_without_a_grant_is_forwarded_unchanged() {
-    let offer = backend(&PgWireBackendMessage::Authentication(Authentication::SASL(vec![
-      SCRAM_SHA_256_METHOD.to_owned(),
-    ])));
-    let seen = forwarded_offer(&offer, &[], Some("app")).await;
-    assert_eq!(seen, offer);
-  }
-
-  #[tokio::test]
   async fn scram_without_a_user_is_forwarded_unchanged() {
     let offer = backend(&PgWireBackendMessage::Authentication(Authentication::SASL(vec![
       SCRAM_SHA_256_METHOD.to_owned(),
@@ -691,10 +706,11 @@ mod tests {
       plugins,
       mint: None,
     };
+    let scope = matched(grants);
     let mut downstream = Postgres::new(grants, ctx.host, ctx.port, Direction::Downstream);
     let mut guest_peer = guest_peer;
     let mut server_peer = server_peer;
-    let outcome = settle(&mut guest_peer, &mut server_peer, &mut downstream, &ctx, Duration::from_secs(2))
+    let outcome = settle(&mut guest_peer, &mut server_peer, &mut downstream, scope, Duration::from_secs(2))
       .await
       .expect("fallback relays");
     guest_task.await.expect("guest");
@@ -732,17 +748,19 @@ mod tests {
     let (server_peer, mut server) = duplex(64 * 1024);
     let startup = startup_message(Some("app"));
     let guest_task = tokio::spawn(async move {
-      prove_decoy(&mut guest, &startup).await;
+      let mut buf = BytesMut::new();
+      prove_decoy(&mut guest, &startup, &mut buf).await;
       std::future::pending::<()>().await;
     });
     let server_task = tokio::spawn(async move {
+      let mut buf = BytesMut::new();
       read_startup(&mut server).await;
       let offer = backend(&PgWireBackendMessage::Authentication(Authentication::SASL(vec![
         SCRAM_SHA_256_METHOD.to_owned(),
       ])));
       server.write_all(&offer).await.expect("offer");
       server.flush().await.expect("offer flush");
-      let PgWireFrontendMessage::PasswordMessageFamily(family) = read_frontend(&mut server).await else {
+      let PgWireFrontendMessage::PasswordMessageFamily(family) = read_frontend(&mut server, &mut buf).await else {
         panic!("upstream client first");
       };
       let initial = family.into_sasl_initial_response().expect("sasl initial");
@@ -756,7 +774,7 @@ mod tests {
       )));
       server.write_all(&continue_message).await.expect("continue");
       server.flush().await.expect("continue flush");
-      let _ = read_frontend(&mut server).await;
+      let _ = read_frontend(&mut server, &mut buf).await;
       let late = backend(&PgWireBackendMessage::Authentication(authentication));
       server.write_all(&late).await.expect("late");
       server.flush().await.expect("late flush");
@@ -771,12 +789,230 @@ mod tests {
       plugins,
       mint: None,
     };
+    let scope = matched(&grants);
     let mut downstream = Postgres::new(&grants, ctx.host, ctx.port, Direction::Downstream);
     let mut guest_peer = guest_peer;
     let mut server_peer = server_peer;
-    let outcome = settle(&mut guest_peer, &mut server_peer, &mut downstream, &ctx, Duration::from_secs(2)).await;
+    let outcome = settle(&mut guest_peer, &mut server_peer, &mut downstream, scope, Duration::from_secs(2)).await;
     guest_task.abort();
     server_task.abort();
     outcome
+  }
+
+  fn ready_frame() -> Vec<u8> {
+    backend(&PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)))
+  }
+
+  fn has_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|window| window == needle)
+  }
+
+  async fn note_until_ok<G>(guest: &mut G, startup: &[u8]) -> Vec<String>
+  where
+    G: AsyncRead + AsyncWrite + Unpin,
+  {
+    guest.write_all(startup).await.expect("startup");
+    guest.flush().await.expect("startup flush");
+    let mut notes = Vec::new();
+    let mut buf = BytesMut::new();
+    let PgWireBackendMessage::Authentication(Authentication::SASL(mechanisms)) = next_meaningful(guest, &mut buf, &mut notes).await else {
+      panic!("guest offer");
+    };
+    assert!(mechanisms.iter().any(|mechanism| mechanism == SCRAM_SHA_256_METHOD));
+    let (client_first, waiting) = ScramClientAuth::new("app".into(), FAKE.into())
+      .build_client_first()
+      .expect("client first");
+    let initial = PgWireFrontendMessage::PasswordMessageFamily(PasswordMessageFamily::SASLInitialResponse(SASLInitialResponse::new(
+      SCRAM_SHA_256_METHOD.into(),
+      Some(bytes::Bytes::from(client_first)),
+    )));
+    guest.write_all(&encode_message(&initial)).await.expect("client first write");
+    guest.flush().await.expect("client first flush");
+    let PgWireBackendMessage::Authentication(Authentication::SASLContinue(data)) = next_meaningful(guest, &mut buf, &mut notes).await
+    else {
+      panic!("guest continue");
+    };
+    let (client_final, _) = waiting.build_client_final(&data).expect("client final");
+    let response = PgWireFrontendMessage::PasswordMessageFamily(PasswordMessageFamily::SASLResponse(SASLResponse::new(
+      bytes::Bytes::from(client_final),
+    )));
+    guest.write_all(&encode_message(&response)).await.expect("client final write");
+    guest.flush().await.expect("client final flush");
+    let PgWireBackendMessage::Authentication(Authentication::SASLFinal(_)) = next_meaningful(guest, &mut buf, &mut notes).await else {
+      panic!("guest server final");
+    };
+    let PgWireBackendMessage::Authentication(Authentication::Ok) = next_meaningful(guest, &mut buf, &mut notes).await else {
+      panic!("guest authentication did not finish");
+    };
+    notes
+  }
+
+  async fn next_meaningful<G>(guest: &mut G, buf: &mut BytesMut, notes: &mut Vec<String>) -> PgWireBackendMessage
+  where
+    G: AsyncRead + Unpin,
+  {
+    loop {
+      match read_backend(guest, buf).await {
+        PgWireBackendMessage::NoticeResponse(notice) => {
+          notes.extend(notice.fields.into_iter().map(|(_, value)| value));
+        }
+        PgWireBackendMessage::NegotiateProtocolVersion(version) => {
+          notes.push(format!("negotiate:{}", version.newest_minor_protocol));
+        }
+        message => return message,
+      }
+    }
+  }
+
+  async fn play_upstream<S>(server: &mut S, preamble: &[Vec<u8>], after_first: &[Vec<u8>], trailer: &[Vec<u8>])
+  where
+    S: AsyncRead + AsyncWrite + Unpin,
+  {
+    read_startup(server).await;
+    let mut buf = BytesMut::new();
+    for frame in preamble {
+      server.write_all(frame).await.expect("preamble");
+    }
+    let offer = backend(&PgWireBackendMessage::Authentication(Authentication::SASL(vec![
+      SCRAM_SHA_256_METHOD.to_owned(),
+    ])));
+    server.write_all(&offer).await.expect("offer");
+    server.flush().await.expect("offer flush");
+    let PgWireFrontendMessage::PasswordMessageFamily(family) = read_frontend(server, &mut buf).await else {
+      panic!("upstream client first");
+    };
+    let initial = family.into_sasl_initial_response().expect("sasl initial");
+    let salt = base64::engine::general_purpose::STANDARD.decode(random_nonce()).expect("salt");
+    let salted = gen_salted_password(REAL, &salt, SCRAM_ITERATIONS);
+    let (server_first, waiting) = ScramServerAuth::new()
+      .on_client_first_message(initial.data.as_deref().expect("client first"), Password::new(Some(salt), salted))
+      .expect("server first");
+    for frame in after_first {
+      server.write_all(frame).await.expect("mid-authentication");
+    }
+    let continue_message = backend(&PgWireBackendMessage::Authentication(Authentication::SASLContinue(
+      bytes::Bytes::from(server_first),
+    )));
+    server.write_all(&continue_message).await.expect("continue");
+    server.flush().await.expect("continue flush");
+    let PgWireFrontendMessage::PasswordMessageFamily(family) = read_frontend(server, &mut buf).await else {
+      panic!("upstream client final");
+    };
+    let response = family.into_sasl_response().expect("sasl response");
+    let server_final = waiting.on_client_final_message(&response.data).expect("server final");
+    let final_message = backend(&PgWireBackendMessage::Authentication(Authentication::SASLFinal(
+      bytes::Bytes::from(server_final),
+    )));
+    server.write_all(&final_message).await.expect("server final");
+    for frame in trailer {
+      server.write_all(frame).await.expect("trailer");
+    }
+    server.flush().await.expect("trailer flush");
+  }
+
+  fn matched(grants: &[Grant]) -> &PostgresScope {
+    grants
+      .iter()
+      .find_map(|grant| grant.postgres(Some("db.internal"), 5432))
+      .expect("matched scope")
+  }
+
+  async fn settle_script(
+    host: &str,
+    preamble: Vec<Vec<u8>>,
+    after_first: Vec<Vec<u8>>,
+    trailer: Vec<Vec<u8>>,
+  ) -> Result<(Prelude, Vec<String>), Error> {
+    let (guest_peer, mut guest) = duplex(64 * 1024);
+    let (server_peer, mut server) = duplex(64 * 1024);
+    let startup = startup_message(Some("app"));
+    let guest_task = tokio::spawn(async move { note_until_ok(&mut guest, &startup).await });
+    let server_task = tokio::spawn(async move { play_upstream(&mut server, &preamble, &after_first, &trailer).await });
+    let grants = [grant()];
+    let plugins = registry();
+    let ctx = PairCtx {
+      grants: &grants,
+      host,
+      port: 5432,
+      plugins,
+      mint: None,
+    };
+    let scope = matched(&grants);
+    let mut downstream = Postgres::new(&grants, ctx.host, ctx.port, Direction::Downstream);
+    let mut guest_peer = guest_peer;
+    let mut server_peer = server_peer;
+    let outcome = settle(&mut guest_peer, &mut server_peer, &mut downstream, scope, Duration::from_secs(2)).await;
+    let ready = ready_frame();
+    let finished = matches!(&outcome, Ok(Prelude::Relay(tail)) if has_bytes(tail, &ready));
+    if !finished {
+      guest_task.abort();
+      server_task.abort();
+      return outcome.map(|prelude| (prelude, Vec::new()));
+    }
+    let notes = guest_task.await.expect("guest");
+    server_task.abort();
+    assert!(
+      notes.iter().all(|note| !note.contains("28P01")),
+      "guest saw an authentication failure: {notes:?}"
+    );
+    outcome.map(|prelude| (prelude, notes))
+  }
+
+  #[tokio::test]
+  async fn post_auth_fatal_is_relayed() {
+    let fatal = backend(&PgWireBackendMessage::ErrorResponse(ErrorResponse::new(vec![
+      (b'S', "FATAL".into()),
+      (b'C', "3D000".into()),
+      (b'M', "database \"main\" does not exist".into()),
+    ])));
+    let outcome = settle_script("db.internal", Vec::new(), Vec::new(), vec![fatal]).await;
+    let Ok((Prelude::Relay(tail), _)) = outcome else {
+      panic!("post-auth fatal was reported as an authentication failure");
+    };
+    assert!(has_bytes(&tail, b"3D000"), "missing database code was not relayed");
+    assert!(has_bytes(&tail, b"does not exist"), "missing database text was not relayed");
+    assert!(!has_bytes(&tail, b"28P01"), "post-auth fatal was rewritten as 28P01");
+  }
+
+  #[tokio::test]
+  async fn startup_notice_and_negotiate_still_finish_scram() {
+    let negotiate = backend(&PgWireBackendMessage::NegotiateProtocolVersion(NegotiateProtocolVersion::new(
+      2,
+      Vec::new(),
+    )));
+    let startup_notice = backend(&PgWireBackendMessage::NoticeResponse(NoticeResponse::new(vec![(
+      b'M',
+      "startup-notice".into(),
+    )])));
+    let mid_notice = backend(&PgWireBackendMessage::NoticeResponse(NoticeResponse::new(vec![(
+      b'M',
+      "inside-notice".into(),
+    )])));
+    let (outcome, notes) = settle_script(
+      "db.internal",
+      vec![negotiate, startup_notice],
+      vec![mid_notice],
+      vec![ready_frame()],
+    )
+    .await
+    .expect("notices stay inside scram");
+    let Prelude::Relay(tail) = outcome else {
+      panic!("startup notice closed the session");
+    };
+    assert!(has_bytes(&tail, &ready_frame()), "scram did not finish");
+    assert!(notes.iter().any(|note| note == "negotiate:2"), "{notes:?}");
+    assert!(notes.iter().any(|note| note == "startup-notice"), "{notes:?}");
+    assert!(notes.iter().any(|note| note == "inside-notice"), "{notes:?}");
+  }
+
+  #[tokio::test]
+  async fn ip_identity_still_terminates_scram() {
+    let (outcome, _) = settle_script("10.202.0.30", Vec::new(), Vec::new(), vec![ready_frame()])
+      .await
+      .expect("captured ip still terminates scram");
+    let Prelude::Relay(tail) = outcome else {
+      panic!("captured ip closed the session");
+    };
+    assert!(has_bytes(&tail, &ready_frame()), "scram did not finish");
   }
 }
