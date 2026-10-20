@@ -121,22 +121,11 @@ fn generate_host_key(path: &Path) -> Result<SshKey, Error> {
 }
 
 /// One `known_hosts` line pinning `key` for `host:port`, OpenSSH's own shape:
-/// `[host]:port` for non-default ports, the bare host for 22. The pinned
-/// blob is these lines, and russh's verifier reads them back.
+/// `[host]:port` for non-default ports, the bare host for 22.
 ///
 /// # Errors
 ///
-/// Returns [`Error::SshKeygen`] when encoding the public half fails.
-pub fn known_hosts_line(host: &str, port: u16, key: &SshKey) -> Result<String, Error> {
-  known_hosts_line_for_public(host, port, key.public())
-}
-
-/// One `known_hosts` line pinning an arbitrary public key for `host:port`,
-/// the same shape [`known_hosts_line`] renders for a whole key pair.
-///
-/// # Errors
-///
-/// Returns [`Error::SshKeygen`] when encoding the public half fails.
+/// Returns [`Error::SshKeygen`] when encoding the public key fails.
 pub fn known_hosts_line_for_public(host: &str, port: u16, key: &PublicKey) -> Result<String, Error> {
   let name = if port == 22 { host.to_string() } else { format!("[{host}]:{port}") };
   Ok(format!(
@@ -157,17 +146,23 @@ pub fn pinned_host_keys(host: &str, port: u16, path: &Path) -> Result<Vec<(usize
 }
 
 /// Append a first-seen host key line, OpenSSH's `accept-new` recording half.
-/// The caller owns the policy: this only writes, never verifies.
+/// The caller owns the policy: this only writes, never verifies. A missing
+/// file is created.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Io`] when the file cannot be written.
+/// Returns [`Error::Io`] when the file cannot be read or written. Returns
+/// [`Error::SshKeygen`] when encoding the public key fails.
 pub fn append_known_host(host: &str, port: u16, key: &PublicKey, path: &Path) -> Result<(), Error> {
   let line = known_hosts_line_for_public(host, port, key)?;
   if let Some(dir) = path.parent() {
     std::fs::create_dir_all(dir)?;
   }
-  let mut text = std::fs::read_to_string(path).unwrap_or_default();
+  let mut text = match std::fs::read_to_string(path) {
+    Ok(text) => text,
+    Err(err) if err.kind() == ErrorKind::NotFound => String::new(),
+    Err(source) => return Err(Error::Io(source)),
+  };
   if !text.is_empty() && !text.ends_with('\n') {
     text.push('\n');
   }
@@ -227,12 +222,35 @@ mod tests {
     let key = SshKey::generate().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("known_hosts");
-    fs::write(&path, format!("{}\n", known_hosts_line("git.example", 2222, &key).unwrap())).unwrap();
+    fs::write(
+      &path,
+      format!("{}\n", known_hosts_line_for_public("git.example", 2222, key.public()).unwrap()),
+    )
+    .unwrap();
     let matched = known_host_keys_path("git.example", 2222, &path).unwrap();
     assert_eq!(matched.len(), 1);
     assert_eq!(&matched[0].1, key.public());
 
-    let line = known_hosts_line("git.example", 22, &key).unwrap();
+    let line = known_hosts_line_for_public("git.example", 22, key.public()).unwrap();
     assert!(line.starts_with("git.example ssh-ed25519 "), "{line}");
+  }
+
+  #[test]
+  fn append_known_host_creates_a_missing_file_and_keeps_a_bad_read() {
+    let key = SshKey::generate().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let missing = dir.path().join("missing_known_hosts");
+    append_known_host("git.example", 22, key.public(), &missing).unwrap();
+    let matched = known_host_keys_path("git.example", 22, &missing).unwrap();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(&matched[0].1, key.public());
+
+    let bad = dir.path().join("bad_known_hosts");
+    let original = [0xff, 0xfe];
+    fs::write(&bad, original).unwrap();
+    let err = append_known_host("git.example", 22, key.public(), &bad).unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err}");
+    assert_eq!(fs::read(&bad).unwrap(), original);
   }
 }
