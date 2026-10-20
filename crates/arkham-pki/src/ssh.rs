@@ -35,6 +35,13 @@ impl SshKey {
     Ok(Self { key })
   }
 
+  /// Build the ed25519 pair `seed` names. The same 32 bytes are the same key.
+  #[must_use]
+  pub fn from_seed(seed: &[u8; 32]) -> Self {
+    let key = PrivateKey::from(russh::keys::ssh_key::private::Ed25519Keypair::from_seed(seed));
+    Self { key }
+  }
+
   /// Decode an unencrypted openssh private key from its file text.
   ///
   /// # Errors
@@ -193,6 +200,18 @@ mod tests {
     assert!(text.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"), "{text}");
     let reloaded = SshKey::from_openssh(&text).unwrap();
     assert_eq!(reloaded.public(), key.public());
+  }
+
+  #[test]
+  fn from_seed_is_stable_and_differs_from_the_real_key() {
+    let seed = [9u8; 32];
+    let first = SshKey::from_seed(&seed);
+    let second = SshKey::from_seed(&seed);
+    assert_eq!(first.public(), second.public());
+    let real = SshKey::generate().unwrap();
+    assert_ne!(first.public(), real.public());
+    let reloaded = SshKey::from_openssh(&first.to_openssh().unwrap()).unwrap();
+    assert_eq!(reloaded.public(), first.public());
   }
 
   #[test]

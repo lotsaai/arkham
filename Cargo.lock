@@ -398,6 +398,7 @@ dependencies = [
  "dirs 6.0.0",
  "gix-config",
  "gix-discover",
+ "glob",
  "libc",
  "nkeys",
  "pretty_assertions",
@@ -406,7 +407,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "shellexpand",
+ "ssh2-config",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -443,6 +446,7 @@ dependencies = [
  "tracing",
  "url",
  "validator",
+ "wildmatch",
 ]
 
 [[package]]
@@ -9351,6 +9355,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssh2-config"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7220846f1080bafaf80204d7268f7e2a1fb0609e34520d2edc3e75cfc55f4c38"
+dependencies = [
+ "bitflags 2.13.2",
+ "dirs 7.0.0",
+ "glob",
+ "log",
+ "thiserror 2.0.21",
+ "wildmatch",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11139,6 +11157,12 @@ checksum = "f9b0540e91e49de3817c314da0dd3bc518093ceacc6ea5327cb0e1eb073e5189"
 dependencies = [
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "wildmatch"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29333c3ea1ba8b17211763463ff24ee84e41c78224c16b001cd907e663a38c68"
 
 [[package]]
 name = "winapi"

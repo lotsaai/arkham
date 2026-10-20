@@ -74,7 +74,7 @@ In `/home/eng/.config/nats`, contexts `demo` and `Demo` both use tls on host `na
 
 ## SSH
 
-One call per host block the existing adapter already grants. The name is `HostName` or `patterns[0]`. This change leaves `*`, `?`, `!`, `Include`, and `Match` unparsed. The decoy key is seeded from `key_seed()`. #65 adds `SshKey::from_seed`. The username is forwarded. Nothing compares it with a grant field. Password auth stays rejected. SSH selection happens in the existing `auth_publickey` callback. It does not add a buffer in front of the session, and it does not go through `relay_guarded`.
+One call per host block. The context name is the first positive `Host` token. `ssh2-config` parses the file, including top-level `Include` globs. `SshKey::from_seed` builds the decoy from `key_seed()`. A known destination uses the more specific pattern: exact, then a glob, then `*.suffix`, then `*`. The same rank keeps file order. The guest config keeps the source and prepends those identities in that order with `IdentitiesOnly yes`, so the first key OpenSSH offers is the more specific block. On a transparent capture the dial carries no hostname; `auth_publickey` selects the real key from the offered decoy. The username is forwarded. Nothing compares it with a grant field. Password auth stays rejected. Selection does not add a buffer and does not go through `relay_guarded`. `Match`, `ProxyJump`, `IdentityAgent`, `CertificateFile`, and an `Include` nested under `Host` are typed errors.
 
 ```mermaid
 stateDiagram-v2
@@ -100,12 +100,10 @@ Adopting the helper changes the label, the env, and the pem file name. Nothing c
 
 The following stay out of this change:
 
-- Adapter edits
-- Proxy edits
 - `twin`
-- Wildcard SSH
-- `SshKey::from_seed`
 - New config keys
 - New buffers
 - A Tokio test
 - A new crate
+
+Wildcard matching and `SshKey::from_seed` live in the ssh host-pattern adapter.

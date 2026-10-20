@@ -437,6 +437,7 @@ mod tests {
         port: 22,
         identity: std::path::PathBuf::from("/arkham/grants/rules.d/t.identity"),
         guest_key: std::path::PathBuf::from("/arkham/grants/rules.d/t.guest_key"),
+        negated: Vec::new(),
       }],
     }];
     let Expect::Ssh(scope) = expect(&grants, Some("git.example"), 22) else {

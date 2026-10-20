@@ -15,7 +15,7 @@ pub(crate) use super::http::machine::Http;
 pub(crate) use super::ldap::machine::Ldap;
 pub(crate) use super::postgres::machine::{GuestOpening, Postgres, read_guest_opening, request_upstream_tls};
 pub(crate) use super::redis::machine::Redis;
-pub(crate) use super::ssh::legs::{LegKeys, SshLegs, SshLegsFiles, Upstream};
+pub(crate) use super::ssh::legs::{LegKeys, SshKeyPair, SshLegs, SshLegsFiles, Upstream};
 pub(crate) use super::tcp::machine::Raw;
 
 use std::borrow::Cow;

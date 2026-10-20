@@ -325,6 +325,63 @@ pub enum Error {
   /// `expose` without a port or `--list` names nothing to do.
   #[error("`arkham expose` needs a container port or `--list`")]
   ExposeNoPort,
+  /// An ssh config keyword this adapter does not map.
+  #[error("ssh config `{keyword}` cannot be derived")]
+  SshUnsupported {
+    /// Keyword OpenSSH would honor and this adapter refuses.
+    keyword: String,
+  },
+  /// An `Include` nested under a `Host` block. The parser crate does not
+  /// expose the parent pattern, so the adapter refuses it.
+  #[error("ssh config include under a Host block cannot be derived")]
+  SshNestedInclude,
+  /// An `Include` names a file that includes it back.
+  #[error("ssh config include cycle at `{}`", path.display())]
+  SshIncludeCycle {
+    /// File that closed the cycle.
+    path: PathBuf,
+  },
+  /// `Include` nesting past the adapter's limit.
+  #[error("ssh config include depth exceeds {limit} at `{}`", path.display())]
+  SshIncludeDepth {
+    /// File past the limit.
+    path: PathBuf,
+    /// The limit the adapter enforces.
+    limit: u8,
+  },
+  /// An `Include` pattern is not a glob.
+  #[error("ssh config include pattern `{pattern}`: {source}")]
+  SshIncludePattern {
+    /// Pattern that failed to compile.
+    pattern: String,
+    /// Underlying glob failure.
+    #[source]
+    source: glob::PatternError,
+  },
+  /// An `Include` glob entry cannot be read.
+  #[error("ssh config include `{}`: {source}", path.display())]
+  SshIncludeGlob {
+    /// Path the glob produced.
+    path: PathBuf,
+    /// Underlying glob failure.
+    #[source]
+    source: glob::GlobError,
+  },
+  /// `ssh2-config` rejected the file.
+  #[error("ssh config `{}`: {source}", path.display())]
+  SshParse {
+    /// Config that failed to parse.
+    path: PathBuf,
+    /// Underlying parser failure.
+    #[source]
+    source: ssh2_config::SshParserError,
+  },
+  /// A parsed host block has no context identity.
+  #[error("ssh host block `{name}` has no context identity")]
+  SshContext {
+    /// Host token that should have been named.
+    name: String,
+  },
 }
 
 impl From<ConfigError> for Error {

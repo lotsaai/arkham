@@ -44,16 +44,21 @@ use crate::connection::dial_marked;
 /// has to outlive the budget or long-lived sessions die mid-thought.
 const INACTIVITY_BUDGET_MULTIPLE: u32 = 60;
 
+/// One decoy the guest may offer, and the real identity that offer selects.
+#[derive(Clone)]
+struct SshCandidate {
+  decoy: PublicKey,
+  identity: Arc<PrivateKey>,
+}
+
 /// Everything one guest connection bridges between: the guest leg's trust,
-/// the upstream leg's identity, and where the upstream session dials.
+/// the upstream identities the offered key selects, and where the session dials.
 #[derive(Clone)]
 pub(crate) struct SshLegs {
   /// Host key the guest verifies: arkham's own, presented by the guest leg.
   host_key: Arc<PrivateKey>,
-  /// The only public key the guest leg admits.
-  decoy: PublicKey,
-  /// Identity arkham presents upstream.
-  identity: Arc<PrivateKey>,
+  /// Decoy keys the guest may offer, in grant order. The signed offer picks one.
+  candidates: Vec<SshCandidate>,
   /// Arkham's own upstream `known_hosts`, OpenSSH `accept-new` semantics:
   /// first-seen keys are recorded, a changed key on a known host fails.
   known_hosts: PathBuf,
@@ -74,16 +79,27 @@ pub(crate) struct Upstream {
   pub(crate) fwmark: Option<u32>,
 }
 
-/// The four files one guest connection's legs need: the guest host key
-/// (arkham's own), the real upstream identity, the decoy admission key, and
+/// One identity file and the decoy public key that selects it.
+#[derive(Clone, Copy)]
+pub(crate) struct SshKeyPair<'a> {
+  /// Identity arkham presents upstream when this decoy is offered.
+  pub(crate) identity: &'a Path,
+  /// Decoy public key the guest leg admits.
+  pub(crate) guest_key: &'a Path,
+}
+
+/// The files one guest connection's legs need: the guest host key, one or
+/// more identity pairs, and arkham's own `known_hosts`.
 #[derive(Clone, Copy)]
 pub(crate) struct SshLegsFiles<'a> {
   /// Host key the guest verifies, generated on first run.
   pub(crate) host_key: &'a Path,
-  /// Identity arkham presents upstream.
+  /// Identity arkham presents upstream for [`Self::guest_key`].
   pub(crate) identity: &'a Path,
-  /// The only public key the guest leg admits.
+  /// Decoy public key paired with [`Self::identity`].
   pub(crate) guest_key: &'a Path,
+  /// Further identity pairs, after the first.
+  pub(crate) extra: &'a [SshKeyPair<'a>],
   /// Arkham's own upstream `known_hosts`.
   pub(crate) known_hosts: &'a Path,
 }
@@ -94,8 +110,22 @@ pub(crate) struct SshLegsFiles<'a> {
 #[derive(Clone)]
 pub(crate) struct LegKeys {
   host_key: Arc<PrivateKey>,
-  decoy: PublicKey,
-  identity: Arc<PrivateKey>,
+  candidates: Vec<SshCandidate>,
+}
+
+fn load_candidate(pair: SshKeyPair<'_>) -> Result<SshCandidate, Error> {
+  let identity_text = std::fs::read_to_string(pair.identity).map_err(|source| Error::SshRead {
+    path: pair.identity.to_path_buf(),
+    source,
+  })?;
+  let identity = Arc::new(decode_secret_key(&identity_text, None).map_err(RusshError::from)?);
+  let guest_line = std::fs::read_to_string(pair.guest_key).map_err(|source| Error::SshRead {
+    path: pair.guest_key.to_path_buf(),
+    source,
+  })?;
+  let blob = guest_line.split(' ').nth(1).unwrap_or_default();
+  let decoy = parse_public_key_base64(blob).map_err(RusshError::from)?;
+  Ok(SshCandidate { decoy, identity })
 }
 
 impl LegKeys {
@@ -109,26 +139,24 @@ impl LegKeys {
   /// when either key file cannot be read or parsed.
   pub(crate) fn load(files: SshLegsFiles<'_>) -> Result<Self, Error> {
     let host_key = Arc::new(arkham_pki::load_or_generate_host_key(files.host_key)?.into_private());
-    let identity_text = std::fs::read_to_string(files.identity).map_err(|source| Error::SshRead {
-      path: files.identity.to_path_buf(),
-      source,
-    })?;
-    let identity = Arc::new(decode_secret_key(&identity_text, None).map_err(RusshError::from)?);
-    let guest_line = std::fs::read_to_string(files.guest_key).map_err(|source| Error::SshRead {
-      path: files.guest_key.to_path_buf(),
-      source,
-    })?;
-    let blob = guest_line.split(' ').nth(1).unwrap_or_default();
-    let decoy = parse_public_key_base64(blob).map_err(RusshError::from)?;
-    Ok(Self { host_key, decoy, identity })
+    let mut pairs = Vec::with_capacity(files.extra.len().saturating_add(1));
+    pairs.push(SshKeyPair {
+      identity: files.identity,
+      guest_key: files.guest_key,
+    });
+    pairs.extend_from_slice(files.extra);
+    let mut candidates = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+      candidates.push(load_candidate(pair)?);
+    }
+    Ok(Self { host_key, candidates })
   }
 
   /// Legs for one connection's dial target over these shared keys.
   fn assemble(&self, known_hosts: &Path, upstream: Upstream) -> SshLegs {
     SshLegs {
       host_key: Arc::clone(&self.host_key),
-      decoy: self.decoy.clone(),
-      identity: Arc::clone(&self.identity),
+      candidates: self.candidates.clone(),
       known_hosts: known_hosts.to_path_buf(),
       upstream,
     }
@@ -157,8 +185,7 @@ impl SshLegs {
   pub(crate) fn keys(&self) -> LegKeys {
     LegKeys {
       host_key: Arc::clone(&self.host_key),
-      decoy: self.decoy.clone(),
-      identity: Arc::clone(&self.identity),
+      candidates: self.candidates.clone(),
     }
   }
 
@@ -179,6 +206,7 @@ impl SshLegs {
     let handler = Guest {
       legs: self,
       user: String::new(),
+      selected: None,
       upstream: None,
       budget,
     };
@@ -192,6 +220,8 @@ impl SshLegs {
 struct Guest {
   legs: SshLegs,
   user: String,
+  /// Real identity selected by the signed public key offer.
+  selected: Option<Arc<PrivateKey>>,
   upstream: Option<Handle<UpstreamLeg>>,
   budget: Duration,
 }
@@ -199,7 +229,7 @@ impl russh::server::Handler for Guest {
   type Error = RusshError;
   fn auth_publickey_offered(&mut self, _user: &str, public_key: &PublicKey) -> impl Future<Output = Result<Auth, Self::Error>> {
     tracing::debug!(key = ?public_key.to_openssh(), "ssh guest leg: key offered");
-    let auth = if *public_key == self.legs.decoy {
+    let auth = if self.legs.candidates.iter().any(|candidate| candidate.decoy == *public_key) {
       Auth::Accept
     } else {
       Auth::reject()
@@ -209,8 +239,9 @@ impl russh::server::Handler for Guest {
 
   fn auth_publickey(&mut self, user: &str, public_key: &PublicKey) -> impl Future<Output = Result<Auth, Self::Error>> {
     tracing::debug!(key = ?public_key.to_openssh(), "ssh guest leg: signed auth");
-    let auth = if *public_key == self.legs.decoy {
+    let auth = if let Some(candidate) = self.legs.candidates.iter().find(|candidate| candidate.decoy == *public_key) {
       self.user = user.to_string();
+      self.selected = Some(Arc::clone(&candidate.identity));
       Auth::Accept
     } else {
       Auth::reject()
@@ -299,6 +330,9 @@ impl Guest {
     let legs = self.legs.clone();
     let budget = self.budget;
     let user = self.user.clone();
+    let Some(identity) = self.selected.clone() else {
+      return Err(RusshError::UnknownKey);
+    };
     let dial = async move {
       let stream = dial_marked(&legs.upstream.host, legs.upstream.port, legs.upstream.fwmark)
         .await
@@ -313,7 +347,7 @@ impl Guest {
         port: legs.upstream.port,
       };
       let mut handle = connect_stream(config, stream, handler).await?;
-      let auth = PrivateKeyWithHashAlg::new(legs.identity, None);
+      let auth = PrivateKeyWithHashAlg::new(identity, None);
       if !handle.authenticate_publickey(user, auth).await?.success() {
         return Err(RusshError::UnknownKey);
       }
@@ -505,6 +539,7 @@ mod tests {
         host_key: &dir.path().join("ssh_host"),
         identity: &write_key(&dir, "identity", &real),
         guest_key: &write_key(&dir, "guest", &decoy),
+        extra: &[],
         known_hosts: &known_hosts,
       },
       Upstream {
@@ -602,6 +637,7 @@ mod tests {
         host_key: &dir.path().join("ssh_host"),
         identity: &write_key(&dir, "identity", &real),
         guest_key: &write_key(&dir, "guest", &decoy),
+        extra: &[],
         known_hosts: &known_hosts,
       },
       Upstream {
@@ -694,6 +730,7 @@ mod tests {
           host_key: &dir.path().join("ssh_host"),
           identity: &write_key(&dir, "identity", &real),
           guest_key: &write_key(&dir, "guest", &decoy),
+          extra: &[],
           known_hosts: &known_hosts,
         },
         Upstream {

@@ -386,6 +386,63 @@ if (SSH_DST) {
   stage("ssh scenario skipped: no SSH_DST (bwrap)");
 }
 
+// 28. Host patterns discovered from ssh_config. The guest holds decoys only.
+// Swapping sshd's authorized_keys proves which real key the proxy presented:
+// db.corp is the exact block, web.corp and the included extra.corp are the
+// wildcard, other.example is Host *.
+const SSH_PUB_A = "/opt/ssh-pubs/id_a.pub";
+const SSH_PUB_B = "/opt/ssh-pubs/id_b.pub";
+const SSH_PUB_C = "/opt/ssh-pubs/id_c.pub";
+if (SSH_DST && (await Bun.file(SSH_PUB_B).exists())) {
+  const sshAs = async (host: string) => {
+    const proc = Bun.spawn(
+      [
+        "ssh",
+        "-F",
+        "/home/eng/.ssh/config",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+        host,
+        "echo",
+        "ssh-ok",
+      ],
+      { stdout: "pipe", stderr: "pipe", env: { ...process.env, HOME: "/home/eng" } },
+    );
+    const out = await new Response(proc.stdout).text();
+    const err = await new Response(proc.stderr).text();
+    const code = await proc.exited;
+    return { code, out, err };
+  };
+  const expectHost = async (host: string, ok: boolean) => {
+    const reply = await sshAs(host);
+    stage(`ssh ${host}: ${JSON.stringify({ code: reply.code, out: reply.out.trim(), err: reply.err.trim() })}`);
+    const passed = reply.code === 0 && reply.out.trim() === "ssh-ok";
+    return passed === ok;
+  };
+  await retry("ssh", "ssh host patterns use the matching real key", async () => {
+    await writeFile("/ssh-auth/authorized_keys", await readFile(SSH_PUB_B));
+    if (!(await expectHost("db.corp", true))) return false;
+    if (!(await expectHost("web.corp", false))) return false;
+    if (!(await expectHost("other.example", false))) return false;
+    if (!(await expectHost("extra.corp", false))) return false;
+    await writeFile("/ssh-auth/authorized_keys", await readFile(SSH_PUB_A));
+    if (!(await expectHost("web.corp", true))) return false;
+    if (!(await expectHost("extra.corp", true))) return false;
+    if (!(await expectHost("db.corp", false))) return false;
+    await writeFile("/ssh-auth/authorized_keys", await readFile(SSH_PUB_C));
+    if (!(await expectHost("other.example", true))) return false;
+    if (!(await expectHost("db.corp", false))) return false;
+    if (!(await expectHost("web.corp", false))) return false;
+    return true;
+  });
+} else {
+  stage("ssh host patterns skipped: no discovered keys");
+}
+
 // Bun's Redis client speaks RESP3. On connect it sends
 // `HELLO 3 AUTH <user> <password>`, using the user `default` when the URL
 // omits one. Commands issued together are pipelined. The proxy swaps the

@@ -34,13 +34,16 @@ use crate::config::{AppConfig, RuleCfg, fake_for};
 use crate::error::Error;
 use crate::plugins::resolve_plugins;
 
-/// Host pattern: exact, `*.`-wildcard (subdomains only), or any.
+/// Host pattern: exact, `*.`-wildcard (subdomains only), a general glob, or any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostPat {
   /// Exact hostname, ASCII case-insensitive.
   Exact(String),
   /// `*.`-prefixed suffix; matches subdomains only, never the apex.
   Wildcard(String),
+  /// A pattern containing `*` or `?` that is not exactly `*` or `*.suffix`.
+  /// Matching is [`wildmatch`] after ASCII lowercasing both sides.
+  Glob(String),
   /// Any host (`*`).
   Any,
 }
@@ -59,14 +62,44 @@ impl HostPat {
       HostPat::Wildcard(pattern) => {
         if let Some(suffix) = pattern.strip_prefix("*.") {
           hostname.len() > suffix.len() + 1
-            && hostname.as_bytes()[hostname.len() - suffix.len() - 1] == b'.'
+            && hostname.as_bytes().get(hostname.len() - suffix.len() - 1) == Some(&b'.')
             && hostname[hostname.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
         } else {
           hostname.eq_ignore_ascii_case(pattern)
         }
       }
+      HostPat::Glob(pattern) => {
+        let pattern = pattern.to_ascii_lowercase();
+        let host = hostname.to_ascii_lowercase();
+        wildmatch::WildMatch::new(&pattern).matches(&host)
+      }
       HostPat::Any => true,
     }
+  }
+
+  /// Rank used when several ssh patterns cover one host. Lower is more specific.
+  #[must_use]
+  pub fn specificity(&self) -> u8 {
+    match self {
+      HostPat::Exact(_) => 0,
+      HostPat::Glob(_) => 1,
+      HostPat::Wildcard(_) => 2,
+      HostPat::Any => 3,
+    }
+  }
+}
+
+/// Parse a host token the way an allow entry spells it.
+#[must_use]
+pub fn host_pat(host: &str) -> HostPat {
+  if host == "*" {
+    HostPat::Any
+  } else if host.strip_prefix("*.").is_some_and(|rest| !rest.contains(['*', '?'])) {
+    HostPat::Wildcard(host.to_string())
+  } else if host.contains(['*', '?']) {
+    HostPat::Glob(host.to_string())
+  } else {
+    HostPat::Exact(host.to_string())
   }
 }
 
@@ -76,13 +109,7 @@ impl FromStr for HostPat {
   type Err = std::convert::Infallible;
 
   fn from_str(host: &str) -> Result<Self, Self::Err> {
-    Ok(if host == "*" {
-      HostPat::Any
-    } else if host.starts_with("*.") {
-      HostPat::Wildcard(host.to_string())
-    } else {
-      HostPat::Exact(host.to_string())
-    })
+    Ok(host_pat(host))
   }
 }
 
@@ -213,6 +240,20 @@ pub struct SshScope {
   pub identity: PathBuf,
   /// Decoy public key (`authorized_keys` format) the guest leg admits.
   pub guest_key: PathBuf,
+  /// `Host` tokens marked with a leading `!`. A match on any of them
+  /// excludes the scope. Empty for grants that state no negation.
+  pub negated: Vec<HostPat>,
+}
+
+impl SshScope {
+  /// Whether `host` survives negation and matches the positive pattern.
+  #[must_use]
+  pub fn matches_host(&self, host: &str) -> bool {
+    if self.negated.iter().any(|pattern| pattern.matches(host)) {
+      return false;
+    }
+    self.host.matches(host)
+  }
 }
 
 /// Upstream trust anchor an entry names with `sslrootcert`: a PEM path, or
@@ -272,17 +313,12 @@ impl FromStr for EndpointScope {
       Some(Host::Ipv6(addr)) => addr.to_string(),
       None => return Err(format!("bad allow entry `{entry}`: empty host")),
     };
+    let decoded = percent_encoding::percent_decode_str(&parsed_host).decode_utf8_lossy();
     let host = if wildcard {
-      let tail = parsed_host.strip_prefix('w').unwrap_or(&parsed_host);
-      if tail.is_empty() {
-        HostPat::Any
-      } else if tail.starts_with('.') && tail.len() > 1 {
-        HostPat::Wildcard(format!("*{tail}"))
-      } else {
-        return Err(format!("bad allow entry `{entry}`: `*` only leads `*` or `*.suffix`"));
-      }
+      let tail = decoded.strip_prefix('w').unwrap_or(&decoded);
+      host_pat(&format!("*{tail}"))
     } else {
-      HostPat::Exact(parsed_host)
+      host_pat(&decoded)
     };
     let port = match (url.port(), scheme) {
       (Some(port), _) => port,
@@ -580,10 +616,73 @@ impl Grant {
     let Grant::Ssh { allow } = self else {
       return None;
     };
-    allow
-      .iter()
-      .find(|entry| entry.port == port && host.is_none_or(|host| entry.host.matches(host)))
+    let mut best: Option<(u8, &SshScope)> = None;
+    for entry in allow {
+      if entry.port != port {
+        continue;
+      }
+      let Some(host) = host else {
+        return Some(entry);
+      };
+      if !entry.matches_host(host) {
+        continue;
+      }
+      let rank = entry.host.specificity();
+      if best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+        best = Some((rank, entry));
+      }
+    }
+    best.map(|(_, entry)| entry)
   }
+}
+
+/// Every ssh scope on `port`. When `host` is known, only the most specific
+/// matching rank is returned, and every scope at that rank stays so a block
+/// with several identity files is still offered.
+#[must_use]
+pub fn ssh_candidates<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> Vec<&'a SshScope> {
+  let mut matched = Vec::new();
+  for grant in grants {
+    let Grant::Ssh { allow } = grant else {
+      continue;
+    };
+    for entry in allow {
+      if entry.port != port {
+        continue;
+      }
+      if host.is_some_and(|host| !entry.matches_host(host)) {
+        continue;
+      }
+      matched.push(entry);
+    }
+  }
+  if host.is_none() {
+    return matched;
+  }
+  let Some(best) = matched.iter().map(|entry| entry.host.specificity()).min() else {
+    return Vec::new();
+  };
+  matched.into_iter().filter(|entry| entry.host.specificity() == best).collect()
+}
+
+fn ssh_negated(entry: &str) -> Result<Vec<HostPat>, String> {
+  let Some((_, fragment)) = entry.split_once('#') else {
+    return Ok(Vec::new());
+  };
+  let mut negated = Vec::new();
+  for token in fragment.split(',') {
+    if token.is_empty() || token.starts_with('~') {
+      continue;
+    }
+    let Some(pattern) = token.strip_prefix('!') else {
+      return Err(format!("ssh fragment `{token}` is not a negated host"));
+    };
+    if pattern.is_empty() {
+      return Err("ssh fragment `!` needs a host".to_string());
+    }
+    negated.push(host_pat(pattern));
+  }
+  Ok(negated)
 }
 
 fn endpoint_match(entry: &EndpointScope, scheme: Scheme, host: &str, port: u16) -> bool {
@@ -591,7 +690,7 @@ fn endpoint_match(entry: &EndpointScope, scheme: Scheme, host: &str, port: u16) 
 }
 
 fn ssh_match(entry: &SshScope, scheme: Scheme, host: &str, port: u16) -> bool {
-  scheme == Scheme::Ssh && entry.port == port && entry.host.matches(host)
+  scheme == Scheme::Ssh && entry.port == port && entry.matches_host(host)
 }
 
 fn host_port_match(pat: &HostPat, entry_port: u16, host: &str, port: u16) -> bool {
@@ -802,11 +901,17 @@ impl GrantCollector {
         entry: entry.clone(),
         detail: "guest_key is required".to_string(),
       })?;
+      let negated = ssh_negated(&entry).map_err(|detail| Error::BadAllow {
+        label: label.to_string(),
+        entry: entry.clone(),
+        detail,
+      })?;
       allow.push(SshScope {
         host: scope.host,
         port: scope.port,
         identity,
         guest_key,
+        negated,
       });
     }
     self.grants.push(Grant::Ssh { allow });
@@ -2387,6 +2492,41 @@ mod tests {
     );
     let err = resolve(&cfg).unwrap_err().to_string();
     assert!(err.contains("states no `tls` config"), "{err}");
+  }
+
+  #[test]
+  fn ssh_known_host_prefers_the_more_specific_pattern() {
+    let entries = ["ssh://*.corp", "ssh://db.corp", "ssh://*"];
+    let mut ssh = BTreeMap::new();
+    for entry in entries {
+      ssh.extend(ssh_material(entry));
+    }
+    let cfg = cfg_with_ssh(&entries, ssh);
+    let grant = &resolve(&cfg).unwrap().grants[0];
+    let db = grant.ssh(Some("db.corp"), 22).expect("db.corp");
+    assert!(matches!(&db.host, HostPat::Exact(host) if host == "db.corp"), "{db:?}");
+    let web = grant.ssh(Some("web.corp"), 22).expect("web.corp");
+    assert!(matches!(&web.host, HostPat::Wildcard(_)), "{web:?}");
+    let other = grant.ssh(Some("other.example"), 22).expect("other.example");
+    assert!(matches!(&other.host, HostPat::Any), "{other:?}");
+  }
+
+  #[test]
+  fn ssh_negated_host_is_excluded() {
+    let entry = "ssh://*.corp#!bastion.corp";
+    let cfg = cfg_with_ssh(&[entry], ssh_material(entry));
+    let grant = &resolve(&cfg).unwrap().grants[0];
+    assert!(grant.ssh(Some("web.corp"), 22).is_some());
+    assert!(grant.ssh(Some("bastion.corp"), 22).is_none());
+    assert!(!grant.matches(Scheme::Ssh, "bastion.corp", 22));
+  }
+
+  #[test]
+  fn ssh_question_mark_pattern_matches_one_character() {
+    let scope: EndpointScope = "ssh://web%3F.corp".parse().unwrap();
+    assert!(scope.host.matches("web1.corp"), "{:?}", scope.host);
+    assert!(!scope.host.matches("web12.corp"));
+    assert!(!scope.host.matches("web.corp"));
   }
 
   #[test]

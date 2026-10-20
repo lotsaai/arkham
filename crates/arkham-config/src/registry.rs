@@ -1263,6 +1263,7 @@ hosts = ["https://api.example/path"]
         let suffix = pattern.strip_prefix("*.").unwrap_or(pattern);
         format!("a.{suffix}")
       }
+      HostPat::Glob(pattern) => pattern.chars().map(|ch| if ch == '*' || ch == '?' { 'a' } else { ch }).collect(),
       HostPat::Any => "example.com".to_string(),
     }
   }

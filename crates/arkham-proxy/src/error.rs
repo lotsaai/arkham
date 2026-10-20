@@ -30,6 +30,12 @@ pub enum Error {
   /// No ssh host key path is set or derivable for a granted ssh leg.
   #[error("ssh host key path is unset")]
   SshHostKeyUnset,
+  /// A granted ssh port has no identity left to present.
+  #[error("ssh grant on port {port} has no identity")]
+  SshNoIdentity {
+    /// Guest port that matched no scope.
+    port: u16,
+  },
   /// An ssh leg blob does not load.
   #[error("ssh blob {path}: {source}")]
   SshRead {

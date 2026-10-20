@@ -45,6 +45,12 @@ cleanup_nats_discovery() {
   if [ -d integration/out/nats-discovery ]; then
     find integration/out/nats-discovery -mindepth 1 -delete
   fi
+  if [ -d integration/out/ssh-discovery ]; then
+    find integration/out/ssh-discovery -mindepth 1 -delete
+  fi
+  if [ -d integration/out/ssh-auth ]; then
+    find integration/out/ssh-auth -mindepth 1 -delete
+  fi
 }
 trap cleanup_nats_discovery EXIT
 
@@ -258,6 +264,123 @@ EOF
   fi
 }
 
+# Host ~/.ssh/config discovery. Include, a wildcard, an exact host, and
+# Host * each carry a distinct identity. arkham init writes the grant; the
+# guest tree receives decoys only. The public halves are what the client
+# later installs as sshd's authorized_keys.
+prepare_ssh_discovery() {
+  local isolate home workspace state_root grant_toml compose_file
+  local dest line rest host container rel key
+  isolate=$(mktemp -d /tmp/arkham-ssh-discovery.XXXXXX)
+  trap 'rm -rf "$isolate"' RETURN
+  home=$isolate/home
+  workspace=$isolate/workspace
+  mkdir -p "$home/.ssh/config.d" "$workspace" "$isolate/xdg-config" "$isolate/xdg-state" "$isolate/xdg-data"
+  for key in id_a id_b id_c; do
+    ssh-keygen -q -t ed25519 -N "" -C "$key" -f "$home/.ssh/$key"
+  done
+  cat >"$home/.ssh/config" <<'EOF'
+Include ~/.ssh/config.d/*
+Host *.corp
+  User agent
+  IdentityFile ~/.ssh/id_a
+Host db.corp
+  User agent
+  IdentityFile ~/.ssh/id_b
+Host *
+  User agent
+  IdentityFile ~/.ssh/id_c
+EOF
+  cat >"$home/.ssh/config.d/extra" <<'EOF'
+Host extra.corp
+  User agent
+  IdentityFile ~/.ssh/id_a
+EOF
+
+  echo "=== ssh discovery: arkham init ==="
+  env -u ARKHAM_CONFIG -u KUBECONFIG -u TALOSCONFIG \
+    HOME="$home" \
+    XDG_CONFIG_HOME="$isolate/xdg-config" \
+    XDG_STATE_HOME="$isolate/xdg-state" \
+    XDG_DATA_HOME="$isolate/xdg-data" \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_SYSTEM=/dev/null \
+    integration/docker/arkham init --backend tun "$workspace"
+
+  state_root=$isolate/xdg-state/arkham/ws
+  grant_toml=$(find "$state_root" -path '*/grants/arkham.toml' -type f -print -quit)
+  compose_file=$(find "$state_root" -name compose.yml -type f -print -quit)
+  if [ -z "$grant_toml" ] || [ -z "$compose_file" ]; then
+    echo "arkham init did not write an ssh grant layer"
+    return 1
+  fi
+  if ! grep -q 'ssh://db.corp' "$grant_toml"; then
+    echo "discovered ssh grant misses db.corp"
+    return 1
+  fi
+  if ! grep -q 'ssh://\*.corp' "$grant_toml"; then
+    echo "discovered ssh grant misses *.corp"
+    return 1
+  fi
+  if ! grep -q 'ssh://extra.corp' "$grant_toml"; then
+    echo "discovered ssh grant misses the included host"
+    return 1
+  fi
+  if ! grep -q 'if_missing = "ignore"' "$grant_toml"; then
+    echo "discovered ssh grant does not ignore a missing fnox key"
+    return 1
+  fi
+
+  dest=integration/out/ssh-discovery
+  mkdir -p "$dest/guest" "$dest/pubs" integration/out/nats-discovery/grants/rules.d
+  find "$dest/guest" "$dest/pubs" -mindepth 1 -delete
+  cp "$home/.ssh/id_a.pub" "$dest/pubs/id_a.pub"
+  cp "$home/.ssh/id_b.pub" "$dest/pubs/id_b.pub"
+  cp "$home/.ssh/id_c.pub" "$dest/pubs/id_c.pub"
+  mkdir -p "$dest/guest/.ssh/config.d"
+  cp "$home/.ssh/config.d/extra" "$dest/guest/.ssh/config.d/extra"
+  while IFS= read -r line; do
+    case "$line" in
+      *"/home/eng/.ssh/"*) ;;
+      *) continue ;;
+    esac
+    rest=${line#*- }
+    host=${rest%%:*}
+    container=${rest#*:}
+    container=${container%%:*}
+    rel=${container#/home/eng/}
+    if [ "$rel" = "$container" ] || [ -z "$rel" ]; then
+      echo "unexpected ssh mount: ${line}"
+      return 1
+    fi
+    mkdir -p "$dest/guest/$(dirname "$rel")"
+    cp "$host" "$dest/guest/$rel"
+  done <"$compose_file"
+  if [ ! -f "$dest/guest/.ssh/config" ]; then
+    echo "discovery did not mount an ssh config into the guest"
+    return 1
+  fi
+  for key in id_a id_b id_c; do
+    # The armor header is shared with every decoy. The first body line is not.
+    body=$(awk 'NR>1 && !/^-----/ && !/^$/ { print; exit }' "$home/.ssh/$key")
+    if [ -z "$body" ]; then
+      echo "could not read ${key}"
+      return 1
+    fi
+    if grep -R -F -q -- "$body" "$dest/guest"; then
+      echo "discovered ssh guest tree contains the real ${key}"
+      return 1
+    fi
+  done
+  cp -a "$(dirname "$grant_toml")/rules.d/." integration/out/nats-discovery/grants/rules.d/
+  certs_cid=$($compose ps -aq certs)
+  certs_cid=${certs_cid%%$'\n'*}
+  $compose run --rm --no-deps -T \
+    -v "${grant_toml}:/discovered.toml:ro" \
+    --entrypoint bash certs \
+    -c 'cat /discovered.toml >> /arkham-config/config.toml'
+}
+
 for backend in $backends; do
   echo "=== backend: $backend ==="
   # A leftover stack holds an old CA while the rerun rotates the volume, and
@@ -268,7 +391,8 @@ for backend in $backends; do
   rm -f integration/out/results/covered.json
   # Create the bind mounts as this user. Docker would otherwise create a
   # missing path as root, and the later cleanup cannot remove it.
-  mkdir -p integration/out/results integration/out/nats-discovery/grants integration/out/nats-discovery/guest
+  mkdir -p integration/out/results integration/out/nats-discovery/grants integration/out/nats-discovery/guest \
+    integration/out/ssh-discovery/guest integration/out/ssh-discovery/pubs integration/out/ssh-auth
   # Bring the stack up without the client. This is the one certs run:
   # dependents wait until it exits, and nothing below starts it again.
   services=()
@@ -280,6 +404,7 @@ for backend in $backends; do
   done <<< "$service_list"
   ARKHAM_BACKEND="$backend" $compose up -d --build "${services[@]}"
   prepare_nats_discovery
+  prepare_ssh_discovery
   # Reload arkham so it reads the appended grant. --no-deps leaves the
   # exited certs container alone.
   ARKHAM_BACKEND="$backend" $compose up -d --no-deps --force-recreate arkham

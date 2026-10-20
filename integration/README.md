@@ -37,6 +37,7 @@ Topology:
 | 6 | Postgres wire protocol driven by the client's own `DATABASE_URL` (the rule's stated fake string): SSLRequest, TLS, cleartext password auth, `SELECT` | `[rules.db]`: `env = "DATABASE_URL"`, `value` the fake URL; the real URL in fnox | the fake password authenticates against real PostgreSQL — arkham swapped the real one in from the secret source — and the query row comes back |
 | 7 | OAuth2 `client_credentials` POST `api:8000/token` with the fake client secret, then GET with the minted token | `[rules.oidc]` + `oauth2` block | issuer saw the real client secret, the client received a minted decoy access token (never the real one), and the decoy swapped back to the real access token on the API call |
 | 8 | OpenSSH client with the decoy identity to `10.202.0.40` | `[rules.ssh]` `ssh://10.202.0.40:22` | `echo ssh-ok`, and `known_hosts` records arkham's host key |
+| 28 | OpenSSH `ssh` to names from a discovered `~/.ssh/config`: `Host *.corp` (A), `Host db.corp` (B), `Host *` (C), plus `Include` of `extra.corp` (A). `test:ssh` is the only path that runs it | no hand-written pattern rule. `arkham init` reads the host config. The guest mounts decoy keys only. The client is the real `ssh` binary; sshd is the compose OpenSSH server | only B's public key lets `db.corp` in, only A's lets `web.corp` and `extra.corp` in, only C's lets `other.example` in |
 | 9 | Redis RESP via Bun's `RedisClient` to `redis:6379`: requirepass, ACL user, `HELLO 3 AUTH`, a pipeline, and `WRONGPASS` | `[rules.redis_plain]`: fake `redis://` URL; real URL rendered into fnox by `gen-secrets.sh` | official Redis accepts the swapped password; the real password is absent from the client error |
 | 10 | Same client to `redis:6380` over TLS. Bun sends no SNI | `[rules.redis_tls]`: fake `rediss://` URL; real URL carries `sslrootcert` | same swap. The guest leaf is minted for the scope host. Redis is started with `tls-auth-clients no` |
 | 11 | Python `smtplib` to `mail:587`: AUTH before STARTTLS is refused; AUTH PLAIN and `SMTP.login` after STARTTLS succeed; a wrong password fails; a one-shot on the server network dials the decoy at `mail` and is refused | `[rules.smtp]`: fake `smtp://` URL; real URL says `starttls=required` and carries `sslrootcert` | docker-mailserver accepts the swapped password and the client never sees it; the decoy is refused when the dial is outside the captured namespace |
@@ -133,6 +134,13 @@ files into the client. The client reads those files before scenarios 19 and
 rewritten to the real public key. The client container does not receive the
 real nkey seed or the real user JWT. `test:ssh` greps the client log for
 those values in `integration/out/nats/nats.env`.
+Scenario 28 is the ssh host-pattern proof, on both tproxy and tun. `test:ssh`
+writes a host `~/.ssh/config` (`Host *.corp`, `Host db.corp`, `Host *`, and
+an `Include` of `extra.corp`), runs `arkham init`, and mounts the decoy
+config and decoy keys into the client. The client is OpenSSH `ssh`. The
+server is the compose `sshd`. The client swaps `authorized_keys` between the
+three real public keys. A name succeeds only for its block's key. The real
+private keys are absent from the guest tree.
 Scenarios 24–27 use the official `rabbitmq` 4.3.6 Alpine image (pinned
 by its manifest-list digest), `amqplib` 2.2.0, and `rhea` 3.0.5. The
 proxy is the only code we wrote on that path. The broker's one user is

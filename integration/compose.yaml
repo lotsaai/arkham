@@ -146,7 +146,7 @@ services:
       [
         "/bin/sh",
         "-c",
-        "apk add --no-cache openssh-server && ssh-keygen -A && adduser -D -s /bin/sh agent && sed -i '/^agent:/s/!/*/' /etc/shadow && mkdir -p /home/agent/.ssh && cp /certs/ssh/authorized_keys /home/agent/.ssh/authorized_keys && chown -R agent:agent /home/agent/.ssh && exec /usr/sbin/sshd -D -e -o Port=22 -o ListenAddress=0.0.0.0 -o PermitRootLogin=no -o PasswordAuthentication=no -o PubkeyAuthentication=yes -o StrictModes=no -o UsePAM=no -o AuthorizedKeysFile=.ssh/authorized_keys -o LogLevel=VERBOSE",
+        "apk add --no-cache openssh-server && ssh-keygen -A && adduser -D -s /bin/sh agent && sed -i '/^agent:/s/!/*/' /etc/shadow && mkdir -p /home/agent/.ssh && cp /certs/ssh/authorized_keys /home/agent/.ssh/authorized_keys && chown -R agent:agent /home/agent/.ssh && chmod 777 /home/agent/.ssh && chmod 666 /home/agent/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e -o Port=22 -o ListenAddress=0.0.0.0 -o PermitRootLogin=no -o PasswordAuthentication=no -o PubkeyAuthentication=yes -o StrictModes=no -o UsePAM=no -o AuthorizedKeysFile=.ssh/authorized_keys -o LogLevel=VERBOSE",
       ]
     healthcheck:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 22"]
@@ -156,6 +156,7 @@ services:
       start_period: 2s
     volumes:
       - certs:/certs:ro
+      - ./out/ssh-auth:/home/agent/.ssh
     networks:
       server:
         ipv4_address: 10.202.0.40
@@ -532,6 +533,18 @@ services:
             chown -R "$$HOST_UID:$$gid" /tmp/.config/nats
           fi
         fi
+        if [ -f /opt/ssh-discovered/.ssh/config ]; then
+          mkdir -p /home/eng
+          cp -a /opt/ssh-discovered/. /home/eng/
+          chmod 700 /home/eng/.ssh
+          chmod 600 /home/eng/.ssh/id_a /home/eng/.ssh/id_b /home/eng/.ssh/id_c
+          chmod 644 /home/eng/.ssh/config /home/eng/.ssh/known_hosts /home/eng/.ssh/config.d/extra
+          printf '%s\n' '10.202.0.40 db.corp' '10.202.0.40 web.corp' '10.202.0.40 extra.corp' '10.202.0.40 other.example' >> /etc/hosts
+          if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
+            gid="$${HOST_GID:-$$HOST_UID}"
+            chown -R "$$HOST_UID:$$gid" /home/eng
+          fi
+        fi
         if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
           gid="$${HOST_GID:-$$HOST_UID}"
           mkdir -p /out
@@ -582,6 +595,9 @@ services:
       - certs:/certs:ro
       - ./out/results:/out
       - ./out/nats-discovery/guest:/opt/nats-discovered:ro
+      - ./out/ssh-discovery/guest:/opt/ssh-discovered:ro
+      - ./out/ssh-discovery/pubs:/opt/ssh-pubs:ro
+      - ./out/ssh-auth:/ssh-auth
     network_mode: service:arkham
     depends_on:
       smtp-direct:

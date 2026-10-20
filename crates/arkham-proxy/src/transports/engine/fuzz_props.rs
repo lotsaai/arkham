@@ -439,6 +439,10 @@ proptest! {
           let suffix = pattern.strip_prefix("*.").unwrap_or(pattern);
           format!("sub.{suffix}")
         }
+        arkham_config::grants::HostPat::Glob(pattern) => pattern
+          .chars()
+          .map(|ch| if ch == '*' || ch == '?' { 'a' } else { ch })
+          .collect(),
         arkham_config::grants::HostPat::Exact(host) => host.clone(),
       };
       assert!(
