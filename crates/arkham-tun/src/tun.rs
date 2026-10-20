@@ -44,48 +44,28 @@ const CHANNEL_CAP: usize = 32;
 /// Returns an error when the TUN device cannot be opened, when policy routes
 /// cannot be installed, or when the in-process stack fails to start.
 pub async fn run_tun(state: Arc<ProxyState>) -> Result<(), Error> {
-  run_tun_named(TUN_NAME, TUN_ADDR, true, None, state).await
-}
-
-/// Test overrides: custom interface name/addr, optional route install,
-/// optional DNS upstream override (else /etc/resolv.conf).
-pub(crate) async fn run_tun_named(
-  name: &str,
-  addr: Ipv4Addr,
-  install_routes: bool,
-  dns_override: Option<SocketAddr>,
-  state: Arc<ProxyState>,
-) -> Result<(), Error> {
   let mut config = tun::Configuration::default();
   config
-    .tun_name(name)
-    .address(addr)
+    .tun_name(TUN_NAME)
+    .address(TUN_ADDR)
     .netmask(Ipv4Addr::new(255, 255, 255, 0))
     .mtu(TUN_MTU)
     .up();
   let device = Arc::new(tun::create_as_async(&config).map_err(|err| Error::TunCreate { origin: err })?);
-  let _guard = if install_routes {
-    let handle = netlink()?;
-    let tun_idx = link_index(&handle, name).await?;
-    let lo_idx = link_index(&handle, "lo").await?;
-    for plan in capture_routes(tun_idx, lo_idx) {
-      add_route(&handle, ROUTE_TABLE, &plan).await?;
-    }
-    for plan in capture_rules(ROUTE_TABLE) {
-      add_rule(&handle, &plan).await?;
-    }
-    Some(RouteGuard::new(capture_undos(ROUTE_TABLE)))
-  } else {
-    None
-  };
-  let dns_upstream = if let Some(addr) = dns_override {
-    addr
-  } else {
-    let text = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-    upstream_dns(&text)
-  };
-  tracing::info!(tun = name, %addr, %dns_upstream, "capturing");
-  run_loop(device, addr, dns_upstream, None, state).await
+  let handle = netlink()?;
+  let tun_idx = link_index(&handle, TUN_NAME).await?;
+  let lo_idx = link_index(&handle, "lo").await?;
+  for plan in capture_routes(tun_idx, lo_idx) {
+    add_route(&handle, ROUTE_TABLE, &plan).await?;
+  }
+  for plan in capture_rules(ROUTE_TABLE) {
+    add_rule(&handle, &plan).await?;
+  }
+  let _guard = RouteGuard::new(capture_undos(ROUTE_TABLE));
+  let text = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+  let dns_upstream = upstream_dns(&text);
+  tracing::info!(tun = TUN_NAME, addr = %TUN_ADDR, %dns_upstream, "capturing");
+  run_loop(device, TUN_ADDR, dns_upstream, None, state).await
 }
 
 /// The capture loop: TUN ingress → smoltcp → relay/spawn/cleanup → TUN egress.
@@ -329,7 +309,6 @@ mod tests {
     let ut0 = link_index(&nl, "arkhamut0").await.unwrap();
     let ut0_route = RoutePlan {
       dst: Some((Ipv4Addr::new(198, 51, 100, 0), 24)),
-      via: None,
       oif: ut0,
     };
     add_route(&nl, TABLE_MAIN, &ut0_route).await.unwrap();
@@ -430,7 +409,6 @@ mod tests {
     let tort0 = link_index(&nl, "arkhamt0").await.unwrap();
     let guest_route = RoutePlan {
       dst: Some((Ipv4Addr::new(198, 51, 100, 0), 24)),
-      via: None,
       oif: tort0,
     };
     add_route(&nl, TABLE_MAIN, &guest_route).await.unwrap();
@@ -536,7 +514,6 @@ mod tests {
     let idx = link_index(&nl, "arkhami0").await.unwrap();
     let guest_route = RoutePlan {
       dst: Some((Ipv4Addr::new(198, 51, 100, 0), 24)),
-      via: None,
       oif: idx,
     };
     add_route(&nl, TABLE_MAIN, &guest_route).await.unwrap();
@@ -612,7 +589,6 @@ mod tests {
     let idx = link_index(&nl, "arkhamr0").await.unwrap();
     let guest_route = RoutePlan {
       dst: Some((Ipv4Addr::new(198, 51, 100, 0), 24)),
-      via: None,
       oif: idx,
     };
     add_route(&nl, TABLE_MAIN, &guest_route).await.unwrap();
@@ -688,7 +664,6 @@ mod tests {
     let idx = link_index(&nl, "arkhamf0").await.unwrap();
     let guest_route = RoutePlan {
       dst: Some((Ipv4Addr::new(198, 51, 100, 0), 24)),
-      via: None,
       oif: idx,
     };
     add_route(&nl, TABLE_MAIN, &guest_route).await.unwrap();
