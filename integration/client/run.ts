@@ -144,6 +144,8 @@ async function retry(scheme: string, what: string, fn: () => Promise<boolean>) {
 
 const ca = await readFile(`${CERT_DIR}/ca.crt`);
 
+// 1. https:// grant, HTTP over MITM TLS: server must see the real bearer;
+//    the redacted body comes back carrying the fake.
 await retry("https", "https mitm substitutes request and redacts response", async () => {
   const resp = await race(
     "https echo",
@@ -157,6 +159,8 @@ await retry("https", "https mitm substitutes request and redacts response", asyn
   return resp.status === 200 && body === `token:${FAKE}\n`;
 });
 
+// 2. http:// grant, cleartext HTTP through transparent capture: server must
+//    see the real bearer; the redacted body comes back carrying the fake.
 await retry("http", "http mitm substitutes request and redacts response", async () => {
   const resp = await race(
     "http echo",
@@ -170,6 +174,7 @@ await retry("http", "http mitm substitutes request and redacts response", async 
 });
 
 // 3. tcp:// grant, cleartext raw stream: opaque substitution both ways.
+//    Scenarios 3-5 stay on raw sockets. They speak the demo's own AUTH <token> line protocol from integration/api/server.ts, which has no client library.
 await retry("tcp", "tcp raw substitutes both directions", async () => {
   stage("tcp api:9000 connecting");
   const sock = await race("tcp api:9000 connect", new Promise<Socket>((resolve, reject) => {
