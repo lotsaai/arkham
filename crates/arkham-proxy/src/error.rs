@@ -431,6 +431,16 @@ pub enum Error {
   /// `guest_tls_mode` is `mtls` and the postgres guest opened in cleartext.
   #[error("postgres mtls guest sent plaintext")]
   PostgresGuestPlaintext,
+  /// Postgres authentication did not finish inside the handshake budget.
+  #[error("postgres authentication timed out")]
+  PostgresAuthTimeout,
+  /// Postgres SCRAM framing failed after the server offered SASL.
+  #[error("postgres scram authentication: {source}")]
+  PostgresScram {
+    /// Underlying protocol failure.
+    #[source]
+    source: Box<dyn StdError + Send + Sync>,
+  },
   /// The configured client identity is empty.
   #[error("client identity `{path}` is empty", path = path.display())]
   EmptyClientIdentity {

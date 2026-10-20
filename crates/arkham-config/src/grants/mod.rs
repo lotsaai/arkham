@@ -2145,6 +2145,12 @@ mod tests {
     assert_eq!(scope.downstream.port, 5433);
     assert_eq!(scope.downstream.user.as_deref(), Some("app"));
     assert_eq!(scope.downstream.password.expose_secret(), "fake");
+    let encoded = postgres_scope(
+      "postgres://app:fake%3Apass@db.internal:5432/main", // betterleaks:allow
+      "postgres://app:real%3Apass@db.internal:5432/main", // betterleaks:allow
+    );
+    assert_eq!(encoded.downstream.password.expose_secret(), "fake:pass");
+    assert_eq!(encoded.upstream.password.expose_secret(), "real:pass");
     assert_eq!(scope.downstream.database.as_deref(), Some("main"));
     // The real string states the server's leg and the upstream policy.
     assert_eq!(scope.upstream.host, "db.internal");

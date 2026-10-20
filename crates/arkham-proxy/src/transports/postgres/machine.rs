@@ -24,7 +24,7 @@ use crate::transports::engine::{Direction, Hit, Raw, Rewritten, Wire};
 
 /// Cap for one greeting message. Real `StartupMessages` are hundreds of
 /// bytes; anything past this is a drip or an attack, never a greeting.
-const MAX_GREETING: usize = 16_384;
+pub(crate) const MAX_GREETING: usize = 16_384;
 
 /// Greeting progress. Response legs skip it: servers open with
 /// length-prefixed Authentication messages, already frame-safe.
