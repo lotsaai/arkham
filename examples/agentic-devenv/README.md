@@ -27,8 +27,8 @@ The agent container holds decoy credentials and shares arkham's network namespac
 ## Before you start
 
 - docker with compose, and arkham on `PATH`.
-- The secrets this workspace uses, declared to fnox. The registry supplies their hosts and decoy shapes, so no `[rules.*]` blocks are needed.
-- Your fnox setup readable by the arkham container: the stack mounts your fnox config directory and arkham's fnox files read-only, and forwards the provider credentials in your environment, so a value that resolves here resolves there.
+- The secrets this workspace uses, declared to fnox. `.config/arkham/config.toml` names `[rules.anthropic]` and `[rules.github]`. The registry supplies their hosts and decoy shapes.
+- The arkham service mounts your fnox config directory and arkham's fnox files read-only. The generated compose file contains no provider credential from your environment.
 
 ## Run it
 
@@ -44,7 +44,7 @@ arkham agent --rm       # the same, stopping both when the shell exits
 arkham down             # stop both
 ```
 
-`init` writes three things, and never overwrites one that already exists:
+`init` writes three things. It replaces `agent-entrypoint.sh` when the copy differs from the generated script. `init` replaces the compose file when the workspace config or the stack shape changes. When neither has changed, `init` leaves the compose file in place. `init` leaves an existing `ca.pem` in place.
 
 | Path | What it is |
 | --- | --- |
@@ -87,7 +87,7 @@ substituted label=anthropic location=Header
 
 - Capture covers every destination in the namespace, LAN included. A connection with no matching grant is spliced byte for byte, so nothing on your network breaks.
 - UDP is passed through. DNS goes to the system resolver, and QUIC on port 443 is dropped, so clients fall back to TCP.
-- The listener is on loopback in the shared namespace, so `HTTPS_PROXY=http://127.0.0.1:8080` works as a fallback if you would rather not rely on capture. Both paths can be live at once.
+- The listener is on loopback in the shared namespace, so `HTTPS_PROXY=http://127.0.0.1:8099` works as a fallback if you would rather not rely on capture. Both paths can be live at once.
 - Keep your own mounts, devices, and environment on the `agent` service: the generated file is a normal compose file for you to edit. To run other images, override `image:` in a compose layer.
 - Each `profiles/<name>/<tool>/` directory mounts into the agent at that tool's default config location, writable. `__shared__` is the base every profile inherits.
 - Recreate the two services together. The agent shares arkham's network namespace, so recreating arkham alone leaves it attached to a dead namespace and its DNS stops resolving.
