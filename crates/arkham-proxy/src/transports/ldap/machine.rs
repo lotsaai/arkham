@@ -1341,13 +1341,18 @@ fn abandon(peek: &Peek, class: &Class) -> Result<Abandon, ()> {
   if tl.content_len > 4 {
     return Err(());
   }
+  // rasn 0.29 reads a definite constructed encoding as the integer octets.
+  let tag = peek.buf.get(class.op_at).copied().ok_or(())?;
+  if tag & 0x20 != 0 {
+    return Err(());
+  }
   let start = class.op_at.checked_add(tl.header).ok_or(())?;
   let end = start.checked_add(tl.content_len).ok_or(())?;
   if peek.buf.len() < end {
     return Ok(Abandon::Need(end));
   }
-  let bytes = peek.buf.get(start..end).ok_or(())?;
-  let target = parse_uint(bytes)?;
+  let bytes = peek.buf.get(class.op_at..end).ok_or(())?;
+  let AbandonRequest(target) = rasn::ber::decode(bytes).map_err(|_err| ())?;
   if target > MAX_INT {
     return Err(());
   }
