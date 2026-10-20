@@ -670,9 +670,9 @@ impl Config {
   ///
   /// # Errors
   ///
-  /// Returns [`Error::ListenPortsZero`] for a zero listen port and
-  /// [`Error::InvalidBypassPrefix`] for a prefix outside `1..=32` or more
-  /// entries than [`MAX_BYPASS`].
+  /// Returns [`Error::ListenPortsZero`] for a zero listen port,
+  /// [`Error::InvalidBypassPrefix`] for a prefix outside `1..=32`, and
+  /// [`Error::TooManyBypasses`] for more entries than [`MAX_BYPASS`].
   fn from_bypass(
     proxy_pid: u32,
     proxy_cgroup: u64,
@@ -770,7 +770,6 @@ pub(crate) struct OrigDst {
 unsafe impl aya::Pod for OrigDst {}
 
 impl OrigDst {
-  /// The recorded destination as a socket address.
   pub(crate) fn socket_addr(&self) -> SocketAddr {
     SocketAddr::from((decode_addr(self.ip), decode_port(self.port)))
   }
@@ -934,7 +933,6 @@ mod tests {
     assert_eq!(encode_port(TCP_LISTEN_PORT), u32::from(TCP_LISTEN_PORT.to_be()));
   }
 
-  /// Bits above the low 16 are dropped. A dirty high half still decodes to the port.
   #[test]
   fn decode_port_truncates_a_dirty_high_half() {
     let port = 443u16;
