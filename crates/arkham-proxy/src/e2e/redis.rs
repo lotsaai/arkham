@@ -23,6 +23,7 @@ fn redis_grant(fake: &str, real: &str) -> Grant {
   }
 }
 
+/// Serve one redis connection: AUTH then PING, recording every byte.
 async fn serve_redis<S>(mut conn: S, seen: Arc<Mutex<Vec<u8>>>)
 where
   S: AsyncRead + AsyncWrite + Unpin,
@@ -174,10 +175,9 @@ async fn redis_tls_without_sni_mints_for_the_grant_host() {
   let mut roots = rustls::RootCertStore::empty();
   roots.add(ca.cert_der().clone()).unwrap();
   let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-  // The redis crate's dialer always sends SNI, so it cannot build this
-  // ClientHello. Bun's client on the transparent path sends none, and the
-  // proxy mints the leaf for the grant host. RESP after the handshake goes
-  // through the redis crate.
+  // The redis crate builds its own rustls ClientConfig (no enable_sni knob)
+  // and verifies the dialed host, so it cannot send a no-SNI ClientHello that
+  // still checks the grant host.
   config.enable_sni = false;
   let name = ServerName::try_from("localhost".to_string()).unwrap();
   let tls = tokio::time::timeout(
