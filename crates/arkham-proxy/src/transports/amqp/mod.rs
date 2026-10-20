@@ -208,13 +208,13 @@ where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  let (mut downstream, mut upstream) = amqp_pair(ctx, swap);
+  let (mut downstream, mut upstream) = amqp_pair(ctx, swap)?;
   relay_guarded(guest, server, &mut downstream, &mut upstream, &[], &[]).await
 }
 
-pub(crate) fn amqp_pair(ctx: &PairCtx<'_>, swap: bool) -> (Amqp, Amqp) {
-  (
-    Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream, swap),
-    Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream, false),
-  )
+pub(crate) fn amqp_pair(ctx: &PairCtx<'_>, swap: bool) -> Result<(Amqp, Amqp), Error> {
+  Ok((
+    Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream, swap)?,
+    Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream, false)?,
+  ))
 }

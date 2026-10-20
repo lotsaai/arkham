@@ -390,6 +390,31 @@ pub enum Error {
   /// An AMQP TLS handshake exceeded the configured budget.
   #[error("amqp handshake timed out")]
   AmqpHandshakeTimeout,
+  /// A secret does not fit the smallest frame either peer can negotiate.
+  #[error("amqp secret of {len} bytes exceeds the minimum frame")]
+  AmqpSecretTooLong {
+    /// Secret length in bytes.
+    len: usize,
+  },
+  /// A guest Open cannot reserve the withheld prefix and stay above the minimum frame size.
+  #[error("amqp open max-frame-size {offered} cannot reserve {room} bytes")]
+  AmqpFrameMax {
+    /// Maximum the guest offered.
+    offered: u32,
+    /// Bytes withheld from a later frame.
+    room: usize,
+  },
+  /// A grant is active and the guest Open could not be lowered.
+  #[error("amqp open could not be lowered")]
+  AmqpOpenUnlowered,
+  /// Retained AMQP payload exceeded the connection carry budget.
+  #[error("amqp carry holds {bytes} bytes across {entries} links")]
+  AmqpCarryBudget {
+    /// Total retained bytes.
+    bytes: usize,
+    /// Carry-map entries.
+    entries: usize,
+  },
   /// An SMTP TLS handshake exceeded the configured budget.
   #[error("smtp handshake timed out")]
   SmtpHandshakeTimeout,

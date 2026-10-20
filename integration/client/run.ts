@@ -876,6 +876,104 @@ function amqp10Open(raw: string, tls: boolean, password: string): Promise<string
   }));
 }
 
+function amqpBody(value: unknown): Buffer {
+  if (Buffer.isBuffer(value)) return value;
+  if (typeof value === "string") return Buffer.from(value);
+  if (value instanceof Uint8Array) return Buffer.from(value);
+  return Buffer.from(String(value));
+}
+
+// One byte short of the real password, then a breaker, repeated. The full
+// password never appears, so a held prefix is released when the message ends.
+// Shifts cover every alignment against a stable frame size. Forty copies are
+// longer than the lowered max, so the broker splits the body.
+function amqpSplitBodies(): Buffer[] {
+  const unit = Buffer.concat([Buffer.from(AMQP_REAL.slice(0, -1)), Buffer.from([0x71])]);
+  const repeated = Buffer.concat(Array.from({ length: 40 }, () => unit));
+  return Array.from({ length: AMQP_REAL.length }, (_, shift) => Buffer.concat([
+    Buffer.alloc(shift, 0x71),
+    repeated,
+  ]));
+}
+
+async function amqp10Split(raw: string): Promise<boolean> {
+  const parts = amqpParts(raw);
+  const sent = amqpSplitBodies();
+  const prefix = AMQP_REAL.slice(0, -1);
+  if (sent.some((body) => body.includes(AMQP_REAL) || !body.includes(prefix))) return false;
+  const queue = `arkham-split-${randomBytes(4).toString("hex")}`;
+  const address = `/queues/${queue}`;
+  const setup = await race("amqp 1.0 split declare", amqplib.connect(raw, { timeout: ATTEMPT_TIMEOUT_MS }));
+  try {
+    const channel = await race("amqp 1.0 split queue", setup.createChannel());
+    // RabbitMQ 4.3 refuses a transient non-exclusive queue. Durable survives
+    // this connection so the rhea link can attach to /queues/:queue.
+    await race("amqp 1.0 split assert", channel.assertQueue(queue, { durable: true }));
+  } finally {
+    await race("amqp 1.0 split close", setup.close()).catch(() => undefined);
+  }
+  return race("amqp 1.0 split", new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      connection.close();
+      resolve(ok);
+    };
+    const connection = rhea.create_container().connect({
+      host: parts.host,
+      port: parts.port,
+      transport: "tcp",
+      username: parts.user,
+      password: parts.password,
+      hostname: "vhost:/",
+      max_frame_size: 1024,
+      reconnect: false,
+    });
+    const got = new Map<number, Buffer>();
+    let sentOnce = false;
+    connection.on("connection_open", () => {
+      connection.open_receiver({ source: { address }, credit_window: 64 });
+      connection.open_sender({ target: { address } });
+    });
+    connection.on("sendable", (context) => {
+      if (sentOnce || context.sender === undefined) return;
+      sentOnce = true;
+      sent.forEach((body, shift) => {
+        context.sender.send({
+          body,
+          message_id: `arkham-${String(shift).padStart(2, "0")}`,
+        });
+      });
+    });
+    connection.on("message", (context) => {
+      const id = context.message?.message_id;
+      const index = typeof id === "string" ? Number(id.slice("arkham-".length)) : Number.NaN;
+      if (!Number.isInteger(index) || index < 0 || index >= sent.length) {
+        stage(`amqp 1.0 split unexpected id: ${String(id)}`);
+        finish(false);
+        return;
+      }
+      got.set(index, amqpBody(context.message?.body));
+      if (got.size < sent.length) return;
+      const match = sent.every((body, at) => got.get(at)?.equals(body) ?? false);
+      const leaked = [...got.values()].some((body) => body.includes(AMQP_REAL));
+      stage(`amqp 1.0 split: messages=${got.size} match=${match} leaked=${leaked}`);
+      finish(match && !leaked);
+    });
+    connection.on("connection_error", (context) => {
+      const error = context.error as { condition?: string; description?: string } | undefined;
+      stage(`amqp 1.0 split error: ${error?.condition ?? ""} ${error?.description ?? ""}`.trim());
+      finish(false);
+    });
+    connection.on("disconnected", (context) => {
+      if (settled) return;
+      stage(`amqp 1.0 split disconnected: ${String(context.error ?? "")}`.trim());
+      finish(false);
+    });
+  }));
+}
+
 async function amqpScenarios(scheme: "amqp" | "amqps", raw: string) {
   const tls = scheme === "amqps";
   const parts = amqpParts(raw);
@@ -899,6 +997,10 @@ async function amqpScenarios(scheme: "amqp" | "amqps", raw: string) {
     stage(`${scheme} 1.0 refusal: ${outcome}`);
     return outcome.includes("amqp:unauthorized-access") && !outcome.includes(AMQP_REAL);
   });
+
+  if (!tls) {
+    await retry(scheme, `${scheme} 1.0 split delivery returns the exact body`, () => amqp10Split(raw));
+  }
 }
 
 function spliceFatal(why: string): never {

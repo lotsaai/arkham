@@ -57,6 +57,7 @@ Topology:
 | 26 | Both clients to `amqp:5671` over TLS with the decoy | `[rules.amqp_tls]`: fake `amqps://` URL; real URL carries `sslrootcert` | same swaps on a guest leg that is TLS from the first byte |
 | 27 | Both clients on both rules with a password that is not the decoy | the same two rules | 0-9-1 gets `ACCESS_REFUSED` and 1.0 gets a failed SASL outcome (`amqp:unauthorized-access`). The password was not swapped, and the error text does not contain the real password |
 | 28 | `amqplib` to port 5673, which has no grant. The client bytes are compared with a tcpflow recording on the broker | no AMQP grant. The witness shares the broker network namespace, drops every capability, and adds `NET_RAW`, `CHOWN`, and `DAC_OVERRIDE`. It is not mounted into the client | RabbitMQ answers `ACCESS_REFUSED` (403). Start-Ok still carries the decoy. The bytes match. `ss` shows a second established socket to 5673, so a bypass cannot pass |
+| 29 | `rhea` to `amqp:5672` with `max_frame_size` 1024. Each body repeats a prefix of the real password, shifted by one byte, so a frame boundary falls on that prefix | `[rules.amqp_plain]` | the receiver gets the exact body, and the connection stays open |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
@@ -153,6 +154,11 @@ the real password only to a TLS upstream. The cleartext-upstream case,
 where the decoy is forwarded, is the in-process test
 `amqp_cleartext_start_ok_forwards_the_decoy`. Scenarios 24–27 are gated
 on `AMQP_URL` and `AMQP_TLS_URL`. Scenario 28 is gated on `AMQP_URL`.
+Scenario 29 is gated on `AMQP_URL`. The client offers a 1024-octet
+`max_frame_size`. Arkham reserves the withheld prefix before forwarding
+that Open, and the broker splits each body. One shift puts a frame
+boundary on a prefix of the real password. The receiver gets that body
+unchanged and the connection stays open.
 The broker also listens on 5673. That port is not a grant, so arkham
 splices it. An empty capture retries. A byte mismatch fails on the
 first attempt.
