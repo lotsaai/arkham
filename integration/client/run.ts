@@ -906,9 +906,11 @@ async function amqp10Split(raw: string): Promise<boolean> {
   const setup = await race("amqp 1.0 split declare", amqplib.connect(raw, { timeout: ATTEMPT_TIMEOUT_MS }));
   try {
     const channel = await race("amqp 1.0 split queue", setup.createChannel());
-    await race("amqp 1.0 split assert", channel.assertQueue(queue, { durable: false, autoDelete: true }));
+    // RabbitMQ 4.3 refuses a transient non-exclusive queue. Durable survives
+    // this connection so the rhea link can attach to /queues/:queue.
+    await race("amqp 1.0 split assert", channel.assertQueue(queue, { durable: true }));
   } finally {
-    await setup.close();
+    await race("amqp 1.0 split close", setup.close()).catch(() => undefined);
   }
   return race("amqp 1.0 split", new Promise<boolean>((resolve) => {
     let settled = false;
