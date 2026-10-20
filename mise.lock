@@ -128,11 +128,6 @@ version = "0.22.2"
 backend = "cargo:cargo-audit"
 specifiers = ["latest"]
 
-[[tools."cargo:cargo-outdated"]]
-version = "0.19.0"
-backend = "cargo:cargo-outdated"
-specifiers = ["latest"]
-
 [[tools."cargo:cargo-sort"]]
 version = "2.1.4"
 backend = "cargo:cargo-sort"
@@ -264,46 +259,6 @@ checksum = "sha256:b765daec9fda475b031b5a5159798cbe4294a3f2a50683cbc0471226e376d
 url = "https://github.com/betterleaks/betterleaks/releases/download/v1.9.0/betterleaks_1.9.0_windows_x64.zip"
 url_api = "https://api.github.com/repos/betterleaks/betterleaks/releases/assets/599108997"
 provenance = "github-attestations"
-
-[[tools."github:casualjim/remark"]]
-version = "0.6.2"
-backend = "github:casualjim/remark"
-specifiers = ["latest"]
-
-[tools."github:casualjim/remark"."platforms.linux-arm64"]
-checksum = "sha256:ddca05e340028c83956335b5d1f231dc94d5321d9f48c468a7ecc64c0122376d"
-url = "https://github.com/casualjim/remark/releases/download/v0.6.2/remark-aarch64-unknown-linux-gnu.tar.xz"
-url_api = "https://api.github.com/repos/casualjim/remark/releases/assets/536124365"
-
-[tools."github:casualjim/remark"."platforms.linux-arm64-musl"]
-checksum = "sha256:ddca05e340028c83956335b5d1f231dc94d5321d9f48c468a7ecc64c0122376d"
-url = "https://github.com/casualjim/remark/releases/download/v0.6.2/remark-aarch64-unknown-linux-gnu.tar.xz"
-url_api = "https://api.github.com/repos/casualjim/remark/releases/assets/536124365"
-
-[tools."github:casualjim/remark"."platforms.linux-x64"]
-checksum = "sha256:7e4ff4fd1f83f4d1964195567c2c9a22d7523a3f46ae35a14b0cc71ec2f3b498"
-url = "https://github.com/casualjim/remark/releases/download/v0.6.2/remark-x86_64-unknown-linux-gnu.tar.xz"
-url_api = "https://api.github.com/repos/casualjim/remark/releases/assets/536124391"
-
-[tools."github:casualjim/remark"."platforms.linux-x64-musl"]
-checksum = "sha256:7e4ff4fd1f83f4d1964195567c2c9a22d7523a3f46ae35a14b0cc71ec2f3b498"
-url = "https://github.com/casualjim/remark/releases/download/v0.6.2/remark-x86_64-unknown-linux-gnu.tar.xz"
-url_api = "https://api.github.com/repos/casualjim/remark/releases/assets/536124391"
-
-[tools."github:casualjim/remark"."platforms.macos-arm64"]
-checksum = "sha256:12bf1cdbdf1b09c47e089dc66efa78f7662a62169638e1492e8f4f9673dcaa4e"
-url = "https://github.com/casualjim/remark/releases/download/v0.6.2/remark-aarch64-apple-darwin.tar.xz"
-url_api = "https://api.github.com/repos/casualjim/remark/releases/assets/536124358"
-
-[tools."github:casualjim/remark"."platforms.macos-x64"]
-checksum = "sha256:9e8560943d8441987caf8a9fc30e9c4e223a368e06208b0c931cc67df2061878"
-url = "https://github.com/casualjim/remark/releases/download/v0.6.2/source.tar.gz"
-url_api = "https://api.github.com/repos/casualjim/remark/releases/assets/536124398"
-
-[tools."github:casualjim/remark"."platforms.windows-x64"]
-checksum = "sha256:052997ae7e1660a60cf0d87e11347b19ca7fca0743173854e1aa1f27738ecc6f"
-url = "https://github.com/casualjim/remark/releases/download/v0.6.2/remark-x86_64-pc-windows-msvc.zip"
-url_api = "https://api.github.com/repos/casualjim/remark/releases/assets/536124385"
 
 [[tools."github:nats-io/nsc"]]
 version = "2.15.0"
@@ -608,79 +563,6 @@ url_api = "https://api.github.com/repos/rui314/mold/releases/assets/557036001"
 checksum = "sha256:ce38c5d5d6a5169e05883d598592b367976a9575abfafcdc49889fcc788b51c0"
 url = "https://github.com/rui314/mold/releases/download/v2.42.1/mold-2.42.1-x86_64-windows.zip"
 url_api = "https://api.github.com/repos/rui314/mold/releases/assets/557036000"
-
-[[tools.node]]
-version = "24.21.0"
-backend = "core:node"
-specifiers = ["lts"]
-
-[tools.node."platforms.linux-arm64"]
-checksum = "sha256:724282c3b43aec998aa9527380465b45d229e021b58035f5f4f63095eabfe5d5"
-url = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-arm64.tar.gz"
-
-[tools.node."platforms.linux-arm64-musl"]
-checksum = "sha256:3048b0811e158ca0d8672b59c839861763e144492980d8d29b369dfee45747e4"
-url = "https://unofficial-builds.nodejs.org/download/release/v24.21.0/node-v24.21.0-linux-arm64-musl.tar.gz"
-
-[tools.node."platforms.linux-x64"]
-checksum = "sha256:6e1db87ef58b8819e5d5402eff1536491b18edd8eb7bee5ef7897876e88dc5ff"
-url = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.gz"
-
-[tools.node."platforms.linux-x64-musl"]
-checksum = "sha256:01a713e34da98e7b4d2a3191ee7ca3f93dd0384d1a2ef23c379b2161ee6e133a"
-url = "https://unofficial-builds.nodejs.org/download/release/v24.21.0/node-v24.21.0-linux-x64-musl.tar.gz"
-
-[tools.node."platforms.macos-arm64"]
-checksum = "sha256:bed7eea5325e1108f32ce5228ddd6a5f0f08a499ee42aa7442aea583702f6057"
-url = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-arm64.tar.gz"
-
-[tools.node."platforms.macos-x64"]
-checksum = "sha256:1462cb3b3046b815cf8ea436d3da450ec1a9f11dac7e5a46b0ada5305d7e8097"
-url = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-x64.tar.gz"
-
-[tools.node."platforms.windows-x64"]
-checksum = "sha256:158f7685b44de51f6c0df1d153526cbcd3e1bc739a8dfc607721cef75de9e541"
-url = "https://nodejs.org/dist/v24.21.0/node-v24.21.0-win-x64.zip"
-
-[[tools.pkl]]
-version = "0.32.1"
-backend = "aqua:apple/pkl"
-specifiers = ["latest"]
-
-[tools.pkl."platforms.linux-arm64"]
-checksum = "sha256:a76d2dd47da435a8f911b0347373f47c7e59ea54fb75ff846d20b8df10dba058"
-url = "https://github.com/apple/pkl/releases/download/0.32.1/pkl-linux-aarch64"
-url_api = "https://api.github.com/repos/apple/pkl/releases/assets/487426568"
-
-[tools.pkl."platforms.linux-arm64-musl"]
-checksum = "sha256:a76d2dd47da435a8f911b0347373f47c7e59ea54fb75ff846d20b8df10dba058"
-url = "https://github.com/apple/pkl/releases/download/0.32.1/pkl-linux-aarch64"
-url_api = "https://api.github.com/repos/apple/pkl/releases/assets/487426568"
-
-[tools.pkl."platforms.linux-x64"]
-checksum = "sha256:3180b62da95c0cad1d904e9bb6c5f4a8f9032413c21e53194bb91ff1ee5f3211"
-url = "https://github.com/apple/pkl/releases/download/0.32.1/pkl-linux-amd64"
-url_api = "https://api.github.com/repos/apple/pkl/releases/assets/487426567"
-
-[tools.pkl."platforms.linux-x64-musl"]
-checksum = "sha256:3180b62da95c0cad1d904e9bb6c5f4a8f9032413c21e53194bb91ff1ee5f3211"
-url = "https://github.com/apple/pkl/releases/download/0.32.1/pkl-linux-amd64"
-url_api = "https://api.github.com/repos/apple/pkl/releases/assets/487426567"
-
-[tools.pkl."platforms.macos-arm64"]
-checksum = "sha256:563eb51c9a20b16a3625464ed745c675ed9750381f2126722696a0d7cac1d9d3"
-url = "https://github.com/apple/pkl/releases/download/0.32.1/pkl-macos-aarch64"
-url_api = "https://api.github.com/repos/apple/pkl/releases/assets/487426570"
-
-[tools.pkl."platforms.macos-x64"]
-checksum = "sha256:5b74b903234047960144f66f2cebdd12d267d9b98e8155ed91d2ae5ed27e2d1f"
-url = "https://github.com/apple/pkl/releases/download/0.32.1/pkl-macos-amd64"
-url_api = "https://api.github.com/repos/apple/pkl/releases/assets/487426599"
-
-[tools.pkl."platforms.windows-x64"]
-checksum = "sha256:8550a00fcf027335e42c5e2cd553b88e98845408cb1880b3e3d1860caf46d22a"
-url = "https://github.com/apple/pkl/releases/download/0.32.1/pkl-windows-amd64.exe"
-url_api = "https://api.github.com/repos/apple/pkl/releases/assets/487426668"
 
 [[tools.rust]]
 version = "nightly-2026-09-18"
