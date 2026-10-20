@@ -626,7 +626,9 @@ fn redaction_pairs(auth: &NatsAuth) -> Vec<(String, String)> {
 
 /// `line` with the real values, when its JSON parses and every auth field
 /// holds the decoy. A method that signs also checks the guest signature and
-/// writes a new one. `None` forwards the line unchanged.
+/// writes a new one. `None` forwards the line unchanged. A JSON null is an
+/// absent field: async-nats writes one for every CONNECT member it does not
+/// set, and a server reads that the same as a missing key.
 fn swap_connect(line: &[u8], auth: &NatsAuth, nonce: &NonceSlot) -> Option<Vec<u8>> {
   let nonce = if auth.signer().is_some() {
     let NonceSlot::Ready(nonce) = nonce else {
@@ -642,6 +644,7 @@ fn swap_connect(line: &[u8], auth: &NatsAuth, nonce: &NonceSlot) -> Option<Vec<u
 /// One CONNECT edit for every auth method. Field checks, the signature
 /// step, and the value swap share this function.
 fn apply_auth(fields: &mut Map<String, Value>, auth: &NatsAuth, nonce: Option<&[u8]>) -> Option<()> {
+  fields.retain(|_, value| !value.is_null());
   let sign = auth.signer().map(|sign| (sign.verify.to_string(), sign.seed.clone()));
   for name in auth.forbidden() {
     if fields.contains_key(<&str>::from(*name)) {
