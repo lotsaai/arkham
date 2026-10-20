@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+
+#MISE description="Prove talosctl context switching through tun and tproxy against official Talos nodes"
+#MISE depends=["build:debug"]
+
+proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
+cd "$proj_dir" || exit 1
+
+set -euo pipefail
+
+if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
+  echo "skip: test:talos needs a docker daemon"
+  exit 0
+fi
+
+talos_version="${ARKHAM_TALOS_VERSION:-v1.14.4}"
+image="ghcr.io/siderolabs/talos:${talos_version}"
+prod_name=arkham-talos-prod
+staging_name=arkham-talos-staging
+prod_subnet=172.31.10.0/24
+staging_subnet=172.31.11.0/24
+proxy=arkham-talos-proxy
+arkham_image=arkham-talos-e2e:local
+
+scratch=$proj_dir/target/talos-e2e
+arkham=$proj_dir/target/debug/arkham
+talosctl=""
+state=""
+
+cleanup() {
+  local status=$?
+  set +e
+  if [ "$status" -ne 0 ]; then
+    echo "=== arkham proxy logs ===" >&2
+    docker logs "$proxy" 2>&1 | tail -200 >&2
+    echo "=== talos node logs ===" >&2
+    docker ps -a --filter name=arkham-talos- --format '{{.Names}}' | while read -r name; do
+      echo "--- $name ---" >&2
+      docker logs --tail 80 "$name" 2>&1 >&2
+    done
+  fi
+  docker rm -f "$proxy" >/dev/null 2>&1
+  if [ -n "$talosctl" ] && [ -x "$talosctl" ] && [ -n "$state" ]; then
+    "$talosctl" --state "$state" cluster destroy --name "$prod_name" >/dev/null 2>&1
+    "$talosctl" --state "$state" cluster destroy --name "$staging_name" >/dev/null 2>&1
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+
+rm -rf "$scratch"
+mkdir -p "$scratch/image" "$scratch/fnox" "$scratch/home/.talos" "$scratch/workspace" "$scratch/xdg-config" "$scratch/xdg-state" "$scratch/xdg-data"
+cp "$arkham" "$scratch/image/arkham"
+
+case "$(uname -m)" in
+  x86_64) talos_arch=amd64 ;;
+  aarch64) talos_arch=arm64 ;;
+  *)
+    echo "unsupported architecture $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+talosctl=$scratch/talosctl
+state=$scratch/state
+curl -fsSL -o "$talosctl" "https://github.com/siderolabs/talos/releases/download/${talos_version}/talosctl-linux-${talos_arch}"
+chmod +x "$talosctl"
+
+if [ ! -e /dev/net/tun ]; then
+  sudo modprobe tun
+fi
+
+context_name() {
+  "$talosctl" --talosconfig "$1" config info | awk -F: 'tolower($1) ~ /context/ { gsub(/^[ \t]+/, "", $2); print $2; exit }'
+}
+
+control_plane() {
+  local name=$1
+  docker ps --format '{{.Names}}' | awk -v prefix="${name}-controlplane-" 'index($0, prefix) == 1 { print; exit }'
+}
+
+node_ip() {
+  local container=$1
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$container" | awk 'NF { print; exit }'
+}
+
+node_network() {
+  local container=$1
+  docker inspect -f '{{range $name, $net := .NetworkSettings.Networks}}{{$name}}{{"\n"}}{{end}}' "$container" | awk 'NF { print; exit }'
+}
+
+create_cluster() {
+  local name=$1 subnet=$2 dest=$3
+  echo "creating ${name} on ${subnet}" >&2
+  "$talosctl" --state "$state" cluster create docker \
+    --name "$name" \
+    --workers 0 \
+    --subnet "$subnet" \
+    --cpus-controlplanes 1.0 \
+    --memory-controlplanes 2.0GiB \
+    --image "$image" \
+    --talosconfig-destination "$dest" >&2
+  local container ip network context
+  container=$(control_plane "$name")
+  if [ -z "$container" ]; then
+    echo "no control plane container for ${name}" >&2
+    exit 1
+  fi
+  ip=$(node_ip "$container")
+  network=$(node_network "$container")
+  context=$(context_name "$dest")
+  if [ -z "$ip" ] || [ -z "$network" ] || [ -z "$context" ]; then
+    echo "cluster ${name} has no node address, network, or context" >&2
+    exit 1
+  fi
+  "$talosctl" --talosconfig "$dest" config endpoint "$ip" >&2
+  "$talosctl" --talosconfig "$dest" config node "$ip" >&2
+  echo "real ${context} reaches ${ip} on ${network}" >&2
+  "$talosctl" --talosconfig "$dest" version >&2
+  printf '%s %s %s\n' "$context" "$ip" "$network"
+}
+
+docker build -t "$arkham_image" -f "$proj_dir/Dockerfile" "$scratch/image"
+
+prod_line=$(create_cluster "$prod_name" "$prod_subnet" "$scratch/prod.yaml")
+staging_line=$(create_cluster "$staging_name" "$staging_subnet" "$scratch/staging.yaml")
+read -r prod_context prod_ip prod_net <<<"$prod_line"
+read -r staging_context staging_ip staging_net <<<"$staging_line"
+
+cp "$scratch/prod.yaml" "$scratch/merged.yaml"
+"$talosctl" --talosconfig "$scratch/merged.yaml" config merge "$scratch/staging.yaml"
+cp "$scratch/merged.yaml" "$scratch/home/.talos/config"
+
+# An empty TALOSCONFIG is the default path under HOME, the same file.
+env -u ARKHAM_CONFIG \
+  HOME="$scratch/home" \
+  TALOSCONFIG= \
+  XDG_CONFIG_HOME="$scratch/xdg-config" \
+  XDG_STATE_HOME="$scratch/xdg-state" \
+  XDG_DATA_HOME="$scratch/xdg-data" \
+  GIT_CONFIG_GLOBAL=/dev/null \
+  GIT_CONFIG_SYSTEM=/dev/null \
+  FNOX_CONFIG_DIR="$scratch/fnox" \
+  "$arkham" init --backend tproxy "$scratch/workspace"
+
+state_root=$scratch/xdg-state/arkham/ws
+grant_toml=$(find "$state_root" -path '*/grants/arkham.toml' -type f -print -quit)
+decoy=$(find "$state_root" -path '*/files/talos-config' -type f -print -quit)
+ca=$scratch/xdg-config/arkham/ca.pem
+if [ -z "$grant_toml" ] || [ -z "$decoy" ] || [ ! -f "$ca" ]; then
+  echo "init did not write a talos grant, decoy, and CA" >&2
+  exit 1
+fi
+grants_dir=$(dirname "$grant_toml")
+for needle in "$prod_ip" "$staging_ip" 'guest_tls_mode = "mtls"'; do
+  if ! grep -F -q -- "$needle" "$grant_toml"; then
+    echo "grant layer is missing ${needle}" >&2
+    exit 1
+  fi
+done
+for needle in "$prod_ip" "$staging_ip" "$prod_context" "$staging_context"; do
+  if ! grep -F -q -- "$needle" "$decoy"; then
+    echo "guest talosconfig is missing ${needle}" >&2
+    exit 1
+  fi
+done
+python3 - "$scratch/merged.yaml" "$decoy" <<'PY'
+import pathlib, sys
+real = pathlib.Path(sys.argv[1]).read_text()
+decoy = pathlib.Path(sys.argv[2]).read_text()
+found = []
+for line in real.splitlines():
+    text = line.strip()
+    for key in ("ca:", "crt:", "key:"):
+        if text.startswith(key):
+            value = text[len(key):].strip().strip('"').strip("'")
+            if len(value) > 40:
+                found.append(value)
+if not found:
+    sys.exit("real talosconfig has no ca, crt, or key")
+if any(value in decoy for value in found):
+    sys.exit("guest talosconfig contains real ca, crt, or key material")
+PY
+
+guest_dir=$scratch/guest-direct
+mkdir -p "$guest_dir"
+cp "$decoy" "$guest_dir/config"
+if timeout 20 "$talosctl" --talosconfig "$guest_dir/config" --context "$prod_context" version; then
+  echo "decoy talosconfig worked without the proxy" >&2
+  exit 1
+fi
+
+run_guest() {
+  local dir=$1
+  shift
+  timeout -k 15 90 docker run --rm --network "container:${proxy}" \
+    -v "${dir}:/work" \
+    -v "${talosctl}:/talosctl:ro" \
+    -e HOME=/work \
+    -e TALOSCONFIG=/work/config \
+    --entrypoint /talosctl \
+    "$arkham_image" \
+    "$@"
+}
+
+wait_serving() {
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if ! docker inspect -f '{{.State.Running}}' "$proxy" 2>/dev/null | grep -qx true; then
+      echo "arkham proxy is not running" >&2
+      return 1
+    fi
+    if docker logs "$proxy" 2>&1 | grep -q 'serving'; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "arkham did not report serving" >&2
+  return 1
+}
+
+prove_backend() {
+  local backend=$1
+  echo "=== ${backend}: decoy through the proxy ==="
+  docker rm -f "$proxy" >/dev/null 2>&1 || true
+  docker run -d --name "$proxy" \
+    --cap-add NET_ADMIN \
+    --device /dev/net/tun \
+    --network "$prod_net" \
+    -v "${grants_dir}:/arkham/grants:ro" \
+    -v "${grant_toml}:/root/.config/arkham/config.toml:ro" \
+    -v "${ca}:/certs/ca.pem:ro" \
+    -e ARKHAM_CA_FILE=/certs/ca.pem \
+    -e RUST_LOG=info \
+    "$arkham_image" \
+    serve --proxy-backend "$backend"
+  docker network connect "$staging_net" "$proxy"
+  wait_serving
+
+  local explicit=$scratch/guest-${backend}-explicit
+  local switched=$scratch/guest-${backend}-switched
+  mkdir -p "$explicit" "$switched"
+  cp "$decoy" "$explicit/config" "$switched/config"
+
+  local explicit_out=$scratch/${backend}-explicit.txt
+  local switched_out=$scratch/${backend}-switched.txt
+  run_guest "$explicit" --context "$prod_context" version | tee "$explicit_out"
+  run_guest "$switched" config context "$staging_context"
+  run_guest "$switched" version | tee "$switched_out"
+  if ! grep -F -q -- "$prod_ip" "$explicit_out"; then
+    echo "${backend}: --context ${prod_context} did not reach ${prod_ip}" >&2
+    exit 1
+  fi
+  if ! grep -F -q -- "$staging_ip" "$switched_out"; then
+    echo "${backend}: context ${staging_context} did not reach ${staging_ip}" >&2
+    exit 1
+  fi
+  docker rm -f "$proxy" >/dev/null
+}
+
+prove_backend tproxy
+prove_backend tun
+
+echo "talosctl substitution proven: ${prod_context} and ${staging_context} on tproxy and tun"
