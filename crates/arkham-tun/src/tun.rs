@@ -68,7 +68,6 @@ pub async fn run_tun(state: Arc<ProxyState>) -> Result<(), Error> {
   run_loop(device, TUN_ADDR, dns_upstream, None, state).await
 }
 
-/// The capture loop: TUN ingress → smoltcp → relay/spawn/cleanup → TUN egress.
 async fn run_loop(
   device: Arc<tun::AsyncDevice>,
   tun_addr: Ipv4Addr,

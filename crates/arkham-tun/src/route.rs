@@ -21,7 +21,6 @@ const RULE_PREF_CAPTURE: u32 = 200;
 /// Main routing table id.
 pub(super) const TABLE_MAIN: u8 = 254;
 
-/// One capture-table route: `dst/plen dev oif`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutePlan {
   pub dst: Option<(Ipv4Addr, u8)>,
