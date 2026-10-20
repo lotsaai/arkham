@@ -427,3 +427,376 @@ fn scram_err(err: impl std::error::Error + Send + Sync + 'static) -> Error {
 fn short(message: &str) -> std::io::Error {
   std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
+
+#[cfg(test)]
+mod tests {
+  use std::sync::OnceLock;
+  use std::time::Instant;
+
+  use arkham_config::grants::{Credential, Grant, PostgresScope};
+  use arkham_plugin::Registry;
+  use pgwire::api::auth::sasl::SCRAM_SHA_256_PLUS_METHOD;
+  use pgwire::messages::Message as _;
+  use pgwire::messages::startup::Startup;
+  use secrecy::SecretString;
+  use tokio::io::duplex;
+
+  use super::*;
+  use crate::transports::engine::Direction;
+
+  const FAKE: &str = "arkham_fake_pg_pass"; // betterleaks:allow
+  const REAL: &str = "arkham_real_pg_pass"; // betterleaks:allow
+  const LEAK: &str = "upstream-leak-marker";
+
+  fn registry() -> &'static Registry {
+    static REGISTRY: OnceLock<Registry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Registry::load(&[]).expect("empty plugin registry"))
+  }
+
+  fn grant() -> Grant {
+    Grant::Postgres {
+      credential: Credential {
+        label: "pg".into(),
+        fake: FAKE.into(),
+        value: SecretString::from(REAL),
+      },
+      scope: Box::new(
+        PostgresScope::from_strings(
+          &format!("postgres://app:{FAKE}@db.internal:5432/main"), // betterleaks:allow
+          &format!("postgres://app:{REAL}@db.internal:5432/main?sslmode=disable"), // betterleaks:allow
+        )
+        .expect("grant"),
+      ),
+    }
+  }
+
+  fn userless_grant() -> Grant {
+    Grant::Postgres {
+      credential: Credential {
+        label: "pg".into(),
+        fake: FAKE.into(),
+        value: SecretString::from(REAL),
+      },
+      scope: Box::new(
+        PostgresScope::from_strings(
+          &format!("postgres://:{FAKE}@db.internal:5432/main"), // betterleaks:allow
+          &format!("postgres://:{REAL}@db.internal:5432/main?sslmode=disable"), // betterleaks:allow
+        )
+        .expect("userless grant"),
+      ),
+    }
+  }
+
+  fn startup_message(user: Option<&str>) -> Vec<u8> {
+    let mut startup = Startup::new();
+    if let Some(user) = user {
+      startup.parameters.insert("user".into(), user.into());
+    }
+    startup.parameters.insert("database".into(), "main".into());
+    let mut buf = BytesMut::new();
+    startup.encode(&mut buf).expect("startup encodes");
+    buf.to_vec()
+  }
+
+  fn backend(message: PgWireBackendMessage) -> Vec<u8> {
+    encode_backend(&message).expect("backend message encodes")
+  }
+
+  async fn read_backend<R>(reader: &mut R) -> PgWireBackendMessage
+  where
+    R: AsyncRead + Unpin,
+  {
+    read_decoded(reader, DecodeContext::default(), PgWireBackendMessage::decode)
+      .await
+      .expect("backend message")
+  }
+
+  async fn read_frontend<R>(reader: &mut R) -> PgWireFrontendMessage
+  where
+    R: AsyncRead + Unpin,
+  {
+    read_decoded(reader, password_ctx(), PgWireFrontendMessage::decode)
+      .await
+      .expect("frontend message")
+  }
+
+  async fn read_decoded<R, T, E>(
+    reader: &mut R,
+    ctx: DecodeContext,
+    decode: impl Fn(&mut BytesMut, &DecodeContext) -> Result<Option<T>, E>,
+  ) -> Option<T>
+  where
+    R: AsyncRead + Unpin,
+    E: std::fmt::Debug,
+  {
+    let mut buf = BytesMut::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+      match decode(&mut buf, &ctx).expect("frame decodes") {
+        Some(message) => return Some(message),
+        None => {
+          let read = reader.read(&mut tmp).await.expect("read");
+          if read == 0 {
+            return None;
+          }
+          buf.extend_from_slice(tmp.get(..read).expect("read fits the buffer"));
+        }
+      }
+    }
+  }
+
+  async fn prove_decoy<G>(guest: &mut G, startup: &[u8])
+  where
+    G: AsyncRead + AsyncWrite + Unpin,
+  {
+    guest.write_all(startup).await.expect("startup");
+    guest.flush().await.expect("startup flush");
+    let PgWireBackendMessage::Authentication(Authentication::SASL(mechanisms)) = read_backend(guest).await else {
+      panic!("guest offer");
+    };
+    assert!(mechanisms.iter().any(|mechanism| mechanism == SCRAM_SHA_256_METHOD));
+    let (client_first, waiting) = ScramClientAuth::new("app".into(), FAKE.into())
+      .build_client_first()
+      .expect("client first");
+    let initial = PgWireFrontendMessage::PasswordMessageFamily(PasswordMessageFamily::SASLInitialResponse(SASLInitialResponse::new(
+      SCRAM_SHA_256_METHOD.into(),
+      Some(bytes::Bytes::from(client_first)),
+    )));
+    guest.write_all(&encode_message(&initial)).await.expect("client first write");
+    guest.flush().await.expect("client first flush");
+    let PgWireBackendMessage::Authentication(Authentication::SASLContinue(data)) = read_backend(guest).await else {
+      panic!("guest continue");
+    };
+    let (client_final, _) = waiting.build_client_final(&data).expect("client final");
+    let response = PgWireFrontendMessage::PasswordMessageFamily(PasswordMessageFamily::SASLResponse(SASLResponse::new(
+      bytes::Bytes::from(client_final),
+    )));
+    guest.write_all(&encode_message(&response)).await.expect("client final write");
+    guest.flush().await.expect("client final flush");
+  }
+
+  fn encode_message(message: &PgWireFrontendMessage) -> Vec<u8> {
+    let mut buf = BytesMut::new();
+    message.encode(&mut buf).expect("frontend message encodes");
+    buf.to_vec()
+  }
+
+  #[test]
+  fn startup_user_reads_the_decoded_parameter() {
+    let startup = startup_message(Some("app"));
+    assert_eq!(startup_user(&startup).as_deref(), Some("app"));
+  }
+
+  #[tokio::test]
+  async fn upstream_rejection_reaches_the_guest_as_our_28p01() {
+    let (guest_peer, mut guest) = duplex(64 * 1024);
+    let (server_peer, mut server) = duplex(64 * 1024);
+    let startup = startup_message(Some("app"));
+    let guest_task = tokio::spawn(async move {
+      prove_decoy(&mut guest, &startup).await;
+      read_backend(&mut guest).await
+    });
+    let server_task = tokio::spawn(async move {
+      let _ = read_startup(&mut server).await;
+      let offer = backend(PgWireBackendMessage::Authentication(Authentication::SASL(vec![
+        SCRAM_SHA_256_METHOD.to_owned(),
+      ])));
+      server.write_all(&offer).await.expect("offer");
+      server.flush().await.expect("offer flush");
+      let _ = read_frontend(&mut server).await;
+      let refusal = backend(PgWireBackendMessage::ErrorResponse(ErrorResponse::new(vec![
+        (b'S', "FATAL".into()),
+        (b'C', "28P01".into()),
+        (b'M', LEAK.into()),
+      ])));
+      server.write_all(&refusal).await.expect("refusal");
+      server.flush().await.expect("refusal flush");
+    });
+    let grants = [grant()];
+    let plugins = registry();
+    let ctx = PairCtx {
+      grants: &grants,
+      host: "db.internal",
+      port: 5432,
+      plugins,
+      mint: None,
+    };
+    let mut downstream = Postgres::new(&grants, ctx.host, ctx.port, Direction::Downstream);
+    let mut guest_peer = guest_peer;
+    let mut server_peer = server_peer;
+    let outcome = settle(&mut guest_peer, &mut server_peer, &mut downstream, &ctx, Duration::from_secs(2))
+      .await
+      .expect("upstream refusal closes");
+    assert!(matches!(outcome, Prelude::Close));
+    let seen = guest_task.await.expect("guest");
+    let PgWireBackendMessage::ErrorResponse(error) = seen else {
+      panic!("guest error");
+    };
+    let text = format!("{error:?}");
+    assert!(text.contains("28P01"), "{text}");
+    assert!(text.contains("password authentication failed"), "{text}");
+    assert!(!text.contains(LEAK), "{text}");
+    server_task.abort();
+  }
+
+  async fn read_startup<R>(reader: &mut R)
+  where
+    R: AsyncRead + Unpin,
+  {
+    let mut buf = BytesMut::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+      if Startup::decode(&mut buf, &DecodeContext::default())
+        .expect("startup decodes")
+        .is_some()
+      {
+        return;
+      }
+      let read = reader.read(&mut tmp).await.expect("startup read");
+      assert_ne!(read, 0, "startup closed");
+      buf.extend_from_slice(tmp.get(..read).expect("read fits"));
+    }
+  }
+
+  #[tokio::test]
+  async fn sasl_without_scram_sha_256_is_forwarded_unchanged() {
+    let mechanisms = vec![SCRAM_SHA_256_PLUS_METHOD.to_owned()];
+    let offer = backend(PgWireBackendMessage::Authentication(Authentication::SASL(mechanisms)));
+    let seen = forwarded_offer(&offer, &[grant()], Some("app")).await;
+    assert_eq!(seen, offer);
+  }
+
+  #[tokio::test]
+  async fn scram_without_a_grant_is_forwarded_unchanged() {
+    let offer = backend(PgWireBackendMessage::Authentication(Authentication::SASL(vec![
+      SCRAM_SHA_256_METHOD.to_owned(),
+    ])));
+    let seen = forwarded_offer(&offer, &[], Some("app")).await;
+    assert_eq!(seen, offer);
+  }
+
+  #[tokio::test]
+  async fn scram_without_a_user_is_forwarded_unchanged() {
+    let offer = backend(PgWireBackendMessage::Authentication(Authentication::SASL(vec![
+      SCRAM_SHA_256_METHOD.to_owned(),
+    ])));
+    let grants = [userless_grant()];
+    let seen = forwarded_offer(&offer, &grants, None).await;
+    assert_eq!(seen, offer);
+  }
+
+  async fn forwarded_offer(offer: &[u8], grants: &[Grant], user: Option<&str>) -> Vec<u8> {
+    let (guest_peer, mut guest) = duplex(64 * 1024);
+    let (server_peer, mut server) = duplex(64 * 1024);
+    let startup = startup_message(user);
+    let guest_task = tokio::spawn(async move {
+      guest.write_all(&startup).await.expect("startup");
+      guest.flush().await.expect("flush");
+      let mut tmp = [0u8; 8];
+      let read = tokio::time::timeout(Duration::from_millis(50), guest.read(&mut tmp)).await;
+      assert!(read.is_err(), "fallback must not write the server message to the guest");
+    });
+    let offer_bytes = offer.to_vec();
+    let server_task = tokio::spawn(async move {
+      read_startup(&mut server).await;
+      server.write_all(&offer_bytes).await.expect("offer");
+      server.flush().await.expect("flush");
+      std::future::pending::<()>().await
+    });
+    let plugins = registry();
+    let ctx = PairCtx {
+      grants,
+      host: "db.internal",
+      port: 5432,
+      plugins,
+      mint: None,
+    };
+    let mut downstream = Postgres::new(grants, ctx.host, ctx.port, Direction::Downstream);
+    let mut guest_peer = guest_peer;
+    let mut server_peer = server_peer;
+    let outcome = settle(&mut guest_peer, &mut server_peer, &mut downstream, &ctx, Duration::from_secs(2))
+      .await
+      .expect("fallback relays");
+    guest_task.await.expect("guest");
+    server_task.abort();
+    match outcome {
+      Prelude::Relay(bytes) => bytes,
+      Prelude::Close => panic!("fallback closed"),
+    }
+  }
+
+  #[tokio::test]
+  async fn late_cleartext_md5_or_sasl_fails_without_waiting() {
+    let cases = [
+      Authentication::CleartextPassword,
+      Authentication::MD5Password(vec![1, 2, 3, 4]),
+      Authentication::SASL(vec![SCRAM_SHA_256_METHOD.to_owned()]),
+      Authentication::SASLContinue(bytes::Bytes::from_static(b"v=late")),
+    ];
+    for authentication in cases {
+      let started = Instant::now();
+      let Err(err) = late_authentication(authentication).await else {
+        panic!("late authentication fails the session");
+      };
+      assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "late authentication waited {elapsed:?}",
+        elapsed = started.elapsed()
+      );
+      assert!(matches!(err, Error::PostgresScram { .. }), "{err}");
+    }
+  }
+
+  async fn late_authentication(authentication: Authentication) -> Result<Prelude, Error> {
+    let (guest_peer, mut guest) = duplex(64 * 1024);
+    let (server_peer, mut server) = duplex(64 * 1024);
+    let startup = startup_message(Some("app"));
+    let guest_task = tokio::spawn(async move {
+      prove_decoy(&mut guest, &startup).await;
+      std::future::pending::<()>().await
+    });
+    let server_task = tokio::spawn(async move {
+      read_startup(&mut server).await;
+      let offer = backend(PgWireBackendMessage::Authentication(Authentication::SASL(vec![
+        SCRAM_SHA_256_METHOD.to_owned(),
+      ])));
+      server.write_all(&offer).await.expect("offer");
+      server.flush().await.expect("offer flush");
+      let PgWireFrontendMessage::PasswordMessageFamily(family) = read_frontend(&mut server).await else {
+        panic!("upstream client first");
+      };
+      let initial = family.into_sasl_initial_response().expect("sasl initial");
+      let salt = base64::engine::general_purpose::STANDARD.decode(random_nonce()).expect("salt");
+      let salted = gen_salted_password(REAL, &salt, SCRAM_ITERATIONS);
+      let (server_first, _) = ScramServerAuth::new()
+        .on_client_first_message(initial.data.as_deref().expect("client first"), Password::new(Some(salt), salted))
+        .expect("server first");
+      let continue_message = backend(PgWireBackendMessage::Authentication(Authentication::SASLContinue(
+        bytes::Bytes::from(server_first),
+      )));
+      server.write_all(&continue_message).await.expect("continue");
+      server.flush().await.expect("continue flush");
+      let _ = read_frontend(&mut server).await;
+      let late = backend(PgWireBackendMessage::Authentication(authentication));
+      server.write_all(&late).await.expect("late");
+      server.flush().await.expect("late flush");
+      std::future::pending::<()>().await
+    });
+    let grants = [grant()];
+    let plugins = registry();
+    let ctx = PairCtx {
+      grants: &grants,
+      host: "db.internal",
+      port: 5432,
+      plugins,
+      mint: None,
+    };
+    let mut downstream = Postgres::new(&grants, ctx.host, ctx.port, Direction::Downstream);
+    let mut guest_peer = guest_peer;
+    let mut server_peer = server_peer;
+    let outcome = settle(&mut guest_peer, &mut server_peer, &mut downstream, &ctx, Duration::from_secs(2)).await;
+    guest_task.abort();
+    server_task.abort();
+    outcome
+  }
+}
