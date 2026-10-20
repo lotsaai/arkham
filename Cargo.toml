@@ -86,6 +86,7 @@ arkham-tun = { path = "crates/arkham-tun" }
 # crates. rama tracks main deliberately: its 0.5 line is unpublished.
 actson = "2.1.0"
 amq-protocol = { version = "10.6.3", default-features = false }
+async-compat = "0.2.6"
 async-nats = { version = "0.50.0", default-features = false, features = ["aws-lc-rs", "nkeys"] }
 async-trait = "0.1"
 atoi = "2"

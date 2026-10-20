@@ -537,6 +537,7 @@ dependencies = [
  "arkham-config",
  "arkham-pki",
  "arkham-plugin",
+ "async-compat",
  "async-nats",
  "async-trait",
  "atoi",

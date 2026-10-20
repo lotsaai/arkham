@@ -141,30 +141,47 @@ where
     .await
 }
 
-// Lapin dials its own TCP socket and its reactor stream is not the proxy leg.
-// Copy bytes across so the library still speaks AMQP there. The password in
-// the URI is the decoy.
-async fn guest_lapin<S>(guest: S) -> lapin::Result<lapin::Connection>
+async fn guest_lapin(stream: TcpStream) -> lapin::Result<lapin::Connection> {
+  let uri = format!("amqp://agent:{FAKE}@127.0.0.1/%2f").parse::<lapin::uri::AMQPUri>().unwrap();
+  let held = Arc::new(Mutex::new(Some(async_compat::Compat::new(stream))));
+  lapin::Connection::connector(
+    uri,
+    lapin::runtime::default_runtime()?,
+    async move |_uri, _runtime| {
+      let Some(sock) = held.lock().unwrap().take() else {
+        return Err(lapin::ErrorKind::InvalidConnectionState(lapin::ConnectionState::Error).into());
+      };
+      Ok(lapin::AsyncTcpStream::Plain(sock))
+    },
+    lapin::ConnectionProperties::default(),
+  )
+  .await
+}
+
+// Lapin's connector stream is Compat<tokio::net::TcpStream>. A rustls
+// TlsStream is not that type. Enabling lapin's rustls feature would also
+// enable TLS on the shared amq-protocol crate. The URI password is the decoy.
+async fn guest_lapin_tls<S>(guest: S) -> lapin::Result<lapin::Connection>
 where
   S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
   let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let port = local_addr(&listener).port();
+  let accept = listener.accept();
+  let dial = TcpStream::connect(("127.0.0.1", port));
+  let (accepted, dialed) = tokio::join!(accept, dial);
+  let (accepted, _) = accepted.unwrap();
+  let dialed = dialed.unwrap();
   tokio::spawn(async move {
-    let Ok((sock, _)) = listener.accept().await else {
-      return;
-    };
-    let (mut reader, mut writer) = tokio::io::split(sock);
+    let (mut reader, mut writer) = tokio::io::split(accepted);
     let (mut guest_reader, mut guest_writer) = tokio::io::split(guest);
     let outbound = tokio::io::copy(&mut reader, &mut guest_writer);
     let inbound = tokio::io::copy(&mut guest_reader, &mut writer);
-    tokio::select! {
-      _ = outbound => {}
-      _ = inbound => {}
-    }
+    let (copied_out, copied_in) = tokio::join!(outbound, inbound);
+    let _ = copied_out.ok();
+    let _ = copied_in.ok();
   });
-  let uri = format!("amqp://agent:{FAKE}@127.0.0.1:{port}/%2f");
-  lapin::Connection::connect(&uri, lapin::ConnectionProperties::default()).await
+  guest_lapin(dialed).await
 }
 
 async fn connect_through_proxy(proxy_addr: SocketAddr, stub_port: u16) -> TcpStream {
@@ -352,7 +369,7 @@ async fn amqps_start_ok_swaps_to_the_real_password_after_tls() {
   let stream = connect_through_proxy(proxy_addr, stub_port).await;
   let name = ServerName::try_from("localhost".to_string()).unwrap();
   let tls = guest_tls(&ca, true).connect(name, stream).await.unwrap();
-  let guest = tokio::spawn(guest_lapin(tls));
+  let guest = tokio::spawn(guest_lapin_tls(tls));
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   let err = tokio::time::timeout(Duration::from_secs(10), guest)
     .await
@@ -430,6 +447,8 @@ async fn amqps_broker_stalls_tls_and_the_leg_closes_within_budget() {
     let (_conn, _) = stub.accept().await.unwrap();
     std::future::pending::<()>().await;
   });
+  // A client writes a protocol header while it waits. This guest stays silent
+  // so only the handshake budget can close the leg.
   let (guest, client_end) = tokio::io::duplex(8 * 1024);
   let serve =
     tokio::spawn(async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await });
