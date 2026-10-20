@@ -206,6 +206,7 @@ impl Transport for PostgresTransport {
 
     let ctx = PairCtx {
       grants: &snapshot.grants,
+      redact: &snapshot.grants,
       host: server_name.as_deref().unwrap_or(raw_host),
       port,
       plugins: &state.plugins,

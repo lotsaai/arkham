@@ -269,6 +269,7 @@ impl Transport for SmtpTransport {
       .filter(|name| scope.downstream.host.eq_ignore_ascii_case(name));
     let ctx = PairCtx {
       grants: &snapshot.grants,
+      redact: &snapshot.grants,
       host: matched_name.unwrap_or(scope.downstream.host.as_str()),
       port,
       plugins: &state.plugins,

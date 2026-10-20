@@ -39,6 +39,7 @@ impl Transport for TcpTransport {
     let upstream = dial_marked(dial_host, port, state.fwmark).await?;
     let ctx = PairCtx {
       grants: &snapshot.grants,
+      redact: &snapshot.grants,
       host: raw_host,
       port,
       plugins: &state.plugins,

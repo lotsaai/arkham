@@ -124,8 +124,10 @@ impl Transport for HttpsTransport {
       guest_io = guest_io.with_client_auth_policy(policy);
     }
     let bridge = BridgeIo(guest_io, GuestIo::bare(upstream));
+    let redact = hits.into_iter().map(|(grant, _)| grant).collect();
     let pump = SubstitutionService {
       grants: selected,
+      redact,
       identity,
       port,
       plugins: Arc::clone(&state.plugins),
@@ -190,6 +192,7 @@ impl Transport for HttpTransport {
     let upstream = dial_marked(dial_host, port, state.fwmark).await?;
     let ctx = PairCtx {
       grants: &snapshot.grants,
+      redact: &snapshot.grants,
       host: if named { &head_host } else { raw_host },
       port: if named { head_port } else { port },
       plugins: &state.plugins,
@@ -215,8 +218,10 @@ impl Transport for HttpTransport {
 /// guarantee the verbatim tests pin.
 #[derive(Debug, Clone)]
 pub(crate) struct SubstitutionService {
-  /// Grants chosen for this connection.
+  /// Grants the handshake chose. The downstream machine substitutes these.
   grants: Arc<Mutex<Vec<Grant>>>,
+  /// Every grant for this destination. The upstream machine redacts these.
+  redact: Vec<Grant>,
   identity: String,
   port: u16,
   plugins: Arc<arkham_plugin::Registry>,
@@ -323,9 +328,11 @@ where
         port: self.port,
       }));
     }
-    // Schemes below are authorization, never a second choice.
+    // Downstream substitutes only the handshake's choice. Upstream redacts
+    // every grant for this destination, including the ones not selected.
     let ctx = PairCtx {
       grants: &grants,
+      redact: &self.redact,
       host: &self.identity,
       port: self.port,
       plugins: &self.plugins,
@@ -425,7 +432,7 @@ pub(crate) fn https_pair(ctx: &PairCtx<'_>) -> (Http, Http) {
       ctx.mint.clone(),
     ),
     Http::new(
-      ctx.grants,
+      ctx.redact,
       Scheme::Https,
       ctx.host,
       ctx.port,
@@ -449,7 +456,7 @@ pub(crate) fn https_h2_pair(ctx: &PairCtx<'_>) -> (H2, H2) {
       ctx.mint.clone(),
     ),
     H2::new(
-      ctx.grants,
+      ctx.redact,
       Scheme::Https,
       ctx.host,
       ctx.port,
@@ -465,7 +472,7 @@ pub(crate) fn https_h2_pair(ctx: &PairCtx<'_>) -> (H2, H2) {
 pub(crate) fn raw_tls_pair(ctx: &PairCtx<'_>) -> (Raw, Raw) {
   (
     Raw::new(ctx.grants, Scheme::Https, ctx.host, ctx.port, Direction::Downstream),
-    Raw::new(ctx.grants, Scheme::Https, ctx.host, ctx.port, Direction::Upstream),
+    Raw::new(ctx.redact, Scheme::Https, ctx.host, ctx.port, Direction::Upstream),
   )
 }
 

@@ -163,16 +163,21 @@ fn warm_grant_files(
 ///
 /// Returns an error when `path` cannot be read, does not parse, or holds no certificate.
 fn require_bundle(cache: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>, path: &Path) -> Result<(), Error> {
-  match crate::transports::tls::cached_guest_certs(cache, path)? {
-    Some(certs) if certs.is_empty() => Err(connection::TrustAnchorsError::Empty { path: path.to_path_buf() }.into()),
-    Some(_) => Ok(()),
-    None => Err(
+  match crate::transports::tls::cached_guest_certs(cache, path) {
+    Ok(Some(certs)) if certs.is_empty() => Err(connection::TrustAnchorsError::Empty { path: path.to_path_buf() }.into()),
+    Ok(Some(_)) => Ok(()),
+    Ok(None) => Err(
       connection::TrustAnchorsError::Read {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::NotFound, "trust bundle not found"),
       }
       .into(),
     ),
+    Err(Error::GuestCertificate { path, source }) => match source.downcast::<rustls::pki_types::pem::Error>() {
+      Ok(pem) => Err(connection::TrustAnchorsError::Parse { path, source: *pem }.into()),
+      Err(source) => Err(Error::GuestCertificate { path, source }),
+    },
+    Err(err) => Err(err),
   }
 }
 
@@ -487,6 +492,7 @@ async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &P
   }
   let ctx = PairCtx {
     grants: &snapshot.grants,
+    redact: &snapshot.grants,
     host: &host,
     port,
     plugins: &state.plugins,

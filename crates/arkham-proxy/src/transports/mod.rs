@@ -81,9 +81,16 @@ pub(crate) trait TlsHalves: Send + Sync {
 
 /// Borrowed construction context for a framing pair: grants authorize,
 /// plugins hook, and the connection identity scopes both.
+///
+/// `grants` is the set the downstream machine may turn from decoys into
+/// reals. `redact` is the set the upstream machine must turn from reals
+/// back into decoys. On https the handshake selects `grants`, and `redact`
+/// is every grant for the destination. Elsewhere the two slices are the same.
 pub(crate) struct PairCtx<'a> {
-  /// Grant source for eligible pairs.
+  /// Grants the downstream machine may substitute.
   pub(crate) grants: &'a [Grant],
+  /// Grants the upstream machine must redact.
+  pub(crate) redact: &'a [Grant],
   /// Connection endpoint host.
   pub(crate) host: &'a str,
   /// Connection endpoint port.

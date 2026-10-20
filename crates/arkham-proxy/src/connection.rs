@@ -233,26 +233,7 @@ fn choose_https(
     None => bearer_grants(candidates, host, port)?,
     Some(leaf) => {
       let der = leaf.to_der().map_err(|err| Error::ClientAuthPolicy { source: Box::new(err) })?;
-      let matched: Vec<&HttpsCandidate> = candidates
-        .iter()
-        .filter(|candidate| candidate.leaf.as_ref() == Some(&der))
-        .collect();
-      match matched.as_slice() {
-        [] => {
-          return Err(Error::UnmatchedClientCert {
-            host: host.to_string(),
-            port,
-          });
-        }
-        [one] => vec![one.grant.clone()],
-        many => {
-          return Err(Error::AmbiguousHttpsGrants {
-            host: host.to_string(),
-            port,
-            labels: grant_labels(many),
-          });
-        }
-      }
+      presented_grants(candidates, &der, host, port)?
     }
   };
   let credential = if wants_upstream && grants.len() == 1 {
@@ -262,6 +243,31 @@ fn choose_https(
   };
   *selected.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = grants;
   Ok(credential)
+}
+
+/// Grants whose guest leaf equals `der`.
+///
+/// # Errors
+///
+/// Returns [`Error::UnmatchedClientCert`] when no candidate carries `der`,
+/// and [`Error::AmbiguousHttpsGrants`] when more than one does.
+pub(crate) fn presented_grants(candidates: &[HttpsCandidate], der: &[u8], host: &str, port: u16) -> Result<Vec<Grant>, Error> {
+  let matched: Vec<&HttpsCandidate> = candidates
+    .iter()
+    .filter(|candidate| candidate.leaf.as_deref() == Some(der))
+    .collect();
+  match matched.as_slice() {
+    [] => Err(Error::UnmatchedClientCert {
+      host: host.to_string(),
+      port,
+    }),
+    [one] => Ok(vec![one.grant.clone()]),
+    many => Err(Error::AmbiguousHttpsGrants {
+      host: host.to_string(),
+      port,
+      labels: grant_labels(many),
+    }),
+  }
 }
 
 fn bearer_grants(candidates: &[HttpsCandidate], host: &str, port: u16) -> Result<Vec<Grant>, Error> {
@@ -570,6 +576,28 @@ mod tests {
     };
     assert_eq!(port, 6443);
     assert_eq!(labels, "alpha, zeta");
+  }
+
+  #[test]
+  fn duplicate_guest_leaf_names_both_grants() {
+    let leaf = b"same-leaf".to_vec();
+    let candidates = [
+      candidate("zeta", "fake-z", GuestTlsMode::Mtls, Some(leaf.clone())),
+      candidate("alpha", "fake-a", GuestTlsMode::Mtls, Some(leaf.clone())),
+    ];
+    let err = presented_grants(&candidates, &leaf, "k8s.example", 6443).expect_err("one leaf cannot choose");
+    let Error::AmbiguousHttpsGrants { labels, port, .. } = err else {
+      panic!("expected both labels, got {err}");
+    };
+    assert_eq!(port, 6443);
+    assert_eq!(labels, "alpha, zeta");
+  }
+
+  #[test]
+  fn unknown_client_certificate_is_unmatched() {
+    let candidates = [candidate("cert-user", "cert-fake", GuestTlsMode::Mtls, Some(b"leaf-a".to_vec()))];
+    let err = presented_grants(&candidates, b"other-leaf", "k8s.example", 6443).expect_err("unknown leaf");
+    assert!(matches!(err, Error::UnmatchedClientCert { port: 6443, .. }), "{err}");
   }
 
   #[test]
