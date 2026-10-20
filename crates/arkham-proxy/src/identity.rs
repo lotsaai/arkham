@@ -443,7 +443,7 @@ mod tests {
     let Grant::Token { credential, .. } = &mut grants[0] else {
       panic!("token grant");
     };
-    credential.label = "talos-266bdf0202b57494d8b421c5064e49c5".to_string();
+    credential.label = "talos-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
     assert_eq!(expect(&grants, Some("10.5.0.6"), 50000), Expect::Talos);
     assert_eq!(expect(&grants, None, 50000), Expect::Talos);
     let mut ordinary = token_grant(&["https://10.5.0.6:50000"]);
