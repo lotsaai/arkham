@@ -9,6 +9,8 @@ cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
+python3 -m unittest discover -s integration/docker/amqp-witness -p 'test_*.py'
+
 if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   echo "skip: test:ssh needs a docker daemon"
   exit 0
