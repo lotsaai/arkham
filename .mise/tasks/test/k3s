@@ -444,7 +444,7 @@ if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
 fi
 kubedir=${kubedirs[0]}
 decoy=${decoys[0]}
-rule_count=$(grep -c '^\[rules\.kube-user-' "$kubedir/arkham.toml" || true)
+rule_count=$(grep -cE '^\[rules\.kube-user-[0-9a-f]{32}\]$' "$kubedir/arkham.toml" || true)
 if [ "$rule_count" -ne 3 ]; then
   echo "expected 3 kube user grants for 4 contexts that share ivan, got ${rule_count}" >&2
   grep '^\[rules\.' "$kubedir/arkham.toml" >&2 || true
@@ -583,7 +583,7 @@ if [ "${#capture_dirs[@]}" -ne 1 ] || [ "${#capture_decoys[@]}" -ne 1 ]; then
 fi
 capture_grants=${capture_dirs[0]}
 capture_decoy=${capture_decoys[0]}
-capture_rules=$(grep -c '^\[rules\.kube-user-' "$capture_grants/arkham.toml" || true)
+capture_rules=$(grep -cE '^\[rules\.kube-user-[0-9a-f]{32}\]$' "$capture_grants/arkham.toml" || true)
 if [ "$capture_rules" -ne 3 ]; then
   echo "capture grant file has ${capture_rules} kube user rules; shared user ivan should stay one grant" >&2
   grep '^\[rules\.' "$capture_grants/arkham.toml" >&2 || true
