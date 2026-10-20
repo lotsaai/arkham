@@ -511,7 +511,6 @@ where
   Ok(None)
 }
 
-/// Drain queued notes, then feed one upstream chunk. A handoff is decided after that chunk is written.
 async fn on_upstream_chunk<G, M>(
   guest: &mut WriteHalf<G>,
   upstream: &mut M,
