@@ -146,8 +146,6 @@ fn sweep(table: &FlowTable, now: Instant) {
 
 #[cfg(test)]
 mod tests {
-  use std::time::UNIX_EPOCH;
-
   use super::*;
 
   /// A monotonic instant this long ago, for aging entries in tests.
@@ -218,7 +216,6 @@ mod tests {
   /// above would pass vacuously.
   #[test]
   fn idle_now_is_older_than_the_limit() {
-    let _ = UNIX_EPOCH;
     assert!(Instant::now().duration_since(idle_now()) > FLOW_IDLE);
   }
 }
