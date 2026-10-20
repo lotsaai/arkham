@@ -65,8 +65,6 @@ pub(crate) struct RewriteInputs<'a> {
   pub(crate) home: &'a str,
   /// Host home relative sources and `~` expand against.
   pub(crate) host_home: Option<&'a Path>,
-  /// Guest-identity CA, preloaded by generation or injected by tests; the
-  /// kube adapter mints the guest pair from it.
   pub(crate) kube_ca: Option<&'a CertAuthority>,
   /// Guest pairs mint here; the kube adapter reads them back for the decoy.
   pub(crate) guests_dir: &'a Path,
@@ -227,7 +225,6 @@ struct ExplicitRewrites<'a> {
   expander: &'a Xpanda,
   /// Container home for `{home}` substitution.
   home: &'a str,
-  /// The guest CA preloaded by the caller, when it loaded one.
   preloaded_ca: Option<&'a CertAuthority>,
   /// The guest CA this pass loaded, on first adapter use.
   ca: Option<CertAuthority>,

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use arkham_config::cli::ProxyBackend;
 use arkham_config::config::{AppConfig, ExposeMap, config_dir, project_profiles_dir};
 use arkham_config::grants::GuestTlsMode;
-use arkham_pki::ca::{CertAuthority, load_or_generate};
+use arkham_pki::ca::load_or_generate;
 use dirs::home_dir;
 use libc::getuid;
 use xpanda::Xpanda;
@@ -159,7 +159,6 @@ impl<'a> StackBuilder<'a> {
   /// Returns an error when a rewrite names an env with no known value or no
   /// decoy, or its dest does not expand to an absolute container path.
   fn rewrites(mut self) -> Result<Self, Error> {
-    let kube_ca = self.rewrite_ca()?;
     let files_dir = self.layout.files_dir();
     let guests_dir = self.layout.guests_dir();
     let rewritten = write_rewrites(&RewriteInputs {
@@ -171,35 +170,12 @@ impl<'a> StackBuilder<'a> {
       expander: &self.expander,
       home: self.layout.home(),
       host_home: self.layout.host_home(),
-      kube_ca: kube_ca.as_ref(),
+      kube_ca: None,
       guests_dir: &guests_dir,
     })?;
     self.grants = rewritten.grants;
     self.file_mounts = rewritten.mounts;
     Ok(self)
-  }
-
-  /// The guest-identity CA when the workspace declares file rewrites: their
-  /// adapters mint guest pairs from it. `None` when there is nothing to
-  /// mint, so no rewrite pays for a CA it does not need.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the config directory does not resolve or the CA
-  /// cannot load.
-  fn rewrite_ca(&self) -> Result<Option<CertAuthority>, Error> {
-    if self.config.workspace.file_rewrite.is_empty() {
-      return Ok(None);
-    }
-    let ca_path = config_dir()
-      .ok_or_else(|| Error::ConfigDir {
-        detail: "file rewrites need the arkham config directory to load the CA from".to_string(),
-      })?
-      .join("ca.pem");
-    load_or_generate(&ca_path).map(Some).map_err(|source| Error::GuestCa {
-      path: ca_path.clone(),
-      source,
-    })
   }
 
   /// The ambient sources — gitconfig, jj, ssh, nats, kube, talos from their
