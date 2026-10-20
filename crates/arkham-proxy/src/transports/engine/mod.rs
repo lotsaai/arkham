@@ -68,8 +68,7 @@ pub(crate) enum Rewritten<'a> {
 /// framing fact to the opposite direction. HTTP uses [`PeerFact::Heads`] so a
 /// HEAD request suppresses the response body. LDAP uses [`PeerFact::Open`]
 /// and [`PeerFact::Abandon`] so the upstream machine knows which client
-/// operations still expect a response. AMQP uses [`PeerFact::FrameMax`] for
-/// the guest frame maximum.
+/// operations still expect a response.
 pub(crate) trait Wire {
   /// Process one chunk; empty input flushes held bytes at stream EOF.
   /// Async because the plugin hook awaits.
@@ -114,8 +113,6 @@ pub(crate) enum PeerFact {
   Open(u32, bool),
   /// An abandon names that operation. It gets no response of its own.
   Abandon(u32),
-  /// Guest AMQP frame maximum. [`usize::MAX`] means the peer set no limit.
-  FrameMax(usize),
 }
 
 /// What the response pump does with a withheld upgrade.
