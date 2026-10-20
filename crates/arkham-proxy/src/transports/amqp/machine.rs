@@ -424,6 +424,10 @@ impl Amqp {
   /// forwards the rest of the stream.
   fn drive_header(&mut self, mut buf: Vec<u8>, input: &mut &[u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Result<(), ()> {
     if buf.is_empty() && input.first().is_some_and(|lead| *lead != protocol_lead()) {
+      if self.lower_open {
+        self.refuse_open();
+        return Err(());
+      }
       if self.down.is_some() {
         return self.opaque(input, out);
       }
