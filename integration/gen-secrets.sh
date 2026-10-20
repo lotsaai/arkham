@@ -70,6 +70,14 @@ value = "$ARKHAM_LDAP_REAL"
 provider = "plain"
 value = "$ARKHAM_LDAP_TLS_REAL"
 
+[secrets.LDAP_UPSTREAM_TLS_URL]
+provider = "plain"
+value = "$ARKHAM_LDAP_TLS_REAL"
+
+[secrets.LDAP_MTLS_URL]
+provider = "plain"
+value = "$ARKHAM_LDAP_REAL"
+
 [secrets.NATS_URL]
 provider = "plain"
 value = "$ARKHAM_NATS_REAL"

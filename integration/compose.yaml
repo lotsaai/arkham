@@ -562,6 +562,8 @@ services:
       SMTPS_URL: smtps://agent%40demo.test:arkham_fake_smtp_pass@mail:465 # nosemgrep: deterministic demo decoy, not a credential
       LDAP_URL: ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3389 # nosemgrep: deterministic demo decoy, not a credential
       LDAP_TLS_URL: ldaps://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3636 # nosemgrep: deterministic demo decoy, not a credential
+      LDAP_UPSTREAM_TLS_URL: ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3390 # nosemgrep: deterministic demo decoy, not a credential
+      LDAP_MTLS_URL: ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3391 # nosemgrep: deterministic demo decoy, not a credential
       NATS_URL: nats://agent:arkham_fake_nats_pass@nats:4222 # nosemgrep: deterministic demo decoy, not a credential
       NATS_NKEY_URL: ${NATS_NKEY_URL:?run integration/gen-nats.sh}
       NATS_JWT_URL: ${NATS_JWT_URL:?run integration/gen-nats.sh}

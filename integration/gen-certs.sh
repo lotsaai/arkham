@@ -54,6 +54,16 @@ printf "subjectAltName=IP:10.202.0.80,DNS:ldap\nextendedKeyUsage=serverAuth\nkey
 openssl x509 -req -in "$dir/ldap.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
   -CAcreateserial -out "$dir/ldap.crt" -days 2 -extfile "$dir/ldap.ext"
 
+# Guest identity for the LDAP mTLS scenario. Arkham's CA is this same key
+# (`ca.pem`), and the client container drops privileges, so the key is
+# world-readable the way the mail leaf is.
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$dir/ldap-guest.key"
+openssl req -new -key "$dir/ldap-guest.key" -out "$dir/ldap-guest.csr" -subj "/CN=ldap-guest"
+printf "extendedKeyUsage=clientAuth\nkeyUsage=critical,digitalSignature\n" >"$dir/ldap-guest.ext"
+openssl x509 -req -in "$dir/ldap-guest.csr" -CA "$dir/ca.crt" -CAkey "$dir/ca.key" \
+  -CAcreateserial -out "$dir/ldap-guest.crt" -days 2 -extfile "$dir/ldap-guest.ext"
+chmod 644 "$dir/ldap-guest.key" "$dir/ldap-guest.crt"
+
 # NATS TLS: nats-server presents this leaf after its cleartext INFO line.
 # SAN carries the hostname the connection strings dial and the static address.
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$dir/nats.key"

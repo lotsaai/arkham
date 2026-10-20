@@ -29,6 +29,8 @@ const SMTP_URL = process.env.SMTP_URL ?? "";
 const SMTPS_URL = process.env.SMTPS_URL ?? "";
 const LDAP_URL = process.env.LDAP_URL ?? "";
 const LDAP_TLS_URL = process.env.LDAP_TLS_URL ?? "";
+const LDAP_UPSTREAM_TLS_URL = process.env.LDAP_UPSTREAM_TLS_URL ?? "";
+const LDAP_MTLS_URL = process.env.LDAP_MTLS_URL ?? "";
 const LDAP_REAL = "arkham_real_ldap_pass_01";
 const NATS_URL = process.env.NATS_URL ?? "";
 const NATS_REAL = "arkham_real_nats_pass";
@@ -650,6 +652,33 @@ if (LDAP_URL) {
     }
   });
 
+  // ldapts sends StartTLS on the open socket with no already-upgraded guard.
+  // The second call is an extended operation over the protected session.
+  await retry("ldap", "ldap second starttls on a tls session is operations error", async () => {
+    const client = ldapPlain(LDAP_URL);
+    try {
+      await client.startTLS({ ca, rejectUnauthorized: true, servername: parts.host });
+      await client.bind(parts.dn, parts.password);
+      try {
+        await client.startTLS({ ca, rejectUnauthorized: true, servername: parts.host });
+        return false;
+      } catch (err) {
+        const text = String(err);
+        stage(`ldap second starttls error: ${text}`);
+        if (ldapCode(err) !== 1 || text.includes(LDAP_REAL)) {
+          return false;
+        }
+      }
+      await client.bind(parts.dn, parts.password);
+      return true;
+    } catch (err) {
+      stage(`ldap second starttls setup error: ${String(err)}`);
+      return false;
+    } finally {
+      await closeLdap(client);
+    }
+  });
+
   await retry("ldap", "ldap starttls non-decoy password is not swapped", async () => {
     const client = ldapPlain(LDAP_URL);
     try {
@@ -695,6 +724,86 @@ if (LDAP_TLS_URL) {
   });
 } else {
   stage("ldaps scenarios skipped: no LDAP_TLS_URL");
+}
+
+if (LDAP_UPSTREAM_TLS_URL) {
+  const parts = ldapParts(LDAP_UPSTREAM_TLS_URL);
+  // The real string is ldaps://, so the cleartext bind is already swapped.
+  // A cleartext upstream would answer that bind with confidentialityRequired.
+  await retry("ldap", "ldap bind then starttls against an already tls upstream swaps the decoy", async () => {
+    const client = ldapPlain(LDAP_UPSTREAM_TLS_URL);
+    try {
+      await client.bind(parts.dn, parts.password);
+      await client.startTLS({ ca, rejectUnauthorized: true, servername: parts.host });
+      await client.bind(parts.dn, parts.password);
+      return true;
+    } catch (err) {
+      stage(`ldap already-tls upstream error: ${String(err)}`);
+      return false;
+    } finally {
+      await closeLdap(client);
+    }
+  });
+} else {
+  stage("ldap upstream-tls scenarios skipped: no LDAP_UPSTREAM_TLS_URL");
+}
+
+if (LDAP_MTLS_URL) {
+  const parts = ldapParts(LDAP_MTLS_URL);
+  const guestCert = await readFile(`${CERT_DIR}/ldap-guest.crt`);
+  const guestKey = await readFile(`${CERT_DIR}/ldap-guest.key`);
+  const protectedTls = { ca, rejectUnauthorized: true, servername: parts.host, cert: guestCert, key: guestKey };
+  await retry("ldap", "ldap bind then starttls with a client certificate swaps the decoy", async () => {
+    const client = ldapPlain(LDAP_MTLS_URL);
+    try {
+      try {
+        await client.bind(parts.dn, parts.password);
+        return false;
+      } catch (err) {
+        const text = String(err);
+        stage(`ldap mtls pre-starttls bind error: ${text}`);
+        if (ldapCode(err) !== 13 || text.includes(LDAP_REAL)) {
+          return false;
+        }
+      }
+      await client.startTLS(protectedTls);
+      await client.bind(parts.dn, parts.password);
+      return true;
+    } catch (err) {
+      stage(`ldap mtls starttls error: ${String(err)}`);
+      return false;
+    } finally {
+      await closeLdap(client);
+    }
+  });
+
+  await retry("ldap", "ldap bind then starttls without a client certificate is refused", async () => {
+    const client = ldapPlain(LDAP_MTLS_URL);
+    try {
+      try {
+        await client.bind(parts.dn, parts.password);
+        return false;
+      } catch (err) {
+        const text = String(err);
+        if (ldapCode(err) !== 13 || text.includes(LDAP_REAL)) {
+          stage(`ldap mtls certless bind error: ${text}`);
+          return false;
+        }
+      }
+      try {
+        await client.startTLS({ ca, rejectUnauthorized: true, servername: parts.host });
+        return false;
+      } catch (err) {
+        const text = String(err);
+        stage(`ldap mtls certless handshake error: ${text}`);
+        return !text.includes(LDAP_REAL);
+      }
+    } finally {
+      await closeLdap(client);
+    }
+  });
+} else {
+  stage("ldap mtls scenarios skipped: no LDAP_MTLS_URL");
 }
 
 function natsParts(raw: string) {

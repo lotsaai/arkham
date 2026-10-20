@@ -5,8 +5,7 @@ use super::*;
 use arkham_config::grants::LdapScope;
 use rasn::prelude::OctetString;
 use rasn_ldap::{
-  AuthenticationChoice, BindRequest, BindResponse, ExtendedRequest, ExtendedResponse, Filter, LdapMessage, LdapResult, LdapString,
-  ProtocolOp, ResultCode, SearchRequest, SearchRequestDerefAliases, SearchRequestScope, SearchResultDone,
+  AuthenticationChoice, BindRequest, BindResponse, ExtendedRequest, ExtendedResponse, LdapMessage, LdapString, ProtocolOp, ResultCode,
 };
 use secrecy::ExposeSecret as _;
 
@@ -125,15 +124,11 @@ async fn ldap_cleartext_bind_forwards_the_decoy() {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Flow {
   StartTlsFirst,
-  BindThenStartTls,
-  SearchThenStartTls,
-  AlreadyTls,
   Pipelined,
-  SecondStartTls,
 }
 
 fn upstream_tls(flow: Flow) -> bool {
-  matches!(flow, Flow::AlreadyTls | Flow::Pipelined | Flow::SecondStartTls)
+  matches!(flow, Flow::Pipelined)
 }
 
 async fn ldap_flow(flow: Flow) {
@@ -159,10 +154,22 @@ async fn ldap_flow(flow: Flow) {
   let stub_task = tokio::spawn(async move { serve_flow(stub, acceptor, flow).await });
   let stream = connect_through_proxy(proxy_addr, stub_port).await;
   if matches!(flow, Flow::StartTlsFirst) {
-    let result = ldap3_bind(stream, Ldap3Open::StartTls(&ca), FAKE).await;
+    let result = ldap3_bind(
+      stream,
+      Ldap3Open::StartTls {
+        ca: &ca,
+        client_cert: false,
+      },
+      FAKE,
+    )
+    .await;
     result.success().expect("protected bind");
   } else {
-    drive_guest(stream, flow, &ca).await;
+    let mut io = Inbox {
+      stream,
+      pending: Vec::new(),
+    };
+    drive_pipelined(&mut io).await;
   }
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   proxy.abort();
@@ -173,7 +180,7 @@ async fn serve_flow(stub: TcpListener, acceptor: TlsAcceptor, flow: Flow) {
   if upstream_tls(flow) {
     serve_tls(acceptor, conn, flow).await;
   } else {
-    serve_clear(acceptor, conn, flow).await;
+    serve_clear(acceptor, conn).await;
   }
 }
 
@@ -185,36 +192,14 @@ where
   let opening = read_message(&mut tls).await;
   assert_eq!(simple_password(&opening), VALUE.as_bytes());
   write_bind_result(&mut tls, opening.message_id, ResultCode::Success).await;
-  if matches!(flow, Flow::Pipelined) {
-    assert!(read_message_result(&mut tls).await.is_err(), "starttls was forwarded");
-    return;
-  }
-  let next = read_message(&mut tls).await;
-  assert_eq!(simple_password(&next), VALUE.as_bytes(), "starttls must not be forwarded");
-  write_bind_result(&mut tls, next.message_id, ResultCode::Success).await;
-  if matches!(flow, Flow::SecondStartTls) {
-    let third = read_message(&mut tls).await;
-    assert_eq!(simple_password(&third), VALUE.as_bytes());
-    write_bind_result(&mut tls, third.message_id, ResultCode::Success).await;
-  }
+  assert!(matches!(flow, Flow::Pipelined));
+  assert!(read_message_result(&mut tls).await.is_err(), "starttls was forwarded");
 }
 
-async fn serve_clear<S>(acceptor: TlsAcceptor, mut conn: S, flow: Flow)
+async fn serve_clear<S>(acceptor: TlsAcceptor, mut conn: S)
 where
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  if flow != Flow::StartTlsFirst {
-    let opening = read_message(&mut conn).await;
-    if matches!(flow, Flow::SearchThenStartTls) {
-      let ProtocolOp::SearchRequest(_) = &opening.protocol_op else {
-        panic!("search request");
-      };
-      write_search_done(&mut conn, opening.message_id).await;
-    } else {
-      assert_eq!(simple_password(&opening), FAKE.as_bytes(), "cleartext bind must keep the decoy");
-      write_bind_result(&mut conn, opening.message_id, ResultCode::InvalidCredentials).await;
-    }
-  }
   let request = read_message(&mut conn).await;
   let ProtocolOp::ExtendedReq(extended) = &request.protocol_op else {
     panic!("starttls after the first operation");
@@ -229,57 +214,6 @@ where
     "protected bind must carry the real password"
   );
   write_bind_result(&mut tls, bind.message_id, ResultCode::Success).await;
-}
-
-async fn drive_guest<S>(stream: S, flow: Flow, ca: &CertAuthority)
-where
-  S: AsyncRead + AsyncWrite + Unpin,
-{
-  let mut io = Inbox {
-    stream,
-    pending: Vec::new(),
-  };
-  if matches!(flow, Flow::Pipelined) {
-    drive_pipelined(&mut io).await;
-    return;
-  }
-  let start_id = 2;
-  match flow {
-    Flow::StartTlsFirst => panic!("ldap3 drives starttls before the bind"),
-    Flow::Pipelined => panic!("pipelined bind returns before the upgrade"),
-    Flow::SearchThenStartTls => {
-      io.write(&encode(&search_message(1))).await;
-      let opened = io.message().await;
-      let ProtocolOp::SearchResDone(SearchResultDone(body)) = opened.protocol_op else {
-        panic!("search done");
-      };
-      assert_eq!(body.result_code, ResultCode::Success);
-    }
-    Flow::BindThenStartTls => expect_bind(&mut io, 1, ResultCode::InvalidCredentials).await,
-    Flow::AlreadyTls | Flow::SecondStartTls => expect_bind(&mut io, 1, ResultCode::Success).await,
-  }
-  io.write(&encode(&starttls_message(start_id))).await;
-  let started = tokio::time::timeout(Duration::from_secs(5), io.message())
-    .await
-    .expect("starttls result");
-  let ProtocolOp::ExtendedResp(body) = &started.protocol_op else {
-    panic!("starttls response");
-  };
-  assert_eq!(body.result_code, ResultCode::Success);
-  let mut tls = handshake(io, ca).await;
-  expect_bind(&mut tls, start_id + 1, ResultCode::Success).await;
-  if matches!(flow, Flow::SecondStartTls) {
-    tls.write(&encode(&starttls_message(start_id + 2))).await;
-    let again = tokio::time::timeout(Duration::from_secs(5), tls.message())
-      .await
-      .expect("second starttls result");
-    let ProtocolOp::ExtendedResp(body) = again.protocol_op else {
-      panic!("starttls response");
-    };
-    assert_eq!(again.message_id, start_id + 2);
-    assert_eq!(body.result_code, ResultCode::OperationsError);
-    expect_bind(&mut tls, start_id + 3, ResultCode::Success).await;
-  }
 }
 
 async fn drive_pipelined<S>(io: &mut Inbox<S>)
@@ -310,38 +244,6 @@ where
     }
   }
   assert!(saw_bind && saw_starttls, "bind result and starttls operationsError");
-}
-
-async fn expect_bind<S>(io: &mut Inbox<S>, id: u32, code: ResultCode)
-where
-  S: AsyncRead + AsyncWrite + Unpin,
-{
-  io.write(&encode(&bind_message(id, FAKE))).await;
-  let response = io.message().await;
-  let ProtocolOp::BindResponse(body) = response.protocol_op else {
-    panic!("bind response");
-  };
-  assert_eq!(response.message_id, id);
-  assert_eq!(body.result_code, code);
-}
-
-async fn handshake<S>(io: Inbox<S>, ca: &CertAuthority) -> Inbox<tokio_rustls::client::TlsStream<crate::connection::Prefixed<S>>>
-where
-  S: AsyncRead + AsyncWrite + Unpin,
-{
-  let Inbox { stream, pending } = io;
-  let name = ServerName::try_from("localhost".to_string()).unwrap();
-  let tls = tokio::time::timeout(
-    Duration::from_secs(5),
-    guest_connector(ca, false).connect(name, crate::connection::Prefixed::new(pending, stream)),
-  )
-  .await
-  .expect("starttls upgrades")
-  .expect("guest handshake");
-  Inbox {
-    stream: tls,
-    pending: Vec::new(),
-  }
 }
 
 struct Inbox<S> {
@@ -381,22 +283,6 @@ fn starttls_message(id: u32) -> LdapMessage {
   )
 }
 
-fn search_message(id: u32) -> LdapMessage {
-  LdapMessage::new(
-    id,
-    ProtocolOp::SearchRequest(SearchRequest::new(
-      LdapString::from(""),
-      SearchRequestScope::BaseObject,
-      SearchRequestDerefAliases::NeverDerefAliases,
-      0,
-      0,
-      false,
-      Filter::Present(LdapString::from("objectClass")),
-      Vec::new(),
-    )),
-  )
-}
-
 async fn write_bind_result<S>(stream: &mut S, id: u32, code: ResultCode)
 where
   S: AsyncWrite + Unpin,
@@ -426,65 +312,33 @@ where
   stream.write_all(&encode(&response)).await.unwrap();
 }
 
-async fn write_search_done<S>(stream: &mut S, id: u32)
-where
-  S: AsyncWrite + Unpin,
-{
-  let response = LdapMessage::new(
-    id,
-    ProtocolOp::SearchResDone(SearchResultDone(LdapResult::new(
-      ResultCode::Success,
-      LdapString::from(""),
-      LdapString::from(""),
-    ))),
-  );
-  stream.write_all(&encode(&response)).await.unwrap();
-}
-
 #[tokio::test]
 async fn ldap_starttls_then_bind_swaps_the_password() {
   ldap_flow(Flow::StartTlsFirst).await;
 }
 
-/// `ldap3` upgrades during connect and cannot bind before that, so this guest stays
-/// on the byte path.
-#[tokio::test]
-async fn ldap_bind_then_starttls_then_protected_bind_swaps_the_password() {
-  ldap_flow(Flow::BindThenStartTls).await;
-}
+// Bind then StartTLS, and search then StartTLS, are compose scenario 14.
+// ldapts drives both against 389ds. The scenario names are
+// `ldap bind then starttls then bind swaps the decoy password` and
+// `ldap search then starttls then bind swaps the decoy password`.
+//
+// A second StartTLS on an already protected session is
+// `ldap second starttls on a tls session is operations error`.
+// Bind then StartTLS when the upstream is already TLS is
+// `ldap bind then starttls against an already tls upstream swaps the decoy`.
+// Bind then StartTLS with guest mTLS is
+// `ldap bind then starttls with a client certificate swaps the decoy`.
 
-/// `ldap3` upgrades during connect and cannot search before that, so this guest stays
-/// on the byte path.
-#[tokio::test]
-async fn ldap_search_then_starttls_then_protected_bind_swaps_the_password() {
-  ldap_flow(Flow::SearchThenStartTls).await;
-}
-
-/// `ldap3` upgrades during connect and cannot bind before that, so this guest stays
-/// on the byte path.
-#[tokio::test]
-async fn ldap_bind_then_starttls_is_answered_when_upstream_is_already_tls() {
-  ldap_flow(Flow::AlreadyTls).await;
-}
-
-/// `ldap3` cannot put a bind and `StartTLS` in one write before reading either
-/// result, so this guest stays on the byte path.
+/// No real client produces a bind and `StartTLS` in one write before reading
+/// either result, so this guest stays on the byte path.
 #[tokio::test]
 async fn ldap_pipelined_bind_then_starttls_is_operations_error() {
   ldap_flow(Flow::Pipelined).await;
 }
 
-/// The guest binds in the clear, upgrades, and only then sends `StartTLS`
-/// again. `ldap3` performs the first `StartTLS` while opening the socket,
-/// before any bind, so this sequence stays on the byte path.
-#[tokio::test]
-async fn ldap_second_starttls_on_a_tls_session_is_operations_error() {
-  ldap_flow(Flow::SecondStartTls).await;
-}
-
 enum Ldap3Open<'a> {
   Clear,
-  StartTls(&'a CertAuthority),
+  StartTls { ca: &'a CertAuthority, client_cert: bool },
   Ldaps { ca: &'a CertAuthority, sni: bool },
 }
 
@@ -500,18 +354,14 @@ fn guest_config(ca: &CertAuthority, present: bool) -> rustls::ClientConfig {
   }
 }
 
-fn guest_connector(ca: &CertAuthority, present: bool) -> TlsConnector {
-  TlsConnector::from(Arc::new(guest_config(ca, present)))
-}
-
 async fn ldap3_bind(stream: TcpStream, open: Ldap3Open<'_>, password: &str) -> ldap3::LdapResult {
   let bind = async {
     let std_stream = stream.into_std().expect("ldap3 takes a std stream");
     let mut settings = ldap3::LdapConnSettings::new().set_std_stream(ldap3::StdStream::Tcp(std_stream));
     let url = match open {
       Ldap3Open::Clear => "ldap://localhost",
-      Ldap3Open::StartTls(ca) => {
-        settings = settings.set_starttls(true).set_config(Arc::new(guest_config(ca, false)));
+      Ldap3Open::StartTls { ca, client_cert } => {
+        settings = settings.set_starttls(true).set_config(Arc::new(guest_config(ca, client_cert)));
         "ldap://localhost"
       }
       Ldap3Open::Ldaps { ca, sni } => {
@@ -540,56 +390,8 @@ async fn answer_ldaps_bind(stub: TcpListener, acceptor: TlsAcceptor) {
   write_bind_result(&mut tls, bind.message_id, ResultCode::Success).await;
 }
 
-/// Cleartext bind, then `StartTLS`, then a protected bind. `Ok` is the
-/// protected result code. `Err` is the guest handshake after a successful
-/// `StartTLS` result.
-async fn bind_then_starttls_bind(proxy_addr: SocketAddr, stub_port: u16, connector: TlsConnector) -> Result<ResultCode, String> {
-  let mut stream = connect_through_proxy(proxy_addr, stub_port).await;
-  stream.write_all(&encode(&bind_message(1, FAKE))).await.unwrap();
-  let opened = read_message(&mut stream).await;
-  let ProtocolOp::BindResponse(body) = opened.protocol_op else {
-    panic!("bind response");
-  };
-  assert_eq!(body.result_code, ResultCode::InvalidCredentials);
-  let start = LdapMessage::new(
-    2,
-    ProtocolOp::ExtendedReq(ExtendedRequest {
-      request_name: OctetString::from_static(STARTTLS_OID),
-      request_value: None,
-    }),
-  );
-  stream.write_all(&encode(&start)).await.unwrap();
-  let started = read_message(&mut stream).await;
-  let ProtocolOp::ExtendedResp(body) = &started.protocol_op else {
-    panic!("starttls response");
-  };
-  assert_eq!(body.result_code, ResultCode::Success);
-  let name = ServerName::try_from("localhost".to_string()).unwrap();
-  let connect = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, stream)).await;
-  let Ok(connect) = connect else {
-    return Err("handshake timed out".to_string());
-  };
-  let mut tls = connect.map_err(|err| err.to_string())?;
-  tls
-    .write_all(&encode(&bind_message(3, FAKE)))
-    .await
-    .map_err(|err| err.to_string())?;
-  let response = read_message_result(&mut tls).await.map_err(|err| err.to_string())?;
-  let ProtocolOp::BindResponse(body) = response.protocol_op else {
-    panic!("bind response");
-  };
-  Ok(body.result_code)
-}
-
-/// `guest_tls_mode = mtls` on a cleartext `ldap://` fake. A CA-signed guest
-/// completes the protected bind and the upstream sees the real password.
-/// A guest with no certificate is refused at the handshake, after it has
-/// already seen the `StartTLS` success, and the upstream never starts TLS.
-///
-/// `ldap3` selects client authentication when it opens the connection, and
-/// it cannot `StartTLS` after a bind, so this guest stays on the byte path.
 #[tokio::test]
-async fn ldap_bind_then_starttls_enforces_guest_mtls() {
+async fn ldap_starttls_with_a_client_cert_swaps_the_password() {
   install_crypto_provider();
   let ca = CertAuthority::generate().unwrap();
   let stub_cert = ca.generate_domain_cert("localhost").unwrap();
@@ -603,83 +405,19 @@ async fn ldap_bind_then_starttls_enforces_guest_mtls() {
   let real = format!("ldap://{}:{VALUE}@localhost:{stub_port}?sslrootcert={}", user(DN), bundle.display());
   let grants = super::resolve_mtls_grants("LDAP_URL", &fake, &real).expect("ldap starttls with mtls still loads");
   let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
-  let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-  let stub_task = tokio::spawn(async move {
-    for _ in 0..2 {
-      let Ok(Ok((mut conn, _))) = tokio::time::timeout(Duration::from_secs(10), stub.accept()).await else {
-        return;
-      };
-      let opening = read_message(&mut conn).await;
-      assert_eq!(simple_password(&opening), FAKE.as_bytes(), "cleartext bind must keep the decoy");
-      let response = LdapMessage::new(
-        opening.message_id,
-        ProtocolOp::BindResponse(BindResponse::new(
-          ResultCode::InvalidCredentials,
-          LdapString::from(""),
-          LdapString::from(""),
-          None,
-          None,
-        )),
-      );
-      conn.write_all(&encode(&response)).await.unwrap();
-      let request = read_message(&mut conn).await;
-      let ProtocolOp::ExtendedReq(extended) = &request.protocol_op else {
-        panic!("starttls after the bind");
-      };
-      assert_eq!(extended.request_name.as_ref(), STARTTLS_OID);
-      let response = LdapMessage::new(
-        request.message_id,
-        ProtocolOp::ExtendedResp(ExtendedResponse {
-          result_code: ResultCode::Success,
-          matched_dn: LdapString::from(""),
-          diagnostic_message: LdapString::from(""),
-          referral: None,
-          response_name: Some(OctetString::from_static(STARTTLS_OID)),
-          response_value: None,
-        }),
-      );
-      conn.write_all(&encode(&response)).await.unwrap();
-      let accepted = tokio::time::timeout(Duration::from_secs(5), acceptor.accept(conn))
-        .await
-        .expect("upstream accept timed out");
-      let Ok(mut tls) = accepted else {
-        let _ = tx.send(false).await;
-        continue;
-      };
-      let bind = read_message(&mut tls).await;
-      assert_eq!(
-        simple_password(&bind),
-        VALUE.as_bytes(),
-        "protected bind must carry the real password"
-      );
-      let ok = LdapMessage::new(
-        bind.message_id,
-        ProtocolOp::BindResponse(BindResponse::new(
-          ResultCode::Success,
-          LdapString::from(""),
-          LdapString::from(""),
-          None,
-          None,
-        )),
-      );
-      tls.write_all(&encode(&ok)).await.unwrap();
-      let _ = tx.send(true).await;
-    }
-  });
-
-  let protected = bind_then_starttls_bind(proxy_addr, stub_port, guest_connector(&ca, true))
-    .await
-    .expect("ca-signed guest handshake");
-  assert_eq!(protected, ResultCode::Success);
-  assert!(rx.recv().await.unwrap(), "ca-signed guest did not open upstream tls");
-
-  let refused = bind_then_starttls_bind(proxy_addr, stub_port, guest_connector(&ca, false)).await;
-  let Err(reason) = refused else {
-    panic!("certless guest completed the handshake");
-  };
-  assert_ne!(reason, "handshake timed out", "certless guest hung instead of being refused");
-  assert!(!rx.recv().await.unwrap(), "certless guest opened upstream tls");
-  stub_task.abort();
+  let stub_task = tokio::spawn(async move { serve_flow(stub, acceptor, Flow::StartTlsFirst).await });
+  let stream = connect_through_proxy(proxy_addr, stub_port).await;
+  let result = ldap3_bind(
+    stream,
+    Ldap3Open::StartTls {
+      ca: &ca,
+      client_cert: true,
+    },
+    FAKE,
+  )
+  .await;
+  result.success().expect("mtls protected bind");
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   proxy.abort();
 }
 

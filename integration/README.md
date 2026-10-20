@@ -58,6 +58,9 @@ Topology:
 | 27 | Both clients on both rules with a password that is not the decoy | the same two rules | 0-9-1 gets `ACCESS_REFUSED` and 1.0 gets a failed SASL outcome (`amqp:unauthorized-access`). The password was not swapped, and the error text does not contain the real password |
 | 28 | `amqplib` to port 5673, which has no grant. The client bytes are compared with a tcpflow recording on the broker | no AMQP grant. The witness shares the broker network namespace, drops every capability, and adds `NET_RAW`, `CHOWN`, and `DAC_OVERRIDE`. It is not mounted into the client | RabbitMQ answers `ACCESS_REFUSED` (403). Start-Ok still carries the decoy. The bytes match. `ss` shows a second established socket to 5673, so a bypass cannot pass |
 | 29 | `rhea` to `amqp:5672` with `max_frame_size` 1024. Each body repeats a prefix of the real password, shifted by one byte, so a frame boundary falls on that prefix | `[rules.amqp_plain]` | the receiver gets the exact body, and the connection stays open |
+| 32 | Same client, after a protected bind, calls `startTLS` again and then binds | `[rules.ldap_plain]` | the second `startTLS` returns `operationsError` (code 1). The error text does not contain the real password. A further decoy bind still succeeds |
+| 33 | Same client binds, then `startTLS`, then binds, on port 3390 | `[rules.ldap_upstream_tls]`: fake `ldap://` on 3390; real string is the LDAPS URL | the cleartext bind succeeds, because the upstream leg is already TLS and the decoy was swapped. `startTLS` and the next bind also succeed |
+| 34 | Same client binds, then `startTLS` with a client certificate, then binds, on port 3391. A second connection omits the certificate | `[rules.ldap_mtls]`: `guest_tls_mode = mtls`; fake `ldap://` on 3391; real string is the cleartext LDAP URL | the cleartext bind is `confidentialityRequired` (code 13). The certified handshake completes and the decoy bind succeeds. The handshake without a certificate is refused, and the error text does not contain the real password |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
 capture has no SNI — the destination address is the identity
@@ -96,16 +99,22 @@ up, `dsconf` sets `nsslapd-require-secure-binds: on`. Before the
 service waits, `ldapsearch` inside the container binds with the decoy
 password over LDAPS and again over StartTLS. Both must exit 49. Those
 binds do not pass through the proxy. The flag requires TLS
-for a simple bind. It does not require a client certificate, and this
-demo does not present one: the proxy's upstream leg has no client
-identity, the same way the Redis demo sets `tls-auth-clients no`. The
+for a simple bind. It does not require a client certificate. Scenarios
+13–16 and 32–33 do not present one: the proxy's upstream leg has no client
+identity, the same way the Redis demo sets `tls-auth-clients no`. Scenario
+34 does. `gen-certs.sh` mints `ldap-guest.crt` from the demo CA, which is
+also arkham's CA, and `ldapts` passes that pair to `startTLS`. The
 trust anchor is the demo CA from `gen-certs.sh`, imported into the
-directory at bootstrap and named by `sslrootcert` on both real strings.
+directory at bootstrap and named by `sslrootcert` on the real strings.
 `ldap://` carries that anchor because StartTLS verifies the upstream
 certificate after the upgrade. A refused bind leaves the `ldapts` socket
 open, and an anonymous root-DSE search is a different first message. Both
-then call `startTLS` on that socket and bind with the decoy. Scenarios
-13–16 are gated on `LDAP_URL` and `LDAP_TLS_URL`.
+then call `startTLS` on that socket and bind with the decoy. Scenario 32
+calls `startTLS` a second time on that protected socket. Scenario 33 dials
+port 3390, whose real string is LDAPS, so the bind before `startTLS` is
+already swapped. Scenario 34 dials port 3391 with `guest_tls_mode = mtls`.
+Scenarios 13–16 and 32 are gated on `LDAP_URL` and `LDAP_TLS_URL`.
+Scenarios 33 and 34 are gated on `LDAP_UPSTREAM_TLS_URL` and `LDAP_MTLS_URL`.
 Scenarios 17 and 18 use the official `nats:2.15.1-alpine` image and
 `@nats-io/transport-node` 3.4.0. The server requires TLS: it writes one
 cleartext INFO line, then expects a handshake on the same socket. Its only
