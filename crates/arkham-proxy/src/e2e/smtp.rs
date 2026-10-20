@@ -10,7 +10,7 @@ use super::*;
 use base64::Engine as _;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{AsyncSmtpConnection, Certificate, CertificateStore, Identity, TlsParameters};
-use lettre::transport::smtp::commands::{Expn, Help, Vrfy};
+use lettre::transport::smtp::commands::{Expn, Help, Starttls, Vrfy};
 use lettre::transport::smtp::extension::ClientId;
 use rama::crypto::pem::PemEncode as _;
 use secrecy::ExposeSecret as _;
@@ -36,10 +36,6 @@ fn plain_initial(user: &str, pass: &str) -> String {
   base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{pass}"))
 }
 
-fn auth_line(user: &str, pass: &str) -> String {
-  format!("AUTH PLAIN {}\r\n", plain_initial(user, pass))
-}
-
 fn hello() -> ClientId {
   ClientId::Domain("client".to_owned())
 }
@@ -48,18 +44,38 @@ fn decoy_credentials() -> Credentials {
   Credentials::new(USER.to_owned(), FAKE.to_owned())
 }
 
-/// `Identity::from_pem` on the rustls backend keeps the certificate argument
-/// as raw bytes and parses only the key as PEM. Callers pass the leaf DER.
-fn tls_trusting(ca_pem: &[u8], identity: Option<Identity>) -> TlsParameters {
-  let mut builder = TlsParameters::builder("localhost".to_owned())
+fn tls_parameters(domain: &str, ca_pem: &[u8], identity: Option<Identity>, skip_server_name: bool) -> TlsParameters {
+  let mut builder = TlsParameters::builder(domain.to_owned())
     .certificate_store(CertificateStore::None)
     .add_root_certificate(Certificate::from_pem(ca_pem).unwrap());
+  if skip_server_name {
+    builder = builder.dangerous_accept_invalid_hostnames(true);
+  }
   if let Some(identity) = identity {
     builder = builder.identify_with(identity);
   }
   builder.build().unwrap()
 }
 
+fn tls_trusting(ca_pem: &[u8], identity: Option<Identity>) -> TlsParameters {
+  tls_parameters("localhost", ca_pem, identity, false)
+}
+
+/// An IP literal becomes `ServerName::IpAddress`. rustls sends the SNI
+/// extension only for a DNS name, so the `ClientHello` has none.
+fn tls_without_sni(ca_pem: &[u8], identity: Option<Identity>) -> TlsParameters {
+  tls_parameters("127.0.0.1", ca_pem, identity, true)
+}
+
+fn assert_leaf_names_localhost(der: &[u8]) {
+  let cert = rustls::pki_types::CertificateDer::from(der.to_vec());
+  let parsed = rustls::server::ParsedCertificate::try_from(&cert).unwrap();
+  let name = ServerName::try_from("localhost".to_owned()).unwrap();
+  rustls::client::verify_server_name(&parsed, &name).unwrap();
+}
+
+/// `Identity::from_pem` on the rustls backend keeps the certificate argument
+/// as raw bytes and parses only the key as PEM. Callers pass the leaf DER.
 fn client_identity(ca: &CertAuthority) -> Identity {
   let (chain, key) = arkham_pki::ca::generate_client_pair(ca, "guest").unwrap();
   let leaf = chain.first().unwrap();
@@ -237,7 +253,6 @@ async fn smtp_auth_before_starttls_stays_the_decoy_and_swaps_after() {
     recorded[1]
   );
   assert!(!recorded[1].contains(&plain_initial(USER, FAKE)));
-  assert!(fx.stub_ca_dir.path().join("ca.pem").is_file());
   fx.proxy.abort();
 }
 
@@ -276,30 +291,32 @@ async fn help_then_starttls_still_swaps_auth() {
 }
 
 /// A `454` leaves the session in the opening. The next `STARTTLS` upgrades.
-///
-/// This stays a byte-level guest. `AsyncSmtpConnection::starttls` treats a
-/// 454 as fatal and aborts the session, so lettre cannot retry STARTTLS on
-/// the same connection.
 #[tokio::test]
 async fn refused_starttls_then_retry_still_swaps_auth() {
   let fx = starttls_fixture().await;
   let stub_seen = Arc::clone(&fx.seen);
   let acceptor = fx.acceptor.clone();
-  let proxy_addr = fx.proxy_addr;
-  let stub_port = fx.stub_port;
   let stub_task = tokio::spawn(async move {
     let (conn, _) = fx.stub.accept().await.unwrap();
     serve_starttls(conn, acceptor, stub_seen, true).await;
   });
-  let mut stream = tunnel(proxy_addr, stub_port).await;
-  let greeting = read_reply(&mut stream).await;
-  assert!(greeting.starts_with("220"), "{greeting}");
-  write_cmd(&mut stream, "EHLO client\r\n").await;
-  let _ = read_reply(&mut stream).await;
-  write_cmd(&mut stream, "STARTTLS\r\n").await;
-  let refused = read_reply(&mut stream).await;
-  assert!(refused.starts_with("454"), "{refused}");
-  upgrade_and_auth(&fx.connector, &fx.proxy, stream, &fx.seen, stub_task).await;
+  let mut conn = lettre_session(tunnel(fx.proxy_addr, fx.stub_port).await).await;
+  let refused = conn.command(Starttls).await.unwrap_err();
+  assert_eq!(refused.status().map(u16::from), Some(454), "{refused}");
+  conn.starttls(tls_trusting(&fx.proxy_ca_pem, None), &hello()).await.unwrap();
+  let ok = conn.auth(&[Mechanism::Plain], &decoy_credentials()).await.unwrap();
+  assert!(ok.has_code(235), "{ok:?}");
+  assert!(!format!("{ok:?}").contains(VALUE), "{ok:?}");
+  drop(conn);
+  let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
+  let recorded = fx.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+  assert_eq!(recorded.len(), 1, "{recorded:?}");
+  assert!(
+    recorded[0].contains(&plain_initial(USER, VALUE)),
+    "post-upgrade AUTH must carry the real password: {}",
+    recorded[0]
+  );
+  fx.proxy.abort();
 }
 
 struct StarttlsFixture {
@@ -308,10 +325,9 @@ struct StarttlsFixture {
   stub: TcpListener,
   stub_port: u16,
   proxy_ca_pem: Vec<u8>,
-  connector: TlsConnector,
   acceptor: TlsAcceptor,
   seen: Arc<Mutex<Vec<String>>>,
-  stub_ca_dir: tempfile::TempDir,
+  _stub_ca_dir: tempfile::TempDir,
 }
 
 async fn starttls_fixture() -> StarttlsFixture {
@@ -333,21 +349,15 @@ async fn starttls_fixture() -> StarttlsFixture {
     ),
   )];
   let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &proxy_ca)).await;
-  let mut roots = rustls::RootCertStore::empty();
-  roots.add(proxy_ca.cert_der().clone()).unwrap();
-  let connector = TlsConnector::from(Arc::new(
-    rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth(),
-  ));
   StarttlsFixture {
     proxy_addr,
     proxy,
     stub,
     stub_port,
     proxy_ca_pem: proxy_ca.cert_pem(),
-    connector,
     acceptor,
     seen: Arc::new(Mutex::new(Vec::new())),
-    stub_ca_dir: bundle,
+    _stub_ca_dir: bundle,
   }
 }
 
@@ -361,37 +371,6 @@ async fn tunnel(proxy_addr: SocketAddr, stub_port: u16) -> TcpStream {
   stream.read_exact(&mut head).await.unwrap();
   assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
   stream
-}
-
-async fn upgrade_and_auth(
-  connector: &TlsConnector,
-  proxy: &tokio::task::JoinHandle<()>,
-  mut stream: TcpStream,
-  seen: &Mutex<Vec<String>>,
-  stub_task: tokio::task::JoinHandle<()>,
-) {
-  write_cmd(&mut stream, "STARTTLS\r\n").await;
-  let ready = read_reply(&mut stream).await;
-  assert!(ready.starts_with("220"), "{ready}");
-  let name = ServerName::try_from("localhost".to_string()).unwrap();
-  let mut tls = connector.connect(name, stream).await.unwrap();
-  write_cmd(&mut tls, "EHLO client\r\n").await;
-  let ehlo = read_reply(&mut tls).await;
-  assert!(ehlo.contains("250"), "{ehlo}");
-  write_cmd(&mut tls, &auth_line(USER, FAKE)).await;
-  let ok = read_reply(&mut tls).await;
-  assert!(ok.starts_with("235"), "{ok}");
-  assert!(!ok.contains(VALUE), "{ok}");
-  drop(tls);
-  let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
-  let recorded = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-  assert_eq!(recorded.len(), 1, "{recorded:?}");
-  assert!(
-    recorded[0].contains(&plain_initial(USER, VALUE)),
-    "post-upgrade AUTH must carry the real password: {}",
-    recorded[0]
-  );
-  proxy.abort();
 }
 
 /// Server that advertises CHUNKING and accepts `BDAT` chunks. Records
@@ -531,22 +510,30 @@ async fn smtp_cleartext_session_forwards_the_decoy() {
   fx.proxy.abort();
 }
 
-#[tokio::test]
-async fn smtps_implicit_tls_swaps_the_password() {
+struct ImplicitTls {
+  ca_pem: Vec<u8>,
+  guest_port: u16,
+  seen: Arc<Mutex<Vec<String>>>,
+  stub: tokio::task::JoinHandle<()>,
+  serve: tokio::task::JoinHandle<Result<(), crate::Error>>,
+  _bundle: tempfile::TempDir,
+}
+
+async fn implicit_tls() -> ImplicitTls {
   install_crypto_provider();
   let ca = CertAuthority::generate().unwrap();
   let stub_cert = ca.generate_domain_cert("localhost").unwrap();
   let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
   let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let stub_port = local_addr(&stub).port();
-  let bundle_dir = tempfile::tempdir().unwrap();
-  let bundle = bundle_dir.path().join("ca.pem");
-  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let bundle = tempfile::tempdir().unwrap();
+  let bundle_path = bundle.path().join("ca.pem");
+  std::fs::write(&bundle_path, ca.cert_pem()).unwrap();
   let grants = vec![smtp_grant(
     &format!("smtps://agent%40demo.test:{FAKE}@localhost:{stub_port}"),
     &format!(
       "smtps://agent%40demo.test:{VALUE}@localhost:{stub_port}?sslrootcert={}",
-      bundle.display()
+      bundle_path.display()
     ),
   )];
   let state = test_state_with(grants, &ca);
@@ -568,22 +555,30 @@ async fn smtps_implicit_tls_swaps_the_password() {
       serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await
     }
   });
+  ImplicitTls {
+    ca_pem: ca.cert_pem(),
+    guest_port,
+    seen,
+    stub: stub_task,
+    serve,
+    _bundle: bundle,
+  }
+}
 
-  let mut conn = AsyncSmtpConnection::connect_tokio1(
-    ("127.0.0.1", guest_port),
+async fn implicit_session(fx: &ImplicitTls, tls: TlsParameters) -> AsyncSmtpConnection {
+  AsyncSmtpConnection::connect_tokio1(
+    ("127.0.0.1", fx.guest_port),
     Some(Duration::from_secs(10)),
     &hello(),
-    Some(tls_trusting(&ca.cert_pem(), None)),
+    Some(tls),
     None,
   )
   .await
-  .unwrap();
-  let ok = conn.auth(&[Mechanism::Plain], &decoy_credentials()).await.unwrap();
-  assert!(ok.has_code(235), "{ok:?}");
-  assert!(!format!("{ok:?}").contains(VALUE), "{ok:?}");
-  drop(conn);
-  let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
-  let recorded = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+  .unwrap()
+}
+
+fn assert_implicit_swapped(recorded: &[String]) {
+  assert_eq!(recorded.len(), 1, "{recorded:?}");
   assert!(
     recorded[0].contains(&plain_initial(USER, VALUE)),
     "implicit TLS AUTH must carry the real password: {recorded:?}"
@@ -592,72 +587,35 @@ async fn smtps_implicit_tls_swaps_the_password() {
     !recorded[0].contains(&plain_initial(USER, FAKE)),
     "implicit TLS AUTH must not carry the decoy"
   );
-  serve.await.unwrap().unwrap();
 }
 
-/// Implicit TLS with SNI disabled stays a byte-level guest. lettre always
-/// sends the domain from `TlsParameters` as the server name and has no
-/// switch to omit it. The SNI path is [`smtps_implicit_tls_swaps_the_password`].
+#[tokio::test]
+async fn smtps_implicit_tls_swaps_the_password() {
+  let fx = implicit_tls().await;
+  let mut conn = implicit_session(&fx, tls_trusting(&fx.ca_pem, None)).await;
+  let ok = conn.auth(&[Mechanism::Plain], &decoy_credentials()).await.unwrap();
+  assert!(ok.has_code(235), "{ok:?}");
+  assert!(!format!("{ok:?}").contains(VALUE), "{ok:?}");
+  drop(conn);
+  let _ = tokio::time::timeout(Duration::from_secs(10), fx.stub).await;
+  let recorded = fx.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+  assert_implicit_swapped(&recorded);
+  fx.serve.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn smtps_without_sni_mints_for_the_grant_host() {
-  install_crypto_provider();
-  let ca = CertAuthority::generate().unwrap();
-  let stub_cert = ca.generate_domain_cert("localhost").unwrap();
-  let acceptor = TlsAcceptor::from(Arc::new((*stub_cert.server_config).clone()));
-  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let stub_port = local_addr(&stub).port();
-  let bundle_dir = tempfile::tempdir().unwrap();
-  let bundle = bundle_dir.path().join("ca.pem");
-  std::fs::write(&bundle, ca.cert_pem()).unwrap();
-  let grants = vec![smtp_grant(
-    &format!("smtps://agent%40demo.test:{FAKE}@localhost:{stub_port}"),
-    &format!(
-      "smtps://agent%40demo.test:{VALUE}@localhost:{stub_port}?sslrootcert={}",
-      bundle.display()
-    ),
-  )];
-  let state = test_state_with(grants, &ca);
-  let snapshot = state.snapshot();
-  let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-  let stub_seen = Arc::clone(&seen);
-  let stub_task = tokio::spawn(async move {
-    let (conn, _) = stub.accept().await.unwrap();
-    let tls = acceptor.accept(conn).await.unwrap();
-    serve_submission(tls, None, stub_seen).await;
-  });
-
-  let (guest, client_end) = tokio::io::duplex(64 * 1024);
-  let serve = tokio::spawn({
-    let state = Arc::clone(&state);
-    let snapshot = Arc::clone(&snapshot);
-    async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await }
-  });
-
-  let mut roots = rustls::RootCertStore::empty();
-  roots.add(ca.cert_der().clone()).unwrap();
-  let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-  config.enable_sni = false;
-  let name = ServerName::try_from("localhost".to_string()).unwrap();
-  let mut tls = tokio::time::timeout(
-    Duration::from_secs(10),
-    TlsConnector::from(Arc::new(config)).connect(name, client_end),
-  )
-  .await
-  .unwrap()
-  .unwrap();
-  let greeting = read_reply(&mut tls).await;
-  assert!(greeting.starts_with("220"), "{greeting}");
-  write_cmd(&mut tls, "EHLO client\r\n").await;
-  let _ = read_reply(&mut tls).await;
-  write_cmd(&mut tls, &auth_line(USER, FAKE)).await;
-  let ok = read_reply(&mut tls).await;
-  assert!(ok.starts_with("235"), "{ok}");
-  assert!(!ok.contains(VALUE), "{ok}");
-  drop(tls);
-  let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
-  let recorded = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-  assert!(recorded[0].contains(&plain_initial(USER, VALUE)), "{recorded:?}");
-  serve.await.unwrap().unwrap();
+  let fx = implicit_tls().await;
+  let mut conn = implicit_session(&fx, tls_without_sni(&fx.ca_pem, None)).await;
+  assert_leaf_names_localhost(&conn.peer_certificate().unwrap());
+  let ok = conn.auth(&[Mechanism::Plain], &decoy_credentials()).await.unwrap();
+  assert!(ok.has_code(235), "{ok:?}");
+  assert!(!format!("{ok:?}").contains(VALUE), "{ok:?}");
+  drop(conn);
+  let _ = tokio::time::timeout(Duration::from_secs(10), fx.stub).await;
+  let recorded = fx.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+  assert_implicit_swapped(&recorded);
+  fx.serve.await.unwrap().unwrap();
 }
 
 #[test]
@@ -778,15 +736,18 @@ async fn accept_starttls_upstream(mut conn: TcpStream, acceptor: TlsAcceptor) ->
   }
 }
 
-async fn guest_starttls_auth(proxy_addr: SocketAddr, stub_port: u16, tls: TlsParameters) -> bool {
+async fn guest_starttls_auth(proxy_addr: SocketAddr, stub_port: u16, tls: TlsParameters) -> Option<Vec<u8>> {
   let stream = tunnel(proxy_addr, stub_port).await;
   let Ok(mut conn) = AsyncSmtpConnection::connect_with_transport(Box::new(stream), &hello()).await else {
-    return false;
+    return None;
   };
   if conn.starttls(tls, &hello()).await.is_err() {
-    return false;
+    return None;
   }
-  conn.auth(&[Mechanism::Plain], &decoy_credentials()).await.is_ok()
+  if conn.auth(&[Mechanism::Plain], &decoy_credentials()).await.is_err() {
+    return None;
+  }
+  Some(conn.peer_certificate().unwrap())
 }
 
 /// STARTTLS under mtls, against an upstream that actually speaks TLS.
@@ -825,8 +786,9 @@ async fn smtp_mtls_starttls_without_a_client_certificate_sends_no_auth_upstream(
   });
 
   let ca_pem = ca.cert_pem();
-  let authed = guest_starttls_auth(proxy_addr, stub_port, tls_trusting(&ca_pem, Some(client_identity(&ca)))).await;
-  assert!(authed, "client certificate did not complete AUTH");
+  let der = guest_starttls_auth(proxy_addr, stub_port, tls_without_sni(&ca_pem, Some(client_identity(&ca)))).await;
+  let der = der.expect("client certificate did not complete AUTH");
+  assert_leaf_names_localhost(&der);
   let control = rx.recv().await.unwrap();
   assert!(control.tls, "client certificate did not open upstream TLS");
   assert!(control.bytes > 0, "client certificate did not reach the upstream TLS handshake");
@@ -839,8 +801,8 @@ async fn smtp_mtls_starttls_without_a_client_certificate_sends_no_auth_upstream(
     "client certificate delivered the decoy upstream"
   );
 
-  let authed = guest_starttls_auth(proxy_addr, stub_port, tls_trusting(&ca_pem, None)).await;
-  assert!(!authed, "certless guest completed STARTTLS");
+  let authed = guest_starttls_auth(proxy_addr, stub_port, tls_without_sni(&ca_pem, None)).await;
+  assert!(authed.is_none(), "certless guest completed STARTTLS");
   let refused = rx.recv().await.unwrap();
   assert_eq!(refused.bytes, 0, "certless guest sent a ClientHello upstream");
   assert!(refused.auth.is_empty(), "certless guest sent AUTH upstream");
