@@ -30,9 +30,19 @@ pub struct MintedPair {
 /// agents reuse tokens across connections.
 // ponytail: process-memory only; restart orphans decoys the agent still
 // holds and forces re-auth. Persist beside the CA if that ceiling bites.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MintStore {
   pairs: DashMap<String, MintedPair>,
+}
+
+impl std::fmt::Debug for MintStore {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let labels: Vec<String> = self.pairs.iter().map(|entry| entry.label.clone()).collect();
+    f.debug_struct("MintStore")
+      .field("len", &self.pairs.len())
+      .field("labels", &labels)
+      .finish()
+  }
 }
 
 /// A handle to the store handed to each substitution machine.
@@ -218,6 +228,17 @@ mod tests {
     store.mint("my-rule", None, "access_token", "v", Some(900)).unwrap();
     let pair = store.pairs.get("v").expect("pair recorded");
     assert_eq!(pair.label, "my-rule");
+  }
+
+  #[test]
+  fn debug_lists_labels_without_the_issued_token() {
+    let store = MintStore::default();
+    let token = "issued-token-9f3c1a";
+    store.mint("my-rule", None, "access_token", token, None).unwrap();
+    let rendered = format!("{store:?}");
+    assert!(!rendered.contains(token), "{rendered}");
+    assert!(rendered.contains("my-rule"), "{rendered}");
+    assert!(rendered.contains("len: 1"), "{rendered}");
   }
 
   #[test]
