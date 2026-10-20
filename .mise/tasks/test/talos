@@ -240,7 +240,8 @@ prove_backend() {
   local explicit=$scratch/guest-${backend}-explicit
   local switched=$scratch/guest-${backend}-switched
   mkdir -p "$explicit" "$switched"
-  cp "$decoy" "$explicit/config" "$switched/config"
+  cp "$decoy" "$explicit/config"
+  cp "$decoy" "$switched/config"
 
   local explicit_out=$scratch/${backend}-explicit.txt
   local switched_out=$scratch/${backend}-switched.txt
