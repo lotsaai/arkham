@@ -89,6 +89,27 @@ impl<S> ExtensionsRef for GuestIo<S> {
   }
 }
 
+/// Talos writes PKCS#8 under `ED25519 PRIVATE KEY`. rustls reads that
+/// encoding only from a `PRIVATE KEY` section and skips every other label.
+fn private_key_der(pem: &[u8]) -> Result<PrivateKeyDer<'static>, PemError> {
+  match PrivateKeyDer::from_pem_slice(pem) {
+    Ok(key) => Ok(key),
+    Err(PemError::NoItemsFound) => ed25519_pkcs8_label(pem),
+    Err(err) => Err(err),
+  }
+}
+
+fn ed25519_pkcs8_label(pem: &[u8]) -> Result<PrivateKeyDer<'static>, PemError> {
+  let Ok(text) = std::str::from_utf8(pem) else {
+    return Err(PemError::NoItemsFound);
+  };
+  if !text.contains("ED25519 PRIVATE KEY") {
+    return Err(PemError::NoItemsFound);
+  }
+  let relabeled = text.replace("ED25519 PRIVATE KEY", "PRIVATE KEY");
+  PrivateKeyDer::from_pem_slice(relabeled.as_bytes())
+}
+
 /// Load an upstream client identity (mTLS) from the entry's PEM paths: the
 /// certificate chain and its key, ready for the relay's egress. Only the
 /// entry names this identity; nothing invents one.
@@ -110,7 +131,7 @@ pub(crate) fn client_identity(cert: &Path, key: &Path) -> Result<ClientAuth, Err
   if chain.is_empty() {
     return Err(Error::EmptyChain { path: cert.to_path_buf() });
   }
-  let private = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|err| Error::ClientKey {
+  let private = private_key_der(&key_bytes).map_err(|err| Error::ClientKey {
     path: key.to_path_buf(),
     source: err.into(),
   })?;
@@ -336,6 +357,7 @@ where
 }
 #[cfg(test)]
 mod tests {
+  use base64::Engine as _;
   use rama::tls::boring::core::x509::store::X509StoreBuilder;
 
   use super::*;
@@ -368,6 +390,50 @@ mod tests {
     assert!(
       policy.is_some(),
       "anonymous legs must answer an upstream certificate request empty instead of dying"
+    );
+  }
+
+  /// PKCS#8 Ed25519 under the PEM label Talos writes (`ED25519 PRIVATE KEY`).
+  /// The seed is a repeated byte so the fixture is not a live credential.
+  fn talos_ed25519_pkcs8() -> Vec<u8> {
+    let mut der = vec![
+      0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+    ];
+    der.extend(std::iter::repeat_n(0x11, 32));
+    der
+  }
+
+  fn pem_block(label: &str, der: &[u8]) -> String {
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    format!("-----BEGIN {label}-----\n{body}\n-----END {label}-----\n")
+  }
+
+  fn identity_files(key_pem: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ca = CertAuthority::generate().expect("ca");
+    let (cert, key) = arkham_pki::ca::load_or_generate_client_pair(&ca, dir.path(), "client").expect("pair");
+    std::fs::write(&key, key_pem).expect("key");
+    (dir, cert, key)
+  }
+
+  #[test]
+  fn talos_ed25519_private_key_pem_loads_as_a_signing_key() {
+    let pkcs8 = talos_ed25519_pkcs8();
+    let (_dir, cert, key) = identity_files(&pem_block("ED25519 PRIVATE KEY", &pkcs8));
+    let ClientAuth::Single(data) = client_identity(&cert, &key).expect("ed25519 key loads") else {
+      panic!("one client identity");
+    };
+    let signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&data.private_key).expect("rustls accepts the key");
+    assert_eq!(signing.algorithm(), rustls::SignatureAlgorithm::ED25519);
+  }
+
+  #[test]
+  fn unknown_private_key_label_stays_an_error() {
+    let (_dir, cert, key) = identity_files(&pem_block("OPENSSH PRIVATE KEY", b"not-a-key"));
+    let err = client_identity(&cert, &key).expect_err("unknown label");
+    assert!(
+      matches!(err, crate::Error::ClientKey { .. }),
+      "an unrecognized label stays a key parse error"
     );
   }
 }
