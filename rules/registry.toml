@@ -2339,13 +2339,13 @@ pattern = "{base62:32}"
 
 [providers.airbrakeprojectkey]
 env = ["AIRBRAKEPROJECTKEY_API_KEY", "AIRBRAKEPROJECTKEY_API_TOKEN", "AIRBRAKEPROJECTKEY_APIKEY", "AIRBRAKEPROJECTKEY_TOKEN", "AIRBRAKEPROJECTKEY_ACCESS_TOKEN", "AIRBRAKEPROJECTKEY_AUTH_TOKEN", "AIRBRAKEPROJECTKEY_SECRET", "AIRBRAKEPROJECTKEY_SECRET_KEY", "AIRBRAKEPROJECTKEY_KEY"]
-hosts = ["https://api.airbrake.io", "https://github.com", "https://howtorotate.com"]
+hosts = ["https://api.airbrake.io"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/airbrakeprojectkey/airbrakeprojectkey.go
 
 [providers.airbrakeuserkey]
 env = ["AIRBRAKEUSERKEY_API_KEY", "AIRBRAKEUSERKEY_API_TOKEN", "AIRBRAKEUSERKEY_APIKEY", "AIRBRAKEUSERKEY_TOKEN", "AIRBRAKEUSERKEY_ACCESS_TOKEN", "AIRBRAKEUSERKEY_AUTH_TOKEN", "AIRBRAKEUSERKEY_SECRET", "AIRBRAKEUSERKEY_SECRET_KEY", "AIRBRAKEUSERKEY_KEY"]
-hosts = ["https://api.airbrake.io", "https://howtorotate.com"]
+hosts = ["https://api.airbrake.io"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/airbrakeuserkey/airbrakeuserkey.go
 
@@ -2499,18 +2499,6 @@ hosts = ["https://api.apptivo.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/apptivo/apptivo.go
 
-[providers.artifactory]
-env = ["ARTIFACTORY_API_KEY", "ARTIFACTORY_API_TOKEN", "ARTIFACTORY_APIKEY", "ARTIFACTORY_TOKEN", "ARTIFACTORY_ACCESS_TOKEN", "ARTIFACTORY_AUTH_TOKEN", "ARTIFACTORY_SECRET", "ARTIFACTORY_SECRET_KEY", "ARTIFACTORY_KEY"]
-hosts = ["https://jfrog.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/artifactory/artifactory.go
-
-[providers.artifactoryreferencetoken]
-env = ["ARTIFACTORYREFERENCETOKEN_API_KEY", "ARTIFACTORYREFERENCETOKEN_API_TOKEN", "ARTIFACTORYREFERENCETOKEN_APIKEY", "ARTIFACTORYREFERENCETOKEN_TOKEN", "ARTIFACTORYREFERENCETOKEN_ACCESS_TOKEN", "ARTIFACTORYREFERENCETOKEN_AUTH_TOKEN", "ARTIFACTORYREFERENCETOKEN_SECRET", "ARTIFACTORYREFERENCETOKEN_SECRET_KEY", "ARTIFACTORYREFERENCETOKEN_KEY"]
-hosts = ["https://jfrog.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/artifactoryreferencetoken/artifactoryreferencetoken.go
-
 [providers.artsy]
 env = ["ARTSY_API_KEY", "ARTSY_API_TOKEN", "ARTSY_APIKEY", "ARTSY_TOKEN", "ARTSY_ACCESS_TOKEN", "ARTSY_AUTH_TOKEN", "ARTSY_SECRET", "ARTSY_SECRET_KEY", "ARTSY_KEY"]
 hosts = ["https://api.artsy.net"]
@@ -2565,27 +2553,6 @@ hosts = ["https://api.aylien.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/aylien/aylien.go
 
-[providers.azureapimanagementsubscriptionkey]
-env = ["AZUREAPIMANAGEMENTSUBSCRIPTIONKEY_API_KEY", "AZUREAPIMANAGEMENTSUBSCRIPTIONKEY_API_TOKEN", "AZUREAPIMANAGEMENTSUBSCRIPTIONKEY_APIKEY", "AZUREAPIMANAGEMENTSUBSCRIPTIONKEY_TOKEN", "AZUREAPIMANAGEMENTSUBSCRIPTIONKEY_ACCESS_TOKEN", "AZUREAPIMANAGEMENTSUBSCRIPTIONKEY_AUTH_TOKEN", "AZUREAPIMANAGEMENTSUBSCRIPTIONKEY_SECRET", "AZUREAPIMANAGEMENTSUBSCRIPTIONKEY_SECRET_KEY", "AZUREAPIMANAGEMENTSUBSCRIPTIONKEY_KEY"]
-hosts = ["https://azure.github.io"]
-pattern = "https{base62:8}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/azureapimanagementsubscriptionkey/azureapimanagementsubscriptionkey.go
-# note: pattern traced from the detector regex.
-
-[providers.azuredirectmanagementkey]
-env = ["AZUREDIRECTMANAGEMENTKEY_API_KEY", "AZUREDIRECTMANAGEMENTKEY_API_TOKEN", "AZUREDIRECTMANAGEMENTKEY_APIKEY", "AZUREDIRECTMANAGEMENTKEY_TOKEN", "AZUREDIRECTMANAGEMENTKEY_ACCESS_TOKEN", "AZUREDIRECTMANAGEMENTKEY_AUTH_TOKEN", "AZUREDIRECTMANAGEMENTKEY_SECRET", "AZUREDIRECTMANAGEMENTKEY_SECRET_KEY", "AZUREDIRECTMANAGEMENTKEY_KEY"]
-hosts = ["https://azure.github.io"]
-pattern = "https{base62:8}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/azuredirectmanagementkey/azuredirectmanagementkey.go
-# note: pattern traced from the detector regex.
-
-[providers.azuresastoken]
-env = ["AZURESASTOKEN_API_KEY", "AZURESASTOKEN_API_TOKEN", "AZURESASTOKEN_APIKEY", "AZURESASTOKEN_TOKEN", "AZURESASTOKEN_ACCESS_TOKEN", "AZURESASTOKEN_AUTH_TOKEN", "AZURESASTOKEN_SECRET", "AZURESASTOKEN_SECRET_KEY", "AZURESASTOKEN_KEY"]
-hosts = ["https://stackoverflow.com"]
-pattern = "https{base62:8}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/azuresastoken/azuresastoken.go
-# note: pattern traced from the detector regex.
-
 [providers.baremetrics]
 env = ["BAREMETRICS_API_KEY", "BAREMETRICS_API_TOKEN", "BAREMETRICS_APIKEY", "BAREMETRICS_TOKEN", "BAREMETRICS_ACCESS_TOKEN", "BAREMETRICS_AUTH_TOKEN", "BAREMETRICS_SECRET", "BAREMETRICS_SECRET_KEY", "BAREMETRICS_KEY"]
 hosts = ["https://api.baremetrics.com"]
@@ -2604,15 +2571,9 @@ hosts = ["https://beebole.com", "https://beebole-apps.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/beebole/beebole.go
 
-[providers.besnappy]
-env = ["BESNAPPY_API_KEY", "BESNAPPY_API_TOKEN", "BESNAPPY_APIKEY", "BESNAPPY_TOKEN", "BESNAPPY_ACCESS_TOKEN", "BESNAPPY_AUTH_TOKEN", "BESNAPPY_SECRET", "BESNAPPY_SECRET_KEY", "BESNAPPY_KEY"]
-hosts = ["https://github.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/besnappy/besnappy.go
-
 [providers.besttime]
 env = ["BESTTIME_API_KEY", "BESTTIME_API_TOKEN", "BESTTIME_APIKEY", "BESTTIME_TOKEN", "BESTTIME_ACCESS_TOKEN", "BESTTIME_AUTH_TOKEN", "BESTTIME_SECRET", "BESTTIME_SECRET_KEY", "BESTTIME_KEY"]
-hosts = ["https://besttime.app", "https://documentation.besttime.app"]
+hosts = ["https://besttime.app"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/besttime/besttime.go
 
@@ -3407,12 +3368,6 @@ hosts = ["https://api.envoy.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/envoyapikey/envoyapikey.go
 
-[providers.eraser]
-env = ["ERASER_API_KEY", "ERASER_API_TOKEN", "ERASER_APIKEY", "ERASER_TOKEN", "ERASER_ACCESS_TOKEN", "ERASER_AUTH_TOKEN", "ERASER_SECRET", "ERASER_SECRET_KEY", "ERASER_KEY"]
-hosts = ["https://howtorotate.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/eraser/eraser.go
-
 [providers.etherscan]
 env = ["ETHERSCAN_API_KEY", "ETHERSCAN_API_TOKEN", "ETHERSCAN_APIKEY", "ETHERSCAN_TOKEN", "ETHERSCAN_ACCESS_TOKEN", "ETHERSCAN_AUTH_TOKEN", "ETHERSCAN_SECRET", "ETHERSCAN_SECRET_KEY", "ETHERSCAN_KEY"]
 hosts = ["https://api.etherscan.io"]
@@ -3457,7 +3412,7 @@ pattern = "{base62:32}"
 
 [providers.facebookoauth]
 env = ["FACEBOOKOAUTH_API_KEY", "FACEBOOKOAUTH_API_TOKEN", "FACEBOOKOAUTH_APIKEY", "FACEBOOKOAUTH_TOKEN", "FACEBOOKOAUTH_ACCESS_TOKEN", "FACEBOOKOAUTH_AUTH_TOKEN", "FACEBOOKOAUTH_SECRET", "FACEBOOKOAUTH_SECRET_KEY", "FACEBOOKOAUTH_KEY"]
-hosts = ["https://stackoverflow.com", "https://graph.facebook.com"]
+hosts = ["https://graph.facebook.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/facebookoauth/facebookoauth.go
 
@@ -3547,7 +3502,7 @@ pattern = "{base62:32}"
 
 [providers.flexport]
 env = ["FLEXPORT_API_KEY", "FLEXPORT_API_TOKEN", "FLEXPORT_APIKEY", "FLEXPORT_TOKEN", "FLEXPORT_ACCESS_TOKEN", "FLEXPORT_AUTH_TOKEN", "FLEXPORT_SECRET", "FLEXPORT_SECRET_KEY", "FLEXPORT_KEY"]
-hosts = ["https://howtorotate.com", "https://logistics-api.flexport.com"]
+hosts = ["https://logistics-api.flexport.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/flexport/flexport.go
 
@@ -3720,15 +3675,9 @@ hosts = ["https://getsandbox.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/getsandbox/getsandbox.go
 
-[providers.github_oauth2]
-env = ["GITHUB_OAUTH2_API_KEY", "GITHUB_OAUTH2_API_TOKEN", "GITHUB_OAUTH2_APIKEY", "GITHUB_OAUTH2_TOKEN", "GITHUB_OAUTH2_ACCESS_TOKEN", "GITHUB_OAUTH2_AUTH_TOKEN", "GITHUB_OAUTH2_SECRET", "GITHUB_OAUTH2_SECRET_KEY", "GITHUB_OAUTH2_KEY"]
-hosts = ["https://howtorotate.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/github_oauth2/github_oauth2.go
-
 [providers.githubapp]
 env = ["GITHUBAPP_API_KEY", "GITHUBAPP_API_TOKEN", "GITHUBAPP_APIKEY", "GITHUBAPP_TOKEN", "GITHUBAPP_ACCESS_TOKEN", "GITHUBAPP_AUTH_TOKEN", "GITHUBAPP_SECRET", "GITHUBAPP_SECRET_KEY", "GITHUBAPP_KEY"]
-hosts = ["https://api.github.com", "https://howtorotate.com"]
+hosts = ["https://api.github.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/githubapp/githubapp.go
 
@@ -4369,14 +4318,6 @@ hosts = ["https://api.monday.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/monday/monday.go
 
-[providers.mongodb]
-env = ["MONGODB_API_KEY", "MONGODB_API_TOKEN", "MONGODB_APIKEY", "MONGODB_TOKEN", "MONGODB_ACCESS_TOKEN", "MONGODB_AUTH_TOKEN", "MONGODB_KEY"]
-hosts = ["https://howtorotate.com"]
-pattern = "{base62:32}"
-send = { header = "Authorization" }
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/mongodb/mongodb.go
-# note: trufflehog lists a placeholder host; MONGODB_SECRET and MONGODB_SECRET_KEY removed (unclear what MongoDB product they refer to, and Atlas API keys are sent in headers)
-
 [providers.monkeylearn]
 env = ["MONKEYLEARN_API_KEY", "MONKEYLEARN_API_TOKEN", "MONKEYLEARN_APIKEY", "MONKEYLEARN_TOKEN", "MONKEYLEARN_ACCESS_TOKEN", "MONKEYLEARN_AUTH_TOKEN", "MONKEYLEARN_SECRET", "MONKEYLEARN_SECRET_KEY", "MONKEYLEARN_KEY"]
 hosts = ["https://api.monkeylearn.com"]
@@ -4433,7 +4374,7 @@ pattern = "{base62:32}"
 
 [providers.neutrinoapi]
 env = ["NEUTRINOAPI_API_KEY", "NEUTRINOAPI_API_TOKEN", "NEUTRINOAPI_APIKEY", "NEUTRINOAPI_TOKEN", "NEUTRINOAPI_ACCESS_TOKEN", "NEUTRINOAPI_AUTH_TOKEN", "NEUTRINOAPI_SECRET", "NEUTRINOAPI_SECRET_KEY", "NEUTRINOAPI_KEY"]
-hosts = ["https://google.com", "https://neutrinoapi.net"]
+hosts = ["https://neutrinoapi.net"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/neutrinoapi/neutrinoapi.go
 
@@ -4463,7 +4404,7 @@ pattern = "{base62:32}"
 
 [providers.newrelicmobileapptoken]
 env = ["NEWRELICMOBILEAPPTOKEN_API_KEY", "NEWRELICMOBILEAPPTOKEN_API_TOKEN", "NEWRELICMOBILEAPPTOKEN_APIKEY", "NEWRELICMOBILEAPPTOKEN_TOKEN", "NEWRELICMOBILEAPPTOKEN_ACCESS_TOKEN", "NEWRELICMOBILEAPPTOKEN_AUTH_TOKEN", "NEWRELICMOBILEAPPTOKEN_SECRET", "NEWRELICMOBILEAPPTOKEN_SECRET_KEY", "NEWRELICMOBILEAPPTOKEN_KEY"]
-hosts = ["https://github.com", "https://mobile-collector.newrelic.com", "https://mobile-collector.eu01.nr-data.net"]
+hosts = ["https://mobile-collector.newrelic.com", "https://mobile-collector.eu01.nr-data.net"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/newrelicmobileapptoken/newrelicmobileapptoken.go
 
@@ -4983,15 +4924,9 @@ hosts = ["https://us.qubole.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/qubole/qubole.go
 
-[providers.rabbitmq]
-env = ["RABBITMQ_API_KEY", "RABBITMQ_API_TOKEN", "RABBITMQ_APIKEY", "RABBITMQ_TOKEN", "RABBITMQ_ACCESS_TOKEN", "RABBITMQ_AUTH_TOKEN", "RABBITMQ_SECRET", "RABBITMQ_SECRET_KEY", "RABBITMQ_KEY"]
-hosts = ["https://github.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/rabbitmq/rabbitmq.go
-
 [providers.railwayapp]
 env = ["RAILWAYAPP_API_KEY", "RAILWAYAPP_API_TOKEN", "RAILWAYAPP_APIKEY", "RAILWAYAPP_TOKEN", "RAILWAYAPP_ACCESS_TOKEN", "RAILWAYAPP_AUTH_TOKEN", "RAILWAYAPP_SECRET", "RAILWAYAPP_SECRET_KEY", "RAILWAYAPP_KEY"]
-hosts = ["https://inigo.io", "https://github.com", "https://howtorotate.com", "https://backboard.railway.app"]
+hosts = ["https://backboard.railway.app"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/railwayapp/railwayapp.go
 
@@ -5117,7 +5052,7 @@ pattern = "{base62:32}"
 
 [providers.robinhoodcrypto]
 env = ["ROBINHOODCRYPTO_API_KEY", "ROBINHOODCRYPTO_API_TOKEN", "ROBINHOODCRYPTO_APIKEY", "ROBINHOODCRYPTO_TOKEN", "ROBINHOODCRYPTO_ACCESS_TOKEN", "ROBINHOODCRYPTO_AUTH_TOKEN", "ROBINHOODCRYPTO_SECRET", "ROBINHOODCRYPTO_SECRET_KEY", "ROBINHOODCRYPTO_KEY"]
-hosts = ["https://stackoverflow.com", "https://trading.robinhood.com"]
+hosts = ["https://trading.robinhood.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/robinhoodcrypto/robinhoodcrypto.go
 
@@ -5153,7 +5088,7 @@ pattern = "{base62:32}"
 
 [providers.saladcloudapikey]
 env = ["SALADCLOUDAPIKEY_API_KEY", "SALADCLOUDAPIKEY_API_TOKEN", "SALADCLOUDAPIKEY_APIKEY", "SALADCLOUDAPIKEY_TOKEN", "SALADCLOUDAPIKEY_ACCESS_TOKEN", "SALADCLOUDAPIKEY_AUTH_TOKEN", "SALADCLOUDAPIKEY_SECRET", "SALADCLOUDAPIKEY_SECRET_KEY", "SALADCLOUDAPIKEY_KEY"]
-hosts = ["https://api.salad.com", "https://howtorotate.com"]
+hosts = ["https://api.salad.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/saladcloudapikey/saladcloudapikey.go
 
@@ -5231,7 +5166,7 @@ pattern = "{base62:32}"
 
 [providers.screenshotapi]
 env = ["SCREENSHOTAPI_API_KEY", "SCREENSHOTAPI_API_TOKEN", "SCREENSHOTAPI_APIKEY", "SCREENSHOTAPI_TOKEN", "SCREENSHOTAPI_ACCESS_TOKEN", "SCREENSHOTAPI_AUTH_TOKEN", "SCREENSHOTAPI_SECRET", "SCREENSHOTAPI_SECRET_KEY", "SCREENSHOTAPI_KEY"]
-hosts = ["https://google.com", "https://shot.screenshotapi.net"]
+hosts = ["https://shot.screenshotapi.net"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/screenshotapi/screenshotapi.go
 
@@ -5273,7 +5208,7 @@ pattern = "{base62:32}"
 
 [providers.sendbird]
 env = ["SENDBIRD_API_KEY", "SENDBIRD_API_TOKEN", "SENDBIRD_APIKEY", "SENDBIRD_TOKEN", "SENDBIRD_ACCESS_TOKEN", "SENDBIRD_AUTH_TOKEN", "SENDBIRD_SECRET", "SENDBIRD_SECRET_KEY", "SENDBIRD_KEY"]
-hosts = ["https://sendbird.com", "https://howtorotate.com"]
+hosts = ["https://sendbird.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/sendbird/sendbird.go
 
@@ -5357,7 +5292,7 @@ pattern = "{base62:32}"
 
 [providers.signable]
 env = ["SIGNABLE_API_KEY", "SIGNABLE_API_TOKEN", "SIGNABLE_APIKEY", "SIGNABLE_TOKEN", "SIGNABLE_ACCESS_TOKEN", "SIGNABLE_AUTH_TOKEN", "SIGNABLE_SECRET", "SIGNABLE_SECRET_KEY", "SIGNABLE_KEY"]
-hosts = ["https://api.signable.co.uk", "https://github.com"]
+hosts = ["https://api.signable.co.uk"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/signable/signable.go
 
@@ -5433,12 +5368,6 @@ hosts = ["https://api.skybiometry.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/skybiometry/skybiometry.go
 
-[providers.slackwebhook]
-env = ["SLACKWEBHOOK_API_KEY", "SLACKWEBHOOK_API_TOKEN", "SLACKWEBHOOK_APIKEY", "SLACKWEBHOOK_TOKEN", "SLACKWEBHOOK_ACCESS_TOKEN", "SLACKWEBHOOK_AUTH_TOKEN", "SLACKWEBHOOK_SECRET", "SLACKWEBHOOK_SECRET_KEY", "SLACKWEBHOOK_KEY"]
-hosts = ["https://howtorotate.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/slackwebhook/slackwebhook.go
-
 [providers.smartsheets]
 env = ["SMARTSHEETS_API_KEY", "SMARTSHEETS_API_TOKEN", "SMARTSHEETS_APIKEY", "SMARTSHEETS_TOKEN", "SMARTSHEETS_ACCESS_TOKEN", "SMARTSHEETS_AUTH_TOKEN", "SMARTSHEETS_SECRET", "SMARTSHEETS_SECRET_KEY", "SMARTSHEETS_KEY"]
 hosts = ["https://api.smartsheet.com"]
@@ -5459,7 +5388,7 @@ pattern = "{base62:32}"
 
 [providers.snykkey]
 env = ["SNYKKEY_API_KEY", "SNYKKEY_API_TOKEN", "SNYKKEY_APIKEY", "SNYKKEY_TOKEN", "SNYKKEY_ACCESS_TOKEN", "SNYKKEY_AUTH_TOKEN", "SNYKKEY_SECRET", "SNYKKEY_SECRET_KEY", "SNYKKEY_KEY"]
-hosts = ["https://snyk.io", "https://snyk.docs.apiary.io"]
+hosts = ["https://snyk.io"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/snykkey/snykkey.go
 
@@ -5472,7 +5401,7 @@ pattern = "{base62:32}"
 
 [providers.sourcegraph]
 env = ["SOURCEGRAPH_API_KEY", "SOURCEGRAPH_API_TOKEN", "SOURCEGRAPH_APIKEY", "SOURCEGRAPH_TOKEN", "SOURCEGRAPH_ACCESS_TOKEN", "SOURCEGRAPH_AUTH_TOKEN", "SOURCEGRAPH_SECRET", "SOURCEGRAPH_SECRET_KEY", "SOURCEGRAPH_KEY"]
-hosts = ["https://howtorotate.com", "https://sourcegraph.com"]
+hosts = ["https://sourcegraph.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/sourcegraph/sourcegraph.go
 
@@ -5514,7 +5443,7 @@ pattern = "{base62:32}"
 
 [providers.square]
 env = ["SQUARE_API_KEY", "SQUARE_API_TOKEN", "SQUARE_APIKEY", "SQUARE_TOKEN", "SQUARE_ACCESS_TOKEN", "SQUARE_AUTH_TOKEN", "SQUARE_SECRET", "SQUARE_SECRET_KEY", "SQUARE_KEY"]
-hosts = ["https://howtorotate.com", "https://connect.squareupsandbox.com"]
+hosts = ["https://connect.squareupsandbox.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/square/square.go
 
@@ -5613,12 +5542,6 @@ env = ["STYTCH_API_KEY", "STYTCH_API_TOKEN", "STYTCH_APIKEY", "STYTCH_TOKEN", "S
 hosts = ["https://api.stytch.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/stytch/stytch.go
-
-[providers.sumologickey]
-env = ["SUMOLOGICKEY_API_KEY", "SUMOLOGICKEY_API_TOKEN", "SUMOLOGICKEY_APIKEY", "SUMOLOGICKEY_TOKEN", "SUMOLOGICKEY_ACCESS_TOKEN", "SUMOLOGICKEY_AUTH_TOKEN", "SUMOLOGICKEY_SECRET", "SUMOLOGICKEY_SECRET_KEY", "SUMOLOGICKEY_KEY"]
-hosts = ["https://howtorotate.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/sumologickey/sumologickey.go
 
 [providers.supabasetoken]
 env = ["SUPABASETOKEN_API_KEY", "SUPABASETOKEN_API_TOKEN", "SUPABASETOKEN_APIKEY", "SUPABASETOKEN_TOKEN", "SUPABASETOKEN_ACCESS_TOKEN", "SUPABASETOKEN_AUTH_TOKEN", "SUPABASETOKEN_SECRET", "SUPABASETOKEN_SECRET_KEY", "SUPABASETOKEN_KEY"]
@@ -5719,7 +5642,7 @@ pattern = "{base62:32}"
 
 [providers.telegrambottoken]
 env = ["TELEGRAMBOTTOKEN_API_KEY", "TELEGRAMBOTTOKEN_API_TOKEN", "TELEGRAMBOTTOKEN_APIKEY", "TELEGRAMBOTTOKEN_TOKEN", "TELEGRAMBOTTOKEN_ACCESS_TOKEN", "TELEGRAMBOTTOKEN_AUTH_TOKEN", "TELEGRAMBOTTOKEN_SECRET", "TELEGRAMBOTTOKEN_SECRET_KEY", "TELEGRAMBOTTOKEN_KEY"]
-hosts = ["https://api.telegram.org", "https://github.com", "https://stackoverflow.com", "https://core.telegram.org"]
+hosts = ["https://api.telegram.org"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/telegrambottoken/telegrambottoken.go
 
@@ -5951,13 +5874,6 @@ hosts = ["https://api.upwave.io"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/upwave/upwave.go
 
-[providers.uri]
-env = ["URI_API_KEY", "URI_API_TOKEN", "URI_APIKEY", "URI_TOKEN", "URI_ACCESS_TOKEN", "URI_AUTH_TOKEN", "URI_SECRET", "URI_SECRET_KEY", "URI_KEY"]
-hosts = ["https://github.com"]
-pattern = "https{base62:8}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/uri/uri.go
-# note: pattern traced from the detector regex.
-
 [providers.urlscan]
 env = ["URLSCAN_API_KEY", "URLSCAN_API_TOKEN", "URLSCAN_APIKEY", "URLSCAN_TOKEN", "URLSCAN_ACCESS_TOKEN", "URLSCAN_AUTH_TOKEN", "URLSCAN_SECRET", "URLSCAN_SECRET_KEY", "URLSCAN_KEY"]
 hosts = ["https://urlscan.io"]
@@ -6008,7 +5924,7 @@ pattern = "{base62:32}"
 
 [providers.voiceflow]
 env = ["VOICEFLOW_API_KEY", "VOICEFLOW_API_TOKEN", "VOICEFLOW_APIKEY", "VOICEFLOW_TOKEN", "VOICEFLOW_ACCESS_TOKEN", "VOICEFLOW_AUTH_TOKEN", "VOICEFLOW_SECRET", "VOICEFLOW_SECRET_KEY", "VOICEFLOW_KEY"]
-hosts = ["https://github.com", "https://general-runtime.voiceflow.com"]
+hosts = ["https://general-runtime.voiceflow.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/voiceflow/voiceflow.go
 
