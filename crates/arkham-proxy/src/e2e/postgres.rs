@@ -127,6 +127,178 @@ async fn postgres_real_client_and_server_round_trip() {
   proxy.abort();
 }
 
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "linear test script, split would obscure the flow")]
+async fn postgres_scram_decoy_substitutes_and_non_decoy_is_refused() {
+  use std::sync::Mutex;
+
+  use base64::Engine as _;
+  use futures::Sink;
+  use futures::stream;
+  use pgwire::api::auth::sasl::SASLAuthStartupHandler;
+  use pgwire::api::auth::sasl::scram::{SCRAM_ITERATIONS, ScramAuth, gen_salted_password, random_nonce};
+  use pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password};
+  use pgwire::api::query::SimpleQueryHandler;
+  use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response};
+  use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
+  use pgwire::error::{PgWireError, PgWireResult};
+  use pgwire::messages::PgWireBackendMessage;
+
+  const FAKE: &str = "$$CREDENTIAL_DODSZYJGK2D0:L$$";
+  const VALUE: &str = "$$CREDENTIAL_C1YI2U4SC3JE:L$$";
+
+  #[derive(Debug)]
+  struct RealPassword;
+
+  #[async_trait::async_trait]
+  impl AuthSource for RealPassword {
+    async fn get_password(&self, _login: &LoginInfo) -> PgWireResult<Password> {
+      let salt = base64::engine::general_purpose::STANDARD
+        .decode(random_nonce())
+        .expect("nonce is standard base64");
+      let password = gen_salted_password(VALUE, &salt, SCRAM_ITERATIONS);
+      Ok(Password::new(Some(salt), password))
+    }
+  }
+
+  struct StubQueryHandler {
+    seen: Arc<Mutex<Option<String>>>,
+  }
+
+  #[async_trait::async_trait]
+  impl SimpleQueryHandler for StubQueryHandler {
+    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    where
+      C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+      C::Error: std::fmt::Debug,
+      PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+      *self.seen.lock().unwrap() = Some(query.to_string());
+      let field = FieldInfo::new("token".into(), None, None, Type::VARCHAR, FieldFormat::Text);
+      let schema = Arc::new(vec![field]);
+      let mut encoder = DataRowEncoder::new(Arc::clone(&schema));
+      encoder.encode_field(&VALUE.to_string())?;
+      let row = encoder.take_row();
+      Ok(vec![Response::Query(QueryResponse::new(schema, stream::iter(vec![Ok(row)])))])
+    }
+  }
+
+  struct StubHandlers {
+    query: Arc<StubQueryHandler>,
+    startup: Arc<SASLAuthStartupHandler<DefaultServerParameterProvider>>,
+  }
+
+  impl PgWireServerHandlers for StubHandlers {
+    fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
+      Arc::clone(&self.query)
+    }
+
+    fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
+      Arc::clone(&self.startup)
+    }
+  }
+
+  let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+  let handler = Arc::new(StubQueryHandler { seen: Arc::clone(&seen) });
+  let fx = mitm_fixture(|port| {
+    vec![Grant::Postgres {
+      credential: Credential {
+        label: "pg".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(VALUE),
+      },
+      scope: Box::new(
+        PostgresScope::from_strings(
+          &format!("postgres://app:{FAKE}@localhost:{port}/main"),
+          &format!("postgres://app:{VALUE}@localhost:{port}/main?sslmode=disable"),
+        )
+        .unwrap(),
+      ),
+    }]
+  })
+  .await;
+  let MitmFixture {
+    proxy_addr,
+    proxy,
+    stub,
+    stub_port,
+    ..
+  } = fx;
+
+  let stub_task: tokio::task::JoinHandle<Result<(), String>> = tokio::spawn(async move {
+    loop {
+      let (conn, _) = stub.accept().await.map_err(|err| format!("accept: {err}"))?;
+      let query = Arc::clone(&handler);
+      tokio::spawn(async move {
+        let startup = SASLAuthStartupHandler::new(Arc::new(DefaultServerParameterProvider::default()))
+          .with_scram(ScramAuth::new(Arc::new(RealPassword)));
+        let _ = pgwire::tokio::process_socket(
+          conn,
+          None,
+          StubHandlers {
+            query,
+            startup: Arc::new(startup),
+          },
+        )
+        .await;
+      });
+    }
+  });
+
+  let client = connect_scram(proxy_addr, stub_port, FAKE)
+    .await
+    .expect("fake password must authenticate through SCRAM to a server that only accepts the real password");
+  let rows = client.simple_query(&format!("SELECT '{FAKE}'")).await.expect("query");
+  let mut token = None;
+  for message in rows {
+    if let tokio_postgres::SimpleQueryMessage::Row(row) = message {
+      token = row.get("token").map(str::to_string);
+    }
+  }
+  assert_eq!(token.as_deref(), Some(FAKE), "response row must carry the fake");
+  assert_eq!(
+    seen.lock().unwrap().as_deref(),
+    Some(format!("SELECT '{VALUE}'").as_str()),
+    "upstream must receive the real value"
+  );
+  drop(client);
+
+  let refused = connect_scram(proxy_addr, stub_port, "not-the-pg-decoy")
+    .await
+    .expect_err("a password that is not the decoy must be refused");
+  let db = refused.as_db_error().expect("refusal is a server error");
+  assert_eq!(db.code().code(), "28P01");
+  assert!(!db.message().contains(VALUE), "real password leaked into the error");
+  assert!(!refused.to_string().contains(VALUE), "real password leaked into the error");
+
+  stub_task.abort();
+  proxy.abort();
+}
+
+async fn connect_scram(
+  proxy_addr: std::net::SocketAddr,
+  stub_port: u16,
+  password: &str,
+) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+  let mut stream = TcpStream::connect(proxy_addr).await.expect("proxy accepts");
+  stream
+    .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+    .await
+    .expect("connect head");
+  let mut head = [0u8; 19];
+  stream.read_exact(&mut head).await.expect("connect response");
+  assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
+  let mut config: tokio_postgres::Config = format!("host=localhost port={stub_port} user=app dbname=main sslmode=disable")
+    .parse()
+    .expect("client config");
+  config.password(password);
+  let (client, connection) = config.connect_raw(stream, tokio_postgres::NoTls).await?;
+  tokio::spawn(async move {
+    let _ = connection.await;
+  });
+  Ok(client)
+}
+
 /// Real TLS Postgres on both ends: a TLS-capable client against a TLS-capable
 /// server, for each handshake shape the entry URL and the guest can ask for.
 ///

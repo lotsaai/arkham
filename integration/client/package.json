@@ -6,6 +6,7 @@
     "@nats-io/transport-node": "3.4.0",
     "amqplib": "2.2.0",
     "ldapts": "9.2.0",
+    "pg": "8.23.1",
     "rhea": "3.0.5"
   }
 }

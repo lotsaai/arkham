@@ -16,6 +16,7 @@ import amqplib from "amqplib";
 import { RedisClient } from "bun";
 import { Client } from "ldapts";
 import { connect as natsConnect, credsAuthenticator, nkeyAuthenticator, type Authenticator, type NatsConnection } from "@nats-io/transport-node";
+import { Client as PgClient } from "pg";
 import rhea from "rhea";
 
 const FAKE = process.env.ARKHAM_FAKE ?? "";
@@ -203,89 +204,51 @@ await retry("", "grantless tls splices untouched", async () => {
   return (await exchange(tls, `AUTH ${FAKE}\n`)) === `ERR ${FAKE}\n`;
 });
 
-// 6. Database rule against real PostgreSQL. Gated on DATABASE_URL so this
-//    script still runs when that service is absent.
-//    The client consumes exactly what the guest holds: its DATABASE_URL,
-//    the rule's stated FAKE connection string. Arkham captures the dial,
-//    matches the rule on the fake string's port, and swaps the fake
-//    password for the real one from the secret source. PostgreSQL rejects
-//    the fake password, so an opened session proves the swap. The guest
-//    dials by the URL's hostname, and arkham mints the leaf for that name,
-//    so full hostname verification stays on — no IPs anywhere.
+// pg parses sslmode out of the connection string and replaces any ssl
+// object passed next to it. The guest URL says sslmode=require, which
+// becomes an empty ssl object and drops the demo CA. Delete that
+// parameter so hostname verification against the demo CA stays on.
+// The server accepts only the real password, so a decoy login means
+// arkham authenticated upstream with it.
 if (PG_URL) {
+  function openPg(raw: string): PgClient {
+    const url = new URL(raw);
+    url.searchParams.delete("sslmode");
+    return new PgClient({
+      connectionString: url.toString(),
+      ssl: { ca, rejectUnauthorized: true },
+      connectionTimeoutMillis: ATTEMPT_TIMEOUT_MS,
+    });
+  }
 
-  function pgFrame(type: number, body: Buffer): Buffer {
-    const len = Buffer.alloc(4);
-    len.writeInt32BE(body.length + 4);
-    return Buffer.concat([Buffer.from([type]), len, body]);
-  }
-  function pgStartup(params: Record<string, string>): Buffer {
-    const body = Buffer.concat([
-      Buffer.from([0, 3, 0, 0]),
-      ...Object.entries(params).map(([key, value]) => Buffer.from(`${key}\0${value}\0`, "utf8")),
-      Buffer.from([0]),
-    ]);
-    const len = Buffer.alloc(4);
-    len.writeInt32BE(body.length + 4);
-    return Buffer.concat([len, body]);
-  }
-  function pgRead(sock: Socket | TLSSocket, n: number): Promise<Buffer> {
-    return race("pg read", new Promise<Buffer>((resolve, reject) => {
-      let buf = Buffer.alloc(0);
-      const onData = (chunk: Buffer) => {
-        buf = Buffer.concat([buf, chunk]);
-        if (buf.length >= n) {
-          sock.off("data", onData);
-          resolve(buf.subarray(0, n));
-        }
-      };
-      sock.on("data", onData);
-      sock.once("error", reject);
-    }));
-  }
   await retry("postgres", "postgres mitm swaps the password for a real server", async () => {
-    const db = new URL(PG_URL);
-    stage(`pg ${db.hostname}:${db.port || 5432} connecting`);
-    const sock = await race("pg connect", new Promise<Socket>((resolve, reject) => {
-      const s = connect(Number(db.port || 5432), db.hostname);
-      s.once("connect", () => resolve(s));
-      s.once("error", reject);
-    }));
-    stage("pg sslRequest");
-    sock.write(Buffer.from([0, 0, 0, 8, 4, 0xd2, 0x16, 0x2f]));
-    const answer = (await pgRead(sock, 1)).toString("latin1");
-    if (answer !== "S") throw new Error(`server refused TLS: ${answer}`);
-    const tls = tlsConnect({ socket: sock, servername: db.hostname, ca, rejectUnauthorized: true });
-    await race("pg tls handshake", new Promise<void>((resolve, reject) => {
-      tls.once("secureConnect", () => resolve());
-      tls.once("error", reject);
-    }));
-    stage("pg tls ok (arkham's minted leaf)");
-    tls.write(pgStartup({ user: db.username, database: db.pathname.slice(1) }));
-    const auth = await pgRead(tls, 9);
-    if (auth[0] !== 0x52 || auth.readUInt32BE(5) !== 3) throw new Error(`expected cleartext password auth, got ${auth.toString("latin1")}`);
-    stage("pg cleartext auth requested");
-    tls.write(pgFrame(0x70, Buffer.from(`${db.password}\0`, "utf8")));
-    const ok = await pgRead(tls, 9);
-    if (ok[0] !== 0x52 || ok.readUInt32BE(5) !== 0) throw new Error(`auth rejected: ${ok.toString("latin1")}`);
-    stage("pg authenticated - the fake was swapped for the real");
-    tls.write(pgFrame(0x51, Buffer.from("SELECT 'ok'\0", "utf8")));
-    const result = await race("pg query reply", new Promise<Buffer>((resolve, reject) => {
-      let buf = Buffer.alloc(0);
-      const onData = (chunk: Buffer) => {
-        buf = Buffer.concat([buf, chunk]);
-        if (buf.includes(0x5a)) {
-          tls.off("data", onData);
-          resolve(buf);
-        }
-      };
-      tls.on("data", onData);
-      tls.once("error", reject);
-    }));
-    tls.destroy();
-    sock.destroy();
-    stage("pg query ok");
-    return result.includes(Buffer.from("ok"));
+    const client = openPg(PG_URL);
+    try {
+      await race("pg connect", client.connect());
+      const result = await race("pg query", client.query("SELECT 'ok' AS ok"));
+      const value = result.rows[0]?.ok;
+      stage(`pg query reply: ${JSON.stringify(value)}`);
+      return value === "ok";
+    } finally {
+      await client.end();
+    }
+  });
+
+  await retry("postgres", "postgres non-decoy password is not swapped", async () => {
+    const url = new URL(PG_URL);
+    url.password = "not-the-pg-decoy";
+    const client = openPg(url.toString());
+    try {
+      await race("pg connect", client.connect());
+      return false;
+    } catch (err) {
+      const text = errorText(err);
+      stage(`pg unswapped error: ${text}`);
+      const refused = text.includes("28P01") || text.includes("password authentication failed");
+      return refused && !text.includes("arkham_real_password_01");
+    } finally {
+      await client.end();
+    }
   });
 } else {
   stage("pg scenario skipped: no DATABASE_URL");

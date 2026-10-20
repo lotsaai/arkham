@@ -103,6 +103,12 @@ struct PgUri {
   query: Vec<(String, String)>,
 }
 
+fn decode_userinfo(raw: &str) -> Result<String, std::str::Utf8Error> {
+  percent_encoding::percent_decode_str(raw)
+    .decode_utf8()
+    .map(std::borrow::Cow::into_owned)
+}
+
 impl PgUri {
   /// Parse one postgres connection string. The password is required — a
   /// string with no credential maps nothing.
@@ -115,12 +121,30 @@ impl PgUri {
       .host()
       .map(|host| host.to_string())
       .ok_or_else(|| format!("bad connection string `{entry}`: empty host"))?;
-    let user = (!url.username().is_empty()).then(|| url.username().to_string());
-    let password = url
-      .password()
-      .filter(|password| !password.is_empty())
-      .map(|password| SecretString::new(password.to_string().into()))
-      .ok_or_else(|| format!("bad connection string `{entry}`: the password is required — a string with no credential maps nothing"))?;
+    // `Url` leaves userinfo percent-encoded. A `:` in the password is stored
+    // as `%3A`, and the client sends the decoded bytes.
+    let user = if url.username().is_empty() {
+      None
+    } else {
+      Some(decode_userinfo(url.username()).map_err(|source| format!("bad connection string `{entry}`: user is not utf-8: {source}"))?)
+    };
+    let password = match url.password().filter(|password| !password.is_empty()) {
+      Some(password) => {
+        let decoded =
+          decode_userinfo(password).map_err(|source| format!("bad connection string `{entry}`: password is not utf-8: {source}"))?;
+        if decoded.is_empty() {
+          return Err(format!(
+            "bad connection string `{entry}`: the password is required — a string with no credential maps nothing"
+          ));
+        }
+        SecretString::new(decoded.into())
+      }
+      None => {
+        return Err(format!(
+          "bad connection string `{entry}`: the password is required — a string with no credential maps nothing"
+        ));
+      }
+    };
     let database = match url.path() {
       "" | "/" => None,
       path => match path.strip_prefix('/').filter(|rest| !rest.contains('/')) {
