@@ -3,26 +3,22 @@
 #MISE description="Run the live TUN tests (build as user, execute as root)"
 #MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**", ".mise/tasks/test/**"]
 #USAGE flag "--use-sudo" help="Skip the gum escalation prompt and go straight to sudo"
-#USAGE arg "[filters]" var=#true help="Test-name filters; default: tun_"
+#USAGE arg "[filters]" var=#true help="Test-name filters; default: tun_live_"
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
-# Build the test binary as the current user so target/ stays user-owned.
 cargo nextest run --locked --no-run --cargo-quiet --package arkham-tun
 
-# Locate the test binary for this one package: the workspace has many, so the
-# package filter is what makes the "exactly one" assertion meaningful.
 test_bin=$(cargo nextest list --package arkham-tun --message-format json |
   jq -r '.["rust-suites"] |
   if length == 1 then first(.[]) | .["binary-path"] else error("expected 1 test binary, got \(length)") end')
 
-# Default to the tun_ prefix unless the caller narrows it.
 eval "filters=(${usage_filters:-})"
 if [ ${#filters[@]} -eq 0 ]; then
-  filters=(tun_)
+  filters=(tun_live_)
 fi
 
 if [ "${usage_use_sudo:-false}" = "true" ]; then
