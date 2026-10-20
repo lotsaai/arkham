@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# Mint the demo operator, accounts, and users with nsc (mise tool
-# github:nats-io/nsc). The trusted account is the only JWT the operator-mode
-# server preloads. The fake user JWT is signed by a different account, so it
-# cannot authenticate unless the proxy rewrites CONNECT. Seeds and JWTs land
-# in integration/out (gitignored) and integration/.env (gitignored). The nsc
-# store is removed when this script exits.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -194,6 +188,6 @@ awk -F= '
   { print }
 ' "$fragment" integration/.env >"$tmp"
 printf '\n' >>"$tmp"
-cat "$fragment" >>"$tmp"
+grep -Ev '^(NATS_NKEY_REAL_SEED|NATS_JWT_REAL_ASSERT)=' "$fragment" >>"$tmp"
 mv "$tmp" integration/.env
 chmod 600 integration/.env
