@@ -13,7 +13,7 @@
 //! arkham's CA.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -208,8 +208,8 @@ pub(crate) fn adapt_sources(sources: &[(&Path, &[u8])], ca: &CertAuthority, gues
   let Some(merged) = merge_sources(sources)? else {
     return Ok(None);
   };
-  let (pending, skips) = classify_merged(&merged)?;
-  let rendered = render_pending(&pending, &skips, ca, guests_dir)?;
+  let pending = classify_merged(&merged)?;
+  let rendered = render_pending(&pending, ca, guests_dir)?;
   let decoy = decoy_document(merged.root, ca, &rendered.faces)?;
   Ok(Some(RewriteAdapted {
     fragment: rendered.fragment,
@@ -347,7 +347,7 @@ fn yaml_key(name: &str) -> Value {
   Value::String(name.to_string())
 }
 
-fn classify_merged(merged: &Merged) -> Result<(Vec<Pending>, Vec<KubeSkip>), Error> {
+fn classify_merged(merged: &Merged) -> Result<Vec<Pending>, Error> {
   let invalid = |detail: String| Error::RewriteInvalid {
     file: merged.origin.clone(),
     format: RewriteFormat::Kubeconfig,
@@ -357,7 +357,6 @@ fn classify_merged(merged: &Merged) -> Result<(Vec<Pending>, Vec<KubeSkip>), Err
     return Err(invalid(format!("unknown context `{}`", merged.current)));
   }
   let mut pending = Vec::new();
-  let mut skips = Vec::new();
   for context in &merged.contexts {
     match classify_context(context, &merged.clusters, &merged.users)? {
       Classified::Grant(row) => pending.push(row),
@@ -366,11 +365,10 @@ fn classify_merged(merged: &Merged) -> Result<(Vec<Pending>, Vec<KubeSkip>), Err
           return Err(invalid(skip.to_string()));
         }
         tracing::warn!(%skip, "kubeconfig context skipped");
-        skips.push(skip);
       }
     }
   }
-  Ok((pending, skips))
+  Ok(pending)
 }
 
 fn classify_context(
@@ -494,13 +492,10 @@ struct Rendered {
   faces: BTreeMap<String, UserFace>,
 }
 
-fn render_pending(pending: &[Pending], skips: &[KubeSkip], ca: &CertAuthority, guests_dir: &Path) -> Result<Rendered, Error> {
+fn render_pending(pending: &[Pending], ca: &CertAuthority, guests_dir: &Path) -> Result<Rendered, Error> {
   let users = live_users(pending, ca, guests_dir)?;
   require_user_servers(&users)?;
   let mut fragment = String::new();
-  for skip in skips {
-    let _ = writeln!(fragment, "# skipped: {skip}");
-  }
   let mut materialized = Vec::new();
   let mut seen_blobs = BTreeSet::new();
   let mut faces = BTreeMap::new();
@@ -851,6 +846,44 @@ users:
     toml_edit::de::from_str::<RulesDoc>(fragment).expect("fragment parses").rules
   }
 
+  const COMMENT_BREAKOUT: &str = "\n[rules.injected]\nallow = [\"https://evil.example:443\"]\nenv = \"INJECTED\"\nvalue = \"x\"\n#";
+
+  fn text(value: &str) -> Value {
+    Value::String(value.to_string())
+  }
+
+  fn named(slot: &str, name: &str, inner: &[(&str, Value)]) -> Value {
+    let mut body = Mapping::new();
+    for (field, value) in inner {
+      body.insert(text(field), value.clone());
+    }
+    let mut entry = Mapping::new();
+    entry.insert(text("name"), text(name));
+    entry.insert(text(slot), Value::Mapping(body));
+    Value::Mapping(entry)
+  }
+
+  fn kubeconfig(current: &str, contexts: Vec<Value>, clusters: Vec<Value>, users: Vec<Value>) -> String {
+    let mut root = Mapping::new();
+    root.insert(text("apiVersion"), text("v1"));
+    root.insert(text("kind"), text("Config"));
+    root.insert(text("current-context"), text(current));
+    root.insert(text("contexts"), Value::Sequence(contexts));
+    root.insert(text("clusters"), Value::Sequence(clusters));
+    root.insert(text("users"), Value::Sequence(users));
+    serde_yaml::to_string(&Value::Mapping(root)).expect("kubeconfig")
+  }
+
+  fn assert_fragment_is_only(adapted: &RewriteAdapted, label: &str) {
+    let rules = rules_from(&adapted.fragment);
+    assert_eq!(
+      rules.keys().map(String::as_str).collect::<Vec<_>>(),
+      vec![label],
+      "{}",
+      adapted.fragment
+    );
+  }
+
   #[test]
   fn foreign_content_is_not_a_kubeconfig() {
     let npmrc = "//registry.npmjs.org/:_authToken=secret";
@@ -1173,8 +1206,8 @@ users:
     assert_ne!(users[0].secret(), users[1].secret());
   }
 
-  /// An exec context that is not selected is named in a warning and left
-  /// out of the grants. The same context as `current-context` still errors.
+  /// An exec context that is not selected stays out of the grant file. The
+  /// same context as `current-context` still errors, and that error names it.
   #[test]
   fn exec_context_is_skipped_unless_it_is_selected() {
     let doc = r"apiVersion: v1
@@ -1195,14 +1228,9 @@ users:
   user: {exec: {command: aws-iam-authenticator}}
 ";
     let adapted = adapt_doc(doc);
-    let rules = rules_from(&adapted.fragment);
-    assert_eq!(rules.len(), 1, "{}", adapted.fragment);
-    assert!(
-      adapted.fragment.contains("context `eks`"),
-      "the skip names the context: {}",
-      adapted.fragment
-    );
-    assert!(adapted.fragment.contains("exec"), "{}", adapted.fragment);
+    assert_fragment_is_only(&adapted, &user_identity("ivan").label);
+    assert!(!adapted.fragment.contains("eks"), "{}", adapted.fragment);
+    assert!(!adapted.fragment.contains("exec"), "{}", adapted.fragment);
     assert!(!adapted.decoy.contains("aws-iam-authenticator"), "{}", adapted.decoy);
     assert!(!adapted.decoy.contains("ivan-real-token"), "{}", adapted.decoy);
     assert!(adapted.decoy.contains("name: eks"), "the context stays in the decoy");
@@ -1212,6 +1240,84 @@ users:
     let err = adapt(Path::new(SOURCE), selected.as_bytes(), &test_ca(), dir.path()).expect_err("selected exec still errors");
     assert!(err.to_string().contains("eks"), "{err}");
     assert!(err.to_string().contains("exec"), "{err}");
+  }
+
+  #[test]
+  fn skipped_context_name_cannot_inject_a_rule() {
+    let name = format!("eks{COMMENT_BREAKOUT}");
+    let mut exec = Mapping::new();
+    exec.insert(text("command"), text("aws-iam-authenticator"));
+    let doc = kubeconfig(
+      "prod",
+      vec![
+        named("context", &name, &[("cluster", text("prod")), ("user", text("exec-user"))]),
+        named("context", "prod", &[("cluster", text("prod")), ("user", text("ivan"))]),
+      ],
+      vec![named(
+        "cluster",
+        "prod",
+        &[
+          ("server", text("https://k8s.example:6443")),
+          ("certificate-authority-data", text("Q0E=")),
+        ],
+      )],
+      vec![
+        named("user", "ivan", &[("token", text("ivan-real-token"))]),
+        named("user", "exec-user", &[("exec", Value::Mapping(exec))]),
+      ],
+    );
+    assert_fragment_is_only(&adapt_doc(&doc), &user_identity("ivan").label);
+  }
+
+  #[test]
+  fn skipped_user_name_cannot_inject_a_rule() {
+    let user = format!("ghost{COMMENT_BREAKOUT}");
+    let doc = kubeconfig(
+      "prod",
+      vec![
+        named("context", "prod", &[("cluster", text("prod")), ("user", text("ivan"))]),
+        named("context", "broken", &[("cluster", text("prod")), ("user", text(&user))]),
+      ],
+      vec![named(
+        "cluster",
+        "prod",
+        &[
+          ("server", text("https://k8s.example:6443")),
+          ("certificate-authority-data", text("Q0E=")),
+        ],
+      )],
+      vec![named("user", "ivan", &[("token", text("ivan-real-token"))])],
+    );
+    assert_fragment_is_only(&adapt_doc(&doc), &user_identity("ivan").label);
+  }
+
+  #[test]
+  fn skipped_server_cannot_inject_a_rule() {
+    let server = format!("https://k8s.example:6443{COMMENT_BREAKOUT}");
+    let doc = kubeconfig(
+      "prod",
+      vec![
+        named("context", "prod", &[("cluster", text("prod")), ("user", text("ivan"))]),
+        named("context", "broken", &[("cluster", text("evil")), ("user", text("ivan"))]),
+      ],
+      vec![
+        named(
+          "cluster",
+          "prod",
+          &[
+            ("server", text("https://k8s.example:6443")),
+            ("certificate-authority-data", text("Q0E=")),
+          ],
+        ),
+        named(
+          "cluster",
+          "evil",
+          &[("server", text(&server)), ("certificate-authority-data", text("Q0E="))],
+        ),
+      ],
+      vec![named("user", "ivan", &[("token", text("ivan-real-token"))])],
+    );
+    assert_fragment_is_only(&adapt_doc(&doc), &user_identity("ivan").label);
   }
 
   /// A later `KUBECONFIG` file does not replace a context, cluster, or user
