@@ -1,8 +1,22 @@
+## [0.3.25] - 2026-10-20
+
+### 🐛 Bug Fixes
+
+- *(ldap)* Upgrade StartTLS after a bind or a search (#67)
+
+### 🧪 Testing
+
+- *(amqp)* Prove a grantless flow splices byte-identical (#70)
 ## [0.3.24] - 2026-10-19
 
 ### 🚀 Features
 
 - *(config)* Name each context by path, protocol, and spelling (#68)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.24 [ci skip]
+- Release
 ## [0.3.23] - 2026-10-19
 
 ### 🚀 Features

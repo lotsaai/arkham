@@ -1,6 +1,6 @@
 [package]
 name = "arkham-compose"
-version = "0.3.24"
+version = "0.3.25"
 edition = "2024"
 description = "grant-scoped MITM proxy: workspace confinement and compose generation"
 license = "Apache-2.0"
