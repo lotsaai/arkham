@@ -626,7 +626,9 @@ fn redaction_pairs(auth: &NatsAuth) -> Vec<(String, String)> {
 
 /// `line` with the real values, when its JSON parses and every auth field
 /// holds the decoy. A method that signs also checks the guest signature and
-/// writes a new one. `None` forwards the line unchanged.
+/// writes a new one. `None` forwards the line unchanged. A JSON null is an
+/// absent field: async-nats writes one for every CONNECT member it does not
+/// set, and a server reads that the same as a missing key.
 fn swap_connect(line: &[u8], auth: &NatsAuth, nonce: &NonceSlot) -> Option<Vec<u8>> {
   let nonce = if auth.signer().is_some() {
     let NonceSlot::Ready(nonce) = nonce else {
@@ -642,6 +644,7 @@ fn swap_connect(line: &[u8], auth: &NatsAuth, nonce: &NonceSlot) -> Option<Vec<u
 /// One CONNECT edit for every auth method. Field checks, the signature
 /// step, and the value swap share this function.
 fn apply_auth(fields: &mut Map<String, Value>, auth: &NatsAuth, nonce: Option<&[u8]>) -> Option<()> {
+  fields.retain(|_, value| !value.is_null());
   let sign = auth.signer().map(|sign| (sign.verify.to_string(), sign.seed.clone()));
   for name in auth.forbidden() {
     if fields.contains_key(<&str>::from(*name)) {
@@ -1569,7 +1572,7 @@ mod tests {
     let grants = jwt_grants(&fake, &real, &fake_jwt, &real_jwt);
     let nonce = b"N0NCE";
     let sig = sig_of(&fake.seed, nonce);
-    for nkey in ["null", "1", "{}"] {
+    for nkey in ["1", "{}"] {
       let line = format!("CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":{nkey},\"sig\":\"{sig}\"}}\r\n");
       let mut down = down(&grants, true);
       let mut up = up(&grants);
@@ -1585,6 +1588,26 @@ mod tests {
     let (out, hits) = feed(&mut down, line.as_bytes()).await;
     assert_eq!(hits, 1);
     assert!(text_of(out).contains(real_jwt.as_str()));
+  }
+
+  #[tokio::test]
+  async fn null_nkey_is_treated_as_absent() {
+    let fake = minted();
+    let real = minted();
+    let fake_jwt = user_jwt(fake.seed.public.as_str());
+    let real_jwt = user_jwt(real.seed.public.as_str());
+    let grants = jwt_grants(&fake, &real, &fake_jwt, &real_jwt);
+    let sig = sig_of(&fake.seed, b"N0NCE");
+    let line = format!("CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":null,\"sig\":\"{sig}\"}}\r\n");
+    let mut down = down(&grants, true);
+    let mut up = up(&grants);
+    arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
+    let (out, hits) = feed(&mut down, line.as_bytes()).await;
+    assert_eq!(hits, 1);
+    let out = text_of(out);
+    assert!(out.contains(real_jwt.as_str()), "{out}");
+    let parsed: serde_json::Value = serde_json::from_str(out.trim().strip_prefix("CONNECT").expect("verb").trim()).expect("json");
+    assert!(parsed.get("nkey").is_none(), "{out}");
   }
 
   /// A password grant and an nkey grant can share one host and port. The
