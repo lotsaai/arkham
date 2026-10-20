@@ -52,6 +52,7 @@ use transports::postgres::PostgresTransport;
 use transports::redis::RedisTransport;
 use transports::smtp::SmtpTransport;
 use transports::ssh::SshTransport;
+use transports::talos::TalosTransport;
 use transports::tcp::TcpTransport;
 /// One HTTPS MITM relay shape: cached in-memory leaf issuer.
 type HttpsRelay = TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCertIssuer>>;
@@ -74,6 +75,7 @@ pub struct ProxyState {
   mtls_trust: X509Store,
   http: Arc<HttpTransport>,
   https: Arc<HttpsTransport>,
+  talos: Arc<TalosTransport>,
   tcp: Arc<TcpTransport>,
   ssh: Arc<SshTransport>,
   postgres: Arc<PostgresTransport>,
@@ -177,6 +179,7 @@ impl ProxyState {
     let ldap = Arc::new(LdapTransport::new(ca)?);
     let nats = Arc::new(NatsTransport::new(ca)?);
     let amqp = Arc::new(AmqpTransport::new(ca)?);
+    let talos = Arc::new(TalosTransport::new(ca)?);
     Ok(Self {
       config: Arc::new(resolved),
       relay,
@@ -184,6 +187,7 @@ impl ProxyState {
       mtls_trust,
       http: Arc::new(HttpTransport),
       https: Arc::new(HttpsTransport),
+      talos,
       tcp: Arc::new(TcpTransport),
       ssh: Arc::new(SshTransport::default()),
       postgres,

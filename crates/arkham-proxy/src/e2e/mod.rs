@@ -28,6 +28,7 @@ mod plugin;
 mod postgres;
 mod redis;
 mod smtp;
+mod talos;
 mod tcp;
 
 /// Test helper: bound address of a listener.

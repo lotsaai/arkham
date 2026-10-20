@@ -38,6 +38,18 @@ impl AmbientProtocol {
   pub fn tag(self) -> &'static str {
     <&'static str>::from(self)
   }
+
+  /// Whether `label` is one this protocol minted: the tag, `-`, and 32 hex characters.
+  #[must_use]
+  pub fn owns_label(self, label: &str) -> bool {
+    let Some(rest) = label.strip_prefix(self.tag()) else {
+      return false;
+    };
+    let Some(hex) = rest.strip_prefix('-') else {
+      return false;
+    };
+    hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+  }
 }
 
 /// Why a source path cannot identify a context.

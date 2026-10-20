@@ -9,6 +9,7 @@
 //! `match` on the picked protocol in the crate; every arm lives in its
 //! vertical under `transports/`.
 
+use arkham_config::context::AmbientProtocol;
 use arkham_config::grants::{
   AmqpScope, Grant, LdapScope, NatsScope, PostgresScope, RedisScope, ResolvedConfig, Scheme, SmtpScope, SshScope,
 };
@@ -54,6 +55,9 @@ pub(crate) struct CandidateParams<'a> {
 pub(crate) enum Expect<'a> {
   /// An `https://` scope: terminate TLS, then read the h1/h2 framing.
   Tls,
+  /// An `https://` scope whose every covering grant is a Talos context.
+  /// The guest certificate selects the context after the handshake.
+  Talos,
   /// An `http://` scope: a plaintext request head.
   Plain,
   /// A `tcp://` scope: opaque bytes, equal-length substitution, nothing read.
@@ -99,7 +103,11 @@ impl PartialEq for Expect<'_> {
       (Expect::Nats(a), Expect::Nats(b)) => std::ptr::eq(*a, *b),
       (Expect::Amqp(a), Expect::Amqp(b)) => std::ptr::eq(*a, *b),
       (Expect::Ssh(a), Expect::Ssh(b)) => std::ptr::eq(*a, *b),
-      (Expect::Tls, Expect::Tls) | (Expect::Plain, Expect::Plain) | (Expect::Raw, Expect::Raw) | (Expect::Splice, Expect::Splice) => true,
+      (Expect::Tls, Expect::Tls)
+      | (Expect::Talos, Expect::Talos)
+      | (Expect::Plain, Expect::Plain)
+      | (Expect::Raw, Expect::Raw)
+      | (Expect::Splice, Expect::Splice) => true,
       _ => false,
     }
   }
@@ -130,16 +138,39 @@ pub(crate) fn expect<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> 
   if let Some(scope) = grants.iter().find_map(|grant| grant.ssh(host, port)) {
     return Expect::Ssh(scope);
   }
-  for (scheme, arm) in [
-    (Scheme::Https, Expect::Tls),
-    (Scheme::Http, Expect::Plain),
-    (Scheme::Tcp, Expect::Raw),
-  ] {
+  if let Some(arm) = https_arm(grants, host, port) {
+    return arm;
+  }
+  for (scheme, arm) in [(Scheme::Http, Expect::Plain), (Scheme::Tcp, Expect::Raw)] {
     if grants.iter().any(|grant| grant.endpoint(scheme, host, port).is_some()) {
       return arm;
     }
   }
   Expect::Splice
+}
+
+/// `https://` covering this destination. Every such grant carrying a Talos
+/// label takes the Talos arm. One ordinary https grant keeps the https arm,
+/// including when it shares the port with a Talos grant.
+fn https_arm<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> Option<Expect<'a>> {
+  let mut covered = false;
+  let mut talos = true;
+  for grant in grants {
+    if grant.endpoint(Scheme::Https, host, port).is_none() {
+      continue;
+    }
+    covered = true;
+    let labeled = grant
+      .credential()
+      .is_some_and(|credential| AmbientProtocol::Talos.owns_label(&credential.label));
+    if !labeled {
+      talos = false;
+    }
+  }
+  if !covered {
+    return None;
+  }
+  Some(if talos { Expect::Talos } else { Expect::Tls })
 }
 
 impl<'a> Expect<'a> {
@@ -168,6 +199,8 @@ impl<'a> Expect<'a> {
       Expect::Plain => state.http.serve(ServeStream { guest, params, scope: &() }).await,
       // Declared TLS: the ClientHello names the peer.
       Expect::Tls => state.https.serve(ServeStream { guest, params, scope: &() }).await,
+      // Talos: the client certificate selects the context, then the bytes pump.
+      Expect::Talos => state.talos.serve(ServeStream { guest, params, scope: &() }).await,
       // Declared Postgres: each leg's transport settles in the vertical.
       Expect::Postgres(scope) => state.postgres.serve(ServeStream { guest, params, scope }).await,
       // Declared Redis: each connection string states its own leg's transport.
@@ -402,6 +435,24 @@ mod tests {
     assert_eq!(expect(&grants, Some("api.github.com"), 443), Expect::Tls);
     let grants = token_grant(&["http://api.github.com"]);
     assert_eq!(expect(&grants, Some("api.github.com"), 80), Expect::Plain);
+  }
+
+  #[test]
+  fn talos_labels_take_the_talos_arm_and_a_mixed_port_stays_https() {
+    let mut grants = token_grant(&["https://10.5.0.6:50000"]);
+    let Grant::Token { credential, .. } = &mut grants[0] else {
+      panic!("token grant");
+    };
+    credential.label = "talos-266bdf0202b57494d8b421c5064e49c5".to_string();
+    assert_eq!(expect(&grants, Some("10.5.0.6"), 50000), Expect::Talos);
+    assert_eq!(expect(&grants, None, 50000), Expect::Talos);
+    let mut ordinary = token_grant(&["https://10.5.0.6:50000"]);
+    let Grant::Token { credential, .. } = &mut ordinary[0] else {
+      panic!("token grant");
+    };
+    credential.label = "home-ivan-talos-config-prod".to_string();
+    grants.extend(ordinary);
+    assert_eq!(expect(&grants, Some("10.5.0.6"), 50000), Expect::Tls);
   }
 
   #[test]
