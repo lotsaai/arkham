@@ -178,6 +178,8 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     guest_tls_mode: GuestTlsMode::Mtls,
     guest_cert: None,
     guest_key: None,
+
+    upstream_port: None,
   };
   let fragment = render_fragment(
     source,

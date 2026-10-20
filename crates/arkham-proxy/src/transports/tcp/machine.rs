@@ -40,6 +40,17 @@ impl Raw {
     Self::from_pairs(eligible_pairs(grants, scheme, host, port, dir))
   }
 
+  pub(crate) fn extend_redaction(&mut self, extra: &[CredentialPair]) {
+    let before = self.pairs.len();
+    self
+      .pairs
+      .extend(extra.iter().filter(|pair| pair.needle.len() == pair.replacement.len()).cloned());
+    if self.pairs.len() == before {
+      return;
+    }
+    self.tail_size = max_tail_size(&self.pairs);
+  }
+
   /// Build from pairs the caller already chose. The hold-back is the longest needle minus one.
   pub(crate) fn from_pairs(pairs: Vec<CredentialPair>) -> Self {
     let tail_size = max_tail_size(&pairs);

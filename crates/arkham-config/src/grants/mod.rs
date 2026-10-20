@@ -196,6 +196,9 @@ pub struct EndpointScope {
   pub root_cert: Option<PathBuf>,
   /// How the guest leg treats client certificates (rule table, not the URL).
   pub guest_tls: GuestTlsMode,
+  /// Port the upstream dial uses when this entry's port is a decoy.
+  /// `None` dials `port`.
+  pub upstream_port: Option<u16>,
 }
 
 /// Allow entry for an SSH identity mapping: the guest leg admits only the
@@ -309,6 +312,8 @@ impl FromStr for EndpointScope {
       client_key: None,
       root_cert: None,
       guest_tls: GuestTlsMode::default(),
+
+      upstream_port: None,
     })
   }
 }
@@ -492,6 +497,18 @@ impl Grant {
       Grant::Amqp { scope, .. } => AmqpScope::matches(scope, scheme, host, port),
       Grant::Ssh { allow } => allow.iter().any(|entry| ssh_match(entry, scheme, host, port)),
     }
+  }
+
+  /// This https grant dials `dial_port` on `host`, whether the allow entry
+  /// names that port or stores it as `upstream_port`.
+  #[must_use]
+  pub fn shares_upstream(&self, scheme: Scheme, host: &str, dial_port: u16) -> bool {
+    let Grant::Token { allow, .. } = self else {
+      return false;
+    };
+    allow
+      .iter()
+      .any(|entry| entry.scheme == scheme && entry.host.matches(host) && entry.upstream_port.unwrap_or(entry.port) == dial_port)
   }
 
   /// Endpoint entry of `scheme` covering a destination. `host` None matches
@@ -752,6 +769,7 @@ impl GrantCollector {
         scope.client_key.clone_from(&tls.client_key);
         scope.root_cert.clone_from(&tls.root_cert);
         scope.guest_tls = tls.guest_tls_mode;
+        scope.upstream_port = tls.upstream_port;
       }
       parsed.push((entry.clone(), scope));
     }
@@ -815,9 +833,10 @@ impl GrantCollector {
 
   /// Token rule: `allow` names the hosts and `value` is the real secret.
   fn token(&mut self, label: &str, rule: &RuleCfg, parsed: Vec<(String, EndpointScope)>) {
-    let Some(value) = rule.value.clone() else {
-      // `secrets::resolve` fills this before `serve`; a caller that skips
-      // resolution gets no grant rather than a rule that swaps in nothing.
+    let pair = parsed
+      .iter()
+      .any(|(_, scope)| scope.client_cert.is_some() && scope.client_key.is_some());
+    let Some(value) = rule.value.clone().or_else(|| pair.then(|| SecretString::from(String::new()))) else {
       tracing::warn!(label, env = %rule.env, "rule has no resolved value; no grant");
       return;
     };
@@ -923,6 +942,37 @@ mod tests {
     }
   }
 
+  #[test]
+  fn https_client_pair_without_a_value_still_grants() {
+    let mut cfg = cfg_with_db("unused", "unused");
+    let rule = cfg.rules.get_mut("t").expect("rule");
+    rule.value = None;
+    rule.real = None;
+    rule.env = "KUBE_USER_ABC".into();
+    rule.allow = vec!["https://k8s.example:6443".into()];
+    rule.tls.insert(
+      "https://k8s.example:6443".into(),
+      HostTlsCfg {
+        client_cert: Some(std::path::PathBuf::from("/state/user.client.crt")),
+        client_key: Some(std::path::PathBuf::from("/state/user.client.key")),
+        root_cert: Some(std::path::PathBuf::from("/state/cluster.ca.crt")),
+        guest_tls_mode: GuestTlsMode::Tls,
+        guest_cert: None,
+        guest_key: None,
+        upstream_port: Some(6443),
+      },
+    );
+    let resolved = resolve(&cfg).expect("cert-only rule grants");
+    let Some(Grant::Token { credential, allow, .. }) = resolved.grants.first() else {
+      panic!("token grant");
+    };
+    assert_eq!(credential.value.expose_secret(), "");
+    assert_ne!(credential.fake, "");
+    assert_eq!(allow[0].guest_tls, GuestTlsMode::Tls);
+    assert_eq!(allow[0].upstream_port, Some(6443));
+    assert!(allow[0].client_cert.is_some());
+  }
+
   fn mtls_on(cfg: &mut AppConfig) {
     let mut tls = BTreeMap::new();
     tls.insert(
@@ -934,6 +984,8 @@ mod tests {
         guest_tls_mode: GuestTlsMode::Mtls,
         guest_cert: None,
         guest_key: None,
+
+        upstream_port: None,
       },
     );
     cfg.rules.get_mut("t").unwrap().tls = tls;
@@ -1284,6 +1336,8 @@ mod tests {
         guest_tls_mode: GuestTlsMode::Mtls,
         guest_cert: None,
         guest_key: None,
+
+        upstream_port: None,
       },
     );
     let err = resolve(&cfg).expect_err("different guest tls on one fake endpoint");
@@ -1389,6 +1443,8 @@ mod tests {
       guest_tls_mode: GuestTlsMode::Mtls,
       guest_cert: None,
       guest_key: None,
+
+      upstream_port: None,
     };
     let mut trust = entry();
     trust.root_cert = Some(PathBuf::from("/certs/ca.crt"));
@@ -1448,6 +1504,8 @@ mod tests {
       guest_tls_mode: GuestTlsMode::Mtls,
       guest_cert: Some(PathBuf::from("/in/cert.pem")),
       guest_key: Some(PathBuf::from("/in/key.pem")),
+
+      upstream_port: None,
     };
     let mut tls = BTreeMap::new();
     let mut e = entry();
@@ -1492,6 +1550,8 @@ mod tests {
         guest_tls_mode: GuestTlsMode::Mtls,
         guest_cert: None,
         guest_key: None,
+
+        upstream_port: None,
       },
     );
     cfg.rules.get_mut("t").unwrap().tls = tls;
@@ -1517,6 +1577,8 @@ mod tests {
       guest_tls_mode: GuestTlsMode::Mtls,
       guest_cert: Some(PathBuf::from("/in/cert.pem")),
       guest_key: Some(PathBuf::from("/in/key.pem")),
+
+      upstream_port: None,
     };
     // A wrong key names nothing; the rule's env is the key.
     let mut tls = BTreeMap::new();
@@ -1798,6 +1860,8 @@ mod tests {
       guest_tls_mode: GuestTlsMode::Mtls,
       guest_cert: Some(PathBuf::from("/in/cert.pem")),
       guest_key: Some(PathBuf::from("/in/key.pem")),
+
+      upstream_port: None,
     };
     let mut tls = BTreeMap::new();
     let mut e = entry();
@@ -2017,6 +2081,8 @@ mod tests {
         guest_tls_mode: GuestTlsMode::Mtls,
         guest_cert: Some(PathBuf::from("/in/cert.pem")),
         guest_key: Some(PathBuf::from("/in/key.pem")),
+
+        upstream_port: None,
       },
     );
     let cfg = cfg_with_tls(&["https://api.internal:443"], tls);
@@ -2042,6 +2108,8 @@ mod tests {
       guest_tls_mode: GuestTlsMode::Mtls,
       guest_cert: Some(PathBuf::from("/in/cert.pem")),
       guest_key: Some(PathBuf::from("/in/key.pem")),
+
+      upstream_port: None,
     };
     // A wrong key names nothing; the rule's env is the key.
     let mut tls = BTreeMap::new();
@@ -2096,6 +2164,8 @@ mod tests {
         guest_tls_mode: GuestTlsMode::default(),
         guest_cert: None,
         guest_key: None,
+
+        upstream_port: None,
       },
     );
     let cfg = cfg_with_tls(&["https://api.internal:443"], tls);
@@ -2383,6 +2453,8 @@ mod tests {
         guest_tls_mode: GuestTlsMode::default(),
         guest_cert: None,
         guest_key: None,
+
+        upstream_port: None,
       },
     );
     let err = resolve(&cfg).unwrap_err().to_string();

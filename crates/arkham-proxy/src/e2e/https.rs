@@ -1,6 +1,9 @@
 use super::*;
 
+use arkham_pki::ca::{generate_client_pair, generate_domain_pair};
 use bytes::Bytes;
+use httlib_hpack::{Decoder, Encoder};
+use rama::crypto::pem::PemEncode as _;
 
 #[tokio::test]
 async fn mitm_terminates_both_ends_verbatim() {
@@ -213,7 +216,6 @@ async fn https_scope_without_alpn_relays_raw() {
 async fn https_entry_presents_its_client_identity_upstream() {
   const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-  use rama::crypto::pem::PemEncode as _;
   install_crypto_provider();
   let ca = CertAuthority::generate().unwrap();
   let dir = tempfile::tempdir().unwrap();
@@ -265,6 +267,8 @@ async fn https_entry_presents_its_client_identity_upstream() {
       client_key: Some(key_path.clone()),
       root_cert: Some(bundle),
       guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+      upstream_port: None,
     }],
     pattern: None,
     oauth2: None,
@@ -344,6 +348,8 @@ async fn https_entry_root_cert_trusts_private_upstream_ca() {
       client_key: None,
       root_cert: Some(bundle),
       guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+      upstream_port: None,
     }],
     pattern: None,
     oauth2: None,
@@ -423,6 +429,8 @@ async fn https_global_root_certs_trust_private_upstream_ca() {
       client_key: None,
       root_cert: None,
       guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+      upstream_port: None,
     }],
     pattern: None,
     oauth2: None,
@@ -517,6 +525,8 @@ async fn https_without_root_cert_fails_closed_on_private_upstream_ca() {
       client_key: None,
       root_cert: None,
       guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+      upstream_port: None,
     }],
     pattern: None,
     oauth2: None,
@@ -662,6 +672,8 @@ async fn https_guest_mtls_admits_only_ca_signed_guests() {
       client_key: None,
       root_cert: Some(bundle),
       guest_tls: arkham_config::grants::GuestTlsMode::Mtls,
+
+      upstream_port: None,
     }],
     pattern: None,
     oauth2: None,
@@ -708,8 +720,6 @@ async fn https_guest_mtls_admits_only_ca_signed_guests() {
 
 #[tokio::test]
 async fn mitm_h2_substitutes_headers() {
-  use httlib_hpack::{Decoder, Encoder};
-
   const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
   let fx = mitm_fixture_h2(|port| localhost_grant(port, FAKE, VALUE)).await;
@@ -804,6 +814,8 @@ async fn transparent_tls_mitm_substitutes_by_sni_identity() {
       client_key: None,
       root_cert: Some(bundle),
       guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+      upstream_port: None,
     }],
     pattern: None,
     oauth2: None,
@@ -897,6 +909,8 @@ async fn transparent_tls_mitm_uses_captured_ip_when_hello_has_no_sni() {
       client_key: None,
       root_cert: Some(bundle),
       guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+      upstream_port: None,
     }],
     pattern: None,
     oauth2: None,
@@ -1038,16 +1052,11 @@ struct SharedPairs {
   bundle: std::path::PathBuf,
   bearer_bundle: std::path::PathBuf,
   expected_leaf: rustls::pki_types::CertificateDer<'static>,
-  guest_pem: std::path::PathBuf,
-  guest_key: std::path::PathBuf,
 }
 
 /// Certificate grant files plus a second copy of the same CA. The two bundle
 /// paths are how a declared kubeconfig and an ambient one name one cluster.
 fn shared_pairs(ca: &CertAuthority, dir: &std::path::Path) -> SharedPairs {
-  use arkham_pki::ca::{generate_client_pair, load_or_generate_client_pair};
-  use rama::crypto::pem::PemEncode as _;
-
   let (upstream_chain, upstream_key) = generate_client_pair(ca, "upstream-user").unwrap();
   let mut upstream_pem = Vec::new();
   for cert in &upstream_chain {
@@ -1057,8 +1066,6 @@ fn shared_pairs(ca: &CertAuthority, dir: &std::path::Path) -> SharedPairs {
   let client_key = dir.join("kube-user-shared.client.key");
   std::fs::write(&client_cert, &upstream_pem).unwrap();
   std::fs::write(&client_key, upstream_key.to_pem()).unwrap();
-  let (guest_pem, guest_key) = load_or_generate_client_pair(ca, dir, "kube-user-shared").unwrap();
-  std::fs::copy(&guest_pem, dir.join("kube-user-shared.guest.crt")).unwrap();
   let bundle = dir.join("ca.pem");
   let bearer_bundle = dir.join("ca-bearer.pem");
   std::fs::write(&bundle, ca.cert_pem()).unwrap();
@@ -1069,8 +1076,6 @@ fn shared_pairs(ca: &CertAuthority, dir: &std::path::Path) -> SharedPairs {
     bundle,
     bearer_bundle,
     expected_leaf: upstream_chain.into_iter().next().unwrap(),
-    guest_pem,
-    guest_key,
   }
 }
 
@@ -1089,6 +1094,7 @@ fn https_scope(
     client_key: key,
     root_cert: Some(root),
     guest_tls,
+    upstream_port: None,
   }
 }
 
@@ -1105,30 +1111,246 @@ fn https_grant(label: &str, fake: &str, value: &str, scope: EndpointScope) -> Gr
   }
 }
 
-fn guest_connector(ca: &CertAuthority, guest_pem: &std::path::Path, guest_key: &std::path::Path) -> TlsConnector {
-  use rustls::pki_types::pem::PemObject as _;
-  use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-  let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(guest_pem)
-    .unwrap()
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap();
-  let key = PrivateKeyDer::from_pem_file(guest_key).unwrap();
-  let mut roots = rustls::RootCertStore::empty();
-  roots.add(ca.cert_der().clone()).unwrap();
-  let mut config = rustls::ClientConfig::builder()
-    .with_root_certificates(roots)
-    .with_client_auth_cert(chain, key)
-    .unwrap();
-  config.alpn_protocols = vec![b"http/1.1".to_vec()];
-  TlsConnector::from(Arc::new(config))
+#[tokio::test]
+async fn https_shared_destination_redacts_every_real_token() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let bundle = dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let server = shared_server(&ca);
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let port = stub.local_addr().unwrap().port();
+  let grants = vec![
+    https_grant(
+      "left",
+      CERT_FAKE,
+      CERT_VALUE,
+      https_scope(port, GuestTlsMode::Tls, None, None, bundle.clone()),
+    ),
+    https_grant(
+      "right",
+      BEARER_FAKE,
+      BEARER_VALUE,
+      https_scope(port, GuestTlsMode::Tls, None, None, bundle),
+    ),
+  ];
+  let state = test_state_with_plugins(grants, Vec::new(), &ca);
+  let request = format!("GET / HTTP/1.1\r\nhost: localhost\r\nAuthorization: Bearer {BEARER_FAKE}\r\n\r\n");
+  let body = format!("{CERT_VALUE}{BEARER_VALUE}");
+  let (upstream, guest, peer) = exchange(
+    state,
+    stub,
+    server,
+    anonymous_connector(&ca),
+    port,
+    request.as_bytes(),
+    body.as_bytes(),
+  )
+  .await;
+  assert!(peer.is_none(), "bearer grants present no client certificate");
+  assert!(
+    holds(&upstream, BEARER_VALUE),
+    "upstream sees the sent user's real token: {}",
+    upstream.escape_ascii()
+  );
+  assert!(
+    !holds(&upstream, BEARER_FAKE),
+    "the decoy stays off upstream: {}",
+    upstream.escape_ascii()
+  );
+  assert!(
+    !holds(&upstream, CERT_VALUE),
+    "the other real token stays off the request: {}",
+    upstream.escape_ascii()
+  );
+  assert!(
+    holds(&guest, CERT_FAKE),
+    "the other decoy is missing from the response: {}",
+    guest.escape_ascii()
+  );
+  assert!(
+    holds(&guest, BEARER_FAKE),
+    "the sent decoy is missing from the response: {}",
+    guest.escape_ascii()
+  );
+  assert!(
+    !holds(&guest, CERT_VALUE),
+    "a real token reached the guest: {}",
+    guest.escape_ascii()
+  );
+  assert!(
+    !holds(&guest, BEARER_VALUE),
+    "a real token reached the guest: {}",
+    guest.escape_ascii()
+  );
 }
 
-/// Two https grants share a destination and name the same CA from different
-/// files. The presented guest certificate selects the certificate grant, and
-/// upstream sees that grant's client pair.
 #[tokio::test]
-async fn https_shared_destination_selects_the_presented_guest_cert() {
+async fn https_decoy_ports_redact_every_real_token_for_the_upstream() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let bundle = dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let server = shared_server(&ca);
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let real_port = stub.local_addr().unwrap().port();
+  let left = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let left_port = left.local_addr().unwrap().port();
+  drop(left);
+  let right = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let right_port = right.local_addr().unwrap().port();
+  drop(right);
+  let mut left_scope = https_scope(left_port, GuestTlsMode::Tls, None, None, bundle.clone());
+  left_scope.upstream_port = Some(real_port);
+  let mut right_scope = https_scope(right_port, GuestTlsMode::Tls, None, None, bundle);
+  right_scope.upstream_port = Some(real_port);
+  let grants = vec![
+    https_grant("left", CERT_FAKE, CERT_VALUE, left_scope),
+    https_grant("right", BEARER_FAKE, BEARER_VALUE, right_scope),
+  ];
+  let state = test_state_with_plugins(grants, Vec::new(), &ca);
+  let request = format!("GET / HTTP/1.1\r\nhost: localhost\r\nAuthorization: Bearer {CERT_FAKE}\r\n\r\n");
+  let body = format!("{CERT_VALUE}{BEARER_VALUE}");
+  let (upstream, guest, peer) = exchange(
+    state,
+    stub,
+    server,
+    anonymous_connector(&ca),
+    left_port,
+    request.as_bytes(),
+    body.as_bytes(),
+  )
+  .await;
+  assert!(peer.is_none(), "bearer grants present no client certificate");
+  assert!(
+    holds(&upstream, CERT_VALUE),
+    "upstream sees the sent user's real token: {}",
+    upstream.escape_ascii()
+  );
+  assert!(
+    !holds(&upstream, CERT_FAKE),
+    "the decoy stays off upstream: {}",
+    upstream.escape_ascii()
+  );
+  assert!(
+    !holds(&upstream, BEARER_VALUE),
+    "the other real token stays off the request: {}",
+    upstream.escape_ascii()
+  );
+  assert!(
+    holds(&guest, CERT_FAKE),
+    "the sent decoy is missing from the response: {}",
+    guest.escape_ascii()
+  );
+  assert!(
+    holds(&guest, BEARER_FAKE),
+    "the other decoy is missing from the response: {}",
+    guest.escape_ascii()
+  );
+  assert!(
+    !holds(&guest, CERT_VALUE),
+    "a real token reached the guest: {}",
+    guest.escape_ascii()
+  );
+  assert!(
+    !holds(&guest, BEARER_VALUE),
+    "a real token reached the guest: {}",
+    guest.escape_ascii()
+  );
+}
+
+#[tokio::test]
+async fn https_decoy_port_dials_the_real_port_and_presents_the_client_certificate() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let pairs = shared_pairs(&ca, dir.path());
+  let expected_leaf = pairs.expected_leaf.clone();
+  let server = shared_server(&ca);
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let real_port = stub.local_addr().unwrap().port();
+  let decoy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let decoy_port = decoy.local_addr().unwrap().port();
+  drop(decoy);
+  let mut scope = https_scope(
+    decoy_port,
+    GuestTlsMode::Tls,
+    Some(pairs.client_cert.clone()),
+    Some(pairs.client_key.clone()),
+    pairs.bundle.clone(),
+  );
+  scope.upstream_port = Some(real_port);
+  let state = test_state_with_plugins(vec![https_grant("kube-user-shared", CERT_FAKE, CERT_VALUE, scope)], Vec::new(), &ca);
+  let request = format!("GET / HTTP/1.1\r\nhost: localhost\r\nAuthorization: Bearer {CERT_FAKE}\r\n\r\n");
+  let (upstream, _guest, peer) = exchange(state, stub, server, anonymous_connector(&ca), decoy_port, request.as_bytes(), b"ok").await;
+  assert_eq!(peer.as_ref(), Some(&expected_leaf), "upstream sees the grant's client certificate");
+  assert!(
+    holds(&upstream, CERT_VALUE),
+    "upstream sees the real token: {}",
+    upstream.escape_ascii()
+  );
+  assert!(
+    !holds(&upstream, CERT_FAKE),
+    "the decoy stays off upstream: {}",
+    upstream.escape_ascii()
+  );
+}
+
+#[tokio::test]
+async fn https_disagreeing_client_certificates_do_not_complete() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let pairs = shared_pairs(&ca, dir.path());
+  let server = shared_server(&ca);
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let port = stub.local_addr().unwrap().port();
+  let bundle = pairs.bundle.clone();
+  let grants = vec![
+    https_grant(
+      "cert-user",
+      CERT_FAKE,
+      CERT_VALUE,
+      https_scope(
+        port,
+        GuestTlsMode::Tls,
+        Some(pairs.client_cert.clone()),
+        Some(pairs.client_key.clone()),
+        bundle.clone(),
+      ),
+    ),
+    https_grant(
+      "bearer-user",
+      BEARER_FAKE,
+      BEARER_VALUE,
+      https_scope(port, GuestTlsMode::Tls, None, None, pairs.bearer_bundle.clone()),
+    ),
+  ];
+  let state = test_state_with_plugins(grants, Vec::new(), &ca);
+  let stub_task = tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(2), stub.accept()).await });
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+  let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
+  guest
+    .write_all(format!("CONNECT localhost:{port} HTTP/1.1\r\n\r\n").as_bytes())
+    .await
+    .unwrap();
+  let mut ok = [0u8; 19];
+  guest.read_exact(&mut ok).await.unwrap();
+  assert_eq!(&ok, b"HTTP/1.1 200 OK\r\n\r\n");
+  let handshake = anonymous_connector(&ca)
+    .connect(ServerName::try_from("localhost".to_string()).unwrap(), guest)
+    .await;
+  assert!(handshake.is_err(), "disagreeing client certificates must not finish the handshake");
+  let accepted = stub_task.await.unwrap();
+  assert!(accepted.is_err(), "the proxy must not dial upstream");
+  drop(server);
+  proxy.abort();
+}
+
+#[tokio::test]
+async fn https_certificate_grant_drops_the_empty_bearer() {
   install_crypto_provider();
   let ca = CertAuthority::generate().unwrap();
   let dir = tempfile::tempdir().unwrap();
@@ -1137,93 +1359,37 @@ async fn https_shared_destination_selects_the_presented_guest_cert() {
   let server = shared_server(&ca);
   let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let port = stub.local_addr().unwrap().port();
-  let state = test_state_with_plugins(shared_grants(port, &pairs), Vec::new(), &ca);
-  let (upstream, _guest, peer) = exchange(
-    state,
-    stub,
-    server,
-    guest_connector(&ca, &pairs.guest_pem, &pairs.guest_key),
+  let scope = https_scope(
     port,
-    b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n",
-    b"ok",
-  )
-  .await;
-  assert_eq!(
-    peer.as_ref(),
-    Some(&expected_leaf),
-    "upstream sees the certificate grant's client pair"
+    GuestTlsMode::Tls,
+    Some(pairs.client_cert),
+    Some(pairs.client_key),
+    pairs.bundle,
+  );
+  let grant = Grant::Token {
+    credential: Credential {
+      label: "cert-only".into(),
+      fake: CERT_FAKE.into(),
+      value: secrecy::SecretString::from(""),
+    },
+    allow: vec![scope],
+    pattern: None,
+    oauth2: None,
+  };
+  let state = test_state_with_plugins(vec![grant], Vec::new(), &ca);
+  let request = format!("GET / HTTP/1.1\r\nhost: localhost\r\nAuthorization: Bearer {CERT_FAKE}\r\n\r\n");
+  let (upstream, _guest, peer) = exchange(state, stub, server, anonymous_connector(&ca), port, request.as_bytes(), b"ok").await;
+  assert_eq!(peer.as_ref(), Some(&expected_leaf), "upstream sees the client certificate");
+  assert!(
+    !holds(&upstream, CERT_FAKE),
+    "the empty-value bearer is removed: {}",
+    upstream.escape_ascii()
   );
   assert!(
-    !holds(&upstream, BEARER_VALUE),
-    "the bearer grant's secret must not ride a certificate-selected connection"
+    !upstream.windows(b"Authorization:".len()).any(|window| window == b"Authorization:"),
+    "no authorization header: {}",
+    upstream.escape_ascii()
   );
-}
-
-/// A certificate-selected connection still redacts every other grant for this
-/// apiserver. The stub echoes the bearer user's real token; the guest reads
-/// that user's decoy.
-#[tokio::test]
-async fn https_cert_selected_connection_redacts_the_bearer_secret() {
-  install_crypto_provider();
-  let ca = CertAuthority::generate().unwrap();
-  let dir = tempfile::tempdir().unwrap();
-  let pairs = shared_pairs(&ca, dir.path());
-  let server = shared_server(&ca);
-  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let port = stub.local_addr().unwrap().port();
-  let state = test_state_with_plugins(shared_grants(port, &pairs), Vec::new(), &ca);
-  let (_upstream, guest, peer) = exchange(
-    state,
-    stub,
-    server,
-    guest_connector(&ca, &pairs.guest_pem, &pairs.guest_key),
-    port,
-    b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n",
-    BEARER_VALUE.as_bytes(),
-  )
-  .await;
-  assert!(peer.is_some(), "the certificate grant presents its client pair");
-  assert!(
-    holds(&guest, BEARER_FAKE),
-    "bearer decoy missing from the guest response: {}",
-    guest.escape_ascii()
-  );
-  assert!(
-    !holds(&guest, BEARER_VALUE),
-    "bearer real reached the guest: {}",
-    guest.escape_ascii()
-  );
-}
-
-/// A connection with no client certificate still redacts the mTLS grant. The
-/// stub echoes that grant's real token; the guest reads its decoy.
-#[tokio::test]
-async fn https_without_a_certificate_redacts_the_mtls_secret() {
-  install_crypto_provider();
-  let ca = CertAuthority::generate().unwrap();
-  let dir = tempfile::tempdir().unwrap();
-  let pairs = shared_pairs(&ca, dir.path());
-  let server = shared_server(&ca);
-  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let port = stub.local_addr().unwrap().port();
-  let state = test_state_with_plugins(shared_grants(port, &pairs), Vec::new(), &ca);
-  let (_upstream, guest, peer) = exchange(
-    state,
-    stub,
-    server,
-    anonymous_connector(&ca),
-    port,
-    b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n",
-    CERT_VALUE.as_bytes(),
-  )
-  .await;
-  assert!(peer.is_none(), "a bearer grant presents no client certificate");
-  assert!(
-    holds(&guest, CERT_FAKE),
-    "mtls decoy missing from the guest response: {}",
-    guest.escape_ascii()
-  );
-  assert!(!holds(&guest, CERT_VALUE), "mtls real reached the guest: {}", guest.escape_ascii());
 }
 
 const CERT_FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1244,8 +1410,6 @@ fn anonymous_connector(ca: &CertAuthority) -> TlsConnector {
 }
 
 fn shared_server(ca: &CertAuthority) -> Arc<rustls::ServerConfig> {
-  use arkham_pki::ca::generate_domain_pair;
-
   let (server_chain, server_key) = generate_domain_pair(ca, "localhost").unwrap();
   let mut trust = rustls::RootCertStore::empty();
   trust.add(ca.cert_der().clone()).unwrap();
@@ -1253,35 +1417,12 @@ fn shared_server(ca: &CertAuthority) -> Arc<rustls::ServerConfig> {
     .allow_unauthenticated()
     .build()
     .unwrap();
-  Arc::new(
-    rustls::ServerConfig::builder()
-      .with_client_cert_verifier(verifier)
-      .with_single_cert(server_chain, server_key)
-      .unwrap(),
-  )
-}
-
-fn shared_grants(port: u16, pairs: &SharedPairs) -> Vec<Grant> {
-  vec![
-    https_grant(
-      "kube-user-shared",
-      CERT_FAKE,
-      CERT_VALUE,
-      https_scope(
-        port,
-        GuestTlsMode::Mtls,
-        Some(pairs.client_cert.clone()),
-        Some(pairs.client_key.clone()),
-        pairs.bundle.clone(),
-      ),
-    ),
-    https_grant(
-      "bearer-user",
-      BEARER_FAKE,
-      BEARER_VALUE,
-      https_scope(port, GuestTlsMode::Tls, None, None, pairs.bearer_bundle.clone()),
-    ),
-  ]
+  let mut config = rustls::ServerConfig::builder()
+    .with_client_cert_verifier(verifier)
+    .with_single_cert(server_chain, server_key)
+    .unwrap();
+  config.alpn_protocols = vec![b"http/1.1".to_vec()];
+  Arc::new(config)
 }
 
 async fn exchange(
@@ -1289,14 +1430,17 @@ async fn exchange(
   stub: TcpListener,
   server: Arc<rustls::ServerConfig>,
   connector: TlsConnector,
-  port: u16,
+  connect_port: u16,
   request: &[u8],
   body: &[u8],
 ) -> (Vec<u8>, Vec<u8>, Option<rustls::pki_types::CertificateDer<'static>>) {
   let body_len = body.len();
   let body = body.to_vec();
   let stub_task = tokio::spawn(async move {
-    let (stream, _) = stub.accept().await.unwrap();
+    let (stream, _) = tokio::time::timeout(Duration::from_secs(5), stub.accept())
+      .await
+      .expect("upstream dial")
+      .unwrap();
     let mut tls = TlsAcceptor::from(server).accept(stream).await.unwrap();
     let peer = tls.get_ref().1.peer_certificates().and_then(|certs| certs.first().cloned());
     let head = read_head_from(&mut tls).await;
@@ -1308,7 +1452,7 @@ async fn exchange(
   let (proxy_addr, proxy) = run_proxy_with(state).await;
   let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
   guest
-    .write_all(format!("CONNECT localhost:{port} HTTP/1.1\r\n\r\n").as_bytes())
+    .write_all(format!("CONNECT localhost:{connect_port} HTTP/1.1\r\n\r\n").as_bytes())
     .await
     .unwrap();
   let mut ok = [0u8; 19];
@@ -1331,151 +1475,4 @@ async fn exchange(
   let (peer, upstream) = stub_task.await.unwrap();
   proxy.abort();
   (upstream, guest_bytes, peer)
-}
-
-/// No client certificate selects the bearer grant. The files are removed
-/// after the proxy state is built, so a later connection cannot be reading
-/// them again.
-#[tokio::test]
-async fn https_without_a_certificate_sends_the_bearer_secret() {
-  install_crypto_provider();
-  let ca = CertAuthority::generate().unwrap();
-  let dir = tempfile::tempdir().unwrap();
-  let pairs = shared_pairs(&ca, dir.path());
-  let server = shared_server(&ca);
-  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let port = stub.local_addr().unwrap().port();
-  let grants = shared_grants(port, &pairs);
-  let connector = anonymous_connector(&ca);
-  let state = test_state_with_plugins(grants, Vec::new(), &ca);
-  for path in [
-    &pairs.client_cert,
-    &pairs.client_key,
-    &pairs.bundle,
-    &pairs.bearer_bundle,
-    &dir.path().join("kube-user-shared.guest.crt"),
-  ] {
-    std::fs::remove_file(path).unwrap();
-  }
-  let request = format!("GET / HTTP/1.1\r\nhost: localhost\r\nAuthorization: Bearer {BEARER_FAKE}\r\n\r\n");
-  let (upstream, _guest, peer) = exchange(state, stub, server, connector, port, request.as_bytes(), b"ok").await;
-  assert!(peer.is_none(), "a bearer grant presents no client certificate");
-  assert!(
-    upstream.windows(BEARER_VALUE.len()).any(|window| window == BEARER_VALUE.as_bytes()),
-    "upstream must see the bearer secret: {}",
-    upstream.escape_ascii()
-  );
-  assert!(
-    !upstream.windows(CERT_VALUE.len()).any(|window| window == CERT_VALUE.as_bytes()),
-    "the certificate grant's secret must stay off this connection"
-  );
-}
-
-/// Sending the certificate grant's decoy as a bearer, with no client
-/// certificate, must not substitute that grant's real secret.
-#[tokio::test]
-async fn https_without_a_certificate_keeps_the_mtls_secret() {
-  install_crypto_provider();
-  let ca = CertAuthority::generate().unwrap();
-  let dir = tempfile::tempdir().unwrap();
-  let pairs = shared_pairs(&ca, dir.path());
-  let server = shared_server(&ca);
-  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let port = stub.local_addr().unwrap().port();
-  let state = test_state_with_plugins(shared_grants(port, &pairs), Vec::new(), &ca);
-  let request = format!("GET / HTTP/1.1\r\nhost: localhost\r\nAuthorization: Bearer {CERT_FAKE}\r\n\r\n");
-  let (upstream, _guest, _) = exchange(state, stub, server, anonymous_connector(&ca), port, request.as_bytes(), b"ok").await;
-  assert!(
-    !upstream.windows(CERT_VALUE.len()).any(|window| window == CERT_VALUE.as_bytes()),
-    "mtls secret leaked without a client certificate: {}",
-    upstream.escape_ascii()
-  );
-  assert!(
-    upstream.windows(CERT_FAKE.len()).any(|window| window == CERT_FAKE.as_bytes()),
-    "the unmatched decoy stays literal: {}",
-    upstream.escape_ascii()
-  );
-}
-
-/// A certificate this CA signed, which no grant's guest leaf is, is closed
-/// before a request completes. The upstream request must not carry the
-/// certificate grant's secret.
-#[tokio::test]
-async fn https_unknown_client_certificate_fails_the_handshake() {
-  use arkham_pki::ca::load_or_generate_client_pair;
-  use rustls::pki_types::pem::PemObject as _;
-
-  install_crypto_provider();
-  let ca = CertAuthority::generate().unwrap();
-  let dir = tempfile::tempdir().unwrap();
-  let pairs = shared_pairs(&ca, dir.path());
-  let (other_pem, other_key) = load_or_generate_client_pair(&ca, dir.path(), "kube-user-other").unwrap();
-  let connector = guest_connector(&ca, &other_pem, &other_key);
-  let server = shared_server(&ca);
-  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let port = stub.local_addr().unwrap().port();
-  let grants = shared_grants(port, &pairs);
-  let other_der = rustls::pki_types::CertificateDer::pem_file_iter(&other_pem)
-    .unwrap()
-    .next()
-    .unwrap()
-    .unwrap();
-  let unmatched = crate::connection::presented_grants(
-    &[crate::connection::HttpsCandidate {
-      grant: grants[0].clone(),
-      guest_tls: GuestTlsMode::Mtls,
-      leaf: Some(pairs.expected_leaf.as_ref().to_vec()),
-    }],
-    other_der.as_ref(),
-    "localhost",
-    port,
-  )
-  .expect_err("unknown certificate");
-  assert!(matches!(unmatched, crate::Error::UnmatchedClientCert { .. }), "{unmatched}");
-  let state = test_state_with_plugins(grants, Vec::new(), &ca);
-  let stub_task = tokio::spawn(async move {
-    let accepted = tokio::time::timeout(Duration::from_secs(3), stub.accept()).await;
-    let Ok(Ok((stream, _))) = accepted else {
-      return None;
-    };
-    let upstream = tokio::time::timeout(Duration::from_secs(2), async move {
-      let mut tls = TlsAcceptor::from(server).accept(stream).await.ok()?;
-      Some(read_head_from(&mut tls).await)
-    })
-    .await;
-    upstream.ok().flatten()
-  });
-  let (proxy_addr, proxy) = run_proxy_with(state).await;
-  let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
-  guest
-    .write_all(format!("CONNECT localhost:{port} HTTP/1.1\r\n\r\n").as_bytes())
-    .await
-    .unwrap();
-  let mut ok = [0u8; 19];
-  guest.read_exact(&mut ok).await.unwrap();
-  assert_eq!(&ok, b"HTTP/1.1 200 OK\r\n\r\n");
-  let connected = connector
-    .connect(ServerName::try_from("localhost".to_string()).unwrap(), guest)
-    .await;
-  let exchanged = match connected {
-    Err(_) => false,
-    Ok(mut tls) => {
-      use tokio::io::AsyncReadExt as _;
-      if tls.write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n").await.is_err() {
-        false
-      } else {
-        let mut buf = [0u8; 8];
-        let got = tokio::time::timeout(Duration::from_secs(2), tls.read(&mut buf)).await;
-        matches!(got, Ok(Ok(n)) if n > 0 && buf[..n].starts_with(b"HTTP/"))
-      }
-    }
-  };
-  assert!(!exchanged, "an unknown client certificate must not complete a request");
-  if let Some(head) = stub_task.await.unwrap() {
-    assert!(
-      !head.windows(CERT_VALUE.len()).any(|window| window == CERT_VALUE.as_bytes()),
-      "unknown certificate must not swap in the mtls secret"
-    );
-  }
-  proxy.abort();
 }

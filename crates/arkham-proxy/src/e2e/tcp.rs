@@ -15,6 +15,8 @@ fn localhost_tcp_grant(port: u16, fake: &str, value: &str) -> Vec<Grant> {
       client_key: None,
       root_cert: None,
       guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+      upstream_port: None,
     }],
     pattern: None,
     oauth2: None,

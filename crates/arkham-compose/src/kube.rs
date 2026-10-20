@@ -2,9 +2,10 @@
 //! differently structured form of the same information a rule holds, so the
 //! adapter derives the grant from the file instead of asking the operator to
 //! state it twice. Every derivable context maps. One user is one rule, and
-//! one cluster is one CA file. `current-context` is copied into the decoy
-//! and is not how a credential is chosen. The file is the secret source, so
-//! a kube entry stating `envs` is an error rather than a second source.
+//! one cluster is one CA file. Users who share a server each get a distinct
+//! guest port. `current-context` is copied into the decoy and is not how a
+//! credential is chosen. The file is the secret source, so a kube entry
+//! stating `envs` is an error rather than a second source.
 //!
 //! Detection is structural: a YAML mapping with `kind: Config` and a
 //! `clusters:` table takes the adapter path, everything else keeps the raw
@@ -14,13 +15,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::{HostTlsCfg, RewriteFormat, fake_for};
-use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, Presented, guest_cert_file, identities, require_distinct};
+use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, Presented, identities, require_distinct};
 use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
-use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
+use arkham_pki::ca::CertAuthority;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use kube_client::config::{AuthInfo, Cluster, Kubeconfig, NamedAuthInfo, NamedCluster, NamedContext};
 use secrecy::ExposeSecret;
@@ -82,11 +82,9 @@ enum Classified {
   Skip(KubeSkip),
 }
 
-/// Decoy material for one granted user, keyed by the kube user name.
+/// Decoy bearer for one granted user, keyed by the kube user name.
 struct UserFace {
-  token: Option<String>,
-  cert: Option<String>,
-  key: Option<String>,
+  token: String,
 }
 
 /// Map several kubeconfig files, in order, onto one grant fragment.
@@ -99,15 +97,14 @@ struct UserFace {
 /// # Errors
 ///
 /// Returns an error when a document does not parse, the selected context
-/// cannot be granted, two users present the same decoy at one server, or a
-/// guest pair cannot be minted.
-pub(crate) fn adapt_sources(sources: &[(&Path, &[u8])], ca: &CertAuthority, guests_dir: &Path) -> Result<Option<RewriteAdapted>, Error> {
+/// cannot be granted, or two users present the same decoy bearer at one server.
+pub(crate) fn adapt_sources(sources: &[(&Path, &[u8])], ca: &CertAuthority, _guests_dir: &Path) -> Result<Option<RewriteAdapted>, Error> {
   let Some(merged) = merge_sources(sources)? else {
     return Ok(None);
   };
   let pending = classify_merged(&merged)?;
-  let rendered = render_pending(&pending, ca, guests_dir)?;
-  let decoy = decoy_document(merged.root, ca, &rendered.faces)?;
+  let rendered = render_pending(&pending)?;
+  let decoy = decoy_document(merged.root, ca, &rendered.faces, &rendered.users)?;
   Ok(Some(RewriteAdapted {
     fragment: rendered.fragment,
     decoy,
@@ -385,8 +382,6 @@ struct LiveUser {
   token: Option<String>,
   cert: Option<Vec<u8>>,
   key: Option<Vec<u8>>,
-  guest_cert: Vec<u8>,
-  guest_key: Vec<u8>,
   servers: Vec<LiveServer>,
 }
 
@@ -395,6 +390,8 @@ struct LiveServer {
   url: String,
   host: String,
   port: u16,
+  upstream_port: Option<u16>,
+  cluster_names: Vec<String>,
   cluster_label: String,
   ca: Option<Vec<u8>>,
 }
@@ -404,10 +401,12 @@ struct Rendered {
   fragment: String,
   materialized: Vec<(String, Vec<u8>)>,
   faces: BTreeMap<String, UserFace>,
+  users: Vec<LiveUser>,
 }
 
-fn render_pending(pending: &[Pending], ca: &CertAuthority, guests_dir: &Path) -> Result<Rendered, Error> {
-  let users = live_users(pending, ca, guests_dir)?;
+fn render_pending(pending: &[Pending]) -> Result<Rendered, Error> {
+  let mut users = live_users(pending)?;
+  assign_decoy_ports(&mut users)?;
   require_user_servers(&users)?;
   let mut fragment = String::new();
   let mut materialized = Vec::new();
@@ -419,9 +418,7 @@ fn render_pending(pending: &[Pending], ca: &CertAuthority, guests_dir: &Path) ->
     faces.insert(
       user.identity.name.clone(),
       UserFace {
-        token: user.token.as_ref().map(|_| user.identity.secret()),
-        cert: pair_b64(&user.guest_cert, user.cert.is_some()),
-        key: pair_b64(&user.guest_key, user.cert.is_some()),
+        token: user.identity.secret(),
       },
     );
   }
@@ -429,14 +426,11 @@ fn render_pending(pending: &[Pending], ca: &CertAuthority, guests_dir: &Path) ->
     fragment,
     materialized,
     faces,
+    users,
   })
 }
 
-fn pair_b64(bytes: &[u8], present: bool) -> Option<String> {
-  present.then(|| STANDARD.encode(bytes))
-}
-
-fn live_users(pending: &[Pending], ca: &CertAuthority, guests_dir: &Path) -> Result<Vec<LiveUser>, Error> {
+fn live_users(pending: &[Pending]) -> Result<Vec<LiveUser>, Error> {
   let user_keys = distinct_keys(pending, |row| (&row.user_source, row.user_name.as_str()));
   let user_refs: Vec<ContextRef<'_>> = user_keys
     .iter()
@@ -473,14 +467,12 @@ fn live_users(pending: &[Pending], ca: &CertAuthority, guests_dir: &Path) -> Res
     let token = first.token.clone();
     let cert = first.cert.clone();
     let key = first.key.clone();
-    let (guest_cert, guest_key) = if cert.is_some() {
-      read_guest_pair(ca, guests_dir, &identity.label)?
-    } else {
-      (Vec::new(), Vec::new())
-    };
-    let mut servers = Vec::new();
+    let mut servers: Vec<LiveServer> = Vec::new();
     for row in &rows {
-      if servers.iter().any(|server: &LiveServer| server.url == row.server) {
+      if let Some(server) = servers.iter_mut().find(|server| server.url == row.server) {
+        if !server.cluster_names.iter().any(|name| name == &row.cluster_name) {
+          server.cluster_names.push(row.cluster_name.clone());
+        }
         continue;
       }
       let cluster_label = cluster_ids
@@ -496,6 +488,8 @@ fn live_users(pending: &[Pending], ca: &CertAuthority, guests_dir: &Path) -> Res
         url: row.server.clone(),
         host: row.host.clone(),
         port: row.port,
+        upstream_port: None,
+        cluster_names: vec![row.cluster_name.clone()],
         cluster_label,
         ca: row.ca.clone(),
       });
@@ -505,8 +499,6 @@ fn live_users(pending: &[Pending], ca: &CertAuthority, guests_dir: &Path) -> Res
       token,
       cert,
       key,
-      guest_cert,
-      guest_key,
       servers,
     });
   }
@@ -528,21 +520,10 @@ fn distinct_keys(pending: &[Pending], key: impl Fn(&Pending) -> (&Path, &str)) -
   out
 }
 
-fn read_guest_pair(ca: &CertAuthority, guests_dir: &Path, label: &str) -> Result<(Vec<u8>, Vec<u8>), Error> {
-  let (cert_path, key_path) = load_or_generate_client_pair(ca, guests_dir, label)?;
-  let cert = fs::read(&cert_path).map_err(|source| Error::ReadFile { path: cert_path, source })?;
-  let key = fs::read(&key_path).map_err(|source| Error::ReadFile { path: key_path, source })?;
-  Ok((cert, key))
-}
-
 fn require_user_servers(users: &[LiveUser]) -> Result<(), Error> {
   let mut owned = Vec::new();
   for user in users {
-    let decoy = if user.cert.is_some() {
-      user.guest_cert.clone()
-    } else {
-      user.identity.secret().into_bytes()
-    };
+    let decoy = user.identity.secret().into_bytes();
     for server in &user.servers {
       owned.push((user.identity.clone(), server.host.clone(), server.port, decoy.clone()));
     }
@@ -560,15 +541,85 @@ fn require_user_servers(users: &[LiveUser]) -> Result<(), Error> {
   Ok(())
 }
 
+const DECOY_PORT_MIN: u16 = 49152;
+const DECOY_PORT_MAX: u16 = 65535;
+
+fn assign_decoy_ports(users: &mut [LiveUser]) -> Result<(), Error> {
+  let mut groups: BTreeMap<(String, u16), Vec<(usize, usize)>> = BTreeMap::new();
+  let mut taken: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
+  for (user_index, user) in users.iter().enumerate() {
+    for (server_index, server) in user.servers.iter().enumerate() {
+      let host = server.host.to_ascii_lowercase();
+      taken.entry(host.clone()).or_default().insert(server.port);
+      groups.entry((host, server.port)).or_default().push((user_index, server_index));
+    }
+  }
+  for ((host, real_port), members) in groups {
+    if members.len() < 2 {
+      continue;
+    }
+    for (user_index, server_index) in members {
+      let port = {
+        let reserved = taken.entry(host.clone()).or_default();
+        let Some(port) = decoy_port(&users[user_index].identity.label, &host, real_port, reserved) else {
+          return Err(Error::RewriteInvalid {
+            file: users[user_index].identity.source.clone(),
+            format: RewriteFormat::Kubeconfig,
+            detail: format!("no free decoy port for {host}:{real_port}"),
+          });
+        };
+        reserved.insert(port);
+        port
+      };
+      let server = &mut users[user_index].servers[server_index];
+      server.upstream_port = Some(real_port);
+      server.port = port;
+      server.url = https_url(&server.host, port);
+    }
+  }
+  Ok(())
+}
+
+fn decoy_port(label: &str, host: &str, real_port: u16, taken: &BTreeSet<u16>) -> Option<u16> {
+  let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+  let real = real_port.to_be_bytes();
+  for byte in label.bytes().chain(host.bytes()).chain(real) {
+    hash ^= u64::from(byte);
+    hash = hash.wrapping_mul(0x0100_0000_01b3);
+  }
+  let span = u64::from(DECOY_PORT_MAX - DECOY_PORT_MIN) + 1;
+  let offset = u16::try_from(hash % span).ok()?;
+  let start = DECOY_PORT_MIN.checked_add(offset)?;
+  let mut port = start;
+  loop {
+    if !taken.contains(&port) {
+      return Some(port);
+    }
+    port = if port == DECOY_PORT_MAX {
+      DECOY_PORT_MIN
+    } else {
+      port.saturating_add(1)
+    };
+    if port == start {
+      return None;
+    }
+  }
+}
+
+fn https_url(host: &str, port: u16) -> String {
+  if host.contains(':') {
+    format!("https://[{host}]:{port}")
+  } else {
+    format!("https://{host}:{port}")
+  }
+}
+
 fn render_user(user: &LiveUser) -> Result<String, Error> {
   let mut tls = BTreeMap::new();
   for server in &user.servers {
     tls.insert(server.url.clone(), server_tls(user, server));
   }
-  let value = match &user.token {
-    Some(token) => token.clone(),
-    None => String::from_utf8_lossy(user.cert.as_deref().unwrap_or_default()).into_owned(),
-  };
+  let value = user.token.clone();
   render_fragment(
     &user.identity.source,
     &user.identity.label,
@@ -576,7 +627,7 @@ fn render_user(user: &LiveUser) -> Result<String, Error> {
       env: user.identity.env(),
       registry: false,
       allow: user.servers.iter().map(|server| server.url.clone()).collect(),
-      value: Some(value),
+      value,
       real: None,
       generated: false,
       if_missing: None,
@@ -593,9 +644,10 @@ fn server_tls(user: &LiveUser, server: &LiveServer) -> HostTlsCfg {
     client_cert: pair.then(|| grant_path(&format!("{label}.client.crt"))),
     client_key: pair.then(|| grant_path(&format!("{label}.client.key"))),
     root_cert: server.ca.as_ref().map(|_| grant_path(&format!("{}.ca.crt", server.cluster_label))),
-    guest_tls_mode: if pair { GuestTlsMode::Mtls } else { GuestTlsMode::Tls },
+    guest_tls_mode: GuestTlsMode::Tls,
     guest_cert: None,
     guest_key: None,
+    upstream_port: server.upstream_port,
   }
 }
 
@@ -603,15 +655,10 @@ fn grant_path(name: &str) -> PathBuf {
   PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{name}"))
 }
 
-/// Write the upstream pair, the guest leaf, and the cluster CA.
-///
-/// `{label}.guest.crt` sits beside `{label}.client.crt`. The proxy compares
-/// a presented client certificate with the first certificate in that file.
 fn push_user_blobs(user: &LiveUser, materialized: &mut Vec<(String, Vec<u8>)>, seen: &mut BTreeSet<String>) {
   if let (Some(cert), Some(key)) = (&user.cert, &user.key) {
     push_blob(materialized, seen, format!("{}.client.crt", user.identity.label), cert.clone());
     push_blob(materialized, seen, format!("{}.client.key", user.identity.label), key.clone());
-    push_blob(materialized, seen, guest_cert_file(&user.identity.label), user.guest_cert.clone());
   }
   for server in &user.servers {
     let Some(ca) = &server.ca else {
@@ -627,10 +674,159 @@ fn push_blob(materialized: &mut Vec<(String, Vec<u8>)>, seen: &mut BTreeSet<Stri
   }
 }
 
-/// The agent's decoy kubeconfig. Every cluster carries arkham's CA.
-/// Every user loses `exec`, file paths, and the whole auth-provider block.
-/// A granted user receives that user's decoy credential.
-fn decoy_document(mut root: Value, ca: &CertAuthority, granted: &BTreeMap<String, UserFace>) -> Result<String, Error> {
+fn guest_endpoints(users: &[LiveUser]) -> BTreeMap<(String, String), String> {
+  let mut endpoints = BTreeMap::new();
+  for user in users {
+    for server in &user.servers {
+      if server.upstream_port.is_none() {
+        continue;
+      }
+      for cluster in &server.cluster_names {
+        endpoints.insert((user.identity.name.clone(), cluster.clone()), server.url.clone());
+      }
+    }
+  }
+  endpoints
+}
+
+fn retarget_guest_clusters(root: &mut Value, users: &[LiveUser]) -> Result<(), Error> {
+  let endpoints = guest_endpoints(users);
+  if endpoints.is_empty() {
+    return Ok(());
+  }
+  let mut planned: Vec<(String, String, String)> = Vec::new();
+  for context in entries_mut(root, "contexts") {
+    let Some(inner) = context.get_mut(yaml_key("context")).and_then(Value::as_mapping_mut) else {
+      continue;
+    };
+    let user = inner.get(yaml_key("user")).and_then(Value::as_str).unwrap_or_default().to_string();
+    let cluster = inner
+      .get(yaml_key("cluster"))
+      .and_then(Value::as_str)
+      .unwrap_or_default()
+      .to_string();
+    let Some(url) = endpoints.get(&(user.clone(), cluster.clone())) else {
+      continue;
+    };
+    let new_name = format!("{cluster}--{user}");
+    inner.insert(yaml_key("cluster"), Value::String(new_name.clone()));
+    if planned.iter().any(|(name, _, _)| name == &new_name) {
+      continue;
+    }
+    planned.push((new_name, cluster, url.clone()));
+  }
+  if planned.is_empty() {
+    return Ok(());
+  }
+  let file = users.first().map(|user| user.identity.source.clone()).unwrap_or_default();
+  let existing = cluster_names(root);
+  for (new_name, _, _) in &planned {
+    if existing.iter().any(|name| name == new_name) {
+      return Err(Error::RewriteInvalid {
+        file: file.clone(),
+        format: RewriteFormat::Kubeconfig,
+        detail: format!("decoy cluster `{new_name}` already exists"),
+      });
+    }
+  }
+  let originals = cluster_entries(root);
+  let Some(seq) = cluster_sequence_mut(root) else {
+    return Err(Error::RewriteInvalid {
+      file: file.clone(),
+      format: RewriteFormat::Kubeconfig,
+      detail: "kubeconfig has no clusters".to_string(),
+    });
+  };
+  for (new_name, source, url) in &planned {
+    let Some(mut entry) = originals.get(source).cloned() else {
+      return Err(Error::RewriteInvalid {
+        file: file.clone(),
+        format: RewriteFormat::Kubeconfig,
+        detail: format!("cluster `{source}` is missing"),
+      });
+    };
+    entry.insert(yaml_key("name"), Value::String(new_name.clone()));
+    if let Some(body) = entry.get_mut(yaml_key("cluster")).and_then(Value::as_mapping_mut) {
+      body.insert(yaml_key("server"), Value::String(url.clone()));
+    }
+    seq.push(Value::Mapping(entry));
+  }
+  let sources: Vec<String> = planned.iter().map(|(_, source, _)| source.clone()).collect();
+  drop_unreferenced_clusters(root, &sources);
+  Ok(())
+}
+
+fn cluster_names(root: &Value) -> Vec<String> {
+  cluster_entries(root).into_keys().collect()
+}
+
+fn cluster_entries(root: &Value) -> BTreeMap<String, Mapping> {
+  let mut entries = BTreeMap::new();
+  let Some(seq) = root
+    .as_mapping()
+    .and_then(|map| map.get(yaml_key("clusters")))
+    .and_then(Value::as_sequence)
+  else {
+    return entries;
+  };
+  for item in seq {
+    let Some(entry) = item.as_mapping() else {
+      continue;
+    };
+    let Some(name) = entry.get(yaml_key("name")).and_then(Value::as_str) else {
+      continue;
+    };
+    entries.insert(name.to_string(), entry.clone());
+  }
+  entries
+}
+
+fn cluster_sequence_mut(root: &mut Value) -> Option<&mut Vec<Value>> {
+  root
+    .as_mapping_mut()
+    .and_then(|map| map.get_mut(yaml_key("clusters")))
+    .and_then(Value::as_sequence_mut)
+}
+
+fn drop_unreferenced_clusters(root: &mut Value, sources: &[String]) {
+  let referenced = context_clusters(root);
+  let Some(seq) = cluster_sequence_mut(root) else {
+    return;
+  };
+  seq.retain(|entry| {
+    let Some(name) = entry.as_mapping().and_then(|map| map.get(yaml_key("name"))).and_then(Value::as_str) else {
+      return true;
+    };
+    !sources.iter().any(|source| source == name) || referenced.iter().any(|cluster| cluster == name)
+  });
+}
+
+fn context_clusters(root: &Value) -> Vec<String> {
+  let mut names = Vec::new();
+  let Some(seq) = root
+    .as_mapping()
+    .and_then(|map| map.get(yaml_key("contexts")))
+    .and_then(Value::as_sequence)
+  else {
+    return names;
+  };
+  for item in seq {
+    let Some(name) = item
+      .as_mapping()
+      .and_then(|map| map.get(yaml_key("context")))
+      .and_then(Value::as_mapping)
+      .and_then(|map| map.get(yaml_key("cluster")))
+      .and_then(Value::as_str)
+    else {
+      continue;
+    };
+    names.push(name.to_string());
+  }
+  names
+}
+
+fn decoy_document(mut root: Value, ca: &CertAuthority, granted: &BTreeMap<String, UserFace>, users: &[LiveUser]) -> Result<String, Error> {
+  retarget_guest_clusters(&mut root, users)?;
   let guest_ca = Value::String(STANDARD.encode(ca.cert_pem()));
   for cluster in entries_mut(&mut root, "clusters") {
     let Some(inner) = cluster.get_mut(yaml_key("cluster")).and_then(Value::as_mapping_mut) else {
@@ -655,19 +851,9 @@ fn decoy_document(mut root: Value, ca: &CertAuthority, granted: &BTreeMap<String
 }
 
 fn write_granted_user(inner: &mut Mapping, face: &UserFace) {
-  if let Some(token) = &face.token
-    && inner.contains_key(yaml_key("token"))
-  {
-    inner.insert(yaml_key("token"), Value::String(token.clone()));
-  }
-  if let (Some(cert), Some(key)) = (&face.cert, &face.key) {
-    let cert_key = yaml_key("client-certificate-data");
-    let key_key = yaml_key("client-key-data");
-    if inner.contains_key(&cert_key) || inner.contains_key(&key_key) {
-      inner.insert(cert_key, Value::String(cert.clone()));
-      inner.insert(key_key, Value::String(key.clone()));
-    }
-  }
+  inner.insert(yaml_key("token"), Value::String(face.token.clone()));
+  inner.remove(yaml_key("client-certificate-data"));
+  inner.remove(yaml_key("client-key-data"));
 }
 
 fn scrub_ungranted_user(inner: &mut Mapping, placeholder: &str) {
@@ -704,6 +890,8 @@ fn entries_mut<'a>(root: &'a mut Value, key: &str) -> Vec<&'a mut Mapping> {
 
 #[cfg(test)]
 mod tests {
+  use std::fs;
+
   use arkham_config::config::RuleCfg;
   use serde::Deserialize;
 
@@ -848,12 +1036,8 @@ users:
         .as_ref()
         .is_some_and(|path| path.ends_with(format!("{}.ca.crt", cluster.label)))
     );
-    assert_eq!(tls.guest_tls_mode, GuestTlsMode::Mtls);
-    assert_eq!(
-      adapted.materialized.len(),
-      4,
-      "pair, guest leaf, and CA materialize beside the fragment"
-    );
+    assert_eq!(tls.guest_tls_mode, GuestTlsMode::Tls);
+    assert_eq!(adapted.materialized.len(), 3, "pair and CA materialize beside the fragment");
   }
 
   #[test]
@@ -869,8 +1053,8 @@ users:
     assert!(!adapted.decoy.contains("Q0VSVA=="), "no real pair survives: {}", adapted.decoy);
     assert!(adapted.decoy.contains("token: "), "decoy token present: {}", adapted.decoy);
     assert!(
-      adapted.decoy.contains("client-certificate-data: "),
-      "guest pair present: {}",
+      !adapted.decoy.contains("client-certificate-data:"),
+      "guest has no client certificate: {}",
       adapted.decoy
     );
   }
@@ -999,9 +1183,7 @@ users:
   }
 
   #[test]
-  fn token_only_user_takes_plain_tls_while_pair_users_take_mtls() {
-    // Only unmasked fixture text is touched here, so the bearer value never
-    // appears in this test.
+  fn token_and_pair_users_both_take_plain_tls() {
     let token_doc = BEARER_DOC.replace(", client-certificate-data: Q0VSVA==, client-key-data: S0VZ", "");
     let token_rules = rules_from(&adapt_doc(&token_doc).fragment);
     let token_rule = token_rules.get(&user_identity("admin").label).expect("rule present");
@@ -1021,8 +1203,20 @@ users:
     let pair_tls = pair_rule.tls.get("https://10.0.0.1:6443").expect("tls keyed by the allow entry");
     assert_eq!(
       pair_tls.guest_tls_mode,
-      GuestTlsMode::Mtls,
-      "pair users still swap the client certificate"
+      GuestTlsMode::Tls,
+      "a client pair stays on the upstream leg"
+    );
+    assert!(pair_tls.client_cert.is_some(), "the real client certificate stays on the grant");
+    let pair_adapted = adapt_doc(&pair_doc);
+    assert!(
+      pair_adapted.decoy.contains("token: "),
+      "a certificate user gets a decoy bearer: {}",
+      pair_adapted.decoy
+    );
+    assert!(
+      !pair_adapted.decoy.contains("client-certificate-data:"),
+      "the guest file has no client certificate: {}",
+      pair_adapted.decoy
     );
   }
 
@@ -1033,12 +1227,23 @@ users:
       "user: {client-certificate-data: Q0VSVA==, client-key-data: S0VZ}",
     );
     let adapted = adapt_doc(&doc);
-    assert!(!adapted.decoy.contains("token:"), "no bearer, no token line: {}", adapted.decoy);
-    let rules = rules_from(&adapted.fragment);
+    let user = user_identity("admin");
     assert!(
-      rules[&user_identity("admin").label].value.is_some(),
-      "identity grant still resolves"
+      adapted.decoy.contains(&user.secret()),
+      "a certificate user gets a decoy bearer: {}",
+      adapted.decoy
     );
+    assert!(
+      !adapted.decoy.contains("client-certificate-data:"),
+      "the guest file has no client certificate: {}",
+      adapted.decoy
+    );
+    let rules = rules_from(&adapted.fragment);
+    let rule = &rules[&user.label];
+    assert!(rule.value.is_none(), "a certificate-only user has no token to swap");
+    let tls = rule.tls.get("https://10.0.0.1:6443").expect("tls keyed by the allow entry");
+    assert!(tls.client_cert.is_some(), "the real client certificate stays on the grant");
+    assert_eq!(tls.guest_tls_mode, GuestTlsMode::Tls);
   }
 
   #[test]
@@ -1108,6 +1313,8 @@ contexts:
   context: {cluster: staging, user: ivan}
 - name: prod-admin
   context: {cluster: prod, user: admin}
+- name: prod-system
+  context: {cluster: prod, user: ivan, namespace: kube-system}
 clusters:
 - name: prod
   cluster: {server: https://k8s.example:6443, certificate-authority-data: Q0E=}
@@ -1120,13 +1327,8 @@ users:
   user: {token: admin-real-token}
 ";
 
-  /// Two clusters and one cluster shared by two users become one rule per
-  /// user. The shared user lists both servers. The shared cluster names one
-  /// CA file. `current-context` stays in the decoy and is not the rule name.
   #[test]
   fn three_contexts_grant_each_user_once_and_share_the_cluster_ca() {
-    use arkham_config::context::{AmbientProtocol, ContextRef, identities};
-
     let source = Path::new(SOURCE);
     let users = identities(&[
       ContextRef {
@@ -1160,24 +1362,56 @@ users:
     let ivan = rules.get(&users[0].label).expect("ivan rule");
     let admin = rules.get(&users[1].label).expect("admin rule");
     assert_eq!(ivan.env, users[0].env());
-    assert_eq!(
-      ivan.allow,
-      vec!["https://k8s.example:6443".to_string(), "https://staging.example:6443".to_string()]
-    );
-    assert_eq!(admin.allow, vec!["https://k8s.example:6443".to_string()]);
+    assert_eq!(ivan.allow.len(), 2, "{}", adapted.fragment);
+    assert_eq!(admin.allow.len(), 1, "{}", adapted.fragment);
+    let ivan_prod = ivan.allow.iter().find(|url| url.contains("k8s.example")).expect("ivan prod");
+    let ivan_staging = ivan.allow.iter().find(|url| url.contains("staging.example")).expect("ivan staging");
+    let admin_prod = &admin.allow[0];
+    assert_eq!(ivan_staging, "https://staging.example:6443");
+    assert_ne!(ivan_prod, admin_prod, "shared server users get different decoy endpoints");
+    assert_ne!(ivan_prod, "https://k8s.example:6443");
+    assert!(admin_prod.contains("k8s.example"), "{admin_prod}");
+    let ivan_prod_tls = ivan.tls.get(ivan_prod).expect("ivan prod tls");
+    let ivan_staging_tls = ivan.tls.get(ivan_staging).expect("ivan staging tls");
+    let admin_prod_tls = admin.tls.get(admin_prod).expect("admin prod tls");
+    assert_eq!(ivan_prod_tls.upstream_port, Some(6443));
+    assert_eq!(admin_prod_tls.upstream_port, Some(6443));
+    assert_eq!(ivan_staging_tls.upstream_port, None);
     let prod_ca = format!("{}.ca.crt", clusters[0].label);
     let staging_ca = format!("{}.ca.crt", clusters[1].label);
-    let ivan_prod = ivan.tls.get("https://k8s.example:6443").expect("ivan prod tls");
-    let ivan_staging = ivan.tls.get("https://staging.example:6443").expect("ivan staging tls");
-    let admin_prod = admin.tls.get("https://k8s.example:6443").expect("admin prod tls");
-    assert!(ivan_prod.root_cert.as_ref().is_some_and(|path| path.ends_with(&prod_ca)));
-    assert!(ivan_staging.root_cert.as_ref().is_some_and(|path| path.ends_with(&staging_ca)));
-    assert!(admin_prod.root_cert.as_ref().is_some_and(|path| path.ends_with(&prod_ca)));
+    assert!(ivan_prod_tls.root_cert.as_ref().is_some_and(|path| path.ends_with(&prod_ca)));
+    assert!(ivan_staging_tls.root_cert.as_ref().is_some_and(|path| path.ends_with(&staging_ca)));
+    assert!(admin_prod_tls.root_cert.as_ref().is_some_and(|path| path.ends_with(&prod_ca)));
     assert_eq!(adapted.materialized.iter().filter(|(name, _)| name == &prod_ca).count(), 1);
-    assert_eq!(ivan_prod.guest_tls_mode, GuestTlsMode::Tls);
+    assert_eq!(ivan_prod_tls.guest_tls_mode, GuestTlsMode::Tls);
+    let decoy: Kubeconfig = from_str(&adapted.decoy).expect("decoy parses");
+    let cluster_of = |name: &str| -> String {
+      decoy
+        .contexts
+        .iter()
+        .find(|entry| entry.name == name)
+        .and_then(|entry| entry.context.as_ref())
+        .map(|spec| spec.cluster.clone())
+        .unwrap_or_default()
+    };
+    let server_of = |name: &str| -> String {
+      let cluster = cluster_of(name);
+      decoy
+        .clusters
+        .iter()
+        .find(|entry| entry.name == cluster)
+        .and_then(|entry| entry.cluster.as_ref())
+        .and_then(|spec| spec.server.clone())
+        .unwrap_or_default()
+    };
+    assert_eq!(cluster_of("prod"), cluster_of("prod-system"));
+    assert_ne!(cluster_of("prod"), cluster_of("prod-admin"));
+    assert_eq!(server_of("prod"), *ivan_prod);
+    assert_eq!(server_of("prod-system"), *ivan_prod);
+    assert_eq!(server_of("prod-admin"), *admin_prod);
+    assert_eq!(server_of("staging"), "https://staging.example:6443");
     assert!(adapted.decoy.contains("current-context: prod"), "{}", adapted.decoy);
-    assert!(adapted.decoy.contains("name: staging"), "{}", adapted.decoy);
-    assert!(adapted.decoy.contains("name: prod-admin"), "{}", adapted.decoy);
+    assert!(adapted.decoy.contains("namespace: kube-system"), "{}", adapted.decoy);
     assert!(!adapted.decoy.contains("ivan-real-token"), "{}", adapted.decoy);
     assert!(!adapted.decoy.contains("admin-real-token"), "{}", adapted.decoy);
     assert!(!adapted.decoy.contains("Q0E="), "{}", adapted.decoy);
@@ -1286,8 +1520,6 @@ users:
   /// path is the file that defined the name.
   #[test]
   fn kubeconfig_list_keeps_the_first_definition() {
-    use arkham_config::context::{AmbientProtocol, ContextRef, identities};
-
     let first = Path::new("/home/ivan/.kube/config");
     let second = Path::new("/home/ivan/.kube/extra.yaml");
     let early = r"apiVersion: v1
@@ -1374,9 +1606,11 @@ users:
 #[cfg(test)]
 mod moved_suite {
 
+  use std::collections::HashMap;
   use std::fs;
 
   use arkham_config::config::{FileRewrite, RewriteFormat};
+  use arkham_pki::ca::CertAuthority;
   use tempfile::tempdir;
 
   use crate::expand::*;
@@ -1388,10 +1622,6 @@ mod moved_suite {
   /// Kubeconfig sources adapt with no `envs`, stated or sniffed.
   #[test]
   fn kube_rewrites_adapt_stated_or_sniffed() {
-    use std::collections::HashMap;
-
-    use arkham_pki::ca::CertAuthority;
-
     let dir = tempdir().unwrap();
     let source = dir.path().join("k3s.yaml");
     fs::write(&source, KUBE_DOC).unwrap();
@@ -1434,10 +1664,6 @@ mod moved_suite {
   /// A stated kubeconfig format on a foreign file fails closed.
   #[test]
   fn stated_kubeconfig_on_plain_text_is_an_error() {
-    use std::collections::HashMap;
-
-    use arkham_pki::ca::CertAuthority;
-
     let dir = tempdir().unwrap();
     let source = dir.path().join("npmrc");
     fs::write(&source, "//registry.npmjs.org/:_authToken=real-secret-1\n").unwrap();

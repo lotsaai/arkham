@@ -182,6 +182,48 @@ pub(crate) fn eligible_pairs(grants: &[Grant], scheme: Scheme, host: &str, port:
   pairs
 }
 
+pub(crate) fn sibling_upstream_pairs(grants: &[Grant], scheme: Scheme, host: &str, guest_port: u16, dial_port: u16) -> Vec<CredentialPair> {
+  let mut pairs = Vec::new();
+  for grant in grants {
+    if grant.matches(scheme, host, guest_port) {
+      continue;
+    }
+    if !grant.shares_upstream(scheme, host, dial_port) {
+      continue;
+    }
+    let Some(credential) = grant.credential() else {
+      continue;
+    };
+    let needle = credential.value.expose_secret().as_bytes();
+    let replacement = credential.fake.as_bytes();
+    if needle.is_empty() || replacement.is_empty() {
+      continue;
+    }
+    pairs.push(CredentialPair {
+      needle: needle.to_vec(),
+      replacement: replacement.to_vec(),
+      label: credential.label.clone(),
+    });
+  }
+  pairs
+}
+
+pub(crate) fn selector_fakes(grants: &[Grant], scheme: Scheme, host: &str, port: u16) -> Vec<Vec<u8>> {
+  let mut fakes = Vec::new();
+  for grant in grants {
+    if !grant.matches(scheme, host, port) {
+      continue;
+    }
+    let Some(credential) = grant.credential() else {
+      continue;
+    };
+    if credential.value.expose_secret().is_empty() && !credential.fake.is_empty() {
+      fakes.push(credential.fake.as_bytes().to_vec());
+    }
+  }
+  fakes
+}
+
 /// Cap on buffered token-response bodies. A token response larger than
 /// this fails closed rather than buffering unbounded attacker data.
 pub(crate) const MAX_MINT_BODY: usize = 1024 * 1024;

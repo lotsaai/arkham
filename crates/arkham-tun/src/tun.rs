@@ -400,6 +400,8 @@ mod tests {
         client_key: None,
         root_cert: Some(bundle),
         guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+        upstream_port: None,
       }],
       pattern: None,
       oauth2: None,

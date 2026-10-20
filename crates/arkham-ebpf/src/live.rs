@@ -250,6 +250,8 @@ async fn ebpf_live_tcp_mitm_substitutes() {
         client_key: None,
         root_cert: Some(bundle),
         guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+        upstream_port: None,
       }],
       pattern: None,
       oauth2: None,

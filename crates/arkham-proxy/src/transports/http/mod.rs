@@ -6,7 +6,7 @@ pub(crate) mod h2;
 pub(crate) mod machine;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -22,19 +22,18 @@ use rama::tls::server::InputWithClientHello;
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use arkham_config::context::guest_cert_file;
 use arkham_config::grants::{EndpointScope, Grant, Scheme};
 use arkham_plugin::Direction as HookDirection;
 
 use super::PairCtx;
 use super::{ServeStream, Transport};
 use crate::Error;
-use crate::connection::{GuestIo, HttpsCandidate, Prefixed, client_auth_policy, dial_marked, optional_client_auth_policy};
+use crate::connection::{GuestIo, Prefixed, client_auth_policy, dial_marked};
 use crate::identity::{CandidateParams, Hello, read_client_hello, read_http_head};
 use crate::into_box_error;
 use crate::mint::MintHandle;
 use crate::relay::relay_guarded;
-use crate::transports::engine::{Direction, H2, Http, Raw};
+use crate::transports::engine::{Direction, H2, Http, Raw, sibling_upstream_pairs};
 use crate::transports::tcp::{self, raw_tcp_pair};
 use crate::transports::tls::cached_guest_certs;
 
@@ -46,8 +45,6 @@ pub(crate) struct HttpsTransport;
 impl Transport for HttpsTransport {
   type Scope = ();
 
-  /// The `https://` MITM arm. Bytes that never complete a hello cannot be
-  /// served here, and an identity no scope names is copied.
   async fn serve<G>(&self, ServeStream { mut guest, params, .. }: ServeStream<'_, G, ()>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -67,9 +64,6 @@ impl Transport for HttpsTransport {
     };
     let (buf, sni, parsed) = match read {
       Hello::Named { buf, sni, hello } => (buf, Some(sni), Some(hello)),
-      // A complete hello without SNI still carries the client's ALPN and
-      // fingerprint: mirror it instead of falling back to boring defaults,
-      // which negotiate no ALPN and drop framed substitution.
       Hello::Unnamed { buf, hello } => (buf, None, hello),
     };
     if let (Some(authority), Some(sni)) = (host, sni.as_deref())
@@ -78,9 +72,6 @@ impl Transport for HttpsTransport {
       tracing::debug!(authority, sni, "CONNECT authority differs from SNI; closing");
       return Ok(());
     }
-    // Transparent capture of an IP-literal client (kubectl against an
-    // address) carries no SNI, so the captured destination is the identity
-    // to mint for. A grant that does not name it still splices below.
     let identity = host.or(sni.as_deref()).unwrap_or(dial_host);
     let hits: Vec<(Grant, EndpointScope)> = snapshot
       .grants
@@ -92,7 +83,6 @@ impl Transport for HttpsTransport {
       })
       .collect();
     if hits.is_empty() {
-      // No https scope names this identity: nothing to substitute.
       return tcp::splice(guest, dial_host, port, state.fwmark, &buf).await;
     }
     let root_cert = shared_root(&state.guest_certs, &hits, identity, port)?;
@@ -102,40 +92,26 @@ impl Transport for HttpsTransport {
         identity: identity.clone(),
       });
     }
-    let selected = Arc::new(Mutex::new(Vec::new()));
-    let policy = if hits.len() == 1 {
-      let (grant, scope) = &hits[0];
-      *selected.lock().unwrap_or_else(PoisonError::into_inner) = vec![grant.clone()];
-      client_auth_policy(&state.identities, scope, &state.mtls_trust)?
-    } else {
-      let candidates = https_candidates(&state.guest_certs, &hits)?;
-      Some(optional_client_auth_policy(
-        candidates,
-        &state.mtls_trust,
-        &identity,
-        port,
-        Arc::clone(&selected),
-        Arc::clone(&state.identities),
-      ))
-    };
-    let upstream = dial_marked(dial_host, port, state.fwmark).await?;
+    let scope = agreed_scope(&hits, &identity, port)?;
+    let dial_port = scope.upstream_port.unwrap_or(port);
+    let policy = client_auth_policy(&state.identities, scope, &state.mtls_trust)?;
+    let upstream = dial_marked(dial_host, dial_port, state.fwmark).await?;
     let mut guest_io = GuestIo::with_target(Prefixed::new(buf, guest), &identity, port)?;
     if let Some(policy) = policy {
       guest_io = guest_io.with_client_auth_policy(policy);
     }
     let bridge = BridgeIo(guest_io, GuestIo::bare(upstream));
-    let redact = hits.into_iter().map(|(grant, _)| grant).collect();
+    let grants: Vec<Grant> = hits.iter().map(|(grant, _)| grant.clone()).collect();
+    let redact = grants_for_dial(&snapshot.grants, &identity, dial_port);
     let pump = SubstitutionService {
-      grants: selected,
       redact,
+      grants,
       identity,
       port,
+      dial_port,
       plugins: Arc::clone(&state.plugins),
       mint: Some(state.mint_handle()),
     };
-    // Entries naming `root_cert` ride their own relay extending the global
-    // egress trust; the map was built from this same config, so a miss is
-    // a bug, failed closed.
     let relay = match &root_cert {
       None => state.relay.clone(),
       Some(path) => state
@@ -208,22 +184,13 @@ impl Transport for HttpTransport {
   }
 }
 
-/// The https vertical's per-connection substitution service: the boring
-/// MITM relay terminates both legs and hands the paired TLS streams here,
-/// where the negotiated ALPN picks the framing and the substitution
-/// machines pump. A struct, not a closure, because rama's relay calls a
-/// `Service` and the guest-side stream type belongs to the caller.
-/// Decoded-request middleware is deliberately not used: a `Request<Body>`
-/// round-trips through the HTTP codec and would break the byte-identical
-/// guarantee the verbatim tests pin.
 #[derive(Debug, Clone)]
 pub(crate) struct SubstitutionService {
-  /// Grants the handshake chose. The downstream machine substitutes these.
-  grants: Arc<Mutex<Vec<Grant>>>,
-  /// Every grant for this destination. The upstream machine redacts these.
+  grants: Vec<Grant>,
   redact: Vec<Grant>,
   identity: String,
   port: u16,
+  dial_port: u16,
   plugins: Arc<arkham_plugin::Registry>,
   mint: Option<MintHandle>,
 }
@@ -281,34 +248,38 @@ fn split_trust(host: &str, port: u16) -> Error {
   }
 }
 
-fn https_candidates(
-  cache: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>,
-  hits: &[(Grant, EndpointScope)],
-) -> Result<Vec<HttpsCandidate>, Error> {
-  let mut candidates = Vec::with_capacity(hits.len());
-  for (grant, scope) in hits {
-    candidates.push(HttpsCandidate {
-      grant: grant.clone(),
-      guest_tls: scope.guest_tls,
-      leaf: guest_leaf(cache, grant, scope)?,
-    });
-  }
-  Ok(candidates)
+fn agreed_scope<'a>(hits: &'a [(Grant, EndpointScope)], host: &str, port: u16) -> Result<&'a EndpointScope, Error> {
+  let Some((_, first)) = hits.first() else {
+    return Err(ambiguous_grants(hits, host, port));
+  };
+  let same = hits.iter().all(|(_, scope)| {
+    scope.client_cert == first.client_cert
+      && scope.client_key == first.client_key
+      && scope.guest_tls == first.guest_tls
+      && scope.upstream_port == first.upstream_port
+  });
+  if same { Ok(first) } else { Err(ambiguous_grants(hits, host, port)) }
 }
 
-fn guest_leaf(
-  cache: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>,
-  grant: &Grant,
-  scope: &EndpointScope,
-) -> Result<Option<Vec<u8>>, Error> {
-  let (Some(credential), Some(client_cert)) = (grant.credential(), scope.client_cert.as_ref()) else {
-    return Ok(None);
-  };
-  let path = client_cert.with_file_name(guest_cert_file(&credential.label));
-  let Some(certs) = cached_guest_certs(cache, &path)? else {
-    return Ok(None);
-  };
-  Ok(certs.first().map(|cert| cert.as_ref().to_vec()))
+fn grants_for_dial(grants: &[Grant], host: &str, dial_port: u16) -> Vec<Grant> {
+  grants
+    .iter()
+    .filter(|grant| grant.shares_upstream(Scheme::Https, host, dial_port))
+    .cloned()
+    .collect()
+}
+
+fn ambiguous_grants(hits: &[(Grant, EndpointScope)], host: &str, port: u16) -> Error {
+  let mut labels: Vec<&str> = hits
+    .iter()
+    .filter_map(|(grant, _)| grant.credential().map(|credential| credential.label.as_str()))
+    .collect();
+  labels.sort_unstable();
+  Error::AmbiguousHttpsGrants {
+    host: host.to_string(),
+    port,
+    labels: labels.join(", "),
+  }
 }
 
 impl<GI, GE> Service<BridgeIo<TlsStream<GI>, TlsStream<GE>>> for SubstitutionService
@@ -320,79 +291,66 @@ where
   type Error = BoxError;
 
   async fn serve(&self, input: BridgeIo<TlsStream<GI>, TlsStream<GE>>) -> Result<Self::Output, Self::Error> {
-    let BridgeIo(mut guest_tls, mut server_tls) = input;
-    let grants = self.grants.lock().unwrap_or_else(PoisonError::into_inner).clone();
-    if grants.is_empty() {
-      return Err(into_box_error(&Error::ClientCertRequired {
-        host: self.identity.clone(),
-        port: self.port,
-      }));
-    }
-    // Downstream substitutes only the handshake's choice. Upstream redacts
-    // every grant for this destination, including the ones not selected.
+    self.dispatch(input).await.map_err(|err| into_box_error(&err))
+  }
+}
+
+impl SubstitutionService {
+  async fn dispatch<GI, GE>(&self, input: BridgeIo<TlsStream<GI>, TlsStream<GE>>) -> Result<(), Error>
+  where
+    GI: AsyncRead + AsyncWrite + Unpin + Send + 'static + ExtensionsRef,
+    GE: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+  {
+    let BridgeIo(guest_tls, server_tls) = input;
+    let alpn = negotiated_alpn(&guest_tls);
+    self.pump(guest_tls, server_tls, &[], alpn.as_deref()).await
+  }
+
+  async fn pump<G, S>(&self, guest: G, server: S, prefix: &[u8], alpn: Option<&[u8]>) -> Result<(), Error>
+  where
+    G: AsyncRead + AsyncWrite + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
+  {
     let ctx = PairCtx {
-      grants: &grants,
+      grants: &self.grants,
       redact: &self.redact,
       host: &self.identity,
       port: self.port,
       plugins: &self.plugins,
       mint: self.mint.clone(),
     };
-    // The relay handshook the upstream leg before the guest's, and answered
-    // the guest with what that leg agreed, so this one fact frames both
-    // directions. Nothing here reads a plaintext byte.
-    let negotiated = guest_tls
-      .extensions()
-      .get_ref::<NegotiatedTlsParameters>()
-      .and_then(|params| params.application_layer_protocol.as_ref());
-    // One negotiated protocol frames both directions. That choice is the only
-    // thing that proves the plaintext is HTTP: a flow that agreed neither
-    // `h2` nor `http/1.1` relays raw, where the equal-length grants for this
-    // scope still swap and no framing is invented for bytes nobody claimed.
-    // HTTP/2 over TLS is defined by its ALPN identifier (RFC 9113 §3.1), so
-    // an unnegotiated connection is never HTTP/2.
-    match negotiated {
-      Some(proto) if proto.as_bytes() == ApplicationProtocol::HTTP_2.as_bytes() => {
+    // HTTP/2 over TLS is defined by its ALPN identifier (RFC 9113 §3.1), so an unnegotiated connection is
+    // never HTTP/2.
+    let extra = sibling_upstream_pairs(&self.redact, Scheme::Https, &self.identity, self.port, self.dial_port);
+    match alpn {
+      Some(proto) if proto == ApplicationProtocol::HTTP_2.as_bytes() => {
         let (mut downstream_machine, mut upstream_machine) = https_h2_pair(&ctx);
-        relay_guarded(
-          &mut guest_tls,
-          &mut server_tls,
-          &mut downstream_machine,
-          &mut upstream_machine,
-          &[],
-          &[],
-        )
-        .await
-        .map_err(|err| into_box_error(&err))
+        upstream_machine.extend_redaction(&extra);
+        relay_guarded(guest, server, &mut downstream_machine, &mut upstream_machine, prefix, &[]).await
       }
-      Some(proto) if proto.as_bytes() == ApplicationProtocol::HTTP_11.as_bytes() => {
+      Some(proto) if proto == ApplicationProtocol::HTTP_11.as_bytes() => {
         let (mut downstream_machine, mut upstream_machine) = https_pair(&ctx);
-        relay_guarded(
-          &mut guest_tls,
-          &mut server_tls,
-          &mut downstream_machine,
-          &mut upstream_machine,
-          &[],
-          &[],
-        )
-        .await
-        .map_err(|err| into_box_error(&err))
+        upstream_machine.extend_redaction(&extra);
+        relay_guarded(guest, server, &mut downstream_machine, &mut upstream_machine, prefix, &[]).await
       }
       _ => {
         let (mut downstream_machine, mut upstream_machine) = raw_tls_pair(&ctx);
-        relay_guarded(
-          &mut guest_tls,
-          &mut server_tls,
-          &mut downstream_machine,
-          &mut upstream_machine,
-          &[],
-          &[],
-        )
-        .await
-        .map_err(|err| into_box_error(&err))
+        upstream_machine.extend_redaction(&extra);
+        relay_guarded(guest, server, &mut downstream_machine, &mut upstream_machine, prefix, &[]).await
       }
     }
   }
+}
+
+fn negotiated_alpn<GI>(guest: &TlsStream<GI>) -> Option<Vec<u8>>
+where
+  GI: ExtensionsRef,
+{
+  guest
+    .extensions()
+    .get_ref::<NegotiatedTlsParameters>()
+    .and_then(|params| params.application_layer_protocol.as_ref())
+    .map(|proto| proto.as_bytes().to_vec())
 }
 
 /// Both directions for a cleartext HTTP connection.
@@ -507,6 +465,8 @@ mod tests {
       client_key: None,
       root_cert: root,
       guest_tls: GuestTlsMode::Tls,
+
+      upstream_port: None,
     };
     (grant, scope)
   }
@@ -536,39 +496,5 @@ mod tests {
     let bundles = DashMap::new();
     let err = shared_root(&bundles, &hits, "127.0.0.1", 6443).expect_err("different certificates disagree");
     assert!(matches!(err, Error::SplitTrustBundle { port: 6443, .. }), "{err}");
-  }
-
-  #[test]
-  fn guest_leaf_follows_the_label_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let ca = CertAuthority::generate().unwrap();
-    let label = "kube-user-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let client = dir.path().join("other.client.crt");
-    std::fs::write(&client, ca.cert_pem()).unwrap();
-    std::fs::write(dir.path().join(format!("{label}.guest.crt")), ca.cert_pem()).unwrap();
-    std::fs::write(dir.path().join("other.guest.crt"), CertAuthority::generate().unwrap().cert_pem()).unwrap();
-    let grant = Grant::Token {
-      credential: Credential {
-        label: label.into(),
-        fake: "fake".into(),
-        value: SecretString::from("real".to_string()),
-      },
-      allow: Vec::new(),
-      pattern: None,
-      oauth2: None,
-    };
-    let scope = EndpointScope {
-      scheme: Scheme::Https,
-      host: "127.0.0.1".parse().unwrap(),
-      port: 6443,
-      client_cert: Some(client),
-      client_key: None,
-      root_cert: None,
-      guest_tls: GuestTlsMode::Tls,
-    };
-    let cache = DashMap::new();
-    let leaf = guest_leaf(&cache, &grant, &scope).expect("leaf reads");
-    let der = leaf.expect("the label file is the guest leaf");
-    assert_eq!(der, ca.cert_der().as_ref());
   }
 }

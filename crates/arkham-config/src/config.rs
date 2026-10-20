@@ -447,9 +447,6 @@ impl RuleCfg {
 }
 
 /// Per-entry TLS configuration, keyed by the rule's own `allow` entry string.
-/// The proxy reads `client_cert`, `client_key`, `root_cert` and `guest_tls_mode`;
-/// `guest_cert` and `guest_key` are compose-only mount targets inside the
-/// guest container and no proxy behavior reads them.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostTlsCfg {
@@ -472,6 +469,10 @@ pub struct HostTlsCfg {
   /// Container-internal path the guest's minted key mounts at.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub guest_key: Option<PathBuf>,
+  /// Port the upstream dial uses when the allow entry's port is a decoy.
+  /// Absent dials the entry port.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub upstream_port: Option<u16>,
 }
 
 /// Per-entry SSH key material, keyed by the rule's own `allow` entry string.
@@ -1094,6 +1095,8 @@ pub fn reference_samples() -> Result<String, Error> {
       guest_tls_mode: GuestTlsMode::Mtls,
       guest_cert: Some("{home}/.certs/client.pem".into()),
       guest_key: Some("{home}/.certs/client.key".into()),
+
+      upstream_port: None,
     },
   );
   let rule = RuleCfg {

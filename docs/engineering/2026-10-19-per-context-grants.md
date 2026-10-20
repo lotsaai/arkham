@@ -2,7 +2,7 @@
 
 Several contexts in one kubeconfig, Talos config, NATS directory, or SSH config can share a destination and still be different subjects. This note is the contract for choosing among them. The helper in `arkham_config::context` names each subject and fails when two of them cannot be told apart on one destination. Adapter and proxy changes belong to #62, #63, #64, and #65.
 
-The choice uses the destination host and port, the client identity, and the decoy bytes. No new config key is added. The proxy terminates the guest session and opens its own upstream session. Real credentials stay on that upstream leg.
+The choice uses the destination host and port and the decoy the guest presents. Kubernetes presents that decoy as a bearer token on a per-user endpoint. Talos presents a client certificate. SSH presents a public key. NATS presents CONNECT fields. The operator sets no new key. The proxy terminates the guest session and opens its own upstream session. Real credentials stay on that upstream leg.
 
 `current-context`, the Talos `context` key, and NATS `context.txt` copy the host's current value into the guest. The proxy does not read that pointer when it chooses a credential. Changing the pointer inside the guest changes the guest's default command. `kubectl --context`, `talosctl --context`, and `nats --context` work because every granted context is in the decoy file with its own decoy. `kubectl config use-context`, `talosctl config context`, and `nats context select` rewrite the pointer. The sibling issues mount the generated decoy so those writes succeed, and they leave the host file unmounted for writes.
 
@@ -24,13 +24,17 @@ For source `/home/ivan/.ssh/config`, protocol `Ssh`, and name `git`, the label a
 
 #62 calls `identities` once per distinct user with `KubernetesUser`, and once per distinct cluster with `KubernetesCluster`. Contexts that share a user share that user identity. Contexts that share a cluster share that cluster's label for the CA file. One user is one rule. The allow list is every server that user talks to. The same server and the same user are one grant. `current-context` is not an input.
 
-#62 asks the client for a certificate and does not require one. A certificate on the handshake selects the grant whose client pair matches those bytes. No certificate selects the grant whose `secret()` matches the bearer. A grant with `guest_tls_mode = mtls` does not match a request that presents no certificate, including a request that carries that context's bearer, so mTLS stays enforced. Two certificate grants that match the same bytes are `AmbiguousContexts`. Two bearer grants that match the same bytes are `AmbiguousContexts`. A tls grant and an mtls grant on one server are two grants. `require_distinct` is not how that pair is refused.
+The host keeps the auth its kubeconfig already has. A bearer stays the grant value. A client certificate and key stay the upstream identity. A user who has only a certificate gets an empty grant value, and the request machine removes that user's decoy `Authorization` bearer so the apiserver sees the client certificate alone. Toward the guest, every user gets one decoy. That decoy is `secret()` as an HTTP bearer, and the decoy cluster is plain TLS to arkham's CA. The decoy file carries no client certificate and no client key. Exec-plugin users and auth-provider users stay out of the grants. That work is #72. An auth-provider block is dropped from the guest file so its secret does not reach the guest.
 
-#62 stops using the first `Grant::endpoint` in `crates/arkham-proxy/src/transports/http/mod.rs` as the credential choice. The selected grant supplies `client_cert`, `client_key`, `root_cert`, and `guest_tls_mode`. `eligible_pairs` for that connection is that grant alone. `client_auth_policy` admits a certificate signed by the arkham CA.
+A context is a cluster server, a user, and a namespace. The server URL does not distinguish two users of one cluster. Compose gives each of those users a distinct guest port in `49152..=65535` and writes `upstream_port` on that allow entry's tls table. The guest port is the allow entry. The proxy dials `upstream_port` when it is set, and the entry port otherwise. One user on a server keeps the real URL, and `upstream_port` stays unset. Two contexts that share a user and a server stay one endpoint.
 
-In `/home/ivan/.kube/config`, contexts `prod` and `staging` both use user `ivan` and server `k8s.example` on port 6443. That is one `KubernetesUser` named `ivan`. A request that presents that user's `secret()` selects that grant.
+`require_distinct` groups host, port, and decoy bearer bytes. Two different users whose decoy bearers match on one host and port are `AmbiguousContexts`, and the message names both. The same user repeated is success.
 
-When two users on `k8s.example:6443` present the same bearer bytes, `require_distinct` names both and #62 writes no grant for that server.
+Grants for one guest host and port must agree on the client certificate, the client key, `guest_tls`, and `upstream_port`. Disagreement is `AmbiguousHttpsGrants`, and the message names the grants. The relay offers that one upstream identity. The request machine substitutes the grants for that guest port. The response machine redacts every real value that dials the same upstream host and port, including a user who reaches that apiserver through a different guest port.
+
+In `/home/ivan/.kube/config`, contexts `prod` and `prod-system` both use user `ivan` and server `k8s.example` on port 6443, and differ by namespace. That is one endpoint. Context `prod-admin` uses user `admin` on that same server, so compose points `ivan` and `admin` at two guest ports and sets `upstream_port` to 6443 on both. Context `staging` uses `ivan` on a different server and keeps that server's URL.
+
+When two users on one guest host and port present the same bearer bytes, `require_distinct` names both and #62 writes no grant for that server.
 
 `KUBECONFIG` is a list split on `:`. #62 reads each file in order and merges it the way kubectl does. A context, cluster, or user name that is already defined stays as it is. A new name is added. `current-context` is the first non-empty value. The winning entry's source path is the file that defined it, so an identity from another file is a different label. A later file's `prod` does not replace the earlier `prod` and is not a second guest context. An empty value means `~/.kube/config`. Host `kubectl --context` is left unread. Context selection stays on the wire.
 
@@ -92,7 +96,7 @@ In `/home/ivan/.ssh/config`, blocks `git` and `git.example` both resolve to host
 
 ## Guest material and old files
 
-The guest file receives `secret()`, the certificate named by the label, or the public half of the seeded key. A destination with no matching grant splices.
+The guest file receives `secret()`, the certificate named by the label, or the public half of the seeded key. A Kubernetes guest receives `secret()` as a bearer and does not receive a guest certificate. A destination with no matching grant splices.
 
 Adopting the helper changes the label, the env, and the pem file name. Nothing copies an old pair onto the new name. `load_or_generate_client_pair` mints a new pair on the first adapt after the switch. `write_state` removes a stale file whose name starts with `kube-`, `talos-`, `ssh-`, `git-`, or `nats-` when that name is not in the current set. Older slug files that do not start with those prefixes stay until a sibling removes them. NATS nkeys and SSH keys become stable on the first adapt that uses `key_seed()`.
 
@@ -100,12 +104,9 @@ Adopting the helper changes the label, the env, and the pem file name. Nothing c
 
 The following stay out of this change:
 
-- Adapter edits
-- Proxy edits
+- Exec and auth-provider credential plugins. That work is #72.
+- Guest-side mTLS for Kubernetes. The guest presents a bearer. The proxy presents the host client certificate upstream.
 - `twin`
 - Wildcard SSH
 - `SshKey::from_seed`
-- New config keys
-- New buffers
-- A Tokio test
 - A new crate

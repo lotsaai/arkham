@@ -121,14 +121,6 @@ fn https_relay(ca: &CertAuthority, extra: &[CertificateDer<'static>]) -> Result<
   Ok(TlsMitmRelay::new_cached_in_memory(crt, key).with_egress_server_auth(egress))
 }
 
-/// Read every bundle, guest leaf, and client pair the grants name.
-///
-/// A missing guest leaf is not an error: that grant has no certificate to match.
-/// A named trust bundle that is missing or empty fails here.
-///
-/// # Errors
-///
-/// Returns an error when a named file cannot be read or a bundle holds no certificate.
 fn warm_grant_files(
   resolved: &ResolvedConfig,
   guest_certs: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>,
@@ -138,16 +130,12 @@ fn warm_grant_files(
     require_bundle(guest_certs, path)?;
   }
   for grant in &resolved.grants {
-    let Grant::Token { credential, allow, .. } = grant else {
+    let Grant::Token { allow, .. } = grant else {
       continue;
     };
     for scope in allow {
       if let Some(path) = &scope.root_cert {
         require_bundle(guest_certs, path)?;
-      }
-      if let Some(cert) = &scope.client_cert {
-        let leaf = cert.with_file_name(arkham_config::context::guest_cert_file(&credential.label));
-        crate::transports::tls::cached_guest_certs(guest_certs, &leaf)?;
       }
       if let (Some(cert), Some(key)) = (&scope.client_cert, &scope.client_key) {
         crate::transports::tls::cached_client_identity(identities, cert, key)?;

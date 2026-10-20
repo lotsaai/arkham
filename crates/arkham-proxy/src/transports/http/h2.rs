@@ -12,6 +12,7 @@ use arkham_plugin::{Head as PluginHead, Header as PluginHeader, RewriteHook, Ver
 use crate::transports::engine::{
   CredentialPair, Direction, Hit, Location, MAX_MINT_BODY, MintPlan, PeerFact, Rewritten, Wire, eligible_pairs, max_tail_size,
   mint_and_redact, mint_plan_for, minted_pairs, needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
+  selector_fakes,
 };
 
 /// HTTP/2 connection preface.
@@ -118,6 +119,7 @@ pub(crate) struct H2 {
   /// Static grant pairs from construction; `pairs` rebuilds from these
   /// whenever minted pairs refresh.
   static_pairs: Vec<CredentialPair>,
+  strip_bearers: Vec<Vec<u8>>,
   /// Runtime mint handle; `None` keeps value-swap-only behavior.
   mint: Option<crate::mint::MintHandle>,
   /// Response side: the flow-granted grant's expectations, when this
@@ -142,6 +144,11 @@ impl H2 {
     mint: Option<crate::mint::MintHandle>,
   ) -> Self {
     let static_pairs = eligible_pairs(grants, scheme, host, port, dir);
+    let strip_bearers = if dir == Direction::Downstream {
+      selector_fakes(grants, scheme, host, port)
+    } else {
+      Vec::new()
+    };
     let tail_size = max_tail_size(&static_pairs);
     let mint_plan = (dir == Direction::Upstream)
       .then(|| mint_plan_for(grants, scheme, host, port))
@@ -167,6 +174,7 @@ impl H2 {
       suppress_body: 0,
       must_close: false,
       static_pairs,
+      strip_bearers,
       mint,
       mint_plan,
       mint_streams: HashMap::new(),
@@ -175,6 +183,18 @@ impl H2 {
     // minted on any connection substitutes or redacts on this one too.
     wire.refresh_minted_pairs();
     wire
+  }
+
+  pub(crate) fn extend_redaction(&mut self, extra: &[CredentialPair]) {
+    if extra.is_empty() {
+      return;
+    }
+    self.static_pairs.extend(extra.iter().cloned());
+    self.pairs.clone_from(&self.static_pairs);
+    if let Some(mint) = &self.mint {
+      self.pairs.extend(minted_pairs(mint, self.dir));
+    }
+    self.tail_size = max_tail_size(&self.pairs);
   }
 
   /// Rebuild the active pair set: static grants plus every minted decoy.
@@ -507,6 +527,9 @@ impl H2 {
       self.refresh_minted_pairs();
     }
     substitute_h2_values(&mut headers, &self.pairs, hits);
+    if self.dir == Direction::Downstream {
+      drop_selector_bearer(&mut headers, &self.strip_bearers);
+    }
     if let Some(hook) = self.hook.as_mut() {
       let has_method = headers.iter().any(|(name, _, _)| name.eq_ignore_ascii_case(b":method"));
       let has_status = headers.iter().any(|(name, _, _)| name.eq_ignore_ascii_case(b":status"));
@@ -694,6 +717,27 @@ fn finalize_borrow(chunk: &[u8], out: Vec<u8>, hits: Vec<Hit>) -> (Cow<'_, [u8]>
   } else {
     (Cow::Owned(out), hits)
   }
+}
+
+fn drop_selector_bearer(headers: &mut Vec<(Vec<u8>, Vec<u8>, u8)>, tokens: &[Vec<u8>]) {
+  if tokens.is_empty() {
+    return;
+  }
+  headers.retain(|(name, value, _)| {
+    if !name.eq_ignore_ascii_case(b"authorization") {
+      return true;
+    }
+    let Ok(text) = std::str::from_utf8(value) else {
+      return true;
+    };
+    let Some((scheme, token)) = text.trim().split_once(char::is_whitespace) else {
+      return true;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+      return true;
+    }
+    !tokens.iter().any(|fake| fake.as_slice() == token.trim().as_bytes())
+  });
 }
 
 /// Substitute all pairs in decoded header values. `:authority` is skipped

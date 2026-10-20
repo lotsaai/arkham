@@ -194,6 +194,8 @@ async fn transparent_plain_http_honors_http_grant() {
       client_key: None,
       root_cert: None,
       guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+      upstream_port: None,
     }],
     pattern: None,
     oauth2: None,

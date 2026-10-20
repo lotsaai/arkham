@@ -823,6 +823,8 @@ mod tests {
         guest_tls_mode: GuestTlsMode::Mtls,
         guest_cert: guest_cert.map(PathBuf::from),
         guest_key: guest_key.map(PathBuf::from),
+
+        upstream_port: None,
       },
     );
     let rule = RuleCfg {

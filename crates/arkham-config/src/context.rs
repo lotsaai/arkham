@@ -40,12 +40,6 @@ impl AmbientProtocol {
   }
 }
 
-/// Guest leaf file written beside a context's client certificate.
-#[must_use]
-pub fn guest_cert_file(label: &str) -> String {
-  format!("{label}.guest.crt")
-}
-
 /// Why a source path cannot identify a context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PathFault {
@@ -729,13 +723,5 @@ mod tests {
       Error::WireHostEmpty => {}
       other => panic!("expected an empty host, got {other}"),
     }
-  }
-
-  #[test]
-  fn guest_cert_file_is_the_label_and_guest_crt() {
-    assert_eq!(
-      super::guest_cert_file("talos-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-      "talos-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.guest.crt"
-    );
   }
 }

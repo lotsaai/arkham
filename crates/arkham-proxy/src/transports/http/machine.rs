@@ -10,6 +10,7 @@ use arkham_plugin::{Head as PluginHead, Header as PluginHeader, RewriteHook, Ver
 use crate::transports::engine::{
   CredentialPair, Direction, Hit, Location, MAX_MINT_BODY, MintPlan, PeerFact, Rewritten, Wire, eligible_pairs, max_tail_size,
   mint_and_redact, mint_plan_for, minted_pairs, needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
+  selector_fakes,
 };
 
 /// Max buffered header block before degrading to opaque scan-only.
@@ -114,6 +115,7 @@ pub(crate) struct Http {
   /// Static grant pairs from construction; `pairs` rebuilds from these
   /// whenever minted pairs refresh.
   static_pairs: Vec<CredentialPair>,
+  strip_bearers: Vec<Vec<u8>>,
   /// Runtime mint handle; `None` keeps value-swap-only behavior.
   mint: Option<crate::mint::MintHandle>,
   /// Response side: the flow-granted grant's expectations, when this
@@ -142,6 +144,11 @@ impl Http {
     mint: Option<crate::mint::MintHandle>,
   ) -> Self {
     let static_pairs = eligible_pairs(grants, scheme, host, port, dir);
+    let strip_bearers = if dir == Direction::Downstream {
+      selector_fakes(grants, scheme, host, port)
+    } else {
+      Vec::new()
+    };
     let tail_size = max_tail_size(&static_pairs);
     // Response machines mint when a flow-granted grant matches this endpoint.
     let mint_plan = (dir == Direction::Upstream)
@@ -167,6 +174,7 @@ impl Http {
       must_close: false,
       hook,
       static_pairs,
+      strip_bearers,
       mint,
       mint_plan,
       mint_head: Vec::new(),
@@ -177,6 +185,18 @@ impl Http {
     // minted on any connection substitutes or redacts on this one too.
     wire.refresh_minted_pairs();
     wire
+  }
+
+  pub(crate) fn extend_redaction(&mut self, extra: &[CredentialPair]) {
+    if extra.is_empty() {
+      return;
+    }
+    self.static_pairs.extend(extra.iter().cloned());
+    self.pairs.clone_from(&self.static_pairs);
+    if let Some(mint) = &self.mint {
+      self.pairs.extend(minted_pairs(mint, self.dir));
+    }
+    self.tail_size = max_tail_size(&self.pairs);
   }
 
   /// Rebuild the active pair set: static grants plus every minted decoy.
@@ -703,6 +723,28 @@ impl Http {
     }
   }
 
+  fn drop_selector_bearer(&self, head: Vec<u8>) -> Vec<u8> {
+    if self.strip_bearers.is_empty() {
+      return head;
+    }
+    let Ok(text) = std::str::from_utf8(&head) else {
+      return head;
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut first = true;
+    for line in text.split("\r\n") {
+      if selector_bearer_line(line, &self.strip_bearers) {
+        continue;
+      }
+      if !first {
+        out.push_str("\r\n");
+      }
+      first = false;
+      out.push_str(line);
+    }
+    out.into_bytes()
+  }
+
   /// Substitute a complete head block (ending exactly at the boundary) and
   /// set the body state. Returns the head bytes to emit plus hits.
   /// Stage order: value swap first (stage 0), then the plugin hook on the
@@ -719,12 +761,14 @@ impl Http {
       // Unparseable head: still substitute header lines (fully buffered),
       // then opaque — the body boundary is unknowable.
       let (new_head, hits) = substitute_head(head_str, &self.pairs);
+      let new_head = self.drop_selector_bearer(new_head);
       self.state = State::Opaque;
       self.fail_closed_on_degrade();
       return (new_head, hits);
     }
     // Stage 0: the value swap, computed once and reused in every arm.
     let (mut new_head, hits) = substitute_head(head_str, &self.pairs);
+    new_head = self.drop_selector_bearer(new_head);
     if self.hook.is_some() {
       // Stage 1: on `Close` the swapped bytes are returned unchanged; the
       // latched relay drops the connection before they reach the wire.
@@ -1089,6 +1133,24 @@ fn has_non_identity_content_encoding(headers: &[httparse::Header<'_>]) -> bool {
       };
       value.split(',').any(|encoding| !encoding.trim().eq_ignore_ascii_case("identity"))
     })
+}
+
+fn selector_bearer_line(line: &str, tokens: &[Vec<u8>]) -> bool {
+  let Some((name, value)) = line.split_once(':') else {
+    return false;
+  };
+  if !name.eq_ignore_ascii_case("authorization") {
+    return false;
+  }
+  let value = value.trim_start();
+  let Some((scheme, token)) = value.split_once(char::is_whitespace) else {
+    return false;
+  };
+  if !scheme.eq_ignore_ascii_case("bearer") {
+    return false;
+  }
+  let token = token.trim();
+  tokens.iter().any(|fake| fake.as_slice() == token.as_bytes())
 }
 
 /// Substitute all pairs in a head block: Basic-auth lines first (decoded),
@@ -1481,6 +1543,25 @@ mod tests {
 
   fn req_machine() -> Http {
     Http::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Downstream, None, None)
+  }
+
+  #[tokio::test]
+  async fn empty_value_bearer_is_removed_without_splitting_the_head() {
+    let grants = vec![Grant::Token {
+      credential: Credential {
+        label: "cert-user".into(),
+        fake: FAKE.into(),
+        value: secrecy::SecretString::from(String::new()),
+      },
+      allow: vec!["https://api.github.com".parse().unwrap()],
+      pattern: None,
+      oauth2: None,
+    }];
+    let mut req = Http::new(&grants, Scheme::Https, "api.github.com", 443, Direction::Downstream, None, None);
+    let input = format!("GET / HTTP/1.1\r\nAuthorization: Bearer {FAKE}\r\nhost: api.github.com\r\n\r\n");
+    let (out, _) = req.substitute(input.as_bytes()).await;
+    let text = String::from_utf8(out.into_owned()).unwrap();
+    assert_eq!(text, "GET / HTTP/1.1\r\nhost: api.github.com\r\n\r\n");
   }
 
   fn resp_machine() -> Http {

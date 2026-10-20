@@ -206,6 +206,8 @@ fn mtls_grants(fake: &str, real: &str) -> Result<Vec<Grant>, Box<arkham_config::
       guest_tls_mode: GuestTlsMode::Mtls,
       guest_cert: None,
       guest_key: None,
+
+      upstream_port: None,
     },
   );
   let mut rules = BTreeMap::new();

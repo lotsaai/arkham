@@ -59,6 +59,8 @@ fn plugin_allow(port: u16) -> Vec<EndpointScope> {
     client_key: None,
     root_cert: None,
     guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+    upstream_port: None,
   }]
 }
 
@@ -399,6 +401,8 @@ async fn plugin_e2e_grant_mismatch_not_invoked() {
           client_key: None,
           root_cert: None,
           guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+
+          upstream_port: None,
         }],
         direction: PluginDirection::Both,
       }]

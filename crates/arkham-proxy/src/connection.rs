@@ -1,12 +1,11 @@
 //! Connection layer: guest adapters, the terminated-TLS pump, dialing.
 //! Knows bytes and TLS; nothing of wire formats.
 
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use dashmap::DashMap;
@@ -18,11 +17,9 @@ use rama::service::service_fn;
 use rama::tcp::client::TcpStreamConnector;
 use rama::tcp::stream::TokioTcpStream;
 use rama::tls::boring::client::ConnectorConfigClientAuth;
-use rama::tls::boring::core::ssl::{SslCredential, SslRef, SslVerifyMode};
+use rama::tls::boring::core::ssl::SslCredential;
 use rama::tls::boring::core::x509::store::X509Store;
-use rama::tls::boring::proxy::client_auth::{
-  TlsMitmClientAuthInput, TlsMitmClientAuthPlan, TlsMitmClientAuthPolicy, TlsMitmClientIdentity,
-};
+use rama::tls::boring::proxy::client_auth::{TlsMitmClientAuthInput, TlsMitmClientAuthPlan, TlsMitmClientAuthPolicy};
 use rama::tls::client::{ClientAuth, ClientAuthData};
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::Error as PemError};
@@ -30,7 +27,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
-use arkham_config::grants::{EndpointScope, Grant, GuestTlsMode, Scheme};
+use arkham_config::grants::{EndpointScope, GuestTlsMode};
 
 use crate::Error;
 use crate::identity::{Hello, read_client_hello};
@@ -168,165 +165,6 @@ fn mtls_policy(store: &X509Store, credential: Option<SslCredential>) -> TlsMitmC
     let store = store.clone();
     async move { Ok::<_, std::convert::Infallible>(TlsMitmClientAuthPlan::fixed(credential).with_ingress_trust(store)) }
   }))
-}
-
-/// One https grant that can be chosen for a destination shared by several grants.
-#[derive(Clone)]
-pub(crate) struct HttpsCandidate {
-  /// Grant this candidate selects.
-  pub(crate) grant: Grant,
-  /// Guest TLS mode of the matching allow entry.
-  pub(crate) guest_tls: GuestTlsMode,
-  /// DER of the guest leaf this grant's client pair expects, when it has one.
-  pub(crate) leaf: Option<Vec<u8>>,
-}
-
-/// Policy for several https grants on one destination.
-///
-/// A presented certificate selects the matching grant. No certificate selects
-/// the `Tls` grants. `choose_https` stores that choice in `selected`.
-pub(crate) fn optional_client_auth_policy(
-  candidates: Vec<HttpsCandidate>,
-  trust: &X509Store,
-  host: &str,
-  port: u16,
-  selected: Arc<Mutex<Vec<Grant>>>,
-  identities: Arc<DashMap<PathBuf, ClientAuth>>,
-) -> TlsMitmClientAuthPolicy {
-  let store = trust.clone();
-  let host = host.to_string();
-  TlsMitmClientAuthPolicy::new(service_fn(move |input: TlsMitmClientAuthInput| {
-    let wants_upstream = input.request.is_some();
-    let candidates = candidates.clone();
-    let selected = Arc::clone(&selected);
-    let identities = Arc::clone(&identities);
-    let store = store.clone();
-    let host = host.clone();
-    async move {
-      let plan = TlsMitmClientAuthPlan::new(service_fn(move |identity: TlsMitmClientIdentity| {
-        let candidates = candidates.clone();
-        let selected = Arc::clone(&selected);
-        let identities = Arc::clone(&identities);
-        let host = host.clone();
-        async move { choose_https(&identity, &candidates, wants_upstream, &host, port, &selected, &identities) }
-      }))
-      .with_ingress(move |ssl: &mut SslRef| {
-        ssl.set_verify_cert_store(store)?;
-        ssl.set_verify(SslVerifyMode::PEER);
-        Ok(())
-      });
-      Ok::<_, std::convert::Infallible>(plan)
-    }
-  }))
-}
-
-fn choose_https(
-  identity: &TlsMitmClientIdentity,
-  candidates: &[HttpsCandidate],
-  wants_upstream: bool,
-  host: &str,
-  port: u16,
-  selected: &Mutex<Vec<Grant>>,
-  identities: &DashMap<PathBuf, ClientAuth>,
-) -> Result<Option<SslCredential>, Error> {
-  let grants = match identity.leaf() {
-    None => bearer_grants(candidates, host, port)?,
-    Some(leaf) => {
-      let der = leaf.to_der().map_err(|err| Error::ClientAuthPolicy { source: Box::new(err) })?;
-      presented_grants(candidates, &der, host, port)?
-    }
-  };
-  let credential = if wants_upstream && grants.len() == 1 {
-    upstream_credential(identities, &grants[0], host, port)?
-  } else {
-    None
-  };
-  *selected.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = grants;
-  Ok(credential)
-}
-
-/// Grants whose guest leaf equals `der`.
-///
-/// # Errors
-///
-/// Returns [`Error::UnmatchedClientCert`] when no candidate carries `der`,
-/// and [`Error::AmbiguousHttpsGrants`] when more than one does.
-pub(crate) fn presented_grants(candidates: &[HttpsCandidate], der: &[u8], host: &str, port: u16) -> Result<Vec<Grant>, Error> {
-  let matched: Vec<&HttpsCandidate> = candidates
-    .iter()
-    .filter(|candidate| candidate.leaf.as_deref() == Some(der))
-    .collect();
-  match matched.as_slice() {
-    [] => Err(Error::UnmatchedClientCert {
-      host: host.to_string(),
-      port,
-    }),
-    [one] => Ok(vec![one.grant.clone()]),
-    many => Err(Error::AmbiguousHttpsGrants {
-      host: host.to_string(),
-      port,
-      labels: grant_labels(many),
-    }),
-  }
-}
-
-fn bearer_grants(candidates: &[HttpsCandidate], host: &str, port: u16) -> Result<Vec<Grant>, Error> {
-  let bearer: Vec<&HttpsCandidate> = candidates
-    .iter()
-    .filter(|candidate| candidate.guest_tls == GuestTlsMode::Tls)
-    .collect();
-  if bearer.is_empty() {
-    return Err(Error::ClientCertRequired {
-      host: host.to_string(),
-      port,
-    });
-  }
-  if let Some(labels) = colliding_fakes(&bearer) {
-    return Err(Error::AmbiguousHttpsGrants {
-      host: host.to_string(),
-      port,
-      labels,
-    });
-  }
-  Ok(bearer.into_iter().map(|candidate| candidate.grant.clone()).collect())
-}
-
-fn colliding_fakes(candidates: &[&HttpsCandidate]) -> Option<String> {
-  let mut groups: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-  for candidate in candidates {
-    let Some(credential) = candidate.grant.credential() else {
-      continue;
-    };
-    groups.entry(credential.fake.as_str()).or_default().push(credential.label.as_str());
-  }
-  let labels = groups.into_values().find(|labels| labels.len() > 1)?;
-  let mut labels: Vec<&str> = labels;
-  labels.sort_unstable();
-  Some(labels.join(", "))
-}
-
-fn grant_labels(candidates: &[&HttpsCandidate]) -> String {
-  let mut labels: Vec<&str> = candidates
-    .iter()
-    .filter_map(|candidate| candidate.grant.credential().map(|credential| credential.label.as_str()))
-    .collect();
-  labels.sort_unstable();
-  labels.join(", ")
-}
-
-fn upstream_credential(
-  identities: &DashMap<PathBuf, ClientAuth>,
-  grant: &Grant,
-  host: &str,
-  port: u16,
-) -> Result<Option<SslCredential>, Error> {
-  let Some(scope) = grant.endpoint(Scheme::Https, Some(host), port) else {
-    return Ok(None);
-  };
-  let (Some(cert), Some(key)) = (&scope.client_cert, &scope.client_key) else {
-    return Ok(None);
-  };
-  ssl_credential(identities, cert, key).map(Some)
 }
 
 fn ssl_credential(identities: &DashMap<PathBuf, ClientAuth>, cert: &Path, key: &Path) -> Result<SslCredential, Error> {
@@ -499,6 +337,7 @@ mod tests {
   use rama::tls::boring::core::x509::store::X509StoreBuilder;
 
   use super::*;
+  use arkham_config::grants::Scheme;
   use arkham_pki::ca::CertAuthority;
 
   fn tls_scope() -> EndpointScope {
@@ -510,6 +349,7 @@ mod tests {
       client_key: None,
       root_cert: None,
       guest_tls: GuestTlsMode::Tls,
+      upstream_port: None,
     }
   }
 
@@ -528,85 +368,5 @@ mod tests {
       policy.is_some(),
       "anonymous legs must answer an upstream certificate request empty instead of dying"
     );
-  }
-
-  fn candidate(label: &str, fake: &str, mode: GuestTlsMode, leaf: Option<Vec<u8>>) -> HttpsCandidate {
-    use arkham_config::grants::Credential;
-    use secrecy::SecretString;
-
-    HttpsCandidate {
-      grant: Grant::Token {
-        credential: Credential {
-          label: label.into(),
-          fake: fake.into(),
-          value: SecretString::from(format!("{label}-real")),
-        },
-        allow: Vec::new(),
-        pattern: None,
-        oauth2: None,
-      },
-      guest_tls: mode,
-      leaf,
-    }
-  }
-
-  #[test]
-  fn bearer_path_excludes_mtls_grants() {
-    let candidates = [
-      candidate("cert-user", "cert-fake", GuestTlsMode::Mtls, Some(b"leaf-a".to_vec())),
-      candidate("bearer-user", "bearer-fake", GuestTlsMode::Tls, None),
-    ];
-    let grants = bearer_grants(&candidates, "k8s.example", 6443).expect("one bearer grant");
-    let labels: Vec<&str> = grants
-      .iter()
-      .filter_map(|grant| grant.credential().map(|cred| cred.label.as_str()))
-      .collect();
-    assert_eq!(labels, ["bearer-user"]);
-  }
-
-  #[test]
-  fn same_fake_on_two_tls_grants_names_both_labels() {
-    let candidates = [
-      candidate("zeta", "same-fake", GuestTlsMode::Tls, None),
-      candidate("alpha", "same-fake", GuestTlsMode::Tls, None),
-    ];
-    let err = bearer_grants(&candidates, "k8s.example", 6443).expect_err("one fake cannot choose");
-    let Error::AmbiguousHttpsGrants { labels, port, .. } = err else {
-      panic!("expected both labels, got {err}");
-    };
-    assert_eq!(port, 6443);
-    assert_eq!(labels, "alpha, zeta");
-  }
-
-  #[test]
-  fn duplicate_guest_leaf_names_both_grants() {
-    let leaf = b"same-leaf".to_vec();
-    let candidates = [
-      candidate("zeta", "fake-z", GuestTlsMode::Mtls, Some(leaf.clone())),
-      candidate("alpha", "fake-a", GuestTlsMode::Mtls, Some(leaf.clone())),
-    ];
-    let err = presented_grants(&candidates, &leaf, "k8s.example", 6443).expect_err("one leaf cannot choose");
-    let Error::AmbiguousHttpsGrants { labels, port, .. } = err else {
-      panic!("expected both labels, got {err}");
-    };
-    assert_eq!(port, 6443);
-    assert_eq!(labels, "alpha, zeta");
-  }
-
-  #[test]
-  fn unknown_client_certificate_is_unmatched() {
-    let candidates = [candidate("cert-user", "cert-fake", GuestTlsMode::Mtls, Some(b"leaf-a".to_vec()))];
-    let err = presented_grants(&candidates, b"other-leaf", "k8s.example", 6443).expect_err("unknown leaf");
-    assert!(matches!(err, Error::UnmatchedClientCert { port: 6443, .. }), "{err}");
-  }
-
-  #[test]
-  fn mtls_grants_without_a_certificate_are_refused() {
-    let candidates = [
-      candidate("one", "fake-one", GuestTlsMode::Mtls, Some(b"leaf-a".to_vec())),
-      candidate("two", "fake-two", GuestTlsMode::Mtls, Some(b"leaf-b".to_vec())),
-    ];
-    let err = bearer_grants(&candidates, "k8s.example", 6443).expect_err("mtls grants need a certificate");
-    assert!(matches!(err, Error::ClientCertRequired { port: 6443, .. }), "{err}");
   }
 }
