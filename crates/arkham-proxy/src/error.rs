@@ -505,48 +505,4 @@ pub enum Error {
     /// Missing bundle path.
     path: PathBuf,
   },
-  /// More than one Talos context matched the guest certificate.
-  #[error("talos contexts {labels} at {host}:{port} match one client certificate")]
-  TalosAmbiguous {
-    /// Labels that matched, already formatted for display.
-    labels: String,
-    /// Destination host the handshake named.
-    host: String,
-    /// Destination port.
-    port: u16,
-  },
-  /// A Talos grant has no upstream CA.
-  #[error("talos grant `{label}` at {host}:{port} names no root_cert")]
-  TalosRootUnset {
-    /// Grant label.
-    label: String,
-    /// Destination host.
-    host: String,
-    /// Destination port.
-    port: u16,
-  },
-  /// A Talos grant has no upstream client certificate.
-  #[error("talos grant `{label}` at {host}:{port} names no client identity")]
-  TalosIdentityUnset {
-    /// Grant label.
-    label: String,
-    /// Destination host.
-    host: String,
-    /// Destination port.
-    port: u16,
-  },
-  /// A Talos upstream name cannot become a TLS server name.
-  #[error("talos server name: {source}")]
-  TalosServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// The Talos upstream TLS handshake fails.
-  #[error("talos upstream TLS: {source}")]
-  TalosUpstreamTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
 }

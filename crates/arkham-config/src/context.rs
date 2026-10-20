@@ -38,24 +38,6 @@ impl AmbientProtocol {
   pub fn tag(self) -> &'static str {
     <&'static str>::from(self)
   }
-
-  /// Whether `label` is one this protocol minted: the tag, `-`, and 32 hex characters.
-  #[must_use]
-  pub fn owns_label(self, label: &str) -> bool {
-    let Some(rest) = label.strip_prefix(self.tag()) else {
-      return false;
-    };
-    let Some(hex) = rest.strip_prefix('-') else {
-      return false;
-    };
-    hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
-  }
-}
-
-/// Guest leaf file written beside a context's client certificate.
-#[must_use]
-pub fn guest_cert_file(label: &str) -> String {
-  format!("{label}.guest.crt")
 }
 
 /// Why a source path cannot identify a context.
@@ -357,8 +339,7 @@ mod tests {
   use pretty_assertions::assert_eq;
 
   use super::{
-    AmbientProtocol, ContextIdentity, ContextRef, NameFault, PathFault, Presented, ensure_distinct, guest_cert_file, identities,
-    require_distinct,
+    AmbientProtocol, ContextIdentity, ContextRef, NameFault, PathFault, Presented, ensure_distinct, identities, require_distinct,
   };
   use crate::Error;
   use crate::config::fake_for;
@@ -742,13 +723,5 @@ mod tests {
       Error::WireHostEmpty => {}
       other => panic!("expected an empty host, got {other}"),
     }
-  }
-
-  #[test]
-  fn guest_cert_file_is_the_label_and_guest_crt() {
-    assert_eq!(
-      guest_cert_file("talos-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-      "talos-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.guest.crt"
-    );
   }
 }

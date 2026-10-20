@@ -36,19 +36,11 @@ When two users on `k8s.example:6443` present the same bearer bytes, `require_dis
 
 ## Talos
 
-The Talos adapter calls `identities` once per context, with protocol `Talos`. One grant per context. Each context gets its own guest pair at the label. The Talos `context` key is left unread. `TALOSCONFIG` is one path. talosctl does not split it on `:`. An empty value means `~/.talos/config`.
+The Talos adapter calls `identities` once per context, with protocol `Talos`. One grant per context. The allow entry is that context's endpoint, and the existing https path matches the host and port, presents that grant's client certificate, and trusts that grant's CA. The Talos `context` key is left unread. `TALOSCONFIG` is one path. talosctl does not split it on `:`. An empty value means `~/.talos/config`.
 
-Selection waits until the handshake shows the client certificate. `relay_guarded` pumps after that choice. There is no new buffer.
+Two contexts that name the same host and port cannot be told apart. `require_distinct` fails the file.
 
-```mermaid
-stateDiagram-v2
-  [*] --> Handshake
-  Handshake --> Selected: client certificate matches one context
-  Handshake --> Closed: no certificate, or more than one context matches
-  Selected --> Pump: relay_guarded
-```
-
-In `/home/ivan/.talos/config`, contexts `prod` and `prod!` both dial host `talos.example` on port 50000. Those are two identities and two certificates. The certificate selects one. When both contexts carry the same certificate bytes, `require_distinct` names `prod` and `prod!` at `talos.example:50000`.
+In `/home/ivan/.talos/config`, contexts `prod` and `staging` that dial `10.5.0.6` and `10.6.0.7` are two grants. Contexts `prod` and `prod!` that both dial `talos.example:50000` fail with `AmbiguousContexts`.
 
 ## NATS
 

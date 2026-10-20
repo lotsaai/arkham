@@ -14,7 +14,6 @@ pub mod postgres;
 pub mod redis;
 pub mod smtp;
 pub mod ssh;
-pub mod talos;
 pub mod tcp;
 pub mod tls;
 

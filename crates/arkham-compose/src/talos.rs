@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::{HostTlsCfg, RewriteFormat};
-use arkham_config::context::{AmbientProtocol, ContextRef, Presented, guest_cert_file, identities, require_distinct};
+use arkham_config::context::{AmbientProtocol, ContextRef, Presented, identities, require_distinct};
 use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -197,7 +197,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     guest_keys.push(fs::read(&key_path).map_err(|source| Error::ReadFile { path: key_path, source })?);
   }
   let mut presented = Vec::new();
-  for ((item, id), guest_cert) in prepared.iter().zip(ids.iter()).zip(guest_certs.iter()) {
+  for (item, id) in prepared.iter().zip(ids.iter()) {
     for allow in &item.allows {
       let HostPat::Exact(host) = &allow.scope.host else {
         return Err(invalid(format!(
@@ -209,7 +209,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
         identity: id,
         host: host.as_str(),
         port: allow.scope.port,
-        decoy: guest_cert.as_slice(),
+        decoy: b"",
       });
     }
   }
@@ -219,8 +219,8 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     return Err(invalid("talos context identities did not cover every granted context".to_string()));
   }
   let mut grants = Vec::with_capacity(prepared.len());
-  for ((item, id), guest_cert) in prepared.iter().zip(ids.iter()).zip(guest_certs.iter()) {
-    grants.push(one_grant(source, item, id, guest_cert, &decoy)?);
+  for (item, id) in prepared.iter().zip(ids.iter()) {
+    grants.push(one_grant(source, item, id, &decoy)?);
   }
   Ok(TalosAdapted { grants, skipped })
 }
@@ -377,24 +377,16 @@ fn client_key_pem(raw: &[u8]) -> Vec<u8> {
 /// # Errors
 ///
 /// Returns an error when the fragment fails to serialize.
-fn one_grant(
-  source: &Path,
-  item: &Prepared,
-  id: &arkham_config::context::ContextIdentity,
-  guest_cert: &[u8],
-  decoy: &str,
-) -> Result<RewriteAdapted, Error> {
+fn one_grant(source: &Path, item: &Prepared, id: &arkham_config::context::ContextIdentity, decoy: &str) -> Result<RewriteAdapted, Error> {
   let label = &id.label;
   let value = String::from_utf8_lossy(&item.crt).into_owned();
   let cert_name = format!("{label}.client.crt");
   let key_name = format!("{label}.client.key");
   let ca_name = format!("{label}.ca.crt");
-  let guest_name = guest_cert_file(label);
   let materialized = vec![
     (cert_name.clone(), item.crt.clone()),
     (key_name.clone(), client_key_pem(&item.key)),
     (ca_name.clone(), item.ca.clone()),
-    (guest_name, guest_cert.to_vec()),
   ];
   let tls = HostTlsCfg {
     client_cert: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}"))),
@@ -529,13 +521,7 @@ mod tests {
     assert!(fragment.contains("guest_tls_mode = \"mtls\""), "{fragment}");
     assert!(decoy.contains("endpoints:\n    - 10.5.0.6"), "{decoy}");
     assert!(decoy.contains("context: prod"), "{decoy}");
-    assert_eq!(adapted.grants[0].materialized.len(), 4);
-    assert!(
-      adapted.grants[0]
-        .materialized
-        .iter()
-        .any(|(name, _)| name == &guest_cert_file(&label))
-    );
+    assert_eq!(adapted.grants[0].materialized.len(), 3);
   }
 
   #[test]
@@ -655,6 +641,25 @@ mod tests {
     for real in [&prod_ca, &prod_crt, &prod_key, &staging_ca, &staging_crt, &staging_key] {
       assert!(!decoy.contains(real), "real material `{real}` survives in the decoy");
     }
+  }
+
+  #[test]
+  fn two_contexts_on_one_endpoint_are_ambiguous() {
+    let body = format!(
+      "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n  staging:\n    endpoints:\n      - 10.5.0.6:50000\n    ca: {}\n    crt: {}\n    key: {}\n",
+      STANDARD.encode(b"CA"),
+      STANDARD.encode(b"CRT"),
+      STANDARD.encode(b"KEY"),
+      STANDARD.encode(b"CA2"),
+      STANDARD.encode(b"CRT2"),
+      STANDARD.encode(b"KEY2"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let err = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).expect_err("shared endpoint");
+    let Error::Config(source) = err else {
+      panic!("expected the context collision, got {err}");
+    };
+    assert!(matches!(source.as_ref(), arkham_config::Error::AmbiguousContexts(_)), "{source}");
   }
 
   #[test]
