@@ -404,6 +404,9 @@ pub enum Error {
     /// Bytes withheld from a later frame.
     room: usize,
   },
+  /// A grant is active and the guest Open could not be lowered.
+  #[error("amqp open could not be lowered")]
+  AmqpOpenUnlowered,
   /// Retained AMQP payload exceeded the connection carry budget.
   #[error("amqp carry holds {bytes} bytes across {entries} links")]
   AmqpCarryBudget {

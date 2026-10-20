@@ -2272,6 +2272,10 @@ mod tests {
     Amqp::new(&grants("amqps"), "mq", 5672, Direction::Upstream, false).expect("secret fits")
   }
 
+  fn up_clear() -> Amqp {
+    Amqp::new(&grants("amqp"), "mq", 5672, Direction::Upstream, false).expect("secret fits")
+  }
+
   fn up_password(real: &str) -> Amqp {
     let scope = AmqpScope::from_strings(&format!("amqp://agent:{FAKE}@mq:5672"), &format!("amqps://svc:{real}@mq:5672")).unwrap();
     let grants = vec![Grant::Amqp {
@@ -3725,6 +3729,83 @@ mod tests {
     client.extend(header_10());
     client.extend(open_frame(max));
     feed_open(&mut guest_side, &client).await
+  }
+
+  fn after_sasl(tail: &[u8]) -> Vec<u8> {
+    let mut client = sasl_init("PLAIN", Some(plain("agent", FAKE)));
+    client.extend(header_10());
+    client.extend(tail);
+    client
+  }
+
+  async fn assert_open_unlowered(tail: &[u8]) {
+    let mut guest_side = down(true);
+    assert!(
+      matches!(guest_side.feed(&after_sasl(tail)).await.0, Rewritten::Close),
+      "an open that cannot be lowered was forwarded"
+    );
+    assert!(
+      matches!(guest_side.close_reason(), Some(crate::Error::AmqpOpenUnlowered)),
+      "the close was not the unlowered open"
+    );
+  }
+
+  #[tokio::test]
+  async fn an_undecodable_open_closes() {
+    let performative = [0x00, 0x53, 0x10, 0x45, 0x00];
+    assert_open_unlowered(&frame_10(0, 2, &performative, &[])).await;
+  }
+
+  #[tokio::test]
+  async fn an_oversized_open_closes() {
+    let total = u32::try_from(super::MAX_CREDENTIAL_FRAME.saturating_add(8)).unwrap();
+    let mut frame = total.to_be_bytes().to_vec();
+    frame.extend([2, 0, 0, 0]);
+    assert_open_unlowered(&frame).await;
+  }
+
+  #[tokio::test]
+  async fn a_bad_header_after_sasl_closes() {
+    let mut guest_side = down(true);
+    let mut client = sasl_init("PLAIN", Some(plain("agent", FAKE)));
+    client.extend(b"AMQP\x02\x00\x00\x00");
+    assert!(
+      matches!(guest_side.feed(&client).await.0, Rewritten::Close),
+      "a bad header after sasl was forwarded"
+    );
+    assert!(
+      matches!(guest_side.close_reason(), Some(crate::Error::AmqpOpenUnlowered)),
+      "the close was not the unlowered open"
+    );
+  }
+
+  #[tokio::test]
+  async fn a_bad_open_doff_closes() {
+    let frame = vec![0, 0, 0, 8, 0, 0, 0, 0];
+    assert_open_unlowered(&frame).await;
+  }
+
+  #[tokio::test]
+  async fn a_cleartext_upstream_does_not_withhold_a_prefix() {
+    let (prefix, rest) = password_split();
+    let mut input = header_10().to_vec();
+    input.extend(transfer(1, true, prefix));
+    input.extend(transfer(1, false, rest));
+    let mut machine = up_clear();
+    let rewritten = machine.feed(&input).await.0;
+    let Rewritten::Emit(emitted) = rewritten else {
+      panic!("cleartext upstream withheld or closed");
+    };
+    assert_eq!(emitted.into_owned(), input);
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn a_cleartext_downstream_forwards_the_open_unchanged() {
+    let mut guest_side = down(false);
+    let client = after_sasl(&open_frame(4_096));
+    let out = feed_open(&mut guest_side, &client).await;
+    assert_eq!(out, client);
   }
 
   #[tokio::test]
