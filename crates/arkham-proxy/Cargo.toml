@@ -40,6 +40,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+async-nats = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 h2 = { workspace = true }
