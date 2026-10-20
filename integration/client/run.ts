@@ -790,12 +790,22 @@ if (LDAP_MTLS_URL) {
           return false;
         }
       }
+      // A required client certificate can close the socket after `startTLS`
+      // has already resolved. The refusal is a failed protected bind.
       try {
         await client.startTLS({ ca, rejectUnauthorized: true, servername: parts.host });
-        return false;
       } catch (err) {
         const text = String(err);
         stage(`ldap mtls certless handshake error: ${text}`);
+        return !text.includes(LDAP_REAL);
+      }
+      try {
+        await client.bind(parts.dn, parts.password);
+        stage("ldap mtls certless protected bind succeeded");
+        return false;
+      } catch (err) {
+        const text = String(err);
+        stage(`ldap mtls certless protected bind error: ${text}`);
         return !text.includes(LDAP_REAL);
       }
     } finally {
