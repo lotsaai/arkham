@@ -26,6 +26,7 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 shellexpand = { workspace = true }
 ssh2-config = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
@@ -37,7 +38,6 @@ xpanda = { workspace = true }
 [dev-dependencies]
 nkeys = { workspace = true }
 pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
 
 [lints]
 workspace = true

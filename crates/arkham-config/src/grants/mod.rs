@@ -313,12 +313,27 @@ impl FromStr for EndpointScope {
       Some(Host::Ipv6(addr)) => addr.to_string(),
       None => return Err(format!("bad allow entry `{entry}`: empty host")),
     };
-    let decoded = percent_encoding::percent_decode_str(&parsed_host).decode_utf8_lossy();
-    let host = if wildcard {
-      let tail = decoded.strip_prefix('w').unwrap_or(&decoded);
-      host_pat(&format!("*{tail}"))
+    // Globs, `?`, and a second percent-decode are ssh allow entries.
+    // Every other scheme keeps `*` and `*.suffix` only.
+    let host = if scheme == Scheme::Ssh {
+      let decoded = percent_encoding::percent_decode_str(&parsed_host).decode_utf8_lossy();
+      if wildcard {
+        let tail = decoded.strip_prefix('w').unwrap_or(decoded.as_ref());
+        host_pat(&format!("*{tail}"))
+      } else {
+        host_pat(decoded.as_ref())
+      }
+    } else if wildcard {
+      let tail = parsed_host.strip_prefix('w').unwrap_or(&parsed_host);
+      if tail.is_empty() {
+        HostPat::Any
+      } else if tail.starts_with('.') && tail.len() > 1 {
+        HostPat::Wildcard(format!("*{tail}"))
+      } else {
+        return Err(format!("bad allow entry `{entry}`: `*` only leads `*` or `*.suffix`"));
+      }
     } else {
-      host_pat(&decoded)
+      HostPat::Exact(parsed_host)
     };
     let port = match (url.port(), scheme) {
       (Some(port), _) => port,
@@ -638,7 +653,11 @@ impl Grant {
 
 /// Every ssh scope on `port`. When `host` is known, only the most specific
 /// matching rank is returned, and every scope at that rank stays so a block
-/// with several identity files is still offered.
+/// with several identity files is still offered. Negation is applied.
+/// When `host` is absent the destination is an address, which is what a
+/// transparent capture has, and neither the pattern nor the negation can
+/// be applied. Every scope on the port stays, and the offered decoy selects
+/// the real key.
 #[must_use]
 pub fn ssh_candidates<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> Vec<&'a SshScope> {
   let mut matched = Vec::new();
@@ -2527,6 +2546,33 @@ mod tests {
     assert!(scope.host.matches("web1.corp"), "{:?}", scope.host);
     assert!(!scope.host.matches("web12.corp"));
     assert!(!scope.host.matches("web.corp"));
+  }
+
+  #[test]
+  fn https_star_inside_the_label_is_rejected() {
+    let err = "https://*api.example.com".parse::<EndpointScope>().unwrap_err();
+    assert!(err.contains("`*` only leads `*` or `*.suffix`"), "{err}");
+  }
+
+  #[test]
+  fn ssh_star_inside_the_label_is_a_glob() {
+    let scope: EndpointScope = "ssh://*api.example.com".parse().unwrap();
+    assert!(matches!(scope.host, HostPat::Glob(_)), "{:?}", scope.host);
+    assert!(scope.host.matches("evilapi.example.com"), "{:?}", scope.host);
+  }
+
+  #[test]
+  fn ssh_candidates_apply_patterns_only_when_the_host_is_known() {
+    let entry = "ssh://*.corp#!bastion.corp";
+    let cfg = cfg_with_ssh(&[entry], ssh_material(entry));
+    let grants = resolve(&cfg).unwrap().grants;
+    assert_eq!(ssh_candidates(&grants, Some("bastion.corp"), 22).len(), 0);
+    assert_eq!(ssh_candidates(&grants, Some("web.corp"), 22).len(), 1);
+    assert_eq!(
+      ssh_candidates(&grants, None, 22).len(),
+      1,
+      "no hostname means the pattern cannot be applied"
+    );
   }
 
   #[test]

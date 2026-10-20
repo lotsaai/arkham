@@ -23,7 +23,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use arkham_config::config::{HostSshCfg, IfMissing};
 use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, Presented, identities, require_distinct};
@@ -35,23 +34,9 @@ use ssh2_config::{ParseRule, SshConfig};
 use crate::adapt::{BLOB_PREFIX_SSH, DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment};
 use crate::error::Error;
 
-/// How deep an `Include` chain may nest. OpenSSH has no fixed cap. Sixteen
-/// is the adapter's.
+/// How many files an `Include` chain may contain, counting the file that
+/// started the chain. The next file is [`Error::SshIncludeDepth`].
 const INCLUDE_LIMIT: u8 = 16;
-
-static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-struct RemoveOnDrop(PathBuf);
-
-impl Drop for RemoveOnDrop {
-  fn drop(&mut self) {
-    if let Err(err) = fs::remove_dir_all(&self.0)
-      && err.kind() != std::io::ErrorKind::NotFound
-    {
-      tracing::warn!(path = %self.0.display(), %err, "ssh include stage cleanup failed");
-    }
-  }
-}
 
 /// One parsed `Host` block that carries at least one readable identity.
 struct ParsedBlock {
@@ -83,18 +68,12 @@ struct Claimed {
 /// contexts share a destination and a decoy.
 pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path) -> Result<Vec<RewriteAdapted>, Error> {
   let text = String::from_utf8_lossy(content);
-  let stage = std::env::temp_dir().join(format!(
-    "arkham-ssh-{}-{}",
-    std::process::id(),
-    STAGE_SEQ.fetch_add(1, Ordering::Relaxed)
-  ));
-  fs::create_dir_all(&stage).map_err(|err| Error::CreateDir {
-    path: stage.clone(),
+  let stage = tempfile::TempDir::new().map_err(|err| Error::CreateDir {
+    path: std::env::temp_dir(),
     source: err,
   })?;
-  let _cleanup = RemoveOnDrop(stage.clone());
   let mut stack = Vec::new();
-  let rewritten = stage_text(source, &text, host_home, &stage, &mut stack, 0)?;
+  let rewritten = stage_text(source, &text, host_home, stage.path(), &mut stack, 0)?;
   let mut reader = Cursor::new(rewritten);
   let parsed = SshConfig::default()
     .parse(&mut reader, ParseRule::ALLOW_UNKNOWN_FIELDS | ParseRule::ALLOW_UNSUPPORTED_FIELDS)
@@ -505,7 +484,7 @@ fn fresh_stem(label: &str, claimed: &BTreeMap<PathBuf, Claimed>) -> String {
 }
 
 fn stage_text(origin: &Path, content: &str, host_home: &Path, stage: &Path, stack: &mut Vec<PathBuf>, depth: u8) -> Result<String, Error> {
-  if depth > INCLUDE_LIMIT {
+  if depth >= INCLUDE_LIMIT {
     return Err(Error::SshIncludeDepth {
       path: origin.to_path_buf(),
       limit: INCLUDE_LIMIT,
@@ -520,28 +499,37 @@ fn stage_text(origin: &Path, content: &str, host_home: &Path, stage: &Path, stac
   let mut out = String::new();
   let mut saw_host = false;
   for line in content.lines() {
-    if let Some((keyword, value)) = directive(line) {
-      let keyword_l = keyword.to_ascii_lowercase();
-      if keyword_l == "host" {
-        saw_host = true;
-      }
-      if keyword_l == "include" {
+    let Some(parsed) = ssh_directive(line) else {
+      out.push_str(line);
+      out.push('\n');
+      continue;
+    };
+    match parsed.keyword.to_ascii_lowercase().as_str() {
+      "host" => saw_host = true,
+      "include" => {
         if saw_host {
           return Err(Error::SshNestedInclude);
         }
-        let pattern = expand_ssh_path(value, host_home);
-        stage_includes(&pattern, host_home, stage, stack, depth)?;
-        out.push_str("Include ");
-        out.push_str(&staged_pattern(&pattern, host_home, stage));
-        out.push('\n');
+        if parsed.args.is_empty() {
+          out.push_str(line);
+          out.push('\n');
+          continue;
+        }
+        for arg in &parsed.args {
+          let pattern = ssh_path(arg, host_home).to_string_lossy().into_owned();
+          stage_includes(&pattern, host_home, stage, stack, depth)?;
+          write_directive(&mut out, "Include", &staged_pattern(&pattern, host_home, stage));
+        }
         continue;
       }
-      if keyword_l == "identityfile" {
-        out.push_str("IdentityFile ");
-        out.push_str(&expand_ssh_path(value, host_home));
-        out.push('\n');
-        continue;
+      "identityfile" => {
+        if let Some(arg) = parsed.args.first() {
+          let path = ssh_path(arg, host_home);
+          write_directive(&mut out, "IdentityFile", &path.to_string_lossy());
+          continue;
+        }
       }
+      _ => {}
     }
     out.push_str(line);
     out.push('\n');
@@ -594,53 +582,118 @@ fn staged_pattern(pattern: &str, host_home: &Path, stage: &Path) -> String {
   format!("{staged}/outside/{rest}")
 }
 
-fn directive(line: &str) -> Option<(&str, &str)> {
-  let line = line.trim();
-  if line.is_empty() || line.starts_with('#') {
+fn write_directive(out: &mut String, keyword: &str, value: &str) {
+  out.push_str(keyword);
+  out.push(' ');
+  if value.contains(char::is_whitespace) {
+    out.push('"');
+    out.push_str(value);
+    out.push('"');
+  } else {
+    out.push_str(value);
+  }
+  out.push('\n');
+}
+
+struct SshDirective<'a> {
+  keyword: &'a str,
+  args: Vec<String>,
+}
+
+/// One `ssh_config` line. The keyword ends at whitespace or `=`. Arguments
+/// split on whitespace outside quotes, and `#` starts a comment there.
+fn ssh_directive(line: &str) -> Option<SshDirective<'_>> {
+  let trimmed = line.trim();
+  if trimmed.is_empty() || trimmed.starts_with('#') {
     return None;
   }
-  let (keyword, rest) = line.split_once(char::is_whitespace).or_else(|| line.split_once('='))?;
-  let rest = rest.trim().trim_matches('"');
-  let rest = rest.split_once(" #").map_or(rest, |(value, _)| value.trim());
-  Some((keyword, rest))
+  let keyword_end = trimmed.find([' ', '\t', '=']).unwrap_or(trimmed.len());
+  let keyword = &trimmed[..keyword_end];
+  if keyword.is_empty() {
+    return None;
+  }
+  let mut rest = trimmed[keyword_end..].trim_start();
+  if let Some(after) = rest.strip_prefix('=') {
+    rest = after.trim_start();
+  }
+  Some(SshDirective {
+    keyword,
+    args: split_ssh_args(cut_ssh_comment(rest)),
+  })
 }
 
-fn expand_ssh_path(raw: &str, host_home: &Path) -> String {
+fn cut_ssh_comment(input: &str) -> &str {
+  let mut quoted = false;
+  let mut escaped = false;
+  for (idx, ch) in input.char_indices() {
+    if escaped {
+      escaped = false;
+      continue;
+    }
+    match ch {
+      '\\' => escaped = true,
+      '"' => quoted = !quoted,
+      '#' if !quoted => return &input[..idx],
+      _ => {}
+    }
+  }
+  input
+}
+
+fn split_ssh_args(input: &str) -> Vec<String> {
+  let mut args = Vec::new();
+  let mut current = String::new();
+  let mut quoted = false;
+  let mut chars = input.chars();
+  while let Some(ch) = chars.next() {
+    if ch == '\\' {
+      if let Some(next) = chars.next() {
+        current.push(next);
+      }
+      continue;
+    }
+    if ch == '"' {
+      quoted = !quoted;
+      continue;
+    }
+    if ch.is_whitespace() && !quoted {
+      if !current.is_empty() {
+        args.push(std::mem::take(&mut current));
+      }
+      continue;
+    }
+    current.push(ch);
+  }
+  if !current.is_empty() {
+    args.push(current);
+  }
+  args
+}
+
+/// `~` expands against the host home. A relative path resolves under
+/// `~/.ssh`, which is where ssh itself looks.
+fn ssh_path(raw: &str, host_home: &Path) -> PathBuf {
   if let Some(rest) = raw.strip_prefix("~/") {
-    host_home.join(rest).to_string_lossy().into_owned()
+    host_home.join(rest)
   } else if raw == "~" {
-    host_home.to_string_lossy().into_owned()
+    host_home.to_path_buf()
   } else if Path::new(raw).is_absolute() {
-    raw.to_string()
+    PathBuf::from(raw)
   } else {
-    host_home.join(".ssh").join(raw).to_string_lossy().into_owned()
+    host_home.join(".ssh").join(raw)
   }
 }
 
-/// Where the real identity lives on the host: `~` expands, relative paths
-/// resolve against `~/.ssh` the way ssh itself resolves them.
+/// Where the real identity lives on the host.
 pub(crate) fn host_identity_path(identity: &str, host_home: &Path) -> PathBuf {
-  if let Some(rest) = identity.strip_prefix("~/") {
-    host_home.join(rest)
-  } else if Path::new(identity).is_absolute() {
-    PathBuf::from(identity)
-  } else {
-    host_home.join(".ssh").join(identity)
-  }
+  ssh_path(identity, host_home)
 }
 
 /// The container path the decoy identity mounts at, mirroring the source
-/// layout under the container home. `~`-relative and home-relative paths
-/// mirror; anything else off the host home does not.
+/// layout under the container home. Paths under the host home mirror.
+/// Anything else does not.
 pub(crate) fn mirror_container_path(identity: &str, host_home: &Path, home: &str) -> Option<String> {
-  let host_path = if let Some(rest) = identity.strip_prefix("~/") {
-    host_home.join(rest)
-  } else if Path::new(identity).is_absolute() {
-    PathBuf::from(identity)
-  } else {
-    host_home.join(".ssh").join(identity)
-  };
-  let host_path = crate::paths::normalize(&host_path);
+  let host_path = crate::paths::normalize(&ssh_path(identity, host_home));
   let rel = crate::paths::path_under_home(&host_path, host_home)?;
   Some(format!("{home}/{rel}"))
 }
@@ -884,6 +937,75 @@ mod tests {
     let adapted = adapt_in(&dir, config);
     assert_eq!(adapted.len(), 1, "{adapted:?}");
     assert!(adapted[0].fragment.contains("ssh://extra.example"), "{}", adapted[0].fragment);
+  }
+
+  #[test]
+  fn identity_file_equals_with_spaces_is_granted() {
+    let (dir, _) = host_home_with_key();
+    let config = "Host git.example\n IdentityFile = ~/.ssh/id_ed25519\n";
+    let adapted = adapt_in(&dir, config);
+    assert_eq!(adapted.len(), 1, "spaces around = must not drop the host: {adapted:?}");
+    assert!(adapted[0].fragment.contains("ssh://git.example"), "{}", adapted[0].fragment);
+  }
+
+  #[test]
+  fn include_with_several_arguments_maps_every_file() {
+    let (dir, _) = host_home_with_key();
+    let ssh = dir.path().join(".ssh");
+    fs::write(ssh.join("one"), "Host one.example\n IdentityFile ~/.ssh/id_ed25519\n").unwrap();
+    fs::write(ssh.join("two"), "Host two.example\n IdentityFile \"~/.ssh/id_ed25519\"\n").unwrap();
+    let config = "Include ~/.ssh/one ~/.ssh/two\n";
+    let adapted = adapt_in(&dir, config);
+    assert_eq!(adapted.len(), 1, "every Include argument is a file: {adapted:?}");
+    let fragment = &adapted[0].fragment;
+    assert!(fragment.contains("ssh://one.example"), "{fragment}");
+    assert!(fragment.contains("ssh://two.example"), "{fragment}");
+  }
+
+  #[test]
+  fn include_cycle_is_a_typed_error() {
+    let (dir, _) = host_home_with_key();
+    let ssh = dir.path().join(".ssh");
+    let config = ssh.join("config");
+    let other = ssh.join("other");
+    fs::write(&other, format!("Include {}\n", config.display())).unwrap();
+    fs::write(&config, "Include ~/.ssh/other\n").unwrap();
+    let err = adapt(&config, &fs::read(&config).unwrap(), "/home/agent", dir.path()).expect_err("cycle");
+    assert!(err.to_string().contains("cycle"), "{err}");
+  }
+
+  #[test]
+  fn include_depth_allows_sixteen_files_and_rejects_the_next() {
+    let (dir, _) = host_home_with_key();
+    let (root, content) = include_chain(&dir, 16);
+    let adapted = adapt(&root, content.as_bytes(), "/home/agent", dir.path()).expect("16 files is the limit");
+    assert!(adapted[0].fragment.contains("ssh://leaf.example"), "{}", adapted[0].fragment);
+    let (root, content) = include_chain(&dir, 17);
+    let failed = adapt(&root, content.as_bytes(), "/home/agent", dir.path());
+    assert!(
+      matches!(failed, Err(ref err) if err.to_string().contains("16")),
+      "17 files exceed the limit"
+    );
+  }
+
+  fn include_chain(dir: &tempfile::TempDir, files: u8) -> (PathBuf, String) {
+    let ssh = dir.path().join(".ssh");
+    let root = ssh.join("config");
+    for index in 0..files {
+      let path = if index == 0 {
+        root.clone()
+      } else {
+        ssh.join(format!("inc-{index}"))
+      };
+      let body = if index + 1 == files {
+        "Host leaf.example\n IdentityFile ~/.ssh/id_ed25519\n".to_string()
+      } else {
+        let next = ssh.join(format!("inc-{}", index + 1));
+        format!("Include {}\n", next.display())
+      };
+      fs::write(&path, body).unwrap();
+    }
+    (root.clone(), fs::read_to_string(&root).unwrap())
   }
 
   #[test]
