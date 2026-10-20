@@ -39,22 +39,6 @@ pub(crate) fn expand_path(expander: &Xpanda, value: &str) -> Result<String, Erro
   Ok(shellexpand::tilde(&expand_value(expander, value)?).into_owned())
 }
 
-/// Run an async fnox lookup from sync generation code. The binary runs on a
-/// multi-thread runtime, so `block_in_place` lets the lookup use it; anywhere
-/// else (tests, one-shot sync contexts) a fresh current-thread runtime serves.
-pub(crate) fn block_on<Fut: Future>(future: Fut) -> Result<Fut::Output, Error> {
-  match tokio::runtime::Handle::try_current() {
-    Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
-    Err(_) => Ok(
-      tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| Error::BlockOn { source })?
-        .block_on(future),
-    ),
-  }
-}
-
 /// Values for `names`: the process environment first, overlaid with fnox for
 /// declared names the environment lacks. Names found in neither are left out
 /// so the `no_unset` expander errors naming them.
