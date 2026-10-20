@@ -1945,6 +1945,20 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn constructed_abandon_closes() {
+    let inner = [0x02, 0x01, 0x01];
+    let mut op = vec![0x70, u8::try_from(inner.len()).unwrap()];
+    op.extend_from_slice(&inner);
+    let seq_content = 3 + op.len();
+    let mut message = vec![0x30, u8::try_from(seq_content).unwrap()];
+    message.extend_from_slice(&[0x02, 0x01, 0x01]);
+    message.extend_from_slice(&op);
+    let mut downstream = down();
+    let (rewritten, _) = downstream.feed(&message).await;
+    assert!(matches!(rewritten, Rewritten::Close), "constructed abandon closes");
+  }
+
+  #[tokio::test]
   async fn wide_abandon_closes_before_the_body() {
     for content_len in [5usize, 8 * 1024] {
       let (head, body) = abandon_declared(content_len);

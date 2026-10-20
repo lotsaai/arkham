@@ -921,6 +921,62 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn queued_handoff_writes_the_split_entry_before_upgrade() {
+    let (entry, split) = big_entry();
+    let (_down, mut up) = pair();
+    let (guest_relay, mut guest) = tokio::io::duplex(64 * 1024);
+    let (_guest_read, mut guest_write) = tokio::io::split(guest_relay);
+    let (requests_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    requests_tx.send(ToResponse::Handoff(3)).unwrap();
+    let (upgrade_tx, mut upgrade_rx) = tokio::sync::mpsc::channel(1);
+    let mut armed = false;
+    let step = on_upstream_chunk(
+      &mut guest_write,
+      &mut up,
+      &mut requests,
+      &mut armed,
+      &upgrade_tx,
+      &entry[..split],
+    )
+    .await
+    .unwrap();
+    match step {
+      ChunkStep::Stay => {}
+      ChunkStep::Upgrade(_) => panic!("handoff upgraded before the entry finished"),
+      ChunkStep::Stop => panic!("relay stopped before the entry finished"),
+    }
+    assert!(upgrade_rx.try_recv().is_err(), "upgrade signal fired before the entry finished");
+    let mut got = vec![0u8; split];
+    tokio::time::timeout(Duration::from_secs(1), guest.read_exact(&mut got))
+      .await
+      .expect("entry prefix")
+      .unwrap();
+    assert_eq!(got, entry[..split]);
+    let step = on_upstream_chunk(
+      &mut guest_write,
+      &mut up,
+      &mut requests,
+      &mut armed,
+      &upgrade_tx,
+      &entry[split..],
+    )
+    .await
+    .unwrap();
+    match step {
+      ChunkStep::Upgrade(prefix) => assert!(prefix.is_empty(), "local handoff carries no unread tail"),
+      ChunkStep::Stay => panic!("upgrade never followed the entry"),
+      ChunkStep::Stop => panic!("relay stopped on the entry tail"),
+    }
+    assert!(upgrade_rx.try_recv().unwrap());
+    let mut tail = vec![0u8; entry.len() - split];
+    tokio::time::timeout(Duration::from_secs(1), guest.read_exact(&mut tail))
+      .await
+      .expect("entry tail")
+      .unwrap();
+    assert_eq!(tail, entry[split..]);
+  }
+
+  #[tokio::test]
   async fn backpressured_prefix_still_upgrades() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
