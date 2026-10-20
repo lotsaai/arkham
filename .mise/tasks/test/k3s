@@ -427,6 +427,9 @@ name=contexts
 ws=$scratch/ws-$name
 mkdir -p "$ws/.config/arkham"
 printf '%s\n' '[[workspace.file_rewrite]]' "source = \"$merged\"" 'dest = "{home}/.kube/config"' 'format = "kubeconfig"' >"$ws/.config/arkham/config.toml"
+# The declared file is the only kubeconfig. A leftover KUBECONFIG would
+# derive the staging admin as a second grant for the same cluster.
+export KUBECONFIG="$merged"
 statedir=$scratch/state-$name
 XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
 shopt -s nullglob
@@ -441,9 +444,10 @@ if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
 fi
 kubedir=${kubedirs[0]}
 decoy=${decoys[0]}
-rule_count=$(grep -c '^\[rules\.' "$kubedir/arkham.toml" || true)
+rule_count=$(grep -c '^\[rules\.kube-user-' "$kubedir/arkham.toml" || true)
 if [ "$rule_count" -ne 3 ]; then
-  echo "expected 3 grants for 4 contexts that share ivan, got ${rule_count}" >&2
+  echo "expected 3 kube user grants for 4 contexts that share ivan, got ${rule_count}" >&2
+  grep '^\[rules\.' "$kubedir/arkham.toml" >&2 || true
   exit 1
 fi
 sed "s|/arkham/grants|$kubedir|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
@@ -564,6 +568,7 @@ capture_name=capture
 capture_ws=$scratch/ws-$capture_name
 mkdir -p "$capture_ws/.config/arkham"
 printf '%s\n' '[[workspace.file_rewrite]]' "source = \"$capture_source\"" 'dest = "{home}/.kube/config"' 'format = "kubeconfig"' >"$capture_ws/.config/arkham/config.toml"
+export KUBECONFIG="$capture_source"
 capture_state=$scratch/state-$capture_name
 XDG_STATE_HOME=$capture_state XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$capture_ws"
 shopt -s nullglob
@@ -578,9 +583,10 @@ if [ "${#capture_dirs[@]}" -ne 1 ] || [ "${#capture_decoys[@]}" -ne 1 ]; then
 fi
 capture_grants=${capture_dirs[0]}
 capture_decoy=${capture_decoys[0]}
-capture_rules=$(grep -c '^\[rules\.' "$capture_grants/arkham.toml" || true)
+capture_rules=$(grep -c '^\[rules\.kube-user-' "$capture_grants/arkham.toml" || true)
 if [ "$capture_rules" -ne 3 ]; then
-  echo "capture grant file has ${capture_rules} rules; shared user ivan should stay one grant" >&2
+  echo "capture grant file has ${capture_rules} kube user rules; shared user ivan should stay one grant" >&2
+  grep '^\[rules\.' "$capture_grants/arkham.toml" >&2 || true
   exit 1
 fi
 for secret in "$oidc_id_token" "$oidc_refresh" "$oidc_client_secret" "$oidc_idp_ca"; do
