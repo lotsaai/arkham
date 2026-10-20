@@ -268,14 +268,21 @@ impl AmbientDeriver<'_> {
         }
       };
       let (adapted, writable) = match name {
-        "kubeconfig" => (
-          kube::adapt(&path, &content, ca, guests_dir)
-            .ok()
-            .flatten()
-            .map(|adapted| vec![adapted])
-            .unwrap_or_default(),
-          false,
-        ),
+        "kubeconfig" => match kube::adapt(&path, &content, ca, guests_dir) {
+          Ok(Some(found)) => {
+            tracing::debug!(
+              source = %path.display(),
+              skipped = found.skipped.len(),
+              "kube contexts left out of the grant set"
+            );
+            (found.grants, true)
+          }
+          Ok(None) => (Vec::new(), true),
+          Err(err) => {
+            tracing::warn!(source = %path.display(), %err, "kubeconfig source skipped");
+            continue;
+          }
+        },
         _ => match talos::adapt(&path, &content, ca, guests_dir) {
           Ok(found) => {
             tracing::debug!(source = %path.display(), skipped = found.skipped.len(), "talos contexts left out of the grant set");

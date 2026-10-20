@@ -296,12 +296,18 @@ cp "$scratch/cert-kubeconfig" "$scratch/token-kubeconfig"
 export KUBECONFIG="$scratch/cert-kubeconfig"
 kubectl create serviceaccount arkham-test >/dev/null
 kubectl create clusterrolebinding arkham-test --clusterrole=cluster-admin --serviceaccount=default:arkham-test >/dev/null
+kubectl create serviceaccount arkham-other >/dev/null
+kubectl create clusterrolebinding arkham-other --clusterrole=cluster-admin --serviceaccount=default:arkham-other >/dev/null
 token=$(kubectl create token arkham-test --duration=3600s)
+token_other=$(kubectl create token arkham-other --duration=3600s)
 user=$(kubectl config view -o 'jsonpath={.users[0].name}')
+cluster_name=$(kubectl config view --minify -o 'jsonpath={.clusters[0].name}')
 export KUBECONFIG="$scratch/token-kubeconfig"
 kubectl config set-credentials "$user" --token="$token" >/dev/null
 kubectl config unset "users.$user.client-certificate-data" >/dev/null
 kubectl config unset "users.$user.client-key-data" >/dev/null
+kubectl config set-credentials arkham-other --token="$token_other" >/dev/null
+kubectl config set-context arkham-other --cluster="$cluster_name" --user=arkham-other >/dev/null
 
 # One leg: init a workspace against a kubeconfig source, serve host-side, and
 # prove the three states — real works direct, decoy fails direct, decoy works
@@ -330,9 +336,10 @@ run_leg() {
   local kubedir=${kubedirs[0]} decoy=${decoys[0]}
   sed "s|/arkham/grants|$kubedir|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
   cp "$decoy" "$scratch/proxy-$name.yaml"
-  local context
+  local context cluster
   context=$(KUBECONFIG="$source" kubectl config current-context)
-  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster "$context" --proxy-url="http://127.0.0.1:$port" >/dev/null
+  cluster=$(KUBECONFIG="$source" kubectl config view --minify -o 'jsonpath={.clusters[0].name}')
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster "$cluster" --proxy-url="http://127.0.0.1:$port" >/dev/null
 
   XDG_STATE_HOME=$statedir FNOX_CONFIG_DIR=$scratch/fnox ARKHAM_CONFIG="$scratch/host-layer-$name.toml" ARKHAM_CA_FILE="$scratch/config/arkham/ca.pem" ARKHAM_LISTEN="127.0.0.1:$port" "$arkham" serve &
   serve_pid=$!
@@ -347,6 +354,17 @@ run_leg() {
   fi
   echo "--- $name: decoy works through the proxy"
   KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get nodes --request-timeout=30s
+  if [ "$name" = bearer ]; then
+    if grep -F -q -e "$token" -e "$token_other" "$decoy"; then
+      echo "real token in the decoy kubeconfig" >&2
+      exit 1
+    fi
+    echo "--- bearer: use-context selects the other user"
+    KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context arkham-other >/dev/null
+    KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get nodes --request-timeout=30s
+    echo "--- bearer: --context selects the original user"
+    KUBECONFIG="$scratch/proxy-$name.yaml" kubectl --context "$context" get nodes --request-timeout=30s
+  fi
 
   kill "$serve_pid" 2>/dev/null || true
   serve_pid=""

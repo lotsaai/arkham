@@ -1,6 +1,6 @@
 //! Declared `file_rewrite` pass: each source expands, swaps its plain env
 //! values or runs the format adapter, and lands in the state directory.
-//! A talosconfig mounts writable. Every other rewrite stays read-only.
+//! A kubeconfig and a talosconfig mount writable. Every other rewrite stays read-only.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -76,17 +76,17 @@ pub(crate) struct RewriteInputs<'a> {
 /// grants whose fragments land in the state grant layer.
 #[derive(Debug)]
 pub(crate) struct RewriteOutputs {
-  /// Read-only mounts of the rewritten files at their dests.
+  /// Mounts of the rewritten files at their dests. A kubeconfig or talosconfig is writable.
   pub(crate) mounts: Vec<Mount>,
   /// Grants adapted from kubeconfig and talosconfig sources.
   pub(crate) grants: Vec<RewriteAdapted>,
 }
 
 /// Rewrite each `file_rewrite` source with decoys and write the outputs under
-/// `files_dir`, returning a read-only mount per entry at its `{home}`-expanded
-/// dest. Kubeconfig sources take the adapter path instead: the file is the
-/// secret source, so they state no `envs`, and the grant layer writes from
-/// the returned grants.
+/// `files_dir`. A kubeconfig or talosconfig mounts writable. Every other
+/// rewrite mounts read-only at its `{home}`-expanded dest. A kubeconfig takes
+/// the adapter path. The file is the secret source, so it states no `envs`,
+/// and the grant layer writes from the returned grants.
 ///
 /// # Errors
 ///
@@ -129,14 +129,14 @@ pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutput
   Ok(pass.collector.outputs())
 }
 
-/// Grants and decoy mounts collected from adapted documents: emitting one
+/// Grants and decoy mounts collected from adapted documents. Emitting one
 /// document writes its decoy side files into the state directory and mounts
-/// each read-only at its stated container path. Shared by the declared pass
-/// and the ambient pass, which is why the collected vecs stay crate-visible.
+/// each at its stated container path. A kubeconfig or talosconfig is writable.
+/// The declared pass and the ambient pass share this collector.
 pub(crate) struct RewriteCollector {
   /// State directory the decoy files land in.
   files_dir: PathBuf,
-  /// Read-only mounts collected with the grants.
+  /// Mounts collected with the grants. A kubeconfig or talosconfig is writable.
   pub(crate) mounts: Vec<Mount>,
   /// Grants adapted from the documents.
   pub(crate) grants: Vec<RewriteAdapted>,
@@ -226,9 +226,9 @@ impl RewriteCollector {
   }
 }
 
-/// One workspace's explicit `[[workspace.file_rewrite]]` pass: each source
+/// One workspace's explicit `[[workspace.file_rewrite]]` pass. Each source
 /// expands, swaps its plain env values or runs the format adapter, and
-/// lands in the state directory with a read-only mount at its dest.
+/// lands in the state directory. A kubeconfig or talosconfig mounts writable.
 struct ExplicitRewrites<'a> {
   /// State directory the rewritten files land in.
   files_dir: &'a Path,
@@ -298,7 +298,13 @@ impl ExplicitRewrites<'_> {
       let guests_dir = self.guests_dir;
       let ca = self.ca()?;
       match format {
-        RewriteFormat::Kubeconfig => kube::adapt(host, content, ca, guests_dir)?.into_iter().collect(),
+        RewriteFormat::Kubeconfig => match kube::adapt(host, content, ca, guests_dir)? {
+          Some(found) => {
+            tracing::debug!(skipped = found.skipped.len(), "kube contexts left out of the grant set");
+            found.grants
+          }
+          None => Vec::new(),
+        },
         RewriteFormat::Talos => {
           let found = talos::adapt(host, content, ca, guests_dir)?;
           tracing::debug!(skipped = found.skipped.len(), "talos contexts left out of the grant set");
@@ -344,10 +350,9 @@ impl ExplicitRewrites<'_> {
       path: host.clone(),
       source,
     })?;
-    let talos_mount = match rewrite.format {
-      Some(RewriteFormat::Talos) => true,
-      Some(RewriteFormat::Kubeconfig) => false,
-      None => sniff(&content) == Some(RewriteFormat::Talos),
+    let writable_mount = match rewrite.format {
+      Some(RewriteFormat::Talos | RewriteFormat::Kubeconfig) => true,
+      None => matches!(sniff(&content), Some(RewriteFormat::Talos | RewriteFormat::Kubeconfig)),
     };
     let out_bytes = self.output(rewrite, &host, &content, &pairs)?;
     let out_path = self.files_dir.join(rewrite_file_name(index, &host));
@@ -364,7 +369,7 @@ impl ExplicitRewrites<'_> {
     self.collector.mounts.push(Mount {
       host: out_path,
       container: PathBuf::from(container),
-      ro: !talos_mount,
+      ro: !writable_mount,
     });
     Ok(())
   }
