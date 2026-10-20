@@ -1168,7 +1168,7 @@ async fn https_shared_destination_selects_the_presented_guest_cert() {
 
   let grants = vec![
     https_grant(
-      "cert-user",
+      "kube-user-shared",
       CERT_FAKE,
       CERT_VALUE,
       https_scope(
@@ -1254,7 +1254,7 @@ fn shared_server(ca: &CertAuthority) -> Arc<rustls::ServerConfig> {
 fn shared_grants(port: u16, pairs: &SharedPairs) -> Vec<Grant> {
   vec![
     https_grant(
-      "cert-user",
+      "kube-user-shared",
       CERT_FAKE,
       CERT_VALUE,
       https_scope(

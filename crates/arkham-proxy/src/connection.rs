@@ -9,6 +9,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use dashmap::DashMap;
 use rama::extensions::{Extensions, ExtensionsRef};
 use rama::net::address::{Host, HostWithPort};
 use rama::net::client::ConnectorTarget;
@@ -16,6 +17,7 @@ use rama::net::socket::SocketOptions;
 use rama::service::service_fn;
 use rama::tcp::client::TcpStreamConnector;
 use rama::tcp::stream::TokioTcpStream;
+use rama::tls::boring::client::ConnectorConfigClientAuth;
 use rama::tls::boring::core::ssl::{SslCredential, SslRef, SslVerifyMode};
 use rama::tls::boring::core::x509::store::X509Store;
 use rama::tls::boring::proxy::client_auth::{
@@ -32,8 +34,8 @@ use arkham_config::grants::{EndpointScope, Grant, GuestTlsMode, Scheme};
 
 use crate::Error;
 use crate::identity::{Hello, read_client_hello};
-use crate::material::GrantMaterial;
 use crate::mint::MintBucket;
+use crate::transports::tls::cached_client_identity;
 /// Guest-side adapter: any tokio stream plus a rama extension map. The relay
 /// reads the [`ConnectorTarget`] identity from these extensions to derive
 /// egress SNI and verification identity.
@@ -131,12 +133,12 @@ pub(crate) fn client_identity(cert: &Path, key: &Path) -> Result<ClientAuth, Err
 /// carries on — which is what servers that request without requiring (like
 /// a kube apiserver) expect.
 pub(crate) fn client_auth_policy(
-  material: &GrantMaterial,
+  identities: &DashMap<PathBuf, ClientAuth>,
   scope: &EndpointScope,
   trust: &X509Store,
 ) -> Result<Option<TlsMitmClientAuthPolicy>, Error> {
   let credential = match (&scope.client_cert, &scope.client_key) {
-    (Some(cert), Some(key)) => Some(material.ssl_credential(cert, key)?),
+    (Some(cert), Some(key)) => Some(ssl_credential(identities, cert, key)?),
     (Some(_) | None, None) | (None, Some(_)) => None,
   };
   match (scope.guest_tls, credential) {
@@ -189,7 +191,7 @@ pub(crate) fn optional_client_auth_policy(
   host: &str,
   port: u16,
   selected: Arc<Mutex<Vec<Grant>>>,
-  material: Arc<GrantMaterial>,
+  identities: Arc<DashMap<PathBuf, ClientAuth>>,
 ) -> TlsMitmClientAuthPolicy {
   let store = trust.clone();
   let host = host.to_string();
@@ -197,16 +199,16 @@ pub(crate) fn optional_client_auth_policy(
     let wants_upstream = input.request.is_some();
     let candidates = candidates.clone();
     let selected = Arc::clone(&selected);
-    let material = Arc::clone(&material);
+    let identities = Arc::clone(&identities);
     let store = store.clone();
     let host = host.clone();
     async move {
       let plan = TlsMitmClientAuthPlan::new(service_fn(move |identity: TlsMitmClientIdentity| {
         let candidates = candidates.clone();
         let selected = Arc::clone(&selected);
-        let material = Arc::clone(&material);
+        let identities = Arc::clone(&identities);
         let host = host.clone();
-        async move { choose_https(&identity, &candidates, wants_upstream, &host, port, &selected, &material) }
+        async move { choose_https(&identity, &candidates, wants_upstream, &host, port, &selected, &identities) }
       }))
       .with_ingress(move |ssl: &mut SslRef| {
         ssl.set_verify_cert_store(store)?;
@@ -225,7 +227,7 @@ fn choose_https(
   host: &str,
   port: u16,
   selected: &Mutex<Vec<Grant>>,
-  material: &GrantMaterial,
+  identities: &DashMap<PathBuf, ClientAuth>,
 ) -> Result<Option<SslCredential>, Error> {
   let grants = match identity.leaf() {
     None => bearer_grants(candidates, host, port)?,
@@ -254,7 +256,7 @@ fn choose_https(
     }
   };
   let credential = if wants_upstream && grants.len() == 1 {
-    upstream_credential(material, &grants[0], host, port)?
+    upstream_credential(identities, &grants[0], host, port)?
   } else {
     None
   };
@@ -306,14 +308,25 @@ fn grant_labels(candidates: &[&HttpsCandidate]) -> String {
   labels.join(", ")
 }
 
-fn upstream_credential(material: &GrantMaterial, grant: &Grant, host: &str, port: u16) -> Result<Option<SslCredential>, Error> {
+fn upstream_credential(
+  identities: &DashMap<PathBuf, ClientAuth>,
+  grant: &Grant,
+  host: &str,
+  port: u16,
+) -> Result<Option<SslCredential>, Error> {
   let Some(scope) = grant.endpoint(Scheme::Https, Some(host), port) else {
     return Ok(None);
   };
   let (Some(cert), Some(key)) = (&scope.client_cert, &scope.client_key) else {
     return Ok(None);
   };
-  material.ssl_credential(cert, key).map(Some)
+  ssl_credential(identities, cert, key).map(Some)
+}
+
+fn ssl_credential(identities: &DashMap<PathBuf, ClientAuth>, cert: &Path, key: &Path) -> Result<SslCredential, Error> {
+  let auth = cached_client_identity(identities, cert, key)?;
+  let configured = ConnectorConfigClientAuth::try_from(auth).map_err(|err| Error::ClientAuthPolicy { source: err })?;
+  SslCredential::try_from(configured).map_err(|err| Error::ClientAuthPolicy { source: err })
 }
 
 /// Failure loading an upstream CA bundle for one entry's extra egress trust.
@@ -343,20 +356,6 @@ pub enum TrustAnchorsError {
     /// Empty bundle path.
     path: PathBuf,
   },
-}
-
-/// Load an upstream CA bundle for one entry's extra egress trust: the PEM
-/// certificates at `path`, additive to the global egress trust. Only the
-/// entry names this bundle; nothing invents one.
-pub(crate) fn trust_anchors(path: &Path) -> Result<Vec<CertificateDer<'static>>, TrustAnchorsError> {
-  let bytes = std::fs::read(path).map_err(|source| TrustAnchorsError::Read { path: path.into(), source })?;
-  let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&bytes)
-    .collect::<Result<_, _>>()
-    .map_err(|source| TrustAnchorsError::Parse { path: path.into(), source })?;
-  if chain.is_empty() {
-    return Err(TrustAnchorsError::Empty { path: path.into() });
-  }
-  Ok(chain)
 }
 
 /// Dial upstream, applying the fwmark when set (TUN self-exclusion).
@@ -518,7 +517,7 @@ mod tests {
 
   #[test]
   fn anonymous_scopes_carry_an_explicit_empty_client_auth_plan() {
-    let policy = client_auth_policy(&GrantMaterial::default(), &tls_scope(), &test_trust()).expect("policy builds");
+    let policy = client_auth_policy(&DashMap::new(), &tls_scope(), &test_trust()).expect("policy builds");
     assert!(
       policy.is_some(),
       "anonymous legs must answer an upstream certificate request empty instead of dying"

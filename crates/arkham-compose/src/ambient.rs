@@ -354,9 +354,10 @@ impl AmbientDeriver<'_> {
 }
 
 /// The source path one single-path override names, or the default under
-/// the host home. A value containing `:` is not a list here.
+/// the host home. An empty value and a value containing `:` use the default.
 fn env_source(env_name: &str, default: &str, host_home: &Path) -> PathBuf {
   match env::var(env_name) {
+    Ok(value) if value.trim().is_empty() => host_home.join(default),
     Ok(value) if !value.contains(':') => PathBuf::from(value),
     Ok(value) => {
       tracing::warn!(env_name, value, "names multiple paths; using the default location instead");
@@ -732,5 +733,18 @@ mod moved_suite {
     let empty = kubeconfig_paths(home);
     unset_env("KUBECONFIG");
     assert_eq!(empty, vec![home.join(".kube/config")]);
+  }
+
+  #[test]
+  fn empty_env_source_uses_the_default_path() {
+    let home = Path::new("/home/ivan");
+    set_env("TALOSCONFIG", "   ");
+    let blank = env_source("TALOSCONFIG", ".talos/config", home);
+    unset_env("TALOSCONFIG");
+    assert_eq!(blank, home.join(".talos/config"));
+    set_env("TALOSCONFIG", "");
+    let empty = env_source("TALOSCONFIG", ".talos/config", home);
+    unset_env("TALOSCONFIG");
+    assert_eq!(empty, home.join(".talos/config"));
   }
 }

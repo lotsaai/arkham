@@ -3,10 +3,11 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use rama::Service;
 use rama::crypto::pki_types::CertificateDer;
 use rama::error::BoxError;
@@ -20,13 +21,12 @@ use rama::tls::boring::core::x509::store::{X509Store, X509StoreBuilder};
 use rama::tls::boring::proxy::TlsMitmEgressServerAuth;
 use rama::tls::boring::proxy::TlsMitmRelay;
 use rama::tls::boring::proxy::cert_issuer::{CachedBoringMitmCertIssuer, InMemoryBoringMitmCertIssuer};
-use rama::tls::client::ServerVerifyMode;
+use rama::tls::client::{ClientAuth, ServerVerifyMode};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
 use crate::connection::dial_marked;
 use crate::identity::{Expect, expect};
-use crate::material::GrantMaterial;
 use crate::mint::{MintBucket, MintHandle, MintStore};
 use crate::transports::PairCtx;
 use crate::transports::http::{MAX_HEAD, http_pair};
@@ -39,7 +39,6 @@ mod connection;
 mod e2e;
 mod error;
 mod identity;
-mod material;
 mod mint;
 mod transports;
 
@@ -71,7 +70,10 @@ pub use error::Error;
 /// egress trust with that bundle; everything else shares `relay`.
 pub struct ProxyState {
   config: Arc<ResolvedConfig>,
-  material: Arc<GrantMaterial>,
+  /// Guest certificate chains named by the grants, read once.
+  guest_certs: Arc<DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>>,
+  /// Upstream client identities named by the grants, read once.
+  identities: Arc<DashMap<PathBuf, ClientAuth>>,
   relay: HttpsRelay,
   extra_relays: HashMap<PathBuf, HttpsRelay>,
   mtls_trust: X509Store,
@@ -119,6 +121,73 @@ fn https_relay(ca: &CertAuthority, extra: &[CertificateDer<'static>]) -> Result<
   Ok(TlsMitmRelay::new_cached_in_memory(crt, key).with_egress_server_auth(egress))
 }
 
+/// Read every bundle, guest leaf, and client pair the grants name.
+///
+/// A missing guest leaf is not an error: that grant has no certificate to match.
+/// A named trust bundle that is missing or empty fails here.
+///
+/// # Errors
+///
+/// Returns an error when a named file cannot be read or a bundle holds no certificate.
+fn warm_grant_files(
+  resolved: &ResolvedConfig,
+  guest_certs: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>,
+  identities: &DashMap<PathBuf, ClientAuth>,
+) -> Result<(), Error> {
+  for path in &resolved.proxy.root_certs {
+    require_bundle(guest_certs, path)?;
+  }
+  for grant in &resolved.grants {
+    let Grant::Token { credential, allow, .. } = grant else {
+      continue;
+    };
+    for scope in allow {
+      if let Some(path) = &scope.root_cert {
+        require_bundle(guest_certs, path)?;
+      }
+      if let Some(cert) = &scope.client_cert {
+        let leaf = cert.with_file_name(arkham_config::context::guest_cert_file(&credential.label));
+        crate::transports::tls::cached_guest_certs(guest_certs, &leaf)?;
+      }
+      if let (Some(cert), Some(key)) = (&scope.client_cert, &scope.client_key) {
+        crate::transports::tls::cached_client_identity(identities, cert, key)?;
+      }
+    }
+  }
+  Ok(())
+}
+
+/// A trust bundle named by config. Missing and empty files fail.
+///
+/// # Errors
+///
+/// Returns an error when `path` cannot be read, does not parse, or holds no certificate.
+fn require_bundle(cache: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>, path: &Path) -> Result<(), Error> {
+  match crate::transports::tls::cached_guest_certs(cache, path)? {
+    Some(certs) if certs.is_empty() => Err(connection::TrustAnchorsError::Empty { path: path.to_path_buf() }.into()),
+    Some(_) => Ok(()),
+    None => Err(
+      connection::TrustAnchorsError::Read {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, "trust bundle not found"),
+      }
+      .into(),
+    ),
+  }
+}
+
+/// Certificates already stored for `path` by [`warm_grant_files`].
+///
+/// # Errors
+///
+/// Returns an error when `path` was not part of the warm-up.
+fn loaded_anchors(cache: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>, path: &Path) -> Result<Vec<CertificateDer<'static>>, Error> {
+  cache
+    .get(path)
+    .map(|certs| certs.iter().cloned().collect())
+    .ok_or_else(|| Error::UnknownTrustBundle { path: path.to_path_buf() })
+}
+
 /// Distinct `root_cert` bundles named by endpoint rules, first-seen order.
 fn entry_anchors(resolved: &ResolvedConfig) -> Vec<PathBuf> {
   let mut seen = Vec::new();
@@ -151,16 +220,18 @@ impl ProxyState {
   /// when a configured plugin cannot be loaded.
   pub fn new(resolved: ResolvedConfig, ca: &CertAuthority) -> Result<Self, Error> {
     let plugins = Arc::new(arkham_plugin::Registry::load(&resolved.plugins)?);
-    let material = Arc::new(GrantMaterial::load(&resolved)?);
+    let guest_certs = Arc::new(DashMap::new());
+    let identities = Arc::new(DashMap::new());
+    warm_grant_files(&resolved, &guest_certs, &identities)?;
     let mut global = Vec::new();
     for path in &resolved.proxy.root_certs {
-      global.extend(material.anchors(path)?.iter().cloned());
+      global.extend(loaded_anchors(&guest_certs, path)?);
     }
     let relay = https_relay(ca, &global)?;
     let mut extra_relays = HashMap::new();
     for path in entry_anchors(&resolved) {
       let mut anchors = global.clone();
-      anchors.extend(material.anchors(&path)?.iter().cloned());
+      anchors.extend(loaded_anchors(&guest_certs, &path)?);
       let extra_relay = https_relay(ca, &anchors).map_err(|source| Error::EntryTrustBundle {
         path: path.clone(),
         source: Box::new(source),
@@ -183,7 +254,8 @@ impl ProxyState {
     let amqp = Arc::new(AmqpTransport::new(ca)?);
     Ok(Self {
       config: Arc::new(resolved),
-      material,
+      guest_certs,
+      identities,
       relay,
       extra_relays,
       mtls_trust,

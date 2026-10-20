@@ -5,23 +5,26 @@
 pub(crate) mod h2;
 pub(crate) mod machine;
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use dashmap::DashMap;
 use rama::Service;
 use rama::error::BoxError;
 use rama::extensions::ExtensionsRef;
 use rama::io::BridgeIo;
+use rama::net::tls::ApplicationProtocol;
 use rama::tls::boring::TlsStream;
 use rama::tls::boring::proxy::TlsMitmRelayService;
 use rama::tls::client::NegotiatedTlsParameters;
 use rama::tls::server::InputWithClientHello;
+use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use arkham_config::context::guest_cert_file;
 use arkham_config::grants::{EndpointScope, Grant, Scheme};
-
 use arkham_plugin::Direction as HookDirection;
-use rama::net::tls::ApplicationProtocol;
 
 use super::PairCtx;
 use super::{ServeStream, Transport};
@@ -32,8 +35,8 @@ use crate::into_box_error;
 use crate::mint::MintHandle;
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Direction, H2, Http, Raw};
-use crate::transports::tcp;
-use crate::transports::tcp::raw_tcp_pair;
+use crate::transports::tcp::{self, raw_tcp_pair};
+use crate::transports::tls::cached_guest_certs;
 
 /// The `https://` transport: terminate the guest's TLS, dial upstream, and
 /// pump the framed substitution through the boring MITM relay.
@@ -92,7 +95,7 @@ impl Transport for HttpsTransport {
       // No https scope names this identity: nothing to substitute.
       return tcp::splice(guest, dial_host, port, state.fwmark, &buf).await;
     }
-    let root_cert = shared_root(&state.material, &hits, identity, port)?;
+    let root_cert = shared_root(&state.guest_certs, &hits, identity, port)?;
     let identity = identity.to_string();
     if !state.mint.allow() {
       return Err(Error::BurstExceeded {
@@ -103,16 +106,16 @@ impl Transport for HttpsTransport {
     let policy = if hits.len() == 1 {
       let (grant, scope) = &hits[0];
       *selected.lock().unwrap_or_else(PoisonError::into_inner) = vec![grant.clone()];
-      client_auth_policy(&state.material, scope, &state.mtls_trust)?
+      client_auth_policy(&state.identities, scope, &state.mtls_trust)?
     } else {
-      let candidates = https_candidates(&state.material, &hits);
+      let candidates = https_candidates(&state.guest_certs, &hits)?;
       Some(optional_client_auth_policy(
         candidates,
         &state.mtls_trust,
         &identity,
         port,
         Arc::clone(&selected),
-        Arc::clone(&state.material),
+        Arc::clone(&state.identities),
       ))
     };
     let upstream = dial_marked(dial_host, port, state.fwmark).await?;
@@ -226,13 +229,13 @@ pub(crate) struct SubstitutionService {
 /// are one bundle when they hold the same certificates. A hit with a bundle
 /// and a hit without one are different bundles.
 fn shared_root(
-  material: &crate::material::GrantMaterial,
+  bundles: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>,
   hits: &[(Grant, EndpointScope)],
   host: &str,
   port: u16,
-) -> Result<Option<std::path::PathBuf>, Error> {
+) -> Result<Option<PathBuf>, Error> {
   let mut missing = false;
-  let mut chosen: Option<std::path::PathBuf> = None;
+  let mut chosen: Option<PathBuf> = None;
   for (_, scope) in hits {
     let Some(path) = &scope.root_cert else {
       if chosen.is_some() {
@@ -247,11 +250,23 @@ fn shared_root(
     match &chosen {
       None => chosen = Some(path.clone()),
       Some(seen) if seen == path => {}
-      Some(seen) if material.anchor_bytes(seen)? == material.anchor_bytes(path)? => {}
+      Some(seen) if bundle_bytes(bundles, seen)? == bundle_bytes(bundles, path)? => {}
       Some(_) => return Err(split_trust(host, port)),
     }
   }
   Ok(chosen)
+}
+
+fn bundle_bytes(bundles: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>, path: &Path) -> Result<Vec<Vec<u8>>, Error> {
+  let Some(certs) = cached_guest_certs(bundles, path)? else {
+    return Err(Error::UnknownTrustBundle { path: path.to_path_buf() });
+  };
+  if certs.is_empty() {
+    return Err(Error::EmptyChain { path: path.to_path_buf() });
+  }
+  let mut anchors: Vec<Vec<u8>> = certs.iter().map(|cert| cert.as_ref().to_vec()).collect();
+  anchors.sort_unstable();
+  Ok(anchors)
 }
 
 fn split_trust(host: &str, port: u16) -> Error {
@@ -261,17 +276,34 @@ fn split_trust(host: &str, port: u16) -> Error {
   }
 }
 
-fn https_candidates(material: &crate::material::GrantMaterial, hits: &[(Grant, EndpointScope)]) -> Vec<HttpsCandidate> {
+fn https_candidates(
+  cache: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>,
+  hits: &[(Grant, EndpointScope)],
+) -> Result<Vec<HttpsCandidate>, Error> {
   let mut candidates = Vec::with_capacity(hits.len());
   for (grant, scope) in hits {
-    let leaf = scope.client_cert.as_ref().and_then(|path| material.guest_leaf(path));
     candidates.push(HttpsCandidate {
       grant: grant.clone(),
       guest_tls: scope.guest_tls,
-      leaf,
+      leaf: guest_leaf(cache, grant, scope)?,
     });
   }
-  candidates
+  Ok(candidates)
+}
+
+fn guest_leaf(
+  cache: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>,
+  grant: &Grant,
+  scope: &EndpointScope,
+) -> Result<Option<Vec<u8>>, Error> {
+  let (Some(credential), Some(client_cert)) = (grant.credential(), scope.client_cert.as_ref()) else {
+    return Ok(None);
+  };
+  let path = client_cert.with_file_name(guest_cert_file(&credential.label));
+  let Some(certs) = cached_guest_certs(cache, &path)? else {
+    return Ok(None);
+  };
+  Ok(certs.first().map(|cert| cert.as_ref().to_vec()))
 }
 
 impl<GI, GE> Service<BridgeIo<TlsStream<GI>, TlsStream<GE>>> for SubstitutionService
@@ -481,8 +513,8 @@ mod tests {
     std::fs::write(&first, ca.cert_pem()).unwrap();
     std::fs::write(&second, ca.cert_pem()).unwrap();
     let hits = vec![hit(6443, Some(first.clone())), hit(6443, Some(second.clone()))];
-    let material = crate::material::GrantMaterial::from_anchor_files(&[first.clone(), second]).expect("bundles load");
-    let chosen = shared_root(&material, &hits, "127.0.0.1", 6443).expect("identical certificates agree");
+    let bundles = DashMap::new();
+    let chosen = shared_root(&bundles, &hits, "127.0.0.1", 6443).expect("identical certificates agree");
     assert_eq!(chosen.as_deref(), Some(first.as_path()));
   }
 
@@ -494,8 +526,42 @@ mod tests {
     std::fs::write(&first, CertAuthority::generate().unwrap().cert_pem()).unwrap();
     std::fs::write(&second, CertAuthority::generate().unwrap().cert_pem()).unwrap();
     let hits = vec![hit(6443, Some(first.clone())), hit(6443, Some(second.clone()))];
-    let material = crate::material::GrantMaterial::from_anchor_files(&[first, second]).expect("bundles load");
-    let err = shared_root(&material, &hits, "127.0.0.1", 6443).expect_err("different certificates disagree");
+    let bundles = DashMap::new();
+    let err = shared_root(&bundles, &hits, "127.0.0.1", 6443).expect_err("different certificates disagree");
     assert!(matches!(err, Error::SplitTrustBundle { port: 6443, .. }), "{err}");
+  }
+
+  #[test]
+  fn guest_leaf_follows_the_label_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = CertAuthority::generate().unwrap();
+    let label = "kube-user-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let client = dir.path().join("other.client.crt");
+    std::fs::write(&client, ca.cert_pem()).unwrap();
+    std::fs::write(dir.path().join(format!("{label}.guest.crt")), ca.cert_pem()).unwrap();
+    std::fs::write(dir.path().join("other.guest.crt"), CertAuthority::generate().unwrap().cert_pem()).unwrap();
+    let grant = Grant::Token {
+      credential: Credential {
+        label: label.into(),
+        fake: "fake".into(),
+        value: SecretString::from("real".to_string()),
+      },
+      allow: Vec::new(),
+      pattern: None,
+      oauth2: None,
+    };
+    let scope = EndpointScope {
+      scheme: Scheme::Https,
+      host: "127.0.0.1".parse().unwrap(),
+      port: 6443,
+      client_cert: Some(client),
+      client_key: None,
+      root_cert: None,
+      guest_tls: GuestTlsMode::Tls,
+    };
+    let cache = DashMap::new();
+    let leaf = guest_leaf(&cache, &grant, &scope).expect("leaf reads");
+    let der = leaf.expect("the label file is the guest leaf");
+    assert_eq!(der, ca.cert_der().as_ref());
   }
 }

@@ -46,14 +46,6 @@ pub fn guest_cert_file(label: &str) -> String {
   format!("{label}.guest.crt")
 }
 
-/// `{label}.guest.crt` beside a `{label}.client.crt` path.
-#[must_use]
-pub fn guest_cert_path(client_cert: &Path) -> Option<PathBuf> {
-  let name = client_cert.file_name()?.to_str()?;
-  let label = name.strip_suffix(".client.crt")?;
-  Some(client_cert.with_file_name(guest_cert_file(label)))
-}
-
 /// Why a source path cannot identify a context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PathFault {
@@ -744,13 +736,6 @@ mod tests {
     assert_eq!(
       super::guest_cert_file("talos-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
       "talos-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.guest.crt"
-    );
-    let client = Path::new("/arkham/grants/rules.d/kube-user-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.client.crt");
-    assert_eq!(
-      super::guest_cert_path(client),
-      Some(PathBuf::from(
-        "/arkham/grants/rules.d/kube-user-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.guest.crt"
-      ))
     );
   }
 }

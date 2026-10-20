@@ -4,9 +4,11 @@
 //! PEM read are the same work, so they live here. A protocol that offers an
 //! ALPN identifier passes it in; one that does not passes `None`.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use rama::tls::client::ClientAuth;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject as _;
 use rustls::{RootCertStore, ServerConfig};
@@ -16,6 +18,7 @@ use arkham_pki::ca::CertAuthority;
 use arkham_pki::ca::generate_domain_pair;
 
 use crate::Error;
+use crate::connection::client_identity;
 
 /// Leaf for one name, cached. Minted before insert so two guests naming the
 /// same host keygen at most twice. `alpn` is offered when the protocol's
@@ -134,4 +137,54 @@ pub(crate) fn cached_roots(roots: &DashMap<RootCert, Arc<RootCertStore>>, root: 
   let store = Arc::new(store);
   roots.insert(root.clone(), Arc::clone(&store));
   Ok(store)
+}
+
+/// Certificates at `path`, read once.
+///
+/// A missing file is [`None`]. An empty file is an empty chain.
+///
+/// # Errors
+///
+/// Returns an error when the file cannot be read or a PEM block is not a certificate.
+pub(crate) fn cached_guest_certs(
+  cache: &DashMap<PathBuf, Arc<Vec<CertificateDer<'static>>>>,
+  path: &Path,
+) -> Result<Option<Arc<Vec<CertificateDer<'static>>>>, Error> {
+  if let Some(hit) = cache.get(path) {
+    return Ok(Some(Arc::clone(hit.value())));
+  }
+  let pem = match std::fs::read(path) {
+    Ok(pem) => pem,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(source) => {
+      return Err(Error::ReadFile {
+        path: path.to_path_buf(),
+        source,
+      });
+    }
+  };
+  let mut certs = Vec::new();
+  for cert in CertificateDer::pem_slice_iter(&pem) {
+    certs.push(cert.map_err(|err| Error::GuestCertificate {
+      path: path.to_path_buf(),
+      source: err.into(),
+    })?);
+  }
+  let certs = Arc::new(certs);
+  cache.insert(path.to_path_buf(), Arc::clone(&certs));
+  Ok(Some(certs))
+}
+
+/// Upstream client identity for `cert` and `key`, read once.
+///
+/// # Errors
+///
+/// Returns an error when the pair cannot be read or parsed.
+pub(crate) fn cached_client_identity(cache: &DashMap<PathBuf, ClientAuth>, cert: &Path, key: &Path) -> Result<ClientAuth, Error> {
+  if let Some(hit) = cache.get(cert) {
+    return Ok(hit.clone());
+  }
+  let auth = client_identity(cert, key)?;
+  cache.insert(cert.to_path_buf(), auth.clone());
+  Ok(auth)
 }
