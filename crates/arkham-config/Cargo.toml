@@ -1,6 +1,6 @@
 [package]
 name = "arkham-config"
-version = "0.3.26"
+version = "0.3.27"
 edition = "2024"
 description = "grant-scoped MITM proxy: config overlay, rules, grants, and the CLI"
 license = "Apache-2.0"

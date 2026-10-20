@@ -15,6 +15,11 @@
 - *(proxy)* Drive sslmode=allow guests with tokio-postgres (#85)
 - *(proxy)* Drive SMTP e2e guests with lettre (#87)
 - *(proxy)* Drive redis e2e AUTH and PING with the redis crate (#90)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.26 [ci skip]
+- Release
 ## [0.3.25] - 2026-10-20
 
 ### 🐛 Bug Fixes
