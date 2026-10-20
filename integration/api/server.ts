@@ -10,8 +10,8 @@ const REAL = process.env.ARKHAM_REAL ?? "";
 const CLIENT_SECRET = process.env.OIDC_CLIENT_SECRET ?? "";
 const ACCESS_TOKEN = process.env.OIDC_ACCESS_TOKEN ?? "";
 const CERT_DIR = process.env.CERT_DIR ?? "/certs";
-if (!REAL || !CLIENT_SECRET || !ACCESS_TOKEN) {
-  console.error("ARKHAM_REAL, OIDC_CLIENT_SECRET, or OIDC_ACCESS_TOKEN not set");
+if (!REAL) {
+  console.error("ARKHAM_REAL not set");
   process.exit(1);
 }
 
@@ -55,6 +55,10 @@ const issuerFetch = (req: Request) => {
     });
   }
   if (req.method === "POST" && url.pathname === "/token") {
+    if (!CLIENT_SECRET || !ACCESS_TOKEN) {
+      console.error("OIDC_CLIENT_SECRET or OIDC_ACCESS_TOKEN not set");
+      return Response.json({ error: "invalid_client" }, { status: 401 });
+    }
     const auth = req.headers.get("authorization") ?? "";
     const expected = `Basic ${Buffer.from(`demo-client:${CLIENT_SECRET}`).toString("base64")}`;
     if (auth !== expected) {
