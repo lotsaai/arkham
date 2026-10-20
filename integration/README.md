@@ -34,7 +34,7 @@ Topology:
 | 3 | Cleartext line protocol to `api:9000` | `tcp://10.202.0.20:9000` | `AUTH fake` became `AUTH real`, `OK real` came back as `OK fake` |
 | 4 | TLS line protocol to `api:9443` | `https://api:9443` | same as 3 through terminated TLS legs |
 | 5 | TLS line protocol to `api:9444` | none | tunnel splices untouched: fake arrives as-is, server rejects |
-| 6 | `pg` connects with the guest's fake `DATABASE_URL` and `ssl: { ca, rejectUnauthorized: true }`, runs `SELECT 'ok'`, then connects again with a password that is not the decoy | `[rules.db]`: `env = "DATABASE_URL"`, `value` the fake URL; the real URL in fnox | PostgreSQL accepts the decoy session, which shows arkham swapped in the real password, and refuses the other password. The error text does not contain the real password |
+| 6 | `pg` connects with the guest's fake `DATABASE_URL` and `ssl: { ca, rejectUnauthorized: true }`, runs `SELECT 'ok'`, then connects again with a password that is not the decoy | `[rules.db]`: `env = "DATABASE_URL"`, `value` the fake URL; the real URL in fnox | PostgreSQL 17 accepts the decoy over SCRAM-SHA-256, so arkham authenticated upstream with the real password, and refuses any other password. The error text does not contain the real password |
 | 7 | OAuth2 `client_credentials` POST `api:8000/token` with the fake client secret, then GET with the minted token | `[rules.oidc]` + `oauth2` block | issuer saw the real client secret, the client received a minted decoy access token (never the real one), and the decoy swapped back to the real access token on the API call |
 | 8 | OpenSSH client with the decoy identity to `10.202.0.40` | `[rules.ssh]` `ssh://10.202.0.40:22` | `echo ssh-ok`, and `known_hosts` records arkham's host key |
 | 9 | Redis RESP via Bun's `RedisClient` to `redis:6379`: requirepass, ACL user, `HELLO 3 AUTH`, a pipeline, and `WRONGPASS` | `[rules.redis_plain]`: fake `redis://` URL; real URL rendered into fnox by `gen-secrets.sh` | official Redis accepts the swapped password; the real password is absent from the client error |
@@ -72,7 +72,10 @@ connection to :5432 resolves to the entry, whatever address DNS resolved.
 Both connection strings name the host the way real deployments do —
 the `db` hostname, never an IP. The client keeps full TLS hostname
 verification on: it dials by that name, and arkham mints the guest leaf
-for it. Scenario 6 is gated on `DATABASE_URL`, so `run.ts` still runs when that service is absent.
+for it. The server uses the image default `scram-sha-256`. The password
+is not on the wire. Arkham finishes the guest handshake with the decoy
+and the upstream handshake with the real password, then splices the
+query stream. Scenario 6 is gated on `DATABASE_URL`, so `run.ts` still runs when that service is absent.
 Scenario 7 exercises runtime token minting
 (`crates/arkham-proxy/src/mint.rs`): the client secret is a static
 substitution (`arkham fake OIDC_CLIENT_SECRET`, pinned in
