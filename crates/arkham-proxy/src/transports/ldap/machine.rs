@@ -422,7 +422,7 @@ impl Wire for Ldap {
     match fact {
       PeerFact::Open(id, abandonable) => track(&mut up.open, id, abandonable),
       PeerFact::Abandon(id) => up.open.retain(|(open, abandonable)| *open != id || !*abandonable),
-      PeerFact::Heads(_) => {}
+      PeerFact::Heads(_) | PeerFact::FrameMax(_) => {}
     }
   }
 

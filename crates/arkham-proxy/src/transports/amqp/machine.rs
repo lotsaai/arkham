@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
@@ -22,7 +22,7 @@ use serde_amqp::serde::de::DeserializeOwned;
 use serde_amqp::serde::{Deserialize, Serialize};
 
 use crate::transports::engine::{
-  CredentialPair, Direction, Hit, Location, Rewritten, Wire, find_new_match, needle_prefix_suffix_len, replace_bytes,
+  CredentialPair, Direction, Hit, Location, PeerFact, Rewritten, Wire, find_new_match, needle_prefix_suffix_len, replace_bytes,
 };
 
 /// Protocol header length. `parse_protocol_header` does not return a partial version.
@@ -166,12 +166,17 @@ pub(crate) struct Amqp {
   framer: Framer,
   phase: Phase,
   carries: HashMap<Link, Carry>,
-  /// Parked 1.0 transfers in the order the server sent them.
-  parked: VecDeque<Link>,
   /// Bytes withheld so a secret split across reads is visible before it is written.
   tail: Vec<u8>,
-  /// Largest frame this direction may emit. Tune and Open replace the floor.
+  /// Protocol default for this direction. A header may replace it.
   frame_max: usize,
+  /// Guest maximum from [`Wire::apply_peer_note`]. Frames this machine emits use it
+  /// once set, including after a later header rewrites [`Self::frame_max`].
+  guest_max: Option<usize>,
+  /// Guest frame maximum waiting for [`Wire::take_peer_note`]. `usize::MAX` means no limit.
+  peer_note: Option<usize>,
+  /// The request leg has not yet read the guest's frame maximum.
+  limit_watch: bool,
   /// Typed reason for the close, when the machine has one.
   fault: Option<crate::Error>,
   closed: bool,
@@ -234,15 +239,9 @@ struct Link {
   handle: Option<u32>,
 }
 
-struct Pending {
-  header: Vec<u8>,
-  room: usize,
-}
-
 struct Carry {
   held: Vec<u8>,
   left: Option<u64>,
-  pending: Option<Pending>,
 }
 
 #[derive(Clone, Copy)]
@@ -321,9 +320,11 @@ impl Amqp {
       framer: Framer::V091,
       phase,
       carries: HashMap::new(),
-      parked: VecDeque::new(),
       tail: Vec::new(),
       frame_max: MIN_FRAME_091,
+      guest_max: None,
+      peer_note: None,
+      limit_watch: false,
       fault: None,
       closed: false,
     })
@@ -344,9 +345,26 @@ impl Wire for Amqp {
   fn feed<'a>(&mut self, chunk: &'a [u8]) -> impl Future<Output = (Rewritten<'a>, Vec<Hit>)> + Send {
     std::future::ready(self.advance(chunk))
   }
+
+  fn take_peer_note(&mut self) -> Option<PeerFact> {
+    self.peer_note.take().map(PeerFact::FrameMax)
+  }
+
+  fn apply_peer_note(&mut self, fact: PeerFact) {
+    if let PeerFact::FrameMax(n) = fact
+      && n > 0
+    {
+      self.guest_max = Some(n);
+    }
+  }
 }
 
 impl Amqp {
+  /// The maximum for a frame this machine emits. The guest value wins over the protocol default.
+  fn emit_limit(&self) -> usize {
+    self.guest_max.unwrap_or(self.frame_max)
+  }
+
   fn advance<'a>(&mut self, chunk: &'a [u8]) -> (Rewritten<'a>, Vec<Hit>) {
     if self.closed {
       return (Rewritten::Close, Vec::new());
@@ -384,6 +402,15 @@ impl Amqp {
       Phase::Frame { .. } | Phase::Forward(_) => false,
     };
     if !idle {
+      if self.limit_watch
+        && let Phase::Head(buf) = std::mem::replace(&mut self.phase, Phase::Opaque)
+      {
+        self.limit_watch = false;
+        if buf.is_empty() {
+          return (Rewritten::Hold, Vec::new());
+        }
+        return (Rewritten::Emit(Cow::Owned(buf)), Vec::new());
+      }
       self.closed = true;
       return (Rewritten::Close, Vec::new());
     }
@@ -454,6 +481,9 @@ impl Amqp {
   }
 
   fn drive_head(&mut self, mut buf: Vec<u8>, input: &mut &[u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Result<(), ()> {
+    if self.limit_watch && self.up.is_none() {
+      return self.drive_watch(buf, input, out);
+    }
     if buf.is_empty() && self.framer == (Framer::V10 { sasl: true }) && input.first() == Some(&protocol_lead()) {
       if self.down.is_some() {
         return self.opaque(input, out);
@@ -751,7 +781,8 @@ impl Amqp {
       Kind::StartOk => {
         let rewritten = self.start_ok(&buf, hits)?;
         out.extend_from_slice(rewritten.as_deref().unwrap_or(&buf));
-        self.phase = Phase::Opaque;
+        self.limit_watch = true;
+        self.phase = Phase::Head(Vec::new());
       }
       Kind::SaslInit => {
         let outcome = self.sasl_init(&buf, hits)?;
@@ -761,12 +792,16 @@ impl Amqp {
           InitRewrite::Unchanged | InitRewrite::AwaitResponse => buf,
         };
         out.extend_from_slice(&frame);
-        self.phase = if await_response { Phase::Head(Vec::new()) } else { Phase::Opaque };
+        if !await_response {
+          self.limit_watch = true;
+        }
+        self.phase = Phase::Head(Vec::new());
       }
       Kind::SaslResponse => {
         let rewritten = self.sasl_response(&buf, hits)?;
         out.extend_from_slice(rewritten.as_deref().unwrap_or(&buf));
-        self.phase = Phase::Opaque;
+        self.limit_watch = true;
+        self.phase = Phase::Head(Vec::new());
       }
       Kind::Close091 => {
         self.forget_091(&buf);
@@ -957,7 +992,6 @@ impl Amqp {
     self.carries.remove(&link).unwrap_or(Carry {
       held: Vec::new(),
       left: None,
-      pending: None,
     })
   }
 
@@ -985,7 +1019,6 @@ impl Amqp {
       Carry {
         held: kept,
         left: (new_left > 0).then_some(new_left),
-        pending: None,
       },
     );
     Ok(())
@@ -996,99 +1029,33 @@ impl Amqp {
     self.fault.as_ref()
   }
 
-  fn park(&mut self, link: Link, pending: Pending) -> Result<(), ()> {
-    let bytes = self
-      .carries
-      .values()
-      .map(carry_weight)
-      .sum::<usize>()
-      .saturating_add(pending.header.len());
-    let entries = self.carries.len();
-    if bytes > CARRY_BYTES || entries > CARRY_ENTRIES {
-      self.fault = Some(crate::Error::AmqpCarryBudget { bytes, entries });
-      return Err(());
-    }
-    let Some(carry) = self.carries.get_mut(&link) else {
-      return Err(());
-    };
-    carry.pending = Some(pending);
-    self.parked.retain(|item| *item != link);
-    self.parked.push_back(link);
-    Ok(())
-  }
-
-  /// `held` plus a parked header, counted the same way as [`Self::park`].
-  fn carry_fits(&self, link: Link, held_len: usize, header_len: usize) -> bool {
-    let old = self.carries.get(&link).map_or(0, carry_weight);
-    let bytes = self
-      .carries
-      .values()
-      .map(carry_weight)
-      .sum::<usize>()
-      .saturating_sub(old)
-      .saturating_add(held_len)
-      .saturating_add(header_len);
-    let entries = self.carries.len() + usize::from(!self.carries.contains_key(&link));
-    bytes <= CARRY_BYTES && entries <= CARRY_ENTRIES
-  }
-
-  /// Put as many released bytes as fit into a parked transfer, and drop them from `held`.
-  fn splice_pending(&mut self, link: Link, pending: &Pending, held: &mut Vec<u8>, out: &mut Vec<u8>) -> Result<(), ()> {
-    self.parked.retain(|item| *item != link);
-    let n = held.len().min(pending.room);
-    let Some(fill) = held.get(..n) else {
-      return Err(());
-    };
-    emit_filled(pending, fill, self.frame_max, out)?;
-    let _removed = held.drain(..n).count();
-    Ok(())
-  }
-
-  fn flush_before(&mut self, link: Link, out: &mut Vec<u8>) -> Result<(), ()> {
-    while let Some(front) = self.parked.front().copied() {
-      if front == link {
-        break;
+  /// Read the guest's frame maximum from the bytes that follow the credential
+  /// exchange, then splice those bytes unchanged.
+  fn drive_watch(&mut self, mut buf: Vec<u8>, input: &mut &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
+    buf.extend_from_slice(input);
+    *input = &[];
+    match read_limit(self.framer, &buf) {
+      Watch::Found { len, limit } => {
+        self.peer_note = Some(limit);
+        self.limit_watch = false;
+        let Some(frame) = buf.get(..len) else {
+          return Err(());
+        };
+        out.extend_from_slice(frame);
+        let Some(rest) = buf.get(len..) else {
+          return Err(());
+        };
+        out.extend_from_slice(rest);
+        self.phase = Phase::Opaque;
       }
-      self.parked.pop_front();
-      let Some(pending) = self.carries.get_mut(&front).and_then(|carry| carry.pending.take()) else {
-        continue;
-      };
-      emit_filled(&pending, &[], self.frame_max, out)?;
-    }
-    Ok(())
-  }
-
-  fn note_limit(&mut self, frame: &[u8]) {
-    match self.framer {
-      Framer::V091 => {
-        let Ok((_, parsed)) = parse_frame(frame) else {
-          return;
-        };
-        let AMQPFrame::Method(_, AMQPClass::Connection(connection::AMQPMethod::Tune(tune))) = parsed else {
-          return;
-        };
-        self.frame_max = usize::try_from(tune.frame_max).unwrap_or(self.frame_max);
-      }
-      Framer::V10 { sasl: true } => {}
-      Framer::V10 { sasl: false } => {
-        let Ok(at) = data_offset(frame) else {
-          return;
-        };
-        let Some(body) = frame.get(at..) else {
-          return;
-        };
-        let Ok(perf) = consume_value(body, PERFORMATIVE_NESTING) else {
-          return;
-        };
-        let Some(encoded) = body.get(..perf) else {
-          return;
-        };
-        let Ok(open) = serde_amqp::from_slice::<Open>(encoded) else {
-          return;
-        };
-        self.frame_max = usize::from(open.max_frame_size);
+      Watch::Need => self.phase = Phase::Head(buf),
+      Watch::Miss => {
+        self.limit_watch = false;
+        out.extend_from_slice(&buf);
+        self.phase = Phase::Opaque;
       }
     }
+    Ok(())
   }
 
   fn forget_091(&mut self, buf: &[u8]) {
@@ -1103,28 +1070,23 @@ impl Amqp {
     };
     if pair == connection_close_ids() {
       self.carries.clear();
-      self.parked.clear();
     } else if pair == channel_close_ids() {
       let link = Link { channel, handle: None };
       self.carries.remove(&link);
-      self.parked.retain(|item| *item != link);
     }
   }
 
   fn forget_10(&mut self, buf: &[u8], code: u64) {
     if Some(code) == close_code() {
       self.carries.clear();
-      self.parked.clear();
       return;
     }
     let Ok(channel) = channel_10(buf) else {
       self.carries.clear();
-      self.parked.clear();
       return;
     };
     if Some(code) == end_code() {
       self.carries.retain(|link, _| link.channel != channel);
-      self.parked.retain(|link| link.channel != channel);
       return;
     }
     if Some(code) != detach_code() {
@@ -1132,7 +1094,6 @@ impl Amqp {
     }
     let Some(handle) = detach_handle(buf) else {
       self.carries.retain(|link, _| link.channel != channel);
-      self.parked.retain(|link| link.channel != channel);
       return;
     };
     let link = Link {
@@ -1140,7 +1101,6 @@ impl Amqp {
       handle: Some(handle),
     };
     self.carries.remove(&link);
-    self.parked.retain(|item| *item != link);
   }
 
   fn on_scanned(&mut self, frame: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
@@ -1148,7 +1108,6 @@ impl Amqp {
       out.extend_from_slice(frame);
       return Ok(());
     }
-    self.note_limit(frame);
     if matches!(self.framer, Framer::V091) && matches!(parse_frame_type(frame), Ok((_, AMQPFrameType::Header))) {
       let payload = frame_payload(self.framer, frame)?;
       let (_, header) = parse_content_header(payload).map_err(|_parse| ())?;
@@ -1169,11 +1128,11 @@ impl Amqp {
     self.store(link, body_size, Vec::new())
   }
 
-  /// One path for every body and transfer. A 1.0 transfer keeps its frame count:
-  /// released bytes are spliced into that transfer. A 0-9-1 body may split so
-  /// each emitted frame fits the negotiated maximum. A buffered frame withholds
-  /// the suffix of the held bytes joined with its payload. A streamed frame
-  /// withholds needle-1.
+  /// One path for every body and transfer. A 1.0 transfer is sent when it
+  /// arrives; a payload that must stay withheld goes out empty and the bytes
+  /// ride the next frame on that link. A 0-9-1 body may split so each emitted
+  /// frame fits the guest's maximum. A buffered frame withholds the suffix of
+  /// the held bytes joined with its payload. A streamed frame withholds needle-1.
   fn open_message(
     &mut self,
     buf: &[u8],
@@ -1197,7 +1156,6 @@ impl Amqp {
         lead: Vec::new(),
         continues: false,
         left: 0,
-        pending: None,
       },
       None => Opened {
         link: Link {
@@ -1212,7 +1170,6 @@ impl Amqp {
         lead: Vec::new(),
         continues: false,
         left: 0,
-        pending: None,
       },
     };
     if opened.aborted {
@@ -1220,8 +1177,7 @@ impl Amqp {
       return self.begin_forward(buf, total, 0, input, out);
     }
     let mut opened = opened;
-    let Carry { held, left, pending } = self.take_link(opened.link);
-    opened.pending = pending;
+    let Carry { held, left } = self.take_link(opened.link);
     let payload_u = u64::try_from(opened.payload_len).map_err(|_wide| ())?;
     let (more, new_left) = match left {
       Some(left) if payload_u > left => return Err(()),
@@ -1278,7 +1234,8 @@ impl Amqp {
     self.withhold(buf, total, &opened, (k, new_left), input, out)
   }
 
-  /// Splice released bytes into the server's transfer. The guest sees that one frame.
+  /// Send this transfer now. A payload that is still a secret prefix goes out
+  /// empty; those bytes stay on the link for the next frame.
   fn relay_transfer(
     &mut self,
     buf: &[u8],
@@ -1290,82 +1247,49 @@ impl Amqp {
   ) -> Result<Phase, ()> {
     let more = opened.continues;
     let new_left = opened.left;
-    let buffered = self.buffered_message(total, opened.payload_len);
-    let room = self.frame_max.saturating_sub(opened.payload_at);
-    self.flush_before(opened.link, out)?;
     if !more {
       return self.finish_transfer(buf, total, opened, held, input, out);
     }
-    if buffered {
-      let Some(payload) = buf.get(opened.payload_at..opened.payload_at.saturating_add(opened.payload_len)) else {
-        return Err(());
-      };
-      let mut joined = held;
-      joined.extend_from_slice(payload);
-      let retain = self.suffix(&joined);
-      let release_at = joined.len().saturating_sub(retain);
-      if release_at == 0 && !joined.is_empty() {
-        let header = buf.get(..opened.payload_at).ok_or(())?.to_vec();
-        let pending_room = opened.payload_len.min(room);
-        if self.carry_fits(opened.link, joined.len(), header.len()) {
-          if let Some(old) = opened.pending.take() {
-            emit_filled(&old, &[], self.frame_max, out)?;
-            self.parked.retain(|item| *item != opened.link);
-          }
-          self.store(opened.link, new_left, joined)?;
-          self.park(
-            opened.link,
-            Pending {
-              header,
-              room: pending_room,
-            },
-          )?;
-          return Ok(Phase::Head(Vec::new()));
-        }
-        // A header this large would exhaust the carry budget. Emit the frame
-        // with its payload withheld and keep the earlier parked transfer.
-        self.store(opened.link, new_left, joined)?;
-        write_transfer(buf, opened, &[], self.frame_max, out)?;
-        if let Some(pending) = opened.pending.take() {
-          self.park(opened.link, pending)?;
-        }
-        return Ok(Phase::Head(Vec::new()));
-      }
-      let mut rest = joined;
-      let kept = rest.split_off(release_at);
-      if let Some(pending) = opened.pending.take() {
-        self.parked.retain(|item| *item != opened.link);
-        let n = rest.len().min(pending.room);
-        let Some(fill) = rest.get(..n) else {
-          return Err(());
-        };
-        emit_filled(&pending, fill, self.frame_max, out)?;
-        let _removed = rest.drain(..n).count();
-      }
-      let fit = rest.len().min(opened.payload_len).min(room);
-      let Some(emit) = rest.get(..fit) else {
-        return Err(());
-      };
-      write_transfer(buf, opened, emit, self.frame_max, out)?;
-      let _removed = rest.drain(..fit).count();
-      rest.extend_from_slice(&kept);
-      self.store(opened.link, new_left, rest)?;
-      return Ok(Phase::Head(Vec::new()));
-    }
-    let mut held = held;
-    if let Some(pending) = opened.pending.take() {
-      self.splice_pending(opened.link, &pending, &mut held, out)?;
+    if self.buffered_message(total, opened.payload_len) {
+      return self.emit_buffered(buf, opened, held, new_left, out);
     }
     let k = self.needle_room().min(opened.payload_len);
     let size = total.saturating_sub(k).saturating_add(held.len());
-    if size > self.frame_max {
+    if size > self.emit_limit() {
       return Err(());
     }
     opened.lead = held;
     self.withhold(buf, total, opened, (k, new_left), input, out)
   }
 
-  /// The server's last transfer on this link. Released bytes fill a parked frame first.
+  fn emit_buffered(&mut self, buf: &[u8], opened: &Opened, held: Vec<u8>, new_left: u64, out: &mut Vec<u8>) -> Result<Phase, ()> {
+    let Some(payload) = buf.get(opened.payload_at..opened.payload_at.saturating_add(opened.payload_len)) else {
+      return Err(());
+    };
+    let mut joined = held;
+    joined.extend_from_slice(payload);
+    let retain = self.suffix(&joined);
+    let release_at = joined.len().saturating_sub(retain);
+    if release_at == 0 && !joined.is_empty() {
+      self.store(opened.link, new_left, joined)?;
+      write_transfer(buf, opened, &[], self.emit_limit(), out)?;
+      return Ok(Phase::Head(Vec::new()));
+    }
+    let mut rest = joined;
+    let kept = rest.split_off(release_at);
+    let room = self.emit_limit().saturating_sub(opened.payload_at);
+    let fit = rest.len().min(opened.payload_len).min(room);
+    let Some(emit) = rest.get(..fit) else {
+      return Err(());
+    };
+    write_transfer(buf, opened, emit, self.emit_limit(), out)?;
+    let _removed = rest.drain(..fit).count();
+    rest.extend_from_slice(&kept);
+    self.store(opened.link, new_left, rest)?;
+    Ok(Phase::Head(Vec::new()))
+  }
+
+  /// The server's last transfer on this link. Released bytes are prepended when they fit.
   fn finish_transfer(
     &mut self,
     buf: &[u8],
@@ -1375,15 +1299,12 @@ impl Amqp {
     input: &mut &[u8],
     out: &mut Vec<u8>,
   ) -> Result<Phase, ()> {
-    if let Some(pending) = opened.pending.take() {
-      self.splice_pending(opened.link, &pending, &mut held, out)?;
-    }
     if held.is_empty() {
       self.store(opened.link, opened.left, Vec::new())?;
       return self.begin_forward(buf, total, 0, input, out);
     }
     let size = total.checked_add(held.len()).ok_or(())?;
-    if size > self.frame_max {
+    if size > self.emit_limit() {
       return Err(());
     }
     if buf.len() < total {
@@ -1405,19 +1326,19 @@ impl Amqp {
       return Err(());
     };
     held.extend_from_slice(payload);
-    write_transfer(buf, opened, &held, self.frame_max, out)?;
+    write_transfer(buf, opened, &held, self.emit_limit(), out)?;
     self.store(opened.link, opened.left, Vec::new())?;
     Ok(Phase::Head(Vec::new()))
   }
 
   fn write_held(&self, opened: &Opened, held: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
-    let room = self.frame_max.saturating_sub(TYPE_CHANNEL_AND_SIZE.saturating_add(1));
+    let room = self.emit_limit().saturating_sub(TYPE_CHANNEL_AND_SIZE.saturating_add(1));
     if room == 0 {
       return Err(());
     }
     for chunk in held.chunks(room) {
       let frame = encode_091(&AMQPFrame::Body(opened.link.channel, chunk.to_vec()))?;
-      if frame.len() > self.frame_max {
+      if frame.len() > self.emit_limit() {
         return Err(());
       }
       out.extend_from_slice(&frame);
@@ -1449,7 +1370,7 @@ impl Amqp {
     };
     if send > 0 || opened.transfer.is_some() {
       let size = total.saturating_sub(k).saturating_add(opened.lead.len());
-      if opened.transfer.is_some() && size > self.frame_max {
+      if opened.transfer.is_some() && size > self.emit_limit() {
         return Err(());
       }
       write_prefix(buf, opened, total, k, out)?;
@@ -1670,29 +1591,10 @@ struct Opened {
   continues: bool,
   /// Bytes still expected on this link after this frame.
   left: u64,
-  /// A transfer parked ahead of this one on the same link.
-  pending: Option<Pending>,
 }
 
 fn carry_weight(carry: &Carry) -> usize {
-  carry.held.len() + carry.pending.as_ref().map_or(0, |pending| pending.header.len())
-}
-
-fn emit_filled(pending: &Pending, payload: &[u8], limit: usize, out: &mut Vec<u8>) -> Result<(), ()> {
-  let n = payload.len().min(pending.room);
-  let Some(payload) = payload.get(..n) else {
-    return Err(());
-  };
-  let size = pending.header.len().checked_add(payload.len()).ok_or(())?;
-  if size > limit {
-    return Err(());
-  }
-  let mut head = pending.header.clone();
-  let bytes = u32::try_from(size).map_err(|_wide| ())?;
-  head.get_mut(..4).ok_or(())?.copy_from_slice(&bytes.to_be_bytes());
-  out.extend_from_slice(&head);
-  out.extend_from_slice(payload);
-  Ok(())
+  carry.held.len()
 }
 
 fn write_transfer(buf: &[u8], opened: &Opened, payload: &[u8], limit: usize, out: &mut Vec<u8>) -> Result<(), ()> {
@@ -1764,12 +1666,117 @@ fn sasl_header() -> [u8; PROTOCOL_HEADER_LEN] {
   bytes
 }
 
+enum Watch {
+  Found { len: usize, limit: usize },
+  Need,
+  Miss,
+}
+
+/// `0` is the 0-9-1 unlimited value, encoded as [`usize::MAX`] so an emit does not treat it as an empty frame.
+fn guest_frame_max(value: u32) -> usize {
+  if value == 0 {
+    usize::MAX
+  } else {
+    usize::try_from(value).unwrap_or(usize::MAX)
+  }
+}
+
+fn read_limit(framer: Framer, buf: &[u8]) -> Watch {
+  match framer {
+    Framer::V091 => watch_091(buf),
+    Framer::V10 { sasl: true } => watch_sasl_tail(buf),
+    Framer::V10 { sasl: false } => watch_open(buf, 0),
+  }
+}
+
+fn watch_091(buf: &[u8]) -> Watch {
+  let size = match payload_len_091(buf) {
+    Ok(Some(size)) => size,
+    Ok(None) if buf.len() > TYPE_CHANNEL_AND_SIZE => return Watch::Miss,
+    Ok(None) => return Watch::Need,
+    Err(()) => return Watch::Miss,
+  };
+  let Some(total) = TYPE_CHANNEL_AND_SIZE.checked_add(size).and_then(|len| len.checked_add(1)) else {
+    return Watch::Miss;
+  };
+  if total > MAX_CREDENTIAL_FRAME {
+    return Watch::Miss;
+  }
+  if buf.len() < total {
+    return Watch::Need;
+  }
+  let Some(frame) = buf.get(..total) else {
+    return Watch::Miss;
+  };
+  let Ok((_, parsed)) = parse_frame(frame) else {
+    return Watch::Miss;
+  };
+  let AMQPFrame::Method(_, AMQPClass::Connection(connection::AMQPMethod::TuneOk(ok))) = parsed else {
+    return Watch::Miss;
+  };
+  Watch::Found {
+    len: total,
+    limit: guest_frame_max(ok.frame_max),
+  }
+}
+
+fn watch_sasl_tail(buf: &[u8]) -> Watch {
+  if buf.len() < PROTOCOL_HEADER_LEN {
+    return Watch::Need;
+  }
+  let Some(header) = buf.get(..PROTOCOL_HEADER_LEN) else {
+    return Watch::Miss;
+  };
+  if header_framer(true, header).is_none() {
+    return Watch::Miss;
+  }
+  let Some(rest) = buf.get(PROTOCOL_HEADER_LEN..) else {
+    return Watch::Miss;
+  };
+  watch_open(rest, PROTOCOL_HEADER_LEN)
+}
+
+fn watch_open(buf: &[u8], extra: usize) -> Watch {
+  let total = match frame_len_10(buf) {
+    Ok(Some((_, total))) => total,
+    Ok(None) if buf.len() >= 4 => return Watch::Miss,
+    Ok(None) => return Watch::Need,
+    Err(()) => return Watch::Miss,
+  };
+  if !(FRAME_HEADER_10..=MAX_CREDENTIAL_FRAME).contains(&total) {
+    return Watch::Miss;
+  }
+  if buf.len() < total {
+    return Watch::Need;
+  }
+  let Some(frame) = buf.get(..total) else {
+    return Watch::Miss;
+  };
+  let Ok(limit) = open_limit(frame) else {
+    return Watch::Miss;
+  };
+  let Some(len) = total.checked_add(extra) else {
+    return Watch::Miss;
+  };
+  Watch::Found { len, limit }
+}
+
+fn open_limit(frame: &[u8]) -> Result<usize, ()> {
+  let at = data_offset(frame)?;
+  let body = frame.get(at..).ok_or(())?;
+  let perf = consume_value(body, PERFORMATIVE_NESTING)?;
+  let encoded = body.get(..perf).ok_or(())?;
+  let open: Open = serde_amqp::from_slice(encoded).map_err(|_open| ())?;
+  let max = u32::try_from(usize::from(open.max_frame_size)).map_err(|_wide| ())?;
+  Ok(guest_frame_max(max))
+}
+
 fn header_framer(downstream: bool, buf: &[u8]) -> Option<Framer> {
   if let Ok((rest, AMQPFrame::ProtocolHeader(version))) = parse_frame(buf) {
     if rest.is_empty() && downstream && version == ProtocolVersion::amqp_0_9_1() {
       return Some(Framer::V091);
     }
-    if rest.is_empty() && !downstream && version.major == MAJOR && version.minor == MINOR && version.revision == REVISION {
+    if rest.is_empty() && version.major == MAJOR && version.minor == MINOR && version.revision == REVISION {
       return Some(Framer::V10 { sasl: false });
     }
   }
@@ -2339,7 +2346,7 @@ mod tests {
   use serde_amqp::serde::Serialize;
 
   use super::{Amqp, SaslMechanism};
-  use crate::transports::engine::{Direction, Rewritten, Wire};
+  use crate::transports::engine::{Direction, PeerFact, Rewritten, Wire};
 
   const FAKE: &str = "arkham_fake_amqp_pass"; // betterleaks:allow
   const REAL: &str = "arkham_real_amqp_pass_longer_01"; // betterleaks:allow
@@ -2585,13 +2592,16 @@ mod tests {
     ))
   }
 
-  /// The relay sends a peer note only when the request leg reports one.
+  /// The relay forwards every note the request leg reports. One note, once.
   fn hand_guest_limit(guest_side: &mut Amqp, server_side: &mut Amqp) -> usize {
-    let pending = guest_side.take_peer_note();
-    if pending > 0 {
-      server_side.apply_peer_note(pending);
+    let mut note = 0usize;
+    while let Some(fact) = guest_side.take_peer_note() {
+      if let PeerFact::FrameMax(n) = fact {
+        note = n;
+      }
+      server_side.apply_peer_note(fact);
     }
-    pending
+    note
   }
 
   fn flow_frame(channel: u16) -> Vec<u8> {
@@ -2668,7 +2678,10 @@ mod tests {
     while !rest.is_empty() {
       let (next, _) = parse_frame(rest).unwrap();
       let size = rest.len() - next.len();
-      assert!(size <= limit, "a delivered frame is {size} bytes, above the guest frame-max {limit}");
+      assert!(
+        size <= limit,
+        "a delivered frame is {size} bytes, above the guest frame-max {limit}"
+      );
       rest = next;
     }
   }
@@ -3325,7 +3338,7 @@ mod tests {
     while !rest.is_empty() {
       assert!(rest.len() >= 8, "a 1.0 header");
       let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
-      assert!(size <= limit, "a delivered frame exceeds the replaced frame");
+      assert!(size <= limit, "a delivered frame exceeds the limit");
       assert!(size <= rest.len() && size >= 8, "the size stays inside the buffer");
       rest = &rest[size..];
     }
@@ -3387,7 +3400,7 @@ mod tests {
       [prefix, filler.as_slice()].concat(),
       "the held prefix precedes the large payload"
     );
-    assert_10_frames_within(&guest, large.len());
+    assert_10_frames_within(&guest, large.len().saturating_add(prefix.len()));
     assert!(!contains(&guest, REAL));
     assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
   }
@@ -3607,20 +3620,19 @@ mod tests {
   #[tokio::test]
   async fn a_released_body_stays_inside_the_negotiated_frame_max() {
     let real = format!("{}uniq", "z".repeat(70));
+    let mut guest_side = down(true);
+    let mut client = start_ok("PLAIN", plain("agent", FAKE));
+    client.extend(tune_ok(64));
+    let _ = feed_open(&mut guest_side, &client).await;
     let mut machine = up_password(&real);
-    let frame_max = 64u32;
-    let mut guest = feed_open(&mut machine, &tune(frame_max)).await;
+    let note = hand_guest_limit(&mut guest_side, &mut machine);
+    assert!(note > 0, "the client tune-ok never reached the response leg");
+    let mut guest = feed_open(&mut machine, &tune(131_072)).await;
     guest.extend(feed_open(&mut machine, &content_header(1, 74)).await);
     guest.extend(feed_open(&mut machine, &body_091(&[b'z'; 50])).await);
     guest.extend(feed_open(&mut machine, &body_091(&[b'z'; 20])).await);
     guest.extend(feed_open(&mut machine, &body_091(b"bbbb")).await);
-    let limit = usize::try_from(frame_max).unwrap();
-    let mut rest = guest.as_slice();
-    while !rest.is_empty() {
-      let (next, _) = parse_frame(rest).unwrap();
-      assert!(rest.len() - next.len() <= limit, "a delivered frame exceeds frame-max");
-      rest = next;
-    }
+    assert_091_within(&guest, 64);
     assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
   }
 
@@ -3770,16 +3782,19 @@ mod tests {
     client.extend(tune_ok(64));
     let _ = feed_open(&mut guest_side, &client).await;
     let mut server = up_password(&real);
-    let _ = feed_open(&mut server, &tune(131_072)).await;
     let note = hand_guest_limit(&mut guest_side, &mut server);
     assert!(note > 0, "the client tune-ok never reached the response leg");
-    let mut guest = feed_open(&mut server, &content_header(1, 74)).await;
+    let mut guest = feed_open(&mut server, &tune(131_072)).await;
+    guest.extend(feed_open(&mut server, &content_header(1, 74)).await);
     guest.extend(feed_open(&mut server, &body_091(&[b'z'; 50])).await);
     guest.extend(feed_open(&mut server, &body_091(&[b'z'; 20])).await);
     guest.extend(feed_open(&mut server, &body_091(b"bbbb")).await);
     assert_091_within(&guest, 64);
     assert!(
-      body_payloads(&guest).concat().windows(held.len()).any(|window| window == held.as_bytes()),
+      body_payloads(&guest)
+        .concat()
+        .windows(held.len())
+        .any(|window| window == held.as_bytes()),
       "the released prefix was not delivered"
     );
     assert!(matches!(server.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
@@ -3820,9 +3835,9 @@ mod tests {
     client.extend(open_frame(512));
     let _ = feed_open(&mut guest_side, &client).await;
     let mut server = up();
-    let mut guest = feed_open(&mut server, &header_10()).await;
     let note = hand_guest_limit(&mut guest_side, &mut server);
     assert!(note > 0, "the guest open never reached the response leg");
+    let mut guest = feed_open(&mut server, &header_10()).await;
     guest.extend(feed_open(&mut server, &open_frame(8_192)).await);
     let (prefix, _) = password_split();
     guest.extend(feed_open(&mut server, &transfer(1, true, prefix)).await);
@@ -3853,11 +3868,7 @@ mod tests {
     let mut machine = up();
     let mut guest = feed_open(&mut machine, &header_10()).await;
     guest.extend(feed_open(&mut machine, &transfer(1, true, prefix)).await);
-    assert_eq!(
-      count_transfers(&guest),
-      1,
-      "the withheld transfer was not sent before the abort"
-    );
+    assert_eq!(count_transfers(&guest), 1, "the withheld transfer was not sent before the abort");
     guest.extend(feed_open(&mut machine, &abort_transfer(1)).await);
     assert_eq!(
       count_transfers(&guest),
@@ -3902,6 +3913,13 @@ mod tests {
       .expect("the flow was forwarded");
     assert!(transfer_at < flow_at, "the flow overtook the withheld transfer");
     assert!(!contains(&guest, std::str::from_utf8(prefix).unwrap()));
+    guest.extend(feed_open(&mut machine, &transfer(1, false, b"bbbb")).await);
+    let mut joined = Vec::new();
+    for payload in transfer_payloads(&guest) {
+      joined.extend(payload);
+    }
+    assert_eq!(joined, [prefix, b"bbbb"].concat(), "the flow dropped the withheld prefix");
+    assert!(!contains(&guest, REAL));
     assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
   }
 }
