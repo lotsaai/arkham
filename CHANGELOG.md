@@ -1,3 +1,20 @@
+## [0.3.26] - 2026-10-20
+
+### 🐛 Bug Fixes
+
+- *(amqp)* Hold a split secret until the body completes (#69)
+
+### 🚜 Refactor
+
+- *(nats)* Stop merging the real seed and jwt into .env (#97)
+
+### 🧪 Testing
+
+- *(integration)* Use @nats-io/transport-node for NATS (#82)
+- *(client)* Use Bun fetch for the HTTP compose legs (#84)
+- *(proxy)* Drive sslmode=allow guests with tokio-postgres (#85)
+- *(proxy)* Drive SMTP e2e guests with lettre (#87)
+- *(proxy)* Drive redis e2e AUTH and PING with the redis crate (#90)
 ## [0.3.25] - 2026-10-20
 
 ### 🐛 Bug Fixes
@@ -7,6 +24,11 @@
 ### 🧪 Testing
 
 - *(amqp)* Prove a grantless flow splices byte-identical (#70)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.25 [ci skip]
+- Release
 ## [0.3.24] - 2026-10-19
 
 ### 🚀 Features
