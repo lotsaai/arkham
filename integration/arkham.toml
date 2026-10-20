@@ -106,6 +106,22 @@ value = "ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3389"
 env = "LDAP_TLS_URL"
 value = "ldaps://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3636"
 
+# The guest dials 3390. Nothing listens there. Capture matches the port and
+# the real string is LDAPS on 3636, so the first cleartext bind is already
+# on a TLS upstream.
+[rules.ldap_upstream_tls]
+env = "LDAP_UPSTREAM_TLS_URL"
+value = "ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3390"
+
+# The guest dials 3391. The real string stays ldap:// on 3389, so StartTLS
+# upgrades both legs. The guest must present a certificate on that handshake.
+[rules.ldap_mtls]
+env = "LDAP_MTLS_URL"
+value = "ldap://cn%3DDirectory%20Manager:arkham_fake_ldap_pass@ldap:3391"
+
+[rules.ldap_mtls.tls.LDAP_MTLS_URL]
+guest_tls_mode = "mtls"
+
 # NATS: the fake string is what the client dials. The real string in fnox
 # is `tls://`, so arkham upgrades the upstream leg after the server's INFO
 # line and swaps the CONNECT password only on that leg. The client sees
