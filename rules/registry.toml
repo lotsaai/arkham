@@ -2864,24 +2864,6 @@ hosts = ["https://api.cloudconvert.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/cloudconvert/cloudconvert.go
 
-[providers.cloudflareapitoken]
-env = ["CLOUDFLAREAPITOKEN_API_KEY", "CLOUDFLAREAPITOKEN_API_TOKEN", "CLOUDFLAREAPITOKEN_APIKEY", "CLOUDFLAREAPITOKEN_TOKEN", "CLOUDFLAREAPITOKEN_ACCESS_TOKEN", "CLOUDFLAREAPITOKEN_AUTH_TOKEN", "CLOUDFLAREAPITOKEN_SECRET", "CLOUDFLAREAPITOKEN_SECRET_KEY", "CLOUDFLAREAPITOKEN_KEY"]
-hosts = ["https://api.cloudflare.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/cloudflareapitoken/cloudflareapitoken.go
-
-[providers.cloudflarecakey]
-env = ["CLOUDFLARECAKEY_API_KEY", "CLOUDFLARECAKEY_API_TOKEN", "CLOUDFLARECAKEY_APIKEY", "CLOUDFLARECAKEY_TOKEN", "CLOUDFLARECAKEY_ACCESS_TOKEN", "CLOUDFLARECAKEY_AUTH_TOKEN", "CLOUDFLARECAKEY_SECRET", "CLOUDFLARECAKEY_SECRET_KEY", "CLOUDFLARECAKEY_KEY"]
-hosts = ["https://api.cloudflare.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/cloudflarecakey/cloudflarecakey.go
-
-[providers.cloudflareglobalapikey]
-env = ["CLOUDFLAREGLOBALAPIKEY_API_KEY", "CLOUDFLAREGLOBALAPIKEY_API_TOKEN", "CLOUDFLAREGLOBALAPIKEY_APIKEY", "CLOUDFLAREGLOBALAPIKEY_TOKEN", "CLOUDFLAREGLOBALAPIKEY_ACCESS_TOKEN", "CLOUDFLAREGLOBALAPIKEY_AUTH_TOKEN", "CLOUDFLAREGLOBALAPIKEY_SECRET", "CLOUDFLAREGLOBALAPIKEY_SECRET_KEY", "CLOUDFLAREGLOBALAPIKEY_KEY"]
-hosts = ["https://api.cloudflare.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/cloudflareglobalapikey/cloudflareglobalapikey.go
-
 [providers.cloudimage]
 env = ["CLOUDIMAGE_API_KEY", "CLOUDIMAGE_API_TOKEN", "CLOUDIMAGE_APIKEY", "CLOUDIMAGE_TOKEN", "CLOUDIMAGE_ACCESS_TOKEN", "CLOUDIMAGE_AUTH_TOKEN", "CLOUDIMAGE_SECRET", "CLOUDIMAGE_SECRET_KEY", "CLOUDIMAGE_KEY"]
 hosts = ["https://api.cloudimage.com"]
@@ -3140,18 +3122,6 @@ hosts = ["https://push.databox.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/databox/databox.go
 
-[providers.datadogapikey]
-env = ["DATADOGAPIKEY_API_KEY", "DATADOGAPIKEY_API_TOKEN", "DATADOGAPIKEY_APIKEY", "DATADOGAPIKEY_TOKEN", "DATADOGAPIKEY_ACCESS_TOKEN", "DATADOGAPIKEY_AUTH_TOKEN", "DATADOGAPIKEY_SECRET", "DATADOGAPIKEY_SECRET_KEY", "DATADOGAPIKEY_KEY"]
-hosts = ["https://api.datadoghq.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/datadogapikey/datadogapikey.go
-
-[providers.datadogtoken]
-env = ["DATADOGTOKEN_API_KEY", "DATADOGTOKEN_API_TOKEN", "DATADOGTOKEN_APIKEY", "DATADOGTOKEN_TOKEN", "DATADOGTOKEN_ACCESS_TOKEN", "DATADOGTOKEN_AUTH_TOKEN", "DATADOGTOKEN_SECRET", "DATADOGTOKEN_SECRET_KEY", "DATADOGTOKEN_KEY"]
-hosts = ["https://api.datadoghq.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/datadogtoken/datadogtoken.go
-
 [providers.datagov]
 env = ["DATAGOV_API_KEY", "DATAGOV_API_TOKEN", "DATAGOV_APIKEY", "DATAGOV_TOKEN", "DATAGOV_ACCESS_TOKEN", "DATAGOV_AUTH_TOKEN", "DATAGOV_SECRET", "DATAGOV_SECRET_KEY", "DATAGOV_KEY"]
 hosts = ["https://api.ers.usda.gov", "https://developer.nrel.gov"]
@@ -3205,18 +3175,6 @@ env = ["DIFFBOT_API_KEY", "DIFFBOT_API_TOKEN", "DIFFBOT_APIKEY", "DIFFBOT_TOKEN"
 hosts = ["https://api.diffbot.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/diffbot/diffbot.go
-
-[providers.digitaloceantoken]
-env = ["DIGITALOCEANTOKEN_API_KEY", "DIGITALOCEANTOKEN_API_TOKEN", "DIGITALOCEANTOKEN_APIKEY", "DIGITALOCEANTOKEN_TOKEN", "DIGITALOCEANTOKEN_ACCESS_TOKEN", "DIGITALOCEANTOKEN_AUTH_TOKEN", "DIGITALOCEANTOKEN_SECRET", "DIGITALOCEANTOKEN_SECRET_KEY", "DIGITALOCEANTOKEN_KEY"]
-hosts = ["https://api.digitalocean.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/digitaloceantoken/digitaloceantoken.go
-
-[providers.digitaloceanv2]
-env = ["DIGITALOCEANV2_API_KEY", "DIGITALOCEANV2_API_TOKEN", "DIGITALOCEANV2_APIKEY", "DIGITALOCEANV2_TOKEN", "DIGITALOCEANV2_ACCESS_TOKEN", "DIGITALOCEANV2_AUTH_TOKEN", "DIGITALOCEANV2_SECRET", "DIGITALOCEANV2_SECRET_KEY", "DIGITALOCEANV2_KEY"]
-hosts = ["https://api.digitalocean.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/digitaloceanv2/digitaloceanv2.go
 
 [providers.discordbottoken]
 env = ["DISCORDBOTTOKEN_API_KEY", "DISCORDBOTTOKEN_API_TOKEN", "DISCORDBOTTOKEN_APIKEY", "DISCORDBOTTOKEN_TOKEN", "DISCORDBOTTOKEN_ACCESS_TOKEN", "DISCORDBOTTOKEN_AUTH_TOKEN", "DISCORDBOTTOKEN_SECRET", "DISCORDBOTTOKEN_SECRET_KEY", "DISCORDBOTTOKEN_KEY"]
@@ -3326,12 +3284,6 @@ hosts = ["https://api.edamam.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/edamam/edamam.go
 
-[providers.edenai]
-env = ["EDENAI_API_TOKEN", "EDENAI_APIKEY", "EDENAI_TOKEN", "EDENAI_ACCESS_TOKEN", "EDENAI_AUTH_TOKEN", "EDENAI_SECRET", "EDENAI_SECRET_KEY", "EDENAI_KEY"]
-hosts = ["https://api.edenai.run"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/edenai/edenai.go
-
 [providers.eightxeight]
 env = ["EIGHTXEIGHT_API_KEY", "EIGHTXEIGHT_API_TOKEN", "EIGHTXEIGHT_APIKEY", "EIGHTXEIGHT_TOKEN", "EIGHTXEIGHT_ACCESS_TOKEN", "EIGHTXEIGHT_AUTH_TOKEN", "EIGHTXEIGHT_SECRET", "EIGHTXEIGHT_SECRET_KEY", "EIGHTXEIGHT_KEY"]
 hosts = ["https://sms.8x8.com"]
@@ -3428,12 +3380,6 @@ hosts = ["https://api.fastforex.io"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/fastforex/fastforex.go
 
-[providers.fastlypersonaltoken]
-env = ["FASTLYPERSONALTOKEN_API_KEY", "FASTLYPERSONALTOKEN_API_TOKEN", "FASTLYPERSONALTOKEN_APIKEY", "FASTLYPERSONALTOKEN_TOKEN", "FASTLYPERSONALTOKEN_ACCESS_TOKEN", "FASTLYPERSONALTOKEN_AUTH_TOKEN", "FASTLYPERSONALTOKEN_SECRET", "FASTLYPERSONALTOKEN_SECRET_KEY", "FASTLYPERSONALTOKEN_KEY"]
-hosts = ["https://api.fastly.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/fastlypersonaltoken/fastlypersonaltoken.go
-
 [providers.feedier]
 env = ["FEEDIER_API_KEY", "FEEDIER_API_TOKEN", "FEEDIER_APIKEY", "FEEDIER_TOKEN", "FEEDIER_ACCESS_TOKEN", "FEEDIER_AUTH_TOKEN", "FEEDIER_SECRET", "FEEDIER_SECRET_KEY", "FEEDIER_KEY"]
 hosts = ["https://api.feedier.com"]
@@ -3445,12 +3391,6 @@ env = ["FETCHRSS_API_KEY", "FETCHRSS_API_TOKEN", "FETCHRSS_APIKEY", "FETCHRSS_TO
 hosts = ["https://fetchrss.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/fetchrss/fetchrss.go
-
-[providers.figmapersonalaccesstoken]
-env = ["FIGMAPERSONALACCESSTOKEN_API_KEY", "FIGMAPERSONALACCESSTOKEN_API_TOKEN", "FIGMAPERSONALACCESSTOKEN_APIKEY", "FIGMAPERSONALACCESSTOKEN_TOKEN", "FIGMAPERSONALACCESSTOKEN_ACCESS_TOKEN", "FIGMAPERSONALACCESSTOKEN_AUTH_TOKEN", "FIGMAPERSONALACCESSTOKEN_SECRET", "FIGMAPERSONALACCESSTOKEN_SECRET_KEY", "FIGMAPERSONALACCESSTOKEN_KEY"]
-hosts = ["https://api.figma.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/figmapersonalaccesstoken/figmapersonalaccesstoken.go
 
 [providers.fileio]
 env = ["FILEIO_API_KEY", "FILEIO_API_TOKEN", "FILEIO_APIKEY", "FILEIO_TOKEN", "FILEIO_ACCESS_TOKEN", "FILEIO_AUTH_TOKEN", "FILEIO_SECRET", "FILEIO_SECRET_KEY", "FILEIO_KEY"]
@@ -3681,12 +3621,6 @@ hosts = ["https://api.github.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/githubapp/githubapp.go
 
-[providers.gitlaboauth2]
-env = ["GITLABOAUTH2_API_KEY", "GITLABOAUTH2_API_TOKEN", "GITLABOAUTH2_APIKEY", "GITLABOAUTH2_TOKEN", "GITLABOAUTH2_ACCESS_TOKEN", "GITLABOAUTH2_AUTH_TOKEN", "GITLABOAUTH2_SECRET", "GITLABOAUTH2_SECRET_KEY", "GITLABOAUTH2_KEY"]
-hosts = ["https://gitlab.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/gitlaboauth2/gitlaboauth2.go
-
 [providers.gitter]
 env = ["GITTER_API_KEY", "GITTER_API_TOKEN", "GITTER_APIKEY", "GITTER_TOKEN", "GITTER_ACCESS_TOKEN", "GITTER_AUTH_TOKEN", "GITTER_SECRET", "GITTER_SECRET_KEY", "GITTER_KEY"]
 hosts = ["https://api.gitter.im"]
@@ -3710,12 +3644,6 @@ env = ["GOODDAY_API_KEY", "GOODDAY_API_TOKEN", "GOODDAY_APIKEY", "GOODDAY_TOKEN"
 hosts = ["https://api.goodday.work"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/goodday/goodday.go
-
-[providers.googlegemini]
-env = ["GOOGLEGEMINI_API_KEY", "GOOGLEGEMINI_API_TOKEN", "GOOGLEGEMINI_APIKEY", "GOOGLEGEMINI_TOKEN", "GOOGLEGEMINI_ACCESS_TOKEN", "GOOGLEGEMINI_AUTH_TOKEN", "GOOGLEGEMINI_SECRET", "GOOGLEGEMINI_SECRET_KEY", "GOOGLEGEMINI_KEY"]
-hosts = ["https://generativelanguage.googleapis.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/googlegemini/googlegemini.go
 
 [providers.graphcms]
 env = ["GRAPHCMS_API_KEY", "GRAPHCMS_API_TOKEN", "GRAPHCMS_APIKEY", "GRAPHCMS_TOKEN", "GRAPHCMS_ACCESS_TOKEN", "GRAPHCMS_AUTH_TOKEN", "GRAPHCMS_SECRET", "GRAPHCMS_SECRET_KEY", "GRAPHCMS_KEY"]
@@ -4083,12 +4011,6 @@ env = ["LEXIGRAM_API_KEY", "LEXIGRAM_API_TOKEN", "LEXIGRAM_APIKEY", "LEXIGRAM_TO
 hosts = ["https://api.lexigram.io"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/lexigram/lexigram.go
-
-[providers.linearapi]
-env = ["LINEARAPI_API_KEY", "LINEARAPI_API_TOKEN", "LINEARAPI_APIKEY", "LINEARAPI_TOKEN", "LINEARAPI_ACCESS_TOKEN", "LINEARAPI_AUTH_TOKEN", "LINEARAPI_SECRET", "LINEARAPI_SECRET_KEY", "LINEARAPI_KEY"]
-hosts = ["https://api.linear.app"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/linearapi/linearapi.go
 
 [providers.linemessaging]
 env = ["LINEMESSAGING_API_KEY", "LINEMESSAGING_API_TOKEN", "LINEMESSAGING_APIKEY", "LINEMESSAGING_TOKEN", "LINEMESSAGING_ACCESS_TOKEN", "LINEMESSAGING_AUTH_TOKEN", "LINEMESSAGING_SECRET", "LINEMESSAGING_SECRET_KEY", "LINEMESSAGING_KEY"]
@@ -4480,18 +4402,6 @@ hosts = ["https://api4.nozbe.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/nozbeteams/nozbeteams.go
 
-[providers.npmtoken]
-env = ["NPMTOKEN_API_KEY", "NPMTOKEN_API_TOKEN", "NPMTOKEN_APIKEY", "NPMTOKEN_TOKEN", "NPMTOKEN_ACCESS_TOKEN", "NPMTOKEN_AUTH_TOKEN", "NPMTOKEN_SECRET", "NPMTOKEN_SECRET_KEY", "NPMTOKEN_KEY"]
-hosts = ["https://howtorotate.com", "https://registry.npmjs.org"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/npmtoken/npmtoken.go
-
-[providers.npmtokenv2]
-env = ["NPMTOKENV2_API_KEY", "NPMTOKENV2_API_TOKEN", "NPMTOKENV2_APIKEY", "NPMTOKENV2_TOKEN", "NPMTOKENV2_ACCESS_TOKEN", "NPMTOKENV2_AUTH_TOKEN", "NPMTOKENV2_SECRET", "NPMTOKENV2_SECRET_KEY", "NPMTOKENV2_KEY"]
-hosts = ["https://howtorotate.com", "https://registry.npmjs.org"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/npmtokenv2/npmtokenv2.go
-
 [providers.numverify]
 env = ["NUMVERIFY_API_KEY", "NUMVERIFY_API_TOKEN", "NUMVERIFY_APIKEY", "NUMVERIFY_TOKEN", "NUMVERIFY_ACCESS_TOKEN", "NUMVERIFY_AUTH_TOKEN", "NUMVERIFY_SECRET", "NUMVERIFY_SECRET_KEY", "NUMVERIFY_KEY"]
 hosts = ["https://apilayer.net"]
@@ -4551,12 +4461,6 @@ env = ["OOPSPAM_API_KEY", "OOPSPAM_API_TOKEN", "OOPSPAM_APIKEY", "OOPSPAM_TOKEN"
 hosts = ["https://api.oopspam.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/oopspam/oopspam.go
-
-[providers.openaiadmin]
-env = ["OPENAIADMIN_API_KEY", "OPENAIADMIN_API_TOKEN", "OPENAIADMIN_APIKEY", "OPENAIADMIN_TOKEN", "OPENAIADMIN_ACCESS_TOKEN", "OPENAIADMIN_AUTH_TOKEN", "OPENAIADMIN_SECRET", "OPENAIADMIN_SECRET_KEY", "OPENAIADMIN_KEY"]
-hosts = ["https://api.openai.com", "https://platform.openai.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/openaiadmin/openaiadmin.go
 
 [providers.opencagedata]
 env = ["OPENCAGEDATA_API_KEY", "OPENCAGEDATA_API_TOKEN", "OPENCAGEDATA_APIKEY", "OPENCAGEDATA_TOKEN", "OPENCAGEDATA_ACCESS_TOKEN", "OPENCAGEDATA_AUTH_TOKEN", "OPENCAGEDATA_SECRET", "OPENCAGEDATA_SECRET_KEY", "OPENCAGEDATA_KEY"]
@@ -5116,12 +5020,6 @@ hosts = ["https://api.sanity.io"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/sanity/sanity.go
 
-[providers.scalewaykey]
-env = ["SCALEWAYKEY_API_KEY", "SCALEWAYKEY_API_TOKEN", "SCALEWAYKEY_APIKEY", "SCALEWAYKEY_TOKEN", "SCALEWAYKEY_ACCESS_TOKEN", "SCALEWAYKEY_AUTH_TOKEN", "SCALEWAYKEY_SECRET", "SCALEWAYKEY_SECRET_KEY", "SCALEWAYKEY_KEY"]
-hosts = ["https://api.scaleway.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/scalewaykey/scalewaykey.go
-
 [providers.scrapeowl]
 env = ["SCRAPEOWL_API_KEY", "SCRAPEOWL_API_TOKEN", "SCRAPEOWL_APIKEY", "SCRAPEOWL_TOKEN", "SCRAPEOWL_ACCESS_TOKEN", "SCRAPEOWL_AUTH_TOKEN", "SCRAPEOWL_SECRET", "SCRAPEOWL_SECRET_KEY", "SCRAPEOWL_KEY"]
 hosts = ["https://api.scrapeowl.com"]
@@ -5223,12 +5121,6 @@ env = ["SENDINBLUEV2_API_KEY", "SENDINBLUEV2_API_TOKEN", "SENDINBLUEV2_APIKEY", 
 hosts = ["https://api.sendinblue.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/sendinbluev2/sendinbluev2.go
-
-[providers.sentryorgtoken]
-env = ["SENTRYORGTOKEN_API_KEY", "SENTRYORGTOKEN_API_TOKEN", "SENTRYORGTOKEN_APIKEY", "SENTRYORGTOKEN_TOKEN", "SENTRYORGTOKEN_ACCESS_TOKEN", "SENTRYORGTOKEN_AUTH_TOKEN", "SENTRYORGTOKEN_SECRET", "SENTRYORGTOKEN_SECRET_KEY", "SENTRYORGTOKEN_KEY"]
-hosts = ["https://sentry.io"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/sentryorgtoken/sentryorgtoken.go
 
 [providers.serphouse]
 env = ["SERPHOUSE_API_KEY", "SERPHOUSE_API_TOKEN", "SERPHOUSE_APIKEY", "SERPHOUSE_TOKEN", "SERPHOUSE_ACCESS_TOKEN", "SERPHOUSE_AUTH_TOKEN", "SERPHOUSE_SECRET", "SERPHOUSE_SECRET_KEY", "SERPHOUSE_KEY"]
@@ -5525,12 +5417,6 @@ hosts = ["https://api.storychief.io"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/storychief/storychief.go
 
-[providers.stripepaymentintent]
-env = ["STRIPEPAYMENTINTENT_API_KEY", "STRIPEPAYMENTINTENT_API_TOKEN", "STRIPEPAYMENTINTENT_APIKEY", "STRIPEPAYMENTINTENT_TOKEN", "STRIPEPAYMENTINTENT_ACCESS_TOKEN", "STRIPEPAYMENTINTENT_AUTH_TOKEN", "STRIPEPAYMENTINTENT_SECRET", "STRIPEPAYMENTINTENT_SECRET_KEY", "STRIPEPAYMENTINTENT_KEY"]
-hosts = ["https://api.stripe.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/stripepaymentintent/stripepaymentintent.go
-
 [providers.stripo]
 env = ["STRIPO_API_KEY", "STRIPO_API_TOKEN", "STRIPO_APIKEY", "STRIPO_TOKEN", "STRIPO_ACCESS_TOKEN", "STRIPO_AUTH_TOKEN", "STRIPO_SECRET", "STRIPO_SECRET_KEY", "STRIPO_KEY"]
 hosts = ["https://api.stripo.email", "https://stripo.email"]
@@ -5766,12 +5652,6 @@ hosts = ["https://api.travis-ci.com"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/travisci/travisci.go
 
-[providers.trelloapikey]
-env = ["TRELLOAPIKEY_API_KEY", "TRELLOAPIKEY_API_TOKEN", "TRELLOAPIKEY_APIKEY", "TRELLOAPIKEY_TOKEN", "TRELLOAPIKEY_ACCESS_TOKEN", "TRELLOAPIKEY_AUTH_TOKEN", "TRELLOAPIKEY_SECRET", "TRELLOAPIKEY_SECRET_KEY", "TRELLOAPIKEY_KEY"]
-hosts = ["https://api.trello.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/trelloapikey/trelloapikey.go
-
 [providers.tru]
 env = ["TRU_API_KEY", "TRU_API_TOKEN", "TRU_APIKEY", "TRU_TOKEN", "TRU_ACCESS_TOKEN", "TRU_AUTH_TOKEN", "TRU_SECRET", "TRU_SECRET_KEY", "TRU_KEY"]
 hosts = ["https://eu.api.tru.id"]
@@ -5945,12 +5825,6 @@ env = ["VPNAPI_API_KEY", "VPNAPI_API_TOKEN", "VPNAPI_APIKEY", "VPNAPI_TOKEN", "V
 hosts = ["https://vpnapi.io"]
 pattern = "{base62:32}"
 # source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/vpnapi/vpnapi.go
-
-[providers.vultrapikey]
-env = ["VULTRAPIKEY_API_KEY", "VULTRAPIKEY_API_TOKEN", "VULTRAPIKEY_APIKEY", "VULTRAPIKEY_TOKEN", "VULTRAPIKEY_ACCESS_TOKEN", "VULTRAPIKEY_AUTH_TOKEN", "VULTRAPIKEY_SECRET", "VULTRAPIKEY_SECRET_KEY", "VULTRAPIKEY_KEY"]
-hosts = ["https://api.vultr.com"]
-pattern = "{base62:32}"
-# source: https://github.com/trufflesecurity/trufflehog/blob/main/pkg/detectors/vultrapikey/vultrapikey.go
 
 [providers.vyte]
 env = ["VYTE_API_KEY", "VYTE_API_TOKEN", "VYTE_APIKEY", "VYTE_TOKEN", "VYTE_ACCESS_TOKEN", "VYTE_AUTH_TOKEN", "VYTE_SECRET", "VYTE_SECRET_KEY", "VYTE_KEY"]
