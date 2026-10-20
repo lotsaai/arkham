@@ -52,6 +52,7 @@ nkeys = { workspace = true }
 pgwire = { workspace = true, features = ["server-api-aws-lc-rs"] }
 pretty_assertions = { workspace = true }
 proptest = { workspace = true }
+redis = { workspace = true }
 tempfile = { workspace = true }
 tokio-postgres = { workspace = true }
 
