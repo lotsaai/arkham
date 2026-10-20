@@ -218,11 +218,6 @@ fn set_mode(target: &Path, mode: u32) -> std::io::Result<()> {
   fs::set_permissions(target, fs::Permissions::from_mode(mode))
 }
 
-#[cfg(not(unix))]
-fn set_mode(_target: &Path, _mode: u32) -> std::io::Result<()> {
-  Ok(())
-}
-
 fn load_ca_file(path: &Path) -> Result<CertAuthority, Error> {
   warn_on_loose_ca_perms(path);
   let text = fs::read_to_string(path)?;
@@ -243,9 +238,6 @@ fn warn_on_loose_ca_perms(path: &Path) {
     tracing::warn!(path = %path.display(), "CA file readable by group/other; expected 0600");
   }
 }
-
-#[cfg(not(unix))]
-fn warn_on_loose_ca_perms(_path: &Path) {}
 
 /// Load the winner's CA file, retrying while the winner is still writing.
 /// Truncated reads (missing key block, PEM parse failure) retry for ~2s;
@@ -274,13 +266,6 @@ fn persist_ca_0600(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let _ = dir.sync_all();
   }
   Ok(())
-}
-
-#[cfg(not(unix))]
-fn persist_ca_0600(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-  let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-  file.write_all(contents)?;
-  file.sync_all()
 }
 
 /// A generated certificate for a specific domain, with a cached

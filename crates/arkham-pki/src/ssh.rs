@@ -121,22 +121,11 @@ fn generate_host_key(path: &Path) -> Result<SshKey, Error> {
 }
 
 /// One `known_hosts` line pinning `key` for `host:port`, OpenSSH's own shape:
-/// `[host]:port` for non-default ports, the bare host for 22. The pinned
-/// blob is these lines, and russh's verifier reads them back.
+/// `[host]:port` for non-default ports, the bare host for 22.
 ///
 /// # Errors
 ///
-/// Returns [`Error::SshKeygen`] when encoding the public half fails.
-pub fn known_hosts_line(host: &str, port: u16, key: &SshKey) -> Result<String, Error> {
-  known_hosts_line_for_public(host, port, key.public())
-}
-
-/// One `known_hosts` line pinning an arbitrary public key for `host:port`,
-/// the same shape [`known_hosts_line`] renders for a whole key pair.
-///
-/// # Errors
-///
-/// Returns [`Error::SshKeygen`] when encoding the public half fails.
+/// Returns [`Error::SshKeygen`] when encoding the public key fails.
 pub fn known_hosts_line_for_public(host: &str, port: u16, key: &PublicKey) -> Result<String, Error> {
   let name = if port == 22 { host.to_string() } else { format!("[{host}]:{port}") };
   Ok(format!(
@@ -227,12 +216,16 @@ mod tests {
     let key = SshKey::generate().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("known_hosts");
-    fs::write(&path, format!("{}\n", known_hosts_line("git.example", 2222, &key).unwrap())).unwrap();
+    fs::write(
+      &path,
+      format!("{}\n", known_hosts_line_for_public("git.example", 2222, key.public()).unwrap()),
+    )
+    .unwrap();
     let matched = known_host_keys_path("git.example", 2222, &path).unwrap();
     assert_eq!(matched.len(), 1);
     assert_eq!(&matched[0].1, key.public());
 
-    let line = known_hosts_line("git.example", 22, &key).unwrap();
+    let line = known_hosts_line_for_public("git.example", 22, key.public()).unwrap();
     assert!(line.starts_with("git.example ssh-ed25519 "), "{line}");
   }
 }
