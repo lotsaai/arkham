@@ -1,2 +1,6 @@
 *
 !.gitignore
+!*/
+!amqp-witness/Dockerfile
+!amqp-witness/amqp-witness.py
+!amqp-witness/test_outcome.py
