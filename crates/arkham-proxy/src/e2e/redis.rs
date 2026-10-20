@@ -1,9 +1,11 @@
-//! Real Redis client and real Redis server through the MITM, on both
-//! transports the strings can state.
+//! Guest AUTH and PING go through the `redis` crate on cleartext, TLS, and a
+//! no-SNI `ClientHello`. The guest holds the decoy. The in-process stub records
+//! the upstream AUTH.
 
 use std::sync::Mutex;
 
 use super::*;
+use ::redis::AsyncCommands as _;
 use secrecy::ExposeSecret as _;
 
 const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -21,24 +23,21 @@ fn redis_grant(fake: &str, real: &str) -> Grant {
   }
 }
 
-fn auth_frame(password: &str) -> String {
-  format!("*2\r\n$4\r\nAUTH\r\n${}\r\n{password}\r\n", password.len())
-}
-
 /// Serve one redis connection: AUTH then PING, recording every byte.
 async fn serve_redis<S>(mut conn: S, seen: Arc<Mutex<Vec<u8>>>)
 where
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  let expected = auth_frame(VALUE);
+  let expected = ::redis::cmd("AUTH").arg(VALUE).get_packed_command();
   let mut buf = vec![0u8; expected.len()];
   conn.read_exact(&mut buf).await.unwrap();
   *seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = buf.clone();
-  assert_eq!(String::from_utf8_lossy(&buf), expected, "upstream must see the real, reframed AUTH");
+  assert_eq!(buf, expected, "upstream must see the real, reframed AUTH");
   conn.write_all(b"+OK\r\n").await.unwrap();
-  let mut ping = [0u8; 14];
-  conn.read_exact(&mut ping).await.unwrap();
-  assert_eq!(&ping, b"*1\r\n$4\r\nPING\r\n");
+  let ping = ::redis::cmd("PING").get_packed_command();
+  let mut got = vec![0u8; ping.len()];
+  conn.read_exact(&mut got).await.unwrap();
+  assert_eq!(got, ping);
   conn.write_all(b"+PONG\r\n").await.unwrap();
 }
 
@@ -52,6 +51,25 @@ async fn connect_through_proxy(proxy_addr: SocketAddr, stub_port: u16) -> TcpStr
   stream.read_exact(&mut head).await.unwrap();
   assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
   stream
+}
+
+/// AUTH with the decoy, then PING, on a stream the test already connected.
+async fn authed_ping<S>(stream: S) -> String
+where
+  S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+  let info = ::redis::RedisConnectionInfo::default().set_password(FAKE).set_skip_set_lib_name();
+  let (mut conn, driver) = ::redis::aio::MultiplexedConnection::new_with_config(&info, stream, ::redis::AsyncConnectionConfig::new())
+    .await
+    .unwrap();
+  let driver = tokio::spawn(driver);
+  let pong: String = conn.ping().await.unwrap();
+  driver.abort();
+  pong
+}
+
+fn recorded(seen: &Mutex<Vec<u8>>) -> Vec<u8> {
+  seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 #[tokio::test]
@@ -70,20 +88,12 @@ async fn redis_auth_swaps_over_cleartext() {
     serve_redis(conn, stub_seen).await;
   });
 
-  let mut stream = connect_through_proxy(fx.proxy_addr, fx.stub_port).await;
-  stream.write_all(auth_frame(FAKE).as_bytes()).await.unwrap();
-  let mut ok = [0u8; 5];
-  stream.read_exact(&mut ok).await.unwrap();
-  assert_eq!(&ok, b"+OK\r\n");
-  stream.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
-  let mut pong = [0u8; 7];
-  stream.read_exact(&mut pong).await.unwrap();
-  assert_eq!(&pong, b"+PONG\r\n");
-  drop(stream);
+  let stream = connect_through_proxy(fx.proxy_addr, fx.stub_port).await;
+  assert_eq!(authed_ping(stream).await, "PONG");
   let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
   assert_eq!(
-    String::from_utf8_lossy(&seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)),
-    auth_frame(VALUE),
+    recorded(&seen),
+    ::redis::cmd("AUTH").arg(VALUE).get_packed_command(),
     "the stub recorded the reframed real AUTH"
   );
   fx.proxy.abort();
@@ -122,21 +132,10 @@ async fn redis_auth_swaps_over_tls_both_legs() {
   roots.add(ca.cert_der().clone()).unwrap();
   let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
   let name = ServerName::try_from("localhost".to_string()).unwrap();
-  let mut tls = TlsConnector::from(Arc::new(config)).connect(name, stream).await.unwrap();
-  tls.write_all(auth_frame(FAKE).as_bytes()).await.unwrap();
-  let mut ok = [0u8; 5];
-  tls.read_exact(&mut ok).await.unwrap();
-  assert_eq!(&ok, b"+OK\r\n");
-  tls.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
-  let mut pong = [0u8; 7];
-  tls.read_exact(&mut pong).await.unwrap();
-  assert_eq!(&pong, b"+PONG\r\n");
-  drop(tls);
+  let tls = TlsConnector::from(Arc::new(config)).connect(name, stream).await.unwrap();
+  assert_eq!(authed_ping(tls).await, "PONG");
   let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
-  assert_eq!(
-    String::from_utf8_lossy(&seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)),
-    auth_frame(VALUE)
-  );
+  assert_eq!(recorded(&seen), ::redis::cmd("AUTH").arg(VALUE).get_packed_command());
   proxy.abort();
 }
 
@@ -176,31 +175,21 @@ async fn redis_tls_without_sni_mints_for_the_grant_host() {
   let mut roots = rustls::RootCertStore::empty();
   roots.add(ca.cert_der().clone()).unwrap();
   let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
-  // The guest checks the grant host and sends no SNI, the same shape as
-  // Bun's Redis client on the transparent path.
+  // The redis crate builds its own rustls ClientConfig (no enable_sni knob)
+  // and verifies the dialed host, so it cannot send a no-SNI ClientHello that
+  // still checks the grant host.
   config.enable_sni = false;
   let name = ServerName::try_from("localhost".to_string()).unwrap();
-  let mut tls = tokio::time::timeout(
+  let tls = tokio::time::timeout(
     Duration::from_secs(10),
     TlsConnector::from(Arc::new(config)).connect(name, client_end),
   )
   .await
   .unwrap()
   .unwrap();
-  tls.write_all(auth_frame(FAKE).as_bytes()).await.unwrap();
-  let mut ok = [0u8; 5];
-  tls.read_exact(&mut ok).await.unwrap();
-  assert_eq!(&ok, b"+OK\r\n");
-  tls.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
-  let mut pong = [0u8; 7];
-  tls.read_exact(&mut pong).await.unwrap();
-  assert_eq!(&pong, b"+PONG\r\n");
-  drop(tls);
+  assert_eq!(authed_ping(tls).await, "PONG");
   let _ = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
-  assert_eq!(
-    String::from_utf8_lossy(&seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner)),
-    auth_frame(VALUE)
-  );
+  assert_eq!(recorded(&seen), ::redis::cmd("AUTH").arg(VALUE).get_packed_command());
   serve.await.unwrap().unwrap();
 }
 

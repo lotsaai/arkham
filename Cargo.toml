@@ -133,6 +133,7 @@ rand = "0.8"
 rasn = { version = "0.29.0", default-features = false, features = ["std"] }
 rasn-ldap = "0.29.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+redis = { version = "1.7.1", default-features = false, features = ["tokio-comp"] }
 regex = "1"
 rtnetlink = "0.23.0"
 russh = { version = "0.56", default-features = false, features = ["aws-lc-rs"] }
