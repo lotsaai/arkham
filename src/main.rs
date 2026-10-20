@@ -155,8 +155,6 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   if args.proxy_backend != ProxyBackend::None {
     eyre::bail!("transparent capture (--proxy-backend) is only supported on Linux");
   }
-  // No default cgroup: attaching to the root cgroup would capture every
-  // process on the machine, arkham's own upstream dials included.
   if args.proxy_backend == ProxyBackend::Ebpf && args.ebpf_cgroup.is_none() {
     eyre::bail!("--ebpf-cgroup is required for --proxy-backend ebpf");
   }
@@ -234,11 +232,9 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     .await;
   }
   #[cfg(target_os = "linux")]
-  if args.proxy_backend == ProxyBackend::Ebpf {
-    let cgroup = args
-      .ebpf_cgroup
-      .clone()
-      .ok_or_else(|| eyre::eyre!("--ebpf-cgroup is required for --proxy-backend ebpf"))?;
+  if args.proxy_backend == ProxyBackend::Ebpf
+    && let Some(cgroup) = args.ebpf_cgroup.clone()
+  {
     let capture = std::sync::Arc::clone(&state);
     let bypass = args.ebpf_bypass.clone();
     let bypass_file = args.ebpf_bypass_file.clone();
