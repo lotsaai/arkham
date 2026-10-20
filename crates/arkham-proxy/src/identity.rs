@@ -405,6 +405,17 @@ mod tests {
   }
 
   #[test]
+  fn an_https_grant_stays_on_the_tls_arm() {
+    let mut grants = token_grant(&["https://10.5.0.6:50000"]);
+    let Grant::Token { credential, .. } = &mut grants[0] else {
+      panic!("token grant");
+    };
+    credential.label = "talos-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    assert_eq!(expect(&grants, Some("10.5.0.6"), 50000), Expect::Tls);
+    assert_eq!(expect(&grants, None, 50000), Expect::Tls);
+  }
+
+  #[test]
   fn an_uncovered_destination_splices_and_a_bare_port_shortlists() {
     let grants = token_grant(&["https://api.github.com"]);
     assert_eq!(expect(&grants, Some("elsewhere.example"), 443), Expect::Splice);

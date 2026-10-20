@@ -1,29 +1,93 @@
 //! Talosconfig adapter for `file_rewrite`: a talosconfig is the same
 //! information a rule holds — endpoints, an upstream CA, and a client pair —
-//! stated in talosctl's shape, so the adapter derives the grant from the file
-//! instead of asking the operator to state it twice. Only the `context` maps;
-//! the file is the secret source, so a talos entry stating `envs` is an
-//! error rather than a second source.
+//! stated in talosctl's shape, so the adapter derives one grant per context
+//! instead of asking the operator to state it twice. The `context` key is
+//! copied through and is not how a grant is chosen. A talos entry stating
+//! `envs` is an error rather than a second source.
 //!
 //! Detection is structural: a YAML mapping with `contexts:` and `endpoints:`
 //! markers takes the adapter path, everything else keeps the raw byte-swap.
 //! The decoy twin keeps the endpoints (transparent capture makes the
-//! destination the identity) and swaps the trust and identity: arkham's CA
-//! and the minted guest pair.
+//! destination the identity) and swaps the trust and identity of every
+//! granted context: arkham's CA and that context's guest pair.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::{HostTlsCfg, RewriteFormat};
-use arkham_config::grants::{EndpointScope, GuestTlsMode, Scheme};
+use arkham_config::context::{AmbientProtocol, ContextRef, Presented, identities, require_distinct};
+use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value, from_str};
 
-use crate::adapt::{GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, decode, render_decoy, render_fragment, rewrite_label};
+use crate::adapt::{GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, decode, render_decoy, render_fragment};
 use crate::error::Error;
+
+/// Why one context did not become a grant. The active context turns a skip
+/// into [`Error::RewriteInvalid`]. Every other context is warned and omitted.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TalosSkip {
+  /// The context lists no endpoints.
+  #[error("context `{name}` states no `endpoints`")]
+  NoEndpoints {
+    /// Context name.
+    name: String,
+  },
+  /// The context has no client pair to substitute.
+  #[error("context `{name}` misses `ca`, `crt`, or `key`: nothing to substitute")]
+  MissingIdentity {
+    /// Context name.
+    name: String,
+  },
+  /// Omni or another service-account `auth` block. Out of scope.
+  #[error("context `{name}` uses alternative `auth` (Omni/SideroV1): it carries no substitutable client pair")]
+  Auth {
+    /// Context name.
+    name: String,
+  },
+  /// An endpoint that is not TLS.
+  #[error("context `{name}` endpoint `{endpoint}` is not TLS: the Talos API is TLS-only")]
+  NotTls {
+    /// Context name.
+    name: String,
+    /// Endpoint text from the file.
+    endpoint: String,
+  },
+  /// An endpoint that does not parse as an allow entry.
+  #[error("context `{name}` endpoint `{endpoint}` is not an allow entry: {detail}")]
+  BadEndpoint {
+    /// Context name.
+    name: String,
+    /// Endpoint text from the file.
+    endpoint: String,
+    /// Parser detail.
+    detail: String,
+  },
+}
+
+impl TalosSkip {
+  fn name(&self) -> &str {
+    match self {
+      Self::NoEndpoints { name }
+      | Self::MissingIdentity { name }
+      | Self::Auth { name }
+      | Self::NotTls { name, .. }
+      | Self::BadEndpoint { name, .. } => name,
+    }
+  }
+}
+
+/// Grants derived from one talosconfig, plus the contexts that were skipped.
+#[derive(Debug)]
+pub(crate) struct TalosAdapted {
+  /// One grant per context that carried a substitutable client pair.
+  pub(crate) grants: Vec<RewriteAdapted>,
+  /// Contexts that were named and left out.
+  pub(crate) skipped: Vec<TalosSkip>,
+}
 
 /// A talosconfig document; unknown fields ignored.
 #[derive(Debug, Deserialize, Default)]
@@ -51,91 +115,40 @@ struct TalosContext {
   /// Base64 client key.
   #[serde(default)]
   key: String,
-  /// Alternative auth (Omni/SideroV1): detected so it errors clearly.
+  /// Alternative auth (Omni/SideroV1): detected so it is skipped or rejected.
   #[serde(default)]
   auth: Option<Mapping>,
 }
 
-/// The validated client identity of the active context.
-struct Identity {
+/// One context that can become a grant, before its guest pair is minted.
+struct Prepared {
+  name: String,
   crt: Vec<u8>,
   key: Vec<u8>,
   ca: Vec<u8>,
+  allows: Vec<Allowed>,
 }
 
-impl TalosDoc {
-  /// Resolve and validate the active context: known, with endpoints, no
-  /// alternative auth, and a full `ca`/`crt`/`key` identity.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the context is missing or unknown, states no
-  /// endpoints, carries no client pair, or uses Omni auth.
-  fn selected<'a>(&'a self, source: &Path, invalid: impl Fn(String) -> Error) -> Result<(&'a TalosContext, Identity), Error> {
-    if self.context.is_empty() {
-      return Err(invalid("missing `context`".to_string()));
-    }
-    let context = self
-      .contexts
-      .get(&self.context)
-      .ok_or_else(|| invalid(format!("unknown context `{}`", self.context)))?;
-    if context.endpoints.is_empty() {
-      return Err(invalid(format!("context `{}` states no `endpoints`", self.context)));
-    }
-    if context.auth.is_some() {
-      return Err(invalid(
-        "alternative `auth` (Omni/SideroV1) is not supported: it carries no substitutable client pair".to_string(),
-      ));
-    }
-    let crt = decode(source, RewriteFormat::Talos, Some(context.crt.as_str()), "crt")?;
-    let key = decode(source, RewriteFormat::Talos, Some(context.key.as_str()), "key")?;
-    let ca_bundle = decode(source, RewriteFormat::Talos, Some(context.ca.as_str()), "ca")?;
-    if crt.is_none() || key.is_none() || ca_bundle.is_none() {
-      return Err(invalid(format!(
-        "context `{}` misses `ca`, `crt`, or `key`: nothing to substitute",
-        self.context
-      )));
-    }
-    Ok((
-      context,
-      Identity {
-        crt: crt.unwrap_or_default(),
-        key: key.unwrap_or_default(),
-        ca: ca_bundle.unwrap_or_default(),
-      },
-    ))
-  }
-
-  /// One allow entry per endpoint, `https://`-normalized and validated.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when an endpoint does not map onto an allow entry or
-  /// is not TLS.
-  fn allows(context: &TalosContext, invalid: impl Fn(String) -> Error) -> Result<Vec<String>, Error> {
-    let mut allows = Vec::new();
-    for endpoint in &context.endpoints {
-      let entry = normalize_endpoint(endpoint);
-      let scope: EndpointScope = entry
-        .parse()
-        .map_err(|detail| invalid(format!("endpoint `{endpoint}` is not an allow entry: {detail}")))?;
-      if scope.scheme != Scheme::Https {
-        return Err(invalid(format!("endpoint `{endpoint}` is not TLS: the Talos API is TLS-only")));
-      }
-      allows.push(entry);
-    }
-    Ok(allows)
-  }
+/// One allow entry and the scope parsed from it.
+struct Allowed {
+  entry: String,
+  scope: EndpointScope,
 }
 
-/// Map a talosconfig onto its grant fragment and decoy twin.
+/// Classification of one context.
+enum Prep {
+  Grant(Prepared),
+  Skip(TalosSkip),
+}
+
+/// Map a talosconfig onto one grant per context and one decoy document.
 ///
 /// # Errors
 ///
-/// Returns an error when the document does not parse, names no context, the
-/// context carries no endpoints or no client pair, or an endpoint does not
-/// map onto an allow entry.
-pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Path) -> Result<RewriteAdapted, Error> {
+/// Returns an error when the document does not parse, the active context is
+/// missing, unknown, or itself skipped, a certificate field is not base64,
+/// or two granted contexts cannot be told apart on one destination.
+pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Path) -> Result<TalosAdapted, Error> {
   let text = String::from_utf8_lossy(content);
   let doc: TalosDoc = from_str(&text).map_err(|err| Error::RewriteYaml {
     file: source.to_path_buf(),
@@ -146,61 +159,127 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     format: RewriteFormat::Talos,
     detail,
   };
-  let (active, identity) = doc.selected(source, invalid)?;
-  let allows = TalosDoc::allows(active, invalid)?;
-  let label = rewrite_label(source, &doc.context)?;
-  let env = label.to_uppercase().replace('-', "_");
-  // Identity-only grant: the certificate never reaches the wire as
-  // application data, so it can never match the swap; it still needs a value
-  // to resolve.
-  let value = String::from_utf8_lossy(&identity.crt).into_owned();
-  let (guest_cert_path, guest_key_path) = load_or_generate_client_pair(ca, guests_dir, &label)?;
-  let guest_cert = fs::read(&guest_cert_path).map_err(|source| Error::ReadFile {
-    path: guest_cert_path.clone(),
-    source,
-  })?;
-  let guest_key = fs::read(&guest_key_path).map_err(|source| Error::ReadFile {
-    path: guest_key_path.clone(),
-    source,
-  })?;
-  let cert_name = format!("{label}.client.crt");
-  let key_name = format!("{label}.client.key");
-  let ca_name = format!("{label}.ca.crt");
-  let materialized = vec![
-    (cert_name.clone(), identity.crt),
-    (key_name.clone(), identity.key),
-    (ca_name.clone(), identity.ca),
-  ];
-  let tls = HostTlsCfg {
-    client_cert: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}"))),
-    client_key: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{key_name}"))),
-    root_cert: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{ca_name}"))),
-    guest_tls_mode: GuestTlsMode::Mtls,
-    guest_cert: None,
-    guest_key: None,
+  if doc.context.is_empty() {
+    return Err(invalid("missing `context`".to_string()));
+  }
+  if !doc.contexts.contains_key(&doc.context) {
+    return Err(invalid(format!("unknown context `{}`", doc.context)));
+  }
+  let mut prepared = Vec::new();
+  let mut skipped = Vec::new();
+  for (name, context) in &doc.contexts {
+    match prepare(source, name, context)? {
+      Prep::Skip(skip) if name == &doc.context => return Err(invalid(skip.to_string())),
+      Prep::Skip(skip) => {
+        tracing::warn!(%skip, "talos context skipped");
+        skipped.push(skip);
+      }
+      Prep::Grant(item) => prepared.push(item),
+    }
+  }
+  if prepared.is_empty() {
+    return Err(invalid(format!("context `{}` did not produce a grant", doc.context)));
+  }
+  let refs = prepared
+    .iter()
+    .map(|item| ContextRef {
+      source,
+      protocol: AmbientProtocol::Talos,
+      name: item.name.as_str(),
+    })
+    .collect::<Vec<_>>();
+  let ids = identities(&refs)?;
+  let mut guest_certs = Vec::with_capacity(prepared.len());
+  let mut guest_keys = Vec::with_capacity(prepared.len());
+  for id in &ids {
+    let (cert_path, key_path) = load_or_generate_client_pair(ca, guests_dir, &id.label)?;
+    guest_certs.push(fs::read(&cert_path).map_err(|source| Error::ReadFile { path: cert_path, source })?);
+    guest_keys.push(fs::read(&key_path).map_err(|source| Error::ReadFile { path: key_path, source })?);
+  }
+  let mut presented = Vec::new();
+  for (item, id) in prepared.iter().zip(ids.iter()) {
+    for allow in &item.allows {
+      let HostPat::Exact(host) = &allow.scope.host else {
+        return Err(invalid(format!(
+          "context `{}` endpoint `{}` is not an exact host",
+          item.name, allow.entry
+        )));
+      };
+      presented.push(Presented {
+        identity: id,
+        host: host.as_str(),
+        port: allow.scope.port,
+        decoy: b"",
+      });
+    }
+  }
+  require_distinct(&presented)?;
+  let decoy = decoy_doc(&text, source, ca, &prepared, &guest_certs, &guest_keys, &skipped)?;
+  if ids.len() != prepared.len() {
+    return Err(invalid("talos context identities did not cover every granted context".to_string()));
+  }
+  let mut grants = Vec::with_capacity(prepared.len());
+  for (item, id) in prepared.iter().zip(ids.iter()) {
+    grants.push(one_grant(source, item, id, &decoy)?);
+  }
+  Ok(TalosAdapted { grants, skipped })
+}
+
+/// Validate one context. A bad base64 field fails the file. Every other
+/// problem is a skip the caller turns into an error only for the active name.
+///
+/// # Errors
+///
+/// Returns an error when `ca`, `crt`, or `key` is present and not base64.
+fn prepare(source: &Path, name: &str, context: &TalosContext) -> Result<Prep, Error> {
+  if context.endpoints.is_empty() {
+    return Ok(Prep::Skip(TalosSkip::NoEndpoints { name: name.to_string() }));
+  }
+  if context.auth.is_some() {
+    return Ok(Prep::Skip(TalosSkip::Auth { name: name.to_string() }));
+  }
+  let crt = decode(source, RewriteFormat::Talos, Some(context.crt.as_str()), "crt")?;
+  let key = decode(source, RewriteFormat::Talos, Some(context.key.as_str()), "key")?;
+  let ca_bundle = decode(source, RewriteFormat::Talos, Some(context.ca.as_str()), "ca")?;
+  let (Some(crt), Some(key), Some(ca_bundle)) = (crt, key, ca_bundle) else {
+    return Ok(Prep::Skip(TalosSkip::MissingIdentity { name: name.to_string() }));
   };
-  let fragment = render_fragment(
-    source,
-    &label,
-    &GrantFragment {
-      env,
-      registry: false,
-      allow: allows.clone(),
-      value: Some(value),
-      real: None,
-      generated: false,
-      if_missing: None,
-      tls: allows.iter().map(|allow| (allow.clone(), tls.clone())).collect(),
-      ssh: BTreeMap::new(),
-    },
-  )?;
-  let decoy = decoy_doc(&text, source, ca, &guest_cert, &guest_key, &doc.context)?;
-  Ok(RewriteAdapted {
-    fragment,
-    decoy,
-    materialized,
-    decoy_files: Vec::new(),
-  })
+  match allows(name, context) {
+    Ok(parsed) => Ok(Prep::Grant(Prepared {
+      name: name.to_string(),
+      crt,
+      key,
+      ca: ca_bundle,
+      allows: parsed,
+    })),
+    Err(skip) => Ok(Prep::Skip(skip)),
+  }
+}
+
+/// One allow entry per endpoint, `https://`-normalized and validated.
+fn allows(name: &str, context: &TalosContext) -> Result<Vec<Allowed>, TalosSkip> {
+  let mut parsed = Vec::new();
+  for endpoint in &context.endpoints {
+    let entry = normalize_endpoint(endpoint);
+    let scope = match entry.parse::<EndpointScope>() {
+      Ok(scope) => scope,
+      Err(detail) => {
+        return Err(TalosSkip::BadEndpoint {
+          name: name.to_string(),
+          endpoint: endpoint.clone(),
+          detail,
+        });
+      }
+    };
+    if scope.scheme != Scheme::Https {
+      return Err(TalosSkip::NotTls {
+        name: name.to_string(),
+        endpoint: endpoint.clone(),
+      });
+    }
+    parsed.push(Allowed { entry, scope });
+  }
+  Ok(parsed)
 }
 
 /// One endpoint as an allow entry: the grant grammar needs a scheme, and the
@@ -221,19 +300,24 @@ fn normalize_endpoint(endpoint: &str) -> String {
   }
 }
 
-/// The agent's decoy talosconfig: the parsed document verbatim, with trust
-/// and identity swapped in every context — arkham's CA, the guest pair —
-/// because only decoys may cross into the agent. `auth` blocks on contexts
-/// beyond the active one are dropped: they carry Omni credential config the
-/// adapter cannot substitute. Every other field round-trips unchanged.
-fn decoy_doc(text: &str, source: &Path, ca: &CertAuthority, guest_cert: &[u8], guest_key: &[u8], active: &str) -> Result<String, Error> {
+/// The agent's decoy talosconfig. Granted contexts receive arkham's CA and
+/// that context's guest pair. Skipped contexts lose `ca`, `crt`, `key`, and
+/// `auth`, so real material is absent. Every other field round-trips,
+/// including the active `context` name.
+fn decoy_doc(
+  text: &str,
+  source: &Path,
+  ca: &CertAuthority,
+  prepared: &[Prepared],
+  guest_certs: &[Vec<u8>],
+  guest_keys: &[Vec<u8>],
+  skipped: &[TalosSkip],
+) -> Result<String, Error> {
   let mut root: Value = from_str(text).map_err(|err| Error::RewriteYaml {
     file: source.to_path_buf(),
     source: err,
   })?;
   let guest_ca = Value::String(STANDARD.encode(ca.cert_pem()));
-  let guest_cert = Value::String(STANDARD.encode(guest_cert));
-  let guest_key = Value::String(STANDARD.encode(guest_key));
   let Some(contexts) = root
     .as_mapping_mut()
     .and_then(|map| map.get_mut(Value::String("contexts".to_string())))
@@ -241,29 +325,99 @@ fn decoy_doc(text: &str, source: &Path, ca: &CertAuthority, guest_cert: &[u8], g
   else {
     return render_decoy(&root);
   };
-  let names = contexts
-    .keys()
-    .filter_map(|key| key.as_str().map(str::to_string))
-    .collect::<Vec<_>>();
-  for name in names {
-    let Some(context) = contexts.get_mut(Value::String(name.clone())).and_then(Value::as_mapping_mut) else {
+  for ((item, guest_cert), guest_key) in prepared.iter().zip(guest_certs.iter()).zip(guest_keys.iter()) {
+    let Some(context) = contexts.get_mut(Value::String(item.name.clone())).and_then(Value::as_mapping_mut) else {
       continue;
     };
-    let ca_key = Value::String("ca".to_string());
-    let crt_key = Value::String("crt".to_string());
-    let key_key = Value::String("key".to_string());
-    if context.contains_key(&ca_key) {
-      context.insert(ca_key, guest_ca.clone());
-    }
-    if context.contains_key(&crt_key) || context.contains_key(&key_key) {
-      context.insert(crt_key, guest_cert.clone());
-      context.insert(key_key, guest_key.clone());
-    }
-    if name != active {
-      context.remove(Value::String("auth".to_string()));
+    context.insert(Value::String("ca".to_string()), guest_ca.clone());
+    context.insert(Value::String("crt".to_string()), Value::String(STANDARD.encode(guest_cert)));
+    context.insert(Value::String("key".to_string()), Value::String(STANDARD.encode(guest_key)));
+  }
+  for skip in skipped {
+    let Some(context) = contexts
+      .get_mut(Value::String(skip.name().to_string()))
+      .and_then(Value::as_mapping_mut)
+    else {
+      continue;
+    };
+    for field in ["ca", "crt", "key", "auth"] {
+      context.remove(Value::String(field.to_string()));
     }
   }
   render_decoy(&root)
+}
+
+const ED25519_PRIVATE_KEY: &str = "ED25519 PRIVATE KEY";
+
+/// Talos writes PKCS#8 under `ED25519 PRIVATE KEY`. rustls reads that encoding
+/// from a `PRIVATE KEY` section. Other labels pass through.
+fn client_key_pem(raw: &[u8]) -> Vec<u8> {
+  let Ok(blocks) = pem::parse_many(raw) else {
+    return raw.to_vec();
+  };
+  if !blocks.iter().any(|block| block.tag() == ED25519_PRIVATE_KEY) {
+    return raw.to_vec();
+  }
+  let renamed = blocks
+    .into_iter()
+    .map(|block| {
+      let tag = if block.tag() == ED25519_PRIVATE_KEY {
+        "PRIVATE KEY".to_string()
+      } else {
+        block.tag().to_string()
+      };
+      pem::Pem::new(tag, block.into_contents())
+    })
+    .collect::<Vec<_>>();
+  pem::encode_many(&renamed).into_bytes()
+}
+
+/// One context's fragment, its materialized blobs, and the shared decoy.
+///
+/// # Errors
+///
+/// Returns an error when the fragment fails to serialize.
+fn one_grant(source: &Path, item: &Prepared, id: &arkham_config::context::ContextIdentity, decoy: &str) -> Result<RewriteAdapted, Error> {
+  let label = &id.label;
+  let value = String::from_utf8_lossy(&item.crt).into_owned();
+  let cert_name = format!("{label}.client.crt");
+  let key_name = format!("{label}.client.key");
+  let ca_name = format!("{label}.ca.crt");
+  let materialized = vec![
+    (cert_name.clone(), item.crt.clone()),
+    (key_name.clone(), client_key_pem(&item.key)),
+    (ca_name.clone(), item.ca.clone()),
+  ];
+  let tls = HostTlsCfg {
+    client_cert: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}"))),
+    client_key: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{key_name}"))),
+    root_cert: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{ca_name}"))),
+    guest_tls_mode: GuestTlsMode::Mtls,
+    guest_cert: None,
+    guest_key: None,
+  };
+  let allows = item.allows.iter().map(|allow| allow.entry.clone()).collect::<Vec<_>>();
+  let fragment = render_fragment(
+    source,
+    label,
+    &GrantFragment {
+      env: id.env(),
+      registry: false,
+      allow: allows.clone(),
+      value: Some(value),
+      real: None,
+      generated: false,
+      if_missing: None,
+      tls: allows.into_iter().map(|allow| (allow, tls.clone())).collect(),
+      ssh: BTreeMap::new(),
+    },
+  )?;
+  Ok(RewriteAdapted {
+    fragment,
+    decoy: decoy.to_string(),
+    materialized,
+    decoy_files: Vec::new(),
+  })
 }
 
 #[cfg(test)]
@@ -285,6 +439,66 @@ mod tests {
     )
   }
 
+  fn parts(adapted: &TalosAdapted) -> (String, String) {
+    let fragment = adapted
+      .grants
+      .iter()
+      .map(|grant| grant.fragment.as_str())
+      .collect::<Vec<_>>()
+      .join("\n");
+    let decoy = adapted.grants.first().map(|grant| grant.decoy.clone()).unwrap_or_default();
+    (fragment, decoy)
+  }
+
+  fn prod_label() -> String {
+    identities(&[ContextRef {
+      source: Path::new(SOURCE),
+      protocol: AmbientProtocol::Talos,
+      name: "prod",
+    }])
+    .unwrap()
+    .into_iter()
+    .next()
+    .unwrap()
+    .label
+  }
+
+  fn ed25519_pkcs8() -> Vec<u8> {
+    let mut der = vec![
+      0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+    ];
+    der.extend(std::iter::repeat_n(0x11, 32));
+    der
+  }
+
+  fn ed25519_private_key_pem() -> String {
+    let body = STANDARD.encode(ed25519_pkcs8());
+    format!("-----BEGIN ED25519 PRIVATE KEY-----\n{body}\n-----END ED25519 PRIVATE KEY-----\n")
+  }
+
+  #[test]
+  fn talos_ed25519_client_key_loads_as_pkcs8() {
+    use rustls::pki_types::pem::PemObject as _;
+
+    let key_pem = ed25519_private_key_pem();
+    let body = format!(
+      "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n",
+      STANDARD.encode(b"CA"),
+      STANDARD.encode(b"CRT"),
+      STANDARD.encode(key_pem.as_bytes()),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let adapted = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).unwrap();
+    let (_, key) = adapted.grants[0]
+      .materialized
+      .iter()
+      .find(|(name, _)| name.ends_with(".client.key"))
+      .expect("client key");
+    let parsed = rustls::pki_types::PrivateKeyDer::from_pem_slice(key).expect("rustls reads the written key");
+    let signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&parsed).expect("signing key");
+    assert_eq!(signing.algorithm(), rustls::SignatureAlgorithm::ED25519);
+  }
+
   #[test]
   fn bare_endpoint_gains_talos_port() {
     assert_eq!(normalize_endpoint("10.5.0.6"), "https://10.5.0.6:50000");
@@ -296,24 +510,18 @@ mod tests {
   fn valid_doc_adapts_with_https_grant_and_guest_identity() {
     let dir = tempfile::tempdir().unwrap();
     let adapted = adapt(Path::new(SOURCE), doc("      - 10.5.0.6\n").as_bytes(), &test_ca(), dir.path()).unwrap();
+    let (fragment, decoy) = parts(&adapted);
+    let label = prod_label();
+    assert!(fragment.contains("allow = [\"https://10.5.0.6:50000\"]"), "{fragment}");
+    assert!(fragment.contains(&format!("[rules.{label}]")), "{fragment}");
     assert!(
-      adapted.fragment.contains("allow = [\"https://10.5.0.6:50000\"]"),
-      "{}",
-      adapted.fragment
+      fragment.contains(&format!("client_cert = \"{GRANTS_STATE_DIR}/rules.d/")),
+      "{fragment}"
     );
-    assert!(
-      adapted.fragment.contains("[rules.home-ivan-talos-config-prod]"),
-      "{}",
-      adapted.fragment
-    );
-    assert!(
-      adapted.fragment.contains(&format!("client_cert = \"{GRANTS_STATE_DIR}/rules.d/")),
-      "{}",
-      adapted.fragment
-    );
-    assert!(adapted.decoy.contains("endpoints:\n    - 10.5.0.6"), "{}", adapted.decoy);
-    assert!(adapted.decoy.contains("context: prod"), "{}", adapted.decoy);
-    assert_eq!(adapted.materialized.len(), 3);
+    assert!(fragment.contains("guest_tls_mode = \"mtls\""), "{fragment}");
+    assert!(decoy.contains("endpoints:\n    - 10.5.0.6"), "{decoy}");
+    assert!(decoy.contains("context: prod"), "{decoy}");
+    assert_eq!(adapted.grants[0].materialized.len(), 3);
   }
 
   #[test]
@@ -329,7 +537,9 @@ mod tests {
     );
     let dir = tempfile::tempdir().unwrap();
     let adapted = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).unwrap();
-    let decoy = &adapted.decoy;
+    let (fragment, decoy) = parts(&adapted);
+    assert!(fragment.contains("https://10.5.0.6:50000"), "{fragment}");
+    assert!(fragment.contains("https://10.6.0.7:50000"), "{fragment}");
     assert!(decoy.contains("staging:"), "{decoy}");
     assert!(decoy.contains("- 10.6.0.7"), "{decoy}");
     assert!(decoy.contains("- 10.6.0.8"), "{decoy}");
@@ -357,11 +567,8 @@ mod tests {
       dir.path(),
     )
     .unwrap();
-    assert!(
-      adapted.fragment.contains("allow = [\"https://omni.example:443\"]"),
-      "{}",
-      adapted.fragment
-    );
+    let (fragment, _) = parts(&adapted);
+    assert!(fragment.contains("allow = [\"https://omni.example:443\"]"), "{fragment}");
   }
 
   #[test]
@@ -406,7 +613,144 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let with_nodes = doc("      - 10.5.0.6\n").replace("    ca:", "    nodes:\n      - 10.5.0.7\n    ca:");
     let adapted = adapt(Path::new(SOURCE), with_nodes.as_bytes(), &test_ca(), dir.path()).unwrap();
-    assert!(adapted.decoy.contains("nodes:\n    - 10.5.0.7"), "{}", adapted.decoy);
+    let (_, decoy) = parts(&adapted);
+    assert!(decoy.contains("nodes:\n    - 10.5.0.7"), "{decoy}");
+  }
+
+  #[test]
+  fn two_contexts_each_get_a_grant_and_a_distinct_guest_cert() {
+    let prod_ca = STANDARD.encode(b"CA-PROD-REAL");
+    let prod_crt = STANDARD.encode(b"CRT-PROD-REAL");
+    let prod_key = STANDARD.encode(b"KEY-PROD-REAL");
+    let staging_ca = STANDARD.encode(b"CA-STAGING-REAL");
+    let staging_crt = STANDARD.encode(b"CRT-STAGING-REAL");
+    let staging_key = STANDARD.encode(b"KEY-STAGING-REAL");
+    let body = format!(
+      "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {prod_ca}\n    crt: {prod_crt}\n    key: {prod_key}\n  staging:\n    endpoints:\n      - 10.6.0.7\n    ca: {staging_ca}\n    crt: {staging_crt}\n    key: {staging_key}\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let adapted = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).unwrap();
+    let (fragment, decoy) = parts(&adapted);
+    assert!(
+      fragment.contains("https://10.5.0.6:50000") && fragment.contains("https://10.6.0.7:50000"),
+      "grant allow for each endpoint missing from {fragment}"
+    );
+    let crts = crt_values(&decoy);
+    assert_eq!(crts.len(), 2, "each granted context keeps a crt: {crts:?}\n{decoy}");
+    assert_ne!(crts[0], crts[1], "guest crt values must differ: {crts:?}");
+    for real in [&prod_ca, &prod_crt, &prod_key, &staging_ca, &staging_crt, &staging_key] {
+      assert!(!decoy.contains(real), "real material `{real}` survives in the decoy");
+    }
+  }
+
+  #[test]
+  fn two_contexts_on_one_endpoint_are_ambiguous() {
+    let body = format!(
+      "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n  staging:\n    endpoints:\n      - 10.5.0.6:50000\n    ca: {}\n    crt: {}\n    key: {}\n",
+      STANDARD.encode(b"CA"),
+      STANDARD.encode(b"CRT"),
+      STANDARD.encode(b"KEY"),
+      STANDARD.encode(b"CA2"),
+      STANDARD.encode(b"CRT2"),
+      STANDARD.encode(b"KEY2"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let err = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).expect_err("shared endpoint");
+    let Error::Config(source) = err else {
+      panic!("expected the context collision, got {err}");
+    };
+    assert!(matches!(source.as_ref(), arkham_config::Error::AmbiguousContexts(_)), "{source}");
+  }
+
+  #[test]
+  fn inactive_auth_context_is_skipped_and_named() {
+    let identity = "real-looking-omni-identity";
+    let body = format!(
+      "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n  omni:\n    endpoints:\n      - https://omni.example:443\n    auth:\n      siderov1:\n        identity: {identity}\n",
+      STANDARD.encode(b"CA"),
+      STANDARD.encode(b"CRT"),
+      STANDARD.encode(b"KEY"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let adapted = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || {
+      adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).unwrap()
+    });
+    let (fragment, decoy) = parts(&adapted);
+    assert!(fragment.contains("https://10.5.0.6:50000"), "prod is granted: {fragment}");
+    assert!(!fragment.contains("omni.example"), "omni is not an allow entry: {fragment}");
+    assert!(!decoy.contains(identity), "auth identity survives in the decoy: {decoy}");
+    assert!(
+      adapted
+        .skipped
+        .iter()
+        .any(|skip| matches!(skip, TalosSkip::Auth { name } if name == "omni")),
+      "skip names omni: {:?}",
+      adapted.skipped
+    );
+    let warnings = lines.lock().unwrap();
+    assert!(warnings.iter().any(|line| line.contains("omni")), "skip names omni: {warnings:?}");
+  }
+
+  #[test]
+  fn selected_context_without_endpoints_still_fails() {
+    let body = format!(
+      "context: prod\ncontexts:\n  prod:\n    endpoints: []\n  staging:\n    endpoints:\n      - 10.6.0.7\n    ca: {}\n    crt: {}\n    key: {}\n",
+      STANDARD.encode(b"CA-STAGING"),
+      STANDARD.encode(b"CRT-STAGING"),
+      STANDARD.encode(b"KEY-STAGING"),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let err = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("prod"), "{text}");
+    assert!(text.contains("endpoints"), "{text}");
+  }
+
+  fn crt_values(decoy: &str) -> Vec<String> {
+    let value: serde_yaml::Value = serde_yaml::from_str(decoy).unwrap();
+    let Some(contexts) = value.get("contexts").and_then(serde_yaml::Value::as_mapping) else {
+      return Vec::new();
+    };
+    contexts
+      .values()
+      .filter_map(|context| context.get("crt").and_then(serde_yaml::Value::as_str).map(str::to_string))
+      .collect()
+  }
+
+  struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+  impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+      *metadata.level() <= tracing::Level::WARN
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+      tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+      let mut message = String::new();
+      event.record(&mut WarnVisit(&mut message));
+      self.0.lock().unwrap().push(message);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+  }
+
+  struct WarnVisit<'a>(&'a mut String);
+
+  impl tracing::field::Visit for WarnVisit<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+      use std::fmt::Write as _;
+      let _ = write!(self.0, "{}={value:?};", field.name());
+    }
   }
 }
 
@@ -424,7 +768,7 @@ mod moved_suite {
   use crate::rewrites::*;
 
   /// Talosconfig sources adapt with no `envs`, stated or sniffed, and an
-  /// `envs` statement is rejected either way.
+  /// `envs` statement is rejected either way. The decoy mounts writable.
   #[test]
   fn talos_rewrites_adapt_stated_or_sniffed() {
     use std::collections::HashMap;
@@ -470,6 +814,7 @@ mod moved_suite {
         "{}",
         outputs.grants[0].fragment
       );
+      assert!(!outputs.mounts[0].ro, "talos decoy is writable");
       let body = fs::read_to_string(&outputs.mounts[0].host).unwrap();
       assert!(body.contains("endpoints:\n    - 10.5.0.6"), "{body}");
       assert!(!body.contains(&STANDARD.encode(b"CRT")), "no real credential survives: {body}");

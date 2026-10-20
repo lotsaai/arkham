@@ -1,6 +1,6 @@
 //! Declared `file_rewrite` pass: each source expands, swaps its plain env
-//! values or runs the format adapter, and lands in the state directory with
-//! a read-only mount at its dest.
+//! values or runs the format adapter, and lands in the state directory.
+//! A talosconfig mounts writable. Every other rewrite stays read-only.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -188,6 +188,17 @@ impl RewriteCollector {
   ///
   /// Returns an error when an output cannot be written.
   pub(crate) fn twin(&mut self, adapted: Vec<RewriteAdapted>, twin_name: &str, twin_dest: &str) -> Result<(), Error> {
+    self.twin_mode(adapted, twin_name, twin_dest, true)
+  }
+
+  /// [`Self::twin`] with the decoy mount's read-only bit chosen by the caller.
+  /// Talos passes `ro = false` so `talosctl config context` can rewrite the
+  /// active name. The host file is not this mount.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when an output cannot be written.
+  pub(crate) fn twin_mode(&mut self, adapted: Vec<RewriteAdapted>, twin_name: &str, twin_dest: &str, ro: bool) -> Result<(), Error> {
     let Some(first) = adapted.first() else {
       return Ok(());
     };
@@ -199,7 +210,7 @@ impl RewriteCollector {
     self.mounts.push(Mount {
       host: twin_path,
       container: PathBuf::from(twin_dest),
-      ro: true,
+      ro,
     });
     self.decoy_files(first)?;
     self.grants.extend(adapted);
@@ -288,7 +299,11 @@ impl ExplicitRewrites<'_> {
       let ca = self.ca()?;
       match format {
         RewriteFormat::Kubeconfig => kube::adapt(host, content, ca, guests_dir)?.into_iter().collect(),
-        RewriteFormat::Talos => Vec::from([talos::adapt(host, content, ca, guests_dir)?]),
+        RewriteFormat::Talos => {
+          let found = talos::adapt(host, content, ca, guests_dir)?;
+          tracing::debug!(skipped = found.skipped.len(), "talos contexts left out of the grant set");
+          found.grants
+        }
       }
     };
     match adapted.first() {
@@ -329,6 +344,11 @@ impl ExplicitRewrites<'_> {
       path: host.clone(),
       source,
     })?;
+    let talos_mount = match rewrite.format {
+      Some(RewriteFormat::Talos) => true,
+      Some(RewriteFormat::Kubeconfig) => false,
+      None => sniff(&content) == Some(RewriteFormat::Talos),
+    };
     let out_bytes = self.output(rewrite, &host, &content, &pairs)?;
     let out_path = self.files_dir.join(rewrite_file_name(index, &host));
     fs::write(&out_path, out_bytes).map_err(|source| Error::WriteFile {
@@ -344,7 +364,7 @@ impl ExplicitRewrites<'_> {
     self.collector.mounts.push(Mount {
       host: out_path,
       container: PathBuf::from(container),
-      ro: true,
+      ro: !talos_mount,
     });
     Ok(())
   }

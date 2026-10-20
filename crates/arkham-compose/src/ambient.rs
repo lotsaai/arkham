@@ -267,22 +267,36 @@ impl AmbientDeriver<'_> {
           continue;
         }
       };
-      let adapted = match name {
-        "kubeconfig" => kube::adapt(&path, &content, ca, guests_dir)
-          .ok()
-          .flatten()
-          .map(|adapted| vec![adapted])
-          .unwrap_or_default(),
-        _ => talos::adapt(&path, &content, ca, guests_dir)
-          .map(|adapted| vec![adapted])
-          .ok()
-          .unwrap_or_default(),
+      let (adapted, writable) = match name {
+        "kubeconfig" => (
+          kube::adapt(&path, &content, ca, guests_dir)
+            .ok()
+            .flatten()
+            .map(|adapted| vec![adapted])
+            .unwrap_or_default(),
+          false,
+        ),
+        _ => match talos::adapt(&path, &content, ca, guests_dir) {
+          Ok(found) => {
+            tracing::debug!(source = %path.display(), skipped = found.skipped.len(), "talos contexts left out of the grant set");
+            (found.grants, true)
+          }
+          Err(err) => {
+            tracing::warn!(source = %path.display(), %err, "talosconfig source skipped");
+            continue;
+          }
+        },
       };
       if adapted.is_empty() {
         tracing::warn!(source = %path.display(), "{name} source skipped: it does not map onto a grant");
         continue;
       }
-      self.collector.twin(adapted, twin_name, &format!("{}/{twin_dest}", self.home))?;
+      let dest = format!("{}/{twin_dest}", self.home);
+      if writable {
+        self.collector.twin_mode(adapted, twin_name, &dest, false)?;
+      } else {
+        self.collector.twin(adapted, twin_name, &dest)?;
+      }
     }
     Ok(())
   }
@@ -316,6 +330,7 @@ impl AmbientDeriver<'_> {
 /// under the host home.
 fn env_source(env_name: &str, default: &str, host_home: &Path) -> PathBuf {
   match env::var(env_name) {
+    Ok(value) if value.trim().is_empty() => host_home.join(default),
     Ok(value) if !value.contains(':') => PathBuf::from(value),
     Ok(value) => {
       tracing::warn!(env_name, value, "names multiple paths; using the default location instead");
@@ -664,5 +679,22 @@ mod moved_suite {
       !containers.contains(&"/home/eng/.kube/config".to_string()),
       "the broken kubeconfig derives nothing: {containers:?}"
     );
+  }
+
+  /// An empty `TALOSCONFIG` is unset: the default path under the host home.
+  #[test]
+  fn empty_talosconfig_uses_the_default_path() {
+    let host = tempdir().unwrap();
+    let saved = std::env::var_os("TALOSCONFIG");
+    set_env("TALOSCONFIG", "   ");
+    let path = env_source("TALOSCONFIG", ".talos/config", host.path());
+    assert_eq!(path, host.path().join(".talos/config"));
+    set_env("TALOSCONFIG", "");
+    let path = env_source("TALOSCONFIG", ".talos/config", host.path());
+    assert_eq!(path, host.path().join(".talos/config"));
+    match saved {
+      Some(value) => set_env("TALOSCONFIG", value),
+      None => unset_env("TALOSCONFIG"),
+    }
   }
 }

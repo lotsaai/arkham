@@ -336,6 +336,7 @@ where
 }
 #[cfg(test)]
 mod tests {
+  use base64::Engine as _;
   use rama::tls::boring::core::x509::store::X509StoreBuilder;
 
   use super::*;
@@ -368,6 +369,29 @@ mod tests {
     assert!(
       policy.is_some(),
       "anonymous legs must answer an upstream certificate request empty instead of dying"
+    );
+  }
+
+  fn pem_block(label: &str, der: &[u8]) -> String {
+    let body = base64::engine::general_purpose::STANDARD.encode(der);
+    format!("-----BEGIN {label}-----\n{body}\n-----END {label}-----\n")
+  }
+
+  fn identity_files(key_pem: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let ca = CertAuthority::generate().expect("ca");
+    let (cert, key) = arkham_pki::ca::load_or_generate_client_pair(&ca, dir.path(), "client").expect("pair");
+    std::fs::write(&key, key_pem).expect("key");
+    (dir, cert, key)
+  }
+
+  #[test]
+  fn unknown_private_key_label_stays_an_error() {
+    let (_dir, cert, key) = identity_files(&pem_block("OPENSSH PRIVATE KEY", b"not-a-key"));
+    let err = client_identity(&cert, &key).expect_err("unknown label");
+    assert!(
+      matches!(err, crate::Error::ClientKey { .. }),
+      "an unrecognized label stays a key parse error"
     );
   }
 }
