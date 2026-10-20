@@ -62,8 +62,9 @@ pub(crate) struct DeriveInputs<'a> {
 /// written.
 ///
 /// ponytail: no opt-out exists yet; none has been asked for.
-/// `KUBECONFIG`/`TALOSCONFIG` honor a single path — a list warns and falls
-/// back to the default.
+/// `KUBECONFIG` is a colon-separated list, merged first-wins. An empty
+/// value reads `~/.kube/config`. `TALOSCONFIG` stays one path: a list warns
+/// and falls back to the default.
 pub(crate) fn derive_sources(inputs: &DeriveInputs<'_>) -> Result<RewriteOutputs, Error> {
   let DeriveInputs {
     files_dir,
@@ -240,51 +241,87 @@ impl AmbientDeriver<'_> {
     }
   }
 
-  /// The kubeconfig and talosconfig at their default paths, honoring a
-  /// single-path `KUBECONFIG`/`TALOSCONFIG` override.
+  /// The kubeconfig list and the talosconfig at their default paths.
   ///
   /// # Errors
   ///
   /// Returns an error when a twin output cannot be written.
   fn kube_and_talos(&mut self) -> Result<(), Error> {
-    for (name, env_name, default, twin_name, twin_dest) in [
-      ("kubeconfig", "KUBECONFIG", ".kube/config", "kube-config", ".kube/config"),
-      ("talosconfig", "TALOSCONFIG", ".talos/config", "talos-config", ".talos/config"),
-    ] {
-      let path = env_source(env_name, default, self.host_home);
+    self.kube()?;
+    self.talos()
+  }
+
+  /// Readable undeclared files from `KUBECONFIG`, merged first-wins.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the twin output cannot be written.
+  fn kube(&mut self) -> Result<(), Error> {
+    let mut loaded = Vec::new();
+    for path in kubeconfig_paths(self.host_home) {
       if self.declared.contains(&path) || !path.is_file() {
         continue;
       }
-      let Ok(content) = fs::read(&path) else {
-        tracing::warn!(source = %path.display(), "{name} source skipped: it cannot be read");
-        continue;
-      };
-      let guests_dir = self.guests_dir;
-      let ca = match self.ca() {
-        Ok(ca) => ca,
-        Err(err) => {
-          tracing::warn!(source = %path.display(), %err, "{name} source skipped: the guest CA is unavailable");
-          continue;
-        }
-      };
-      let adapted = match name {
-        "kubeconfig" => kube::adapt(&path, &content, ca, guests_dir)
-          .ok()
-          .flatten()
-          .map(|adapted| vec![adapted])
-          .unwrap_or_default(),
-        _ => talos::adapt(&path, &content, ca, guests_dir)
-          .map(|adapted| vec![adapted])
-          .ok()
-          .unwrap_or_default(),
-      };
-      if adapted.is_empty() {
-        tracing::warn!(source = %path.display(), "{name} source skipped: it does not map onto a grant");
-        continue;
+      if let Ok(content) = fs::read(&path) {
+        loaded.push((path, content));
+      } else {
+        tracing::warn!(source = %path.display(), "kubeconfig source skipped: it cannot be read");
       }
-      self.collector.twin(adapted, twin_name, &format!("{}/{twin_dest}", self.home))?;
     }
-    Ok(())
+    let Some(source) = loaded.first().map(|(path, _)| path.clone()) else {
+      return Ok(());
+    };
+    let guests_dir = self.guests_dir;
+    let ca = match self.ca() {
+      Ok(ca) => ca,
+      Err(err) => {
+        tracing::warn!(source = %source.display(), %err, "kubeconfig source skipped: the guest CA is unavailable");
+        return Ok(());
+      }
+    };
+    let refs: Vec<(&Path, &[u8])> = loaded.iter().map(|(path, bytes)| (path.as_path(), bytes.as_slice())).collect();
+    let adapted = kube::adapt_sources(&refs, ca, guests_dir)
+      .ok()
+      .flatten()
+      .into_iter()
+      .collect::<Vec<_>>();
+    if adapted.is_empty() {
+      tracing::warn!(source = %source.display(), "kubeconfig source skipped: it does not map onto a grant");
+      return Ok(());
+    }
+    self.collector.twin(adapted, "kube-config", &format!("{}/.kube/config", self.home))
+  }
+
+  /// The talosconfig at `TALOSCONFIG` or `~/.talos/config`.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the twin output cannot be written.
+  fn talos(&mut self) -> Result<(), Error> {
+    let path = env_source("TALOSCONFIG", ".talos/config", self.host_home);
+    if self.declared.contains(&path) || !path.is_file() {
+      return Ok(());
+    }
+    let Ok(content) = fs::read(&path) else {
+      tracing::warn!(source = %path.display(), "talosconfig source skipped: it cannot be read");
+      return Ok(());
+    };
+    let guests_dir = self.guests_dir;
+    let ca = match self.ca() {
+      Ok(ca) => ca,
+      Err(err) => {
+        tracing::warn!(source = %path.display(), %err, "talosconfig source skipped: the guest CA is unavailable");
+        return Ok(());
+      }
+    };
+    let adapted = talos::adapt(&path, &content, ca, guests_dir).ok().into_iter().collect::<Vec<_>>();
+    if adapted.is_empty() {
+      tracing::warn!(source = %path.display(), "talosconfig source skipped: it does not map onto a grant");
+      return Ok(());
+    }
+    self
+      .collector
+      .twin(adapted, "talos-config", &format!("{}/.talos/config", self.home))
   }
 
   /// The guest CA for the kubeconfig and talosconfig adapters, loaded on
@@ -312,8 +349,8 @@ impl AmbientDeriver<'_> {
   }
 }
 
-/// The source path one `KUBECONFIG`-style override names, or the default
-/// under the host home.
+/// The source path one single-path override names, or the default under
+/// the host home. A value containing `:` is not a list here.
 fn env_source(env_name: &str, default: &str, host_home: &Path) -> PathBuf {
   match env::var(env_name) {
     Ok(value) if !value.contains(':') => PathBuf::from(value),
@@ -322,6 +359,19 @@ fn env_source(env_name: &str, default: &str, host_home: &Path) -> PathBuf {
       host_home.join(default)
     }
     Err(_) => host_home.join(default),
+  }
+}
+
+/// Files named by `KUBECONFIG`, in order. An empty value is `~/.kube/config`.
+fn kubeconfig_paths(host_home: &Path) -> Vec<PathBuf> {
+  let Ok(value) = env::var("KUBECONFIG") else {
+    return vec![host_home.join(".kube/config")];
+  };
+  let paths: Vec<PathBuf> = value.split(':').filter(|part| !part.is_empty()).map(PathBuf::from).collect();
+  if paths.is_empty() {
+    vec![host_home.join(".kube/config")]
+  } else {
+    paths
   }
 }
 

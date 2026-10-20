@@ -9,6 +9,7 @@ cd "$proj_dir" || exit 1
 set -euo pipefail
 
 cluster="arkham-k3s-test"
+cluster_b="arkham-k3s-test-b"
 scratch=$proj_dir/target/k3s-e2e
 arkham=$proj_dir/target/debug/arkham
 serve_pid=""
@@ -107,6 +108,7 @@ cleanup() {
     kill "$serve_pid" 2>/dev/null || true
   fi
   k3d cluster delete "$cluster" >/dev/null 2>&1 || true
+  k3d cluster delete "$cluster_b" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -184,6 +186,7 @@ printf '[workspace]\nhome = "%s"\n' "$HOME" >"$scratch/config/arkham/config.toml
 # The kubeconfig flags keep k3d from touching ~/.kube/config even if the
 # KUBECONFIG export above were lost.
 k3d cluster delete "$cluster" >/dev/null 2>&1 || true
+k3d cluster delete "$cluster_b" >/dev/null 2>&1 || true
 sweep_host_capture
 # Publish the API on loopback. k3d's default kubeconfig server is 0.0.0.0,
 # a listen address: CI dialed https://0.0.0.0:<port> and the serverlb closed
@@ -355,4 +358,116 @@ run_leg() {
 run_leg cert "$scratch/cert-kubeconfig" 18099
 run_leg bearer "$scratch/token-kubeconfig" 18100
 
-echo "k3s substitution proven: bearer + cert auth"
+# A bearer is not valid on both apiservers, so the shared-user case stays in the kube unit tests.
+export KUBECONFIG="$scratch/staging-kubeconfig"
+k3d cluster create "$cluster_b" \
+  --wait \
+  --api-port 127.0.0.1:random \
+  --kubeconfig-update-default=false \
+  --kubeconfig-switch-context=false
+k3d kubeconfig get "$cluster_b" >"$KUBECONFIG"
+server_b=$(kubectl config view --minify -o 'jsonpath={.clusters[0].cluster.server}')
+case "$server_b" in
+  https://127.0.0.1:[0-9]*) ;;
+  *)
+    echo "staging server is ${server_b}; expected https://127.0.0.1:<port>" >&2
+    exit 1
+    ;;
+esac
+ready_started=$SECONDS
+deadline=$((ready_started + ready_timeout))
+echo "staging readiness budget ${ready_timeout}s"
+wait_for_apiserver
+kubectl create serviceaccount arkham-staging >/dev/null
+kubectl create clusterrolebinding arkham-staging --clusterrole=cluster-admin --serviceaccount=default:arkham-staging >/dev/null
+staging_token=$(kubectl create token arkham-staging --duration=3600s)
+
+mkdir -p "$scratch/prod-pair" "$scratch/staging-pair"
+kubectl --kubeconfig "$scratch/cert-kubeconfig" config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d >"$scratch/prod-pair/ca.crt"
+kubectl --kubeconfig "$scratch/cert-kubeconfig" config view --raw -o jsonpath='{.users[0].user.client-certificate-data}' | base64 -d >"$scratch/prod-pair/client.crt"
+kubectl --kubeconfig "$scratch/cert-kubeconfig" config view --raw -o jsonpath='{.users[0].user.client-key-data}' | base64 -d >"$scratch/prod-pair/client.key"
+kubectl --kubeconfig "$scratch/staging-kubeconfig" config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}' | base64 -d >"$scratch/staging-pair/ca.crt"
+server_a=$(kubectl --kubeconfig "$scratch/cert-kubeconfig" config view --minify -o 'jsonpath={.clusters[0].cluster.server}')
+
+merged=$scratch/contexts.yaml
+rm -f "$merged"
+kubectl --kubeconfig "$merged" config set-cluster prod --server="$server_a" --certificate-authority="$scratch/prod-pair/ca.crt" --embed-certs=true >/dev/null
+kubectl --kubeconfig "$merged" config set-credentials prod-admin --client-certificate="$scratch/prod-pair/client.crt" --client-key="$scratch/prod-pair/client.key" --embed-certs=true >/dev/null
+kubectl --kubeconfig "$merged" config set-context prod-admin --cluster=prod --user=prod-admin >/dev/null
+kubectl --kubeconfig "$merged" config set-credentials ivan --token="$token" >/dev/null
+kubectl --kubeconfig "$merged" config set-context prod --cluster=prod --user=ivan >/dev/null
+kubectl --kubeconfig "$merged" config set-cluster staging --server="$server_b" --certificate-authority="$scratch/staging-pair/ca.crt" --embed-certs=true >/dev/null
+kubectl --kubeconfig "$merged" config set-credentials staging-user --token="$staging_token" >/dev/null
+kubectl --kubeconfig "$merged" config set-context staging --cluster=staging --user=staging-user >/dev/null
+kubectl --kubeconfig "$merged" config use-context prod >/dev/null
+
+echo "--- contexts: each real credential reaches its own server"
+for ctx in prod prod-admin staging; do
+  kubectl --kubeconfig "$merged" --context "$ctx" get ns --request-timeout=30s >/dev/null
+done
+
+name=contexts
+ws=$scratch/ws-$name
+mkdir -p "$ws/.config/arkham"
+printf '%s\n' '[[workspace.file_rewrite]]' "source = \"$merged\"" 'dest = "{home}/.kube/config"' 'format = "kubeconfig"' >"$ws/.config/arkham/config.toml"
+statedir=$scratch/state-$name
+XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
+shopt -s nullglob
+kubedirs=()
+for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
+decoys=()
+for d in "$statedir"/arkham/ws/*/files/00-*; do decoys+=("$d"); done
+shopt -u nullglob
+if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
+  echo "init generated no kube state for the multi-context file" >&2
+  exit 1
+fi
+kubedir=${kubedirs[0]}
+decoy=${decoys[0]}
+sed "s|/arkham/grants|$kubedir|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
+cp "$decoy" "$scratch/proxy-$name.yaml"
+KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster prod --proxy-url="http://127.0.0.1:18101" >/dev/null
+KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster staging --proxy-url="http://127.0.0.1:18101" >/dev/null
+
+paths=()
+for index in 0 1; do
+  paths+=("{.clusters[${index}].cluster.certificate-authority-data}")
+done
+for index in 0 1 2; do
+  paths+=(
+    "{.users[${index}].user.token}"
+    "{.users[${index}].user.client-certificate-data}"
+    "{.users[${index}].user.client-key-data}"
+  )
+done
+for path in "${paths[@]}"; do
+  secret=$(kubectl --kubeconfig "$merged" config view --raw -o "jsonpath=${path}")
+  if [ -n "$secret" ] && grep -F -q -- "$secret" "$decoy"; then
+    echo "decoy still contains a real kubeconfig field ${path}" >&2
+    exit 1
+  fi
+done
+
+XDG_STATE_HOME=$statedir FNOX_CONFIG_DIR=$scratch/fnox ARKHAM_CONFIG="$scratch/host-layer-$name.toml" ARKHAM_CA_FILE="$scratch/config/arkham/ca.pem" ARKHAM_LISTEN="127.0.0.1:18101" "$arkham" serve &
+serve_pid=$!
+sleep 2
+
+echo "--- contexts: decoy fails direct"
+if env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy KUBECONFIG="$decoy" kubectl --context prod get ns --request-timeout=30s; then
+  echo "decoy kubeconfig worked without the proxy; substitution unproven" >&2
+  exit 1
+fi
+echo "--- contexts: kubectl --context through the proxy"
+for ctx in prod prod-admin staging; do
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl --context "$ctx" get ns --request-timeout=30s
+done
+echo "--- contexts: kubectl config use-context"
+KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context staging >/dev/null
+KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get ns --request-timeout=30s
+KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context prod >/dev/null
+KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get ns --request-timeout=30s
+
+kill "$serve_pid" 2>/dev/null || true
+serve_pid=""
+
+echo "k3s substitution proven: bearer + cert auth, three contexts"

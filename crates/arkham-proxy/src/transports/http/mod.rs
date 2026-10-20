@@ -5,7 +5,7 @@
 pub(crate) mod h2;
 pub(crate) mod machine;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rama::Service;
@@ -18,7 +18,7 @@ use rama::tls::client::NegotiatedTlsParameters;
 use rama::tls::server::InputWithClientHello;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use arkham_config::grants::{ResolvedConfig, Scheme};
+use arkham_config::grants::{EndpointScope, Grant, Scheme};
 
 use arkham_plugin::Direction as HookDirection;
 use rama::net::tls::ApplicationProtocol;
@@ -26,7 +26,7 @@ use rama::net::tls::ApplicationProtocol;
 use super::PairCtx;
 use super::{ServeStream, Transport};
 use crate::Error;
-use crate::connection::{GuestIo, Prefixed, client_auth_policy, dial_marked};
+use crate::connection::{GuestIo, HttpsCandidate, Prefixed, client_auth_policy, dial_marked, guest_leaf_der, optional_client_auth_policy};
 use crate::identity::{CandidateParams, Hello, read_client_hello, read_http_head};
 use crate::into_box_error;
 use crate::mint::MintHandle;
@@ -79,32 +79,49 @@ impl Transport for HttpsTransport {
     // address) carries no SNI, so the captured destination is the identity
     // to mint for. A grant that does not name it still splices below.
     let identity = host.or(sni.as_deref()).unwrap_or(dial_host);
-    let Some(scope) = snapshot
+    let hits: Vec<(Grant, EndpointScope)> = snapshot
       .grants
       .iter()
-      .find_map(|grant| grant.endpoint(Scheme::Https, Some(identity), port))
-    else {
+      .filter_map(|grant| {
+        grant
+          .endpoint(Scheme::Https, Some(identity), port)
+          .map(|scope| (grant.clone(), scope.clone()))
+      })
+      .collect();
+    if hits.is_empty() {
       // No https scope names this identity: nothing to substitute.
       return tcp::splice(guest, dial_host, port, state.fwmark, &buf).await;
-    };
+    }
+    let root_cert = shared_root(&hits, identity, port)?;
     let identity = identity.to_string();
     if !state.mint.allow() {
       return Err(Error::BurstExceeded {
         identity: identity.clone(),
       });
     }
+    let selected = Arc::new(Mutex::new(Vec::new()));
+    let policy = if hits.len() == 1 {
+      let (grant, scope) = &hits[0];
+      *selected.lock().unwrap_or_else(PoisonError::into_inner) = vec![grant.clone()];
+      client_auth_policy(scope, &state.mtls_trust)?
+    } else {
+      let candidates = https_candidates(&hits)?;
+      Some(optional_client_auth_policy(
+        candidates,
+        &state.mtls_trust,
+        &identity,
+        port,
+        Arc::clone(&selected),
+      ))
+    };
     let upstream = dial_marked(dial_host, port, state.fwmark).await?;
-    let guest_io = GuestIo::with_target(Prefixed::new(buf, guest), &identity, port)?;
-    // The entry can name the proxy's upstream client identity, and the rule
-    // can demand a guest certificate: the relay reads the resulting policy
-    // off the guest leg's extensions and enforces it on both legs.
-    let mut guest_io = guest_io;
-    if let Some(policy) = client_auth_policy(scope, &state.mtls_trust)? {
+    let mut guest_io = GuestIo::with_target(Prefixed::new(buf, guest), &identity, port)?;
+    if let Some(policy) = policy {
       guest_io = guest_io.with_client_auth_policy(policy);
     }
     let bridge = BridgeIo(guest_io, GuestIo::bare(upstream));
     let pump = SubstitutionService {
-      snapshot: state.snapshot(),
+      grants: selected,
       identity,
       port,
       plugins: Arc::clone(&state.plugins),
@@ -113,7 +130,7 @@ impl Transport for HttpsTransport {
     // Entries naming `root_cert` ride their own relay extending the global
     // egress trust; the map was built from this same config, so a miss is
     // a bug, failed closed.
-    let relay = match &scope.root_cert {
+    let relay = match &root_cert {
       None => state.relay.clone(),
       Some(path) => state
         .extra_relays
@@ -194,11 +211,42 @@ impl Transport for HttpTransport {
 /// guarantee the verbatim tests pin.
 #[derive(Debug, Clone)]
 pub(crate) struct SubstitutionService {
-  snapshot: Arc<ResolvedConfig>,
+  /// Grants chosen for this connection.
+  grants: Arc<Mutex<Vec<Grant>>>,
   identity: String,
   port: u16,
   plugins: Arc<arkham_plugin::Registry>,
   mint: Option<MintHandle>,
+}
+
+/// The trust bundle every hit names, or an error when they disagree.
+fn shared_root(hits: &[(Grant, EndpointScope)], host: &str, port: u16) -> Result<Option<std::path::PathBuf>, Error> {
+  let Some((_, first)) = hits.first() else {
+    return Ok(None);
+  };
+  if hits.iter().any(|(_, scope)| scope.root_cert != first.root_cert) {
+    return Err(Error::SplitTrustBundle {
+      host: host.to_string(),
+      port,
+    });
+  }
+  Ok(first.root_cert.clone())
+}
+
+fn https_candidates(hits: &[(Grant, EndpointScope)]) -> Result<Vec<HttpsCandidate>, Error> {
+  let mut candidates = Vec::with_capacity(hits.len());
+  for (grant, scope) in hits {
+    let leaf = match &scope.client_cert {
+      Some(path) => guest_leaf_der(path)?,
+      None => None,
+    };
+    candidates.push(HttpsCandidate {
+      grant: grant.clone(),
+      guest_tls: scope.guest_tls,
+      leaf,
+    });
+  }
+  Ok(candidates)
 }
 
 impl<GI, GE> Service<BridgeIo<TlsStream<GI>, TlsStream<GE>>> for SubstitutionService
@@ -211,10 +259,16 @@ where
 
   async fn serve(&self, input: BridgeIo<TlsStream<GI>, TlsStream<GE>>) -> Result<Self::Output, Self::Error> {
     let BridgeIo(mut guest_tls, mut server_tls) = input;
-    // The scope that matched selected TLS termination; framing picks the legs.
-    // Schemes below are grant scopes (authorization), never selection.
+    let grants = self.grants.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    if grants.is_empty() {
+      return Err(into_box_error(&Error::ClientCertRequired {
+        host: self.identity.clone(),
+        port: self.port,
+      }));
+    }
+    // Schemes below are authorization, never a second choice.
     let ctx = PairCtx {
-      grants: &self.snapshot.grants,
+      grants: &grants,
       host: &self.identity,
       port: self.port,
       plugins: &self.plugins,

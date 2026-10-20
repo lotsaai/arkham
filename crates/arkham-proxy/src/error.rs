@@ -505,4 +505,38 @@ pub enum Error {
     /// Missing bundle path.
     path: PathBuf,
   },
+  /// Two https grants for one destination cannot be told apart.
+  #[error("ambiguous https grants at {host}:{port}: {labels}")]
+  AmbiguousHttpsGrants {
+    /// Destination host.
+    host: String,
+    /// Destination port.
+    port: u16,
+    /// Grant labels, sorted and comma-separated.
+    labels: String,
+  },
+  /// A presented client certificate matches no grant for this destination.
+  #[error("client certificate matches no grant at {host}:{port}")]
+  UnmatchedClientCert {
+    /// Destination host.
+    host: String,
+    /// Destination port.
+    port: u16,
+  },
+  /// Every grant for this destination requires a client certificate.
+  #[error("client certificate required at {host}:{port}")]
+  ClientCertRequired {
+    /// Destination host.
+    host: String,
+    /// Destination port.
+    port: u16,
+  },
+  /// https grants for one destination name different upstream trust bundles.
+  #[error("https grants at {host}:{port} name different trust bundles")]
+  SplitTrustBundle {
+    /// Destination host.
+    host: String,
+    /// Destination port.
+    port: u16,
+  },
 }
