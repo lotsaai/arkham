@@ -221,6 +221,17 @@ mod tests {
   }
 
   #[test]
+  fn debug_lists_labels_without_the_issued_token() {
+    let store = MintStore::default();
+    let token = "issued-token-9f3c1a";
+    store.mint("my-rule", None, "access_token", token, None).unwrap();
+    let rendered = format!("{store:?}");
+    assert!(!rendered.contains(token), "{rendered}");
+    assert!(rendered.contains("my-rule"), "{rendered}");
+    assert!(rendered.contains("len: 1"), "{rendered}");
+  }
+
+  #[test]
   fn handle_mints_through_the_plan_arguments() {
     let store = Arc::new(MintStore::default());
     let handle = MintHandle::new(Arc::clone(&store));
