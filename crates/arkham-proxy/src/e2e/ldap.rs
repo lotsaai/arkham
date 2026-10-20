@@ -115,7 +115,7 @@ async fn ldap_cleartext_bind_forwards_the_decoy() {
     conn.write_all(&encode(&response)).await.unwrap();
   });
   let stream = connect_through_proxy(fx.proxy_addr, fx.stub_port).await;
-  let result = ldap3_bind(stream, Ldap3Open::Clear, FAKE).await;
+  let result = ldap3_bind(stream, Ldap3Open::Clear, FAKE).await.expect("ldap3 bind");
   assert_eq!(result.rc, ResultCode::InvalidCredentials as u32, "{result}");
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   fx.proxy.abort();
@@ -162,7 +162,8 @@ async fn ldap_flow(flow: Flow) {
       },
       FAKE,
     )
-    .await;
+    .await
+    .expect("ldap3 bind");
     result.success().expect("protected bind");
   } else {
     let mut io = Inbox {
@@ -329,8 +330,9 @@ async fn ldap_starttls_then_bind_swaps_the_password() {
 // Bind then StartTLS with guest mTLS is
 // `ldap bind then starttls with a client certificate swaps the decoy`.
 
-/// No real client produces a bind and `StartTLS` in one write before reading
-/// either result, so this guest stays on the byte path.
+/// ldap3 can send a bind and `StartTLS` before either result, using two
+/// cloned handles and `extended`. It flushes each message on its own, so
+/// only this byte guest puts both in one read.
 #[tokio::test]
 async fn ldap_pipelined_bind_then_starttls_is_operations_error() {
   ldap_flow(Flow::Pipelined).await;
@@ -354,7 +356,7 @@ fn guest_config(ca: &CertAuthority, present: bool) -> rustls::ClientConfig {
   }
 }
 
-async fn ldap3_bind(stream: TcpStream, open: Ldap3Open<'_>, password: &str) -> ldap3::LdapResult {
+async fn ldap3_bind(stream: TcpStream, open: Ldap3Open<'_>, password: &str) -> Result<ldap3::LdapResult, ldap3::LdapError> {
   let bind = async {
     let std_stream = stream.into_std().expect("ldap3 takes a std stream");
     let mut settings = ldap3::LdapConnSettings::new().set_std_stream(ldap3::StdStream::Tcp(std_stream));
@@ -371,11 +373,11 @@ async fn ldap3_bind(stream: TcpStream, open: Ldap3Open<'_>, password: &str) -> l
         "ldaps://localhost"
       }
     };
-    let (conn, mut ldap) = ldap3::LdapConnAsync::with_settings(settings, url).await.expect("ldap3 open");
+    let (conn, mut ldap) = ldap3::LdapConnAsync::with_settings(settings, url).await?;
     tokio::spawn(async move {
       let _ = conn.drive().await;
     });
-    ldap.simple_bind(DN, password).await.expect("ldap3 bind")
+    ldap.simple_bind(DN, password).await
   };
   tokio::time::timeout(Duration::from_secs(10), bind)
     .await
@@ -415,10 +417,84 @@ async fn ldap_starttls_with_a_client_cert_swaps_the_password() {
     },
     FAKE,
   )
-  .await;
+  .await
+  .expect("ldap3 bind");
   result.success().expect("mtls protected bind");
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   proxy.abort();
+}
+
+#[tokio::test]
+async fn ldap_starttls_without_a_client_cert_never_reaches_upstream() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let bundle_dir = tempfile::tempdir().unwrap();
+  let bundle = bundle_dir.path().join("ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let fake = format!("ldap://{}:{FAKE}@localhost:{stub_port}", user(DN));
+  let real = format!("ldap://{}:{VALUE}@localhost:{stub_port}?sslrootcert={}", user(DN), bundle.display());
+  let grants = super::resolve_mtls_grants("LDAP_URL", &fake, &real).expect("ldap starttls with mtls still loads");
+  let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
+  let stub_task = tokio::spawn(async move { bytes_after_starttls(stub).await });
+  let stream = connect_through_proxy(proxy_addr, stub_port).await;
+  let opened = ldap3_bind(
+    stream,
+    Ldap3Open::StartTls {
+      ca: &ca,
+      client_cert: false,
+    },
+    FAKE,
+  )
+  .await;
+  assert!(opened.is_err(), "certless guest completed starttls");
+  let tail = tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  assert!(
+    !tail.windows(VALUE.len()).any(|window| window == VALUE.as_bytes()),
+    "real password reached the upstream"
+  );
+  assert!(tail.is_empty(), "upstream saw bytes after starttls");
+  proxy.abort();
+}
+
+async fn bytes_after_starttls(stub: TcpListener) -> Vec<u8> {
+  let (mut conn, _) = tokio::time::timeout(Duration::from_secs(10), stub.accept()).await.unwrap().unwrap();
+  let (request, mut tail) = read_message_and_rest(&mut conn).await;
+  match &request.protocol_op {
+    ProtocolOp::BindRequest(_) => {
+      assert_ne!(simple_password(&request), VALUE.as_bytes(), "real password on the opening bind");
+      panic!("upstream saw a bind");
+    }
+    ProtocolOp::ExtendedReq(extended) => {
+      assert_eq!(extended.request_name.as_ref(), STARTTLS_OID);
+    }
+    _ => panic!("opening message"),
+  }
+  write_starttls_success(&mut conn, request.message_id).await;
+  let mut tmp = [0u8; 2048];
+  if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(2), conn.read(&mut tmp)).await
+    && let Some(chunk) = tmp.get(..n)
+  {
+    tail.extend_from_slice(chunk);
+  }
+  tail
+}
+
+async fn read_message_and_rest<S: AsyncRead + Unpin>(conn: &mut S) -> (LdapMessage, Vec<u8>) {
+  let mut buf = Vec::new();
+  let mut tmp = [0u8; 1024];
+  loop {
+    let n = conn.read(&mut tmp).await.unwrap();
+    assert_ne!(n, 0, "peer closed before an ldap message");
+    let Some(chunk) = tmp.get(..n) else {
+      panic!("short read");
+    };
+    buf.extend_from_slice(chunk);
+    if let Ok((message, rest)) = rasn::ber::decode_with_remainder::<LdapMessage>(&buf) {
+      return (message, rest.to_vec());
+    }
+  }
 }
 
 #[tokio::test]
@@ -443,7 +519,9 @@ async fn ldap_ldaps_bind_swaps_the_password() {
   let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
   let stub_task = tokio::spawn(async move { answer_ldaps_bind(stub, acceptor).await });
   let stream = connect_through_proxy(proxy_addr, stub_port).await;
-  let result = ldap3_bind(stream, Ldap3Open::Ldaps { ca: &ca, sni: true }, FAKE).await;
+  let result = ldap3_bind(stream, Ldap3Open::Ldaps { ca: &ca, sni: true }, FAKE)
+    .await
+    .expect("ldap3 bind");
   result.success().expect("ldaps bind");
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   proxy.abort();
@@ -482,7 +560,9 @@ async fn ldap_tls_without_sni_mints_for_the_grant_host() {
     }
   });
   let stream = TcpStream::connect(ingress_addr).await.unwrap();
-  let result = ldap3_bind(stream, Ldap3Open::Ldaps { ca: &ca, sni: false }, FAKE).await;
+  let result = ldap3_bind(stream, Ldap3Open::Ldaps { ca: &ca, sni: false }, FAKE)
+    .await
+    .expect("ldap3 bind");
   result.success().expect("ldaps bind without sni");
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   serve.await.unwrap().unwrap();
