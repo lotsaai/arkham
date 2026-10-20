@@ -1,6 +1,3 @@
-//! Talos vertical: terminate the guest with mutual TLS, select the context
-//! from the client certificate, dial that context's upstream, then pump.
-
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -27,8 +24,6 @@ use crate::transports::tls::cached_leaf_mtls;
 /// HTTP/2 ALPN. The Talos API is gRPC.
 const ALPN_H2: &[u8] = b"h2";
 
-/// Talos transport. The guest certificate selects one context. The upstream
-/// leg trusts that context's CA and presents that context's client certificate.
 #[derive(Debug)]
 pub(crate) struct TalosTransport {
   ca: CertAuthority,
@@ -37,11 +32,6 @@ pub(crate) struct TalosTransport {
 }
 
 impl TalosTransport {
-  /// Build the guest leaf cache over the CA that signs those leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
   pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
     Ok(Self {
       ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
@@ -54,15 +44,6 @@ impl TalosTransport {
 impl Transport for TalosTransport {
   type Scope = ();
 
-  /// Handshake the guest, select one Talos grant from its certificate, dial
-  /// that grant, and pump both directions. No certificate, or a certificate
-  /// that matches nothing, closes without dialing.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when two contexts match the certificate, when the
-  /// selected grant cannot name an upstream identity, or when a leg fails
-  /// after selection. A guest handshake that does not complete closes quietly.
   async fn serve<G>(&self, ServeStream { mut guest, params, .. }: ServeStream<'_, G, ()>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -133,13 +114,6 @@ impl Transport for TalosTransport {
 }
 
 impl TalosTransport {
-  /// Dial `dial_host` and present this grant's client certificate. Trust is
-  /// the grant's `root_cert` alone.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the grant names no CA or client identity, when
-  /// those files do not load, or when the handshake fails.
   async fn connect_upstream(
     &self,
     label: &str,
@@ -184,11 +158,6 @@ impl TalosTransport {
   }
 }
 
-/// Talos grants covering `host`:`port` whose guest certificate file holds `peer`.
-///
-/// # Errors
-///
-/// Returns an error when a guest certificate file exists but does not parse.
 fn matching_grants<'a>(grants: &'a [Grant], host: &str, port: u16, peer: &[u8]) -> Result<Vec<(&'a str, &'a EndpointScope)>, Error> {
   let mut matched = Vec::new();
   for grant in grants {
@@ -208,12 +177,6 @@ fn matching_grants<'a>(grants: &'a [Grant], host: &str, port: u16, peer: &[u8]) 
   Ok(matched)
 }
 
-/// The guest leaf materialized beside `client_cert` as `{label}.guest.crt`.
-/// A missing file is not a match.
-///
-/// # Errors
-///
-/// Returns an error when the file cannot be read or holds no PEM certificate.
 fn guest_leaf_matches(scope: &EndpointScope, label: &str, peer: &[u8]) -> Result<bool, Error> {
   let Some(client_cert) = &scope.client_cert else {
     return Ok(false);
@@ -236,13 +199,10 @@ fn guest_leaf_matches(scope: &EndpointScope, label: &str, peer: &[u8]) -> Result
   Ok(false)
 }
 
-/// The upstream TLS name. An IP endpoint parses as an IP server name, and a
-/// hostname stays a DNS name.
 fn upstream_server_name(identity: &str) -> Result<ServerName<'static>, Error> {
   ServerName::try_from(identity.to_string()).map_err(|err| Error::TalosServerName { source: err.into() })
 }
 
-/// Zero matches closes. Two or more is an error naming every label.
 fn one_match<'a>(host: &str, port: u16, matched: Vec<(&'a str, &'a EndpointScope)>) -> Result<Option<(&'a str, &'a EndpointScope)>, Error> {
   match matched.len() {
     0 => Ok(None),
