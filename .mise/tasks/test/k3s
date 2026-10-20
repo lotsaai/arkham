@@ -423,89 +423,8 @@ for ctx in prod prod-admin staging prod-system; do
   kubectl --kubeconfig "$merged" --context "$ctx" get ns --request-timeout=30s >/dev/null
 done
 
-name=contexts
-ws=$scratch/ws-$name
-mkdir -p "$ws/.config/arkham"
-printf '%s\n' '[[workspace.file_rewrite]]' "source = \"$merged\"" 'dest = "{home}/.kube/config"' 'format = "kubeconfig"' >"$ws/.config/arkham/config.toml"
-# The declared file is the only kubeconfig. A leftover KUBECONFIG would
-# derive the staging admin as a second grant for the same cluster.
-export KUBECONFIG="$merged"
-statedir=$scratch/state-$name
-XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
-shopt -s nullglob
-kubedirs=()
-for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
-decoys=()
-for d in "$statedir"/arkham/ws/*/files/00-*; do decoys+=("$d"); done
-shopt -u nullglob
-if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
-  echo "init generated no kube state for the multi-context file" >&2
-  exit 1
-fi
-kubedir=${kubedirs[0]}
-decoy=${decoys[0]}
-rule_count=$(grep -cE '^\[rules\.kube-user-[0-9a-f]{32}\]$' "$kubedir/arkham.toml" || true)
-if [ "$rule_count" -ne 3 ]; then
-  echo "expected 3 kube user grants for 4 contexts that share ivan, got ${rule_count}" >&2
-  grep '^\[rules\.' "$kubedir/arkham.toml" >&2 || true
-  exit 1
-fi
-sed "s|/arkham/grants|$kubedir|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
-cp "$decoy" "$scratch/proxy-$name.yaml"
-KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster prod --proxy-url="http://127.0.0.1:18101" >/dev/null
-KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster staging --proxy-url="http://127.0.0.1:18101" >/dev/null
-
-paths=()
-for index in 0 1; do
-  paths+=("{.clusters[${index}].cluster.certificate-authority-data}")
-done
-for index in 0 1 2 3; do
-  paths+=(
-    "{.users[${index}].user.token}"
-    "{.users[${index}].user.client-certificate-data}"
-    "{.users[${index}].user.client-key-data}"
-  )
-done
-for path in "${paths[@]}"; do
-  secret=$(kubectl --kubeconfig "$merged" config view --raw -o "jsonpath=${path}")
-  if [ -n "$secret" ] && grep -F -q -- "$secret" "$decoy"; then
-    echo "decoy still contains a real kubeconfig field ${path}" >&2
-    exit 1
-  fi
-done
-for secret in "$oidc_id_token" "$oidc_refresh" "$oidc_client_secret" "$oidc_idp_ca"; do
-  if grep -F -q -- "$secret" "$decoy"; then
-    echo "decoy contains an auth-provider secret" >&2
-    exit 1
-  fi
-done
-
-XDG_STATE_HOME=$statedir FNOX_CONFIG_DIR=$scratch/fnox ARKHAM_CONFIG="$scratch/host-layer-$name.toml" ARKHAM_CA_FILE="$scratch/config/arkham/ca.pem" ARKHAM_LISTEN="127.0.0.1:18101" "$arkham" serve &
-serve_pid=$!
-sleep 2
-
-echo "--- contexts: decoy fails direct"
-if env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy KUBECONFIG="$decoy" kubectl --context prod get ns --request-timeout=30s; then
-  echo "decoy kubeconfig worked without the proxy; substitution unproven" >&2
-  exit 1
-fi
-echo "--- contexts: kubectl --context through the proxy"
-for ctx in prod prod-admin staging prod-system; do
-  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl --context "$ctx" get ns --request-timeout=30s
-done
-KUBECONFIG="$scratch/proxy-$name.yaml" kubectl --context prod-system get ns kube-system --request-timeout=30s
-echo "--- contexts: kubectl config use-context"
-KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context staging >/dev/null
-KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get ns --request-timeout=30s
-KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context prod >/dev/null
-KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get ns --request-timeout=30s
-
-kill "$serve_pid" 2>/dev/null || true
-serve_pid=""
-
-# tun does not capture loopback, so the proxy-url legs above never enter it.
-# This leg puts the proxy on the clusters' docker networks and drives kubectl
-# with the decoy kubeconfig, server URLs unchanged after init.
+# The proxy joins the clusters' docker networks and drives kubectl with the
+# decoy kubeconfig. Server URLs stay the addresses init wrote.
 if [ ! -e /dev/net/tun ]; then
   run_privileged modprobe tun || {
     echo "tun device is missing" >&2
@@ -533,19 +452,10 @@ apiserver_host() {
   exit 1
 }
 
-case "$(uname -m)" in
-  x86_64) kube_arch=amd64 ;;
-  aarch64) kube_arch=arm64 ;;
-  *)
-    echo "unsupported architecture $(uname -m)" >&2
-    exit 1
-    ;;
-esac
-kube_version=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
-curl -fsSL -o "$scratch/kubectl" "https://dl.k8s.io/release/${kube_version}/bin/linux/${kube_arch}/kubectl"
-curl -fsSL -o "$scratch/kubectl.sha256" "https://dl.k8s.io/release/${kube_version}/bin/linux/${kube_arch}/kubectl.sha256"
-echo "$(tr -d '[:space:]' <"$scratch/kubectl.sha256")  kubectl" | (cd "$scratch" && sha256sum -c -)
-chmod +x "$scratch/kubectl"
+if ! guest_kubectl=$(command -v kubectl); then
+  echo "kubectl is not on PATH" >&2
+  exit 1
+fi
 mkdir -p "$scratch/image"
 cp "$arkham" "$scratch/image/arkham"
 docker build -t arkham-k3s-e2e:local -f "$proj_dir/Dockerfile" "$scratch/image"
@@ -600,12 +510,33 @@ if grep -q 'proxy-url' "$capture_decoy"; then
   exit 1
 fi
 
+echo "--- capture: decoy fails direct"
+direct=$scratch/guest-direct
+mkdir -p "$direct"
+cp "$capture_decoy" "$direct/config"
+direct_status=0
+timeout -k 15 90 docker run --rm --network "$prod_net" \
+  -v "${direct}:/work" \
+  -v "${guest_kubectl}:/kubectl:ro" \
+  -e KUBECONFIG=/work/config \
+  --entrypoint /kubectl \
+  arkham-k3s-e2e:local \
+  --context prod get ns --request-timeout=30s || direct_status=$?
+if [ "$direct_status" -eq 0 ]; then
+  echo "decoy kubeconfig worked without the proxy; substitution unproven" >&2
+  exit 1
+fi
+if [ "$direct_status" -ge 124 ]; then
+  echo "decoy direct check did not run kubectl (status ${direct_status})" >&2
+  exit 1
+fi
+
 run_capture_guest() {
   local dir=$1
   shift
   timeout -k 15 90 docker run --rm --network "container:${capture_proxy}" \
     -v "${dir}:/work" \
-    -v "${scratch}/kubectl:/kubectl:ro" \
+    -v "${guest_kubectl}:/kubectl:ro" \
     -e KUBECONFIG=/work/config \
     --entrypoint /kubectl \
     arkham-k3s-e2e:local \
