@@ -208,6 +208,8 @@ await retry("", "grantless tls splices untouched", async () => {
 // object passed next to it. The guest URL says sslmode=require, which
 // becomes an empty ssl object and drops the demo CA. Delete that
 // parameter so hostname verification against the demo CA stays on.
+// The server accepts only the real password, so a decoy login means
+// arkham authenticated upstream with it.
 if (PG_URL) {
   function openPg(raw: string): PgClient {
     const url = new URL(raw);

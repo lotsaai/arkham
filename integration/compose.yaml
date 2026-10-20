@@ -109,6 +109,9 @@ services:
 
   db:
     image: postgres:17-alpine
+    # The image default is scram-sha-256, so this leg exercises SCRAM.
+    # The key is copied out of the shared volume and re-owned: postgres
+    # refuses a private key it does not own, and the volume file is root-owned.
     command:
       - sh
       - -c

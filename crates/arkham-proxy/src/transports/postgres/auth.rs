@@ -6,8 +6,8 @@ use pgwire::api::auth::Password;
 use pgwire::api::auth::sasl::SCRAM_SHA_256_METHOD;
 use pgwire::api::auth::sasl::scram::{SCRAM_ITERATIONS, ScramClientAuth, ScramServerAuth, gen_salted_password, random_nonce};
 use pgwire::messages::response::ErrorResponse;
-use pgwire::messages::startup::{Authentication, PasswordMessageFamily, SASLInitialResponse, SASLResponse};
-use pgwire::messages::{DecodeContext, PgWireBackendMessage, PgWireFrontendMessage};
+use pgwire::messages::startup::{Authentication, PasswordMessageFamily, SASLInitialResponse, SASLResponse, Startup};
+use pgwire::messages::{DecodeContext, Message as _, PgWireBackendMessage, PgWireFrontendMessage};
 use secrecy::ExposeSecret as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -230,14 +230,7 @@ where
         waiting_final.verify_server_final(&data).map_err(scram_err)?;
         saw_final = true;
       }
-      Some(PgWireBackendMessage::Authentication(
-        Authentication::Ok
-        | Authentication::CleartextPassword
-        | Authentication::KerberosV5
-        | Authentication::MD5Password(_)
-        | Authentication::SASL(_)
-        | Authentication::SASLContinue(_),
-      )) => {}
+      Some(PgWireBackendMessage::Authentication(Authentication::Ok | Authentication::KerberosV5)) => {}
       Some(PgWireBackendMessage::Authentication(_)) => {
         return Err(scram_err(short("postgres authentication message is not scram")));
       }
@@ -268,19 +261,10 @@ fn scram_user(startup: &[u8], ctx: &PairCtx<'_>) -> Option<String> {
 }
 
 fn startup_user(startup: &[u8]) -> Option<String> {
-  let len = usize::try_from(u32::from_be_bytes(startup.get(..4)?.try_into().ok()?)).ok()?;
-  let startup = startup.get(..len)?;
-  let mut pos = 8usize;
-  while pos < startup.len() {
-    let key_end = pos + startup.get(pos..)?.iter().position(|&byte| byte == 0)?;
-    let value_start = key_end.checked_add(1)?;
-    let value_end = value_start + startup.get(value_start..)?.iter().position(|&byte| byte == 0)?;
-    if startup.get(pos..key_end) == Some(b"user".as_slice()) {
-      return std::str::from_utf8(startup.get(value_start..value_end)?).ok().map(str::to_owned);
-    }
-    pos = value_end.checked_add(1)?;
-  }
-  None
+  let body = startup.get(4..)?;
+  let mut buf = BytesMut::from(body);
+  let decoded = Startup::decode_body(&mut buf, body.len(), &DecodeContext::default()).ok()?;
+  decoded.parameters.get("user").filter(|user| !user.is_empty()).cloned()
 }
 
 fn leg_passwords(ctx: &PairCtx<'_>) -> Option<(String, String)> {
@@ -436,8 +420,6 @@ mod tests {
   use arkham_config::grants::{Credential, Grant, PostgresScope};
   use arkham_plugin::Registry;
   use pgwire::api::auth::sasl::SCRAM_SHA_256_PLUS_METHOD;
-  use pgwire::messages::Message as _;
-  use pgwire::messages::startup::Startup;
   use secrecy::SecretString;
   use tokio::io::duplex;
 
@@ -498,8 +480,8 @@ mod tests {
     buf.to_vec()
   }
 
-  fn backend(message: PgWireBackendMessage) -> Vec<u8> {
-    encode_backend(&message).expect("backend message encodes")
+  fn backend(message: &PgWireBackendMessage) -> Vec<u8> {
+    encode_backend(message).expect("backend message encodes")
   }
 
   async fn read_backend<R>(reader: &mut R) -> PgWireBackendMessage
@@ -532,16 +514,14 @@ mod tests {
     let mut buf = BytesMut::new();
     let mut tmp = [0u8; 1024];
     loop {
-      match decode(&mut buf, &ctx).expect("frame decodes") {
-        Some(message) => return Some(message),
-        None => {
-          let read = reader.read(&mut tmp).await.expect("read");
-          if read == 0 {
-            return None;
-          }
-          buf.extend_from_slice(tmp.get(..read).expect("read fits the buffer"));
-        }
+      if let Some(message) = decode(&mut buf, &ctx).expect("frame decodes") {
+        return Some(message);
       }
+      let read = reader.read(&mut tmp).await.expect("read");
+      if read == 0 {
+        return None;
+      }
+      buf.extend_from_slice(tmp.get(..read).expect("read fits the buffer"));
     }
   }
 
@@ -597,14 +577,14 @@ mod tests {
       read_backend(&mut guest).await
     });
     let server_task = tokio::spawn(async move {
-      let _ = read_startup(&mut server).await;
-      let offer = backend(PgWireBackendMessage::Authentication(Authentication::SASL(vec![
+      let () = read_startup(&mut server).await;
+      let offer = backend(&PgWireBackendMessage::Authentication(Authentication::SASL(vec![
         SCRAM_SHA_256_METHOD.to_owned(),
       ])));
       server.write_all(&offer).await.expect("offer");
       server.flush().await.expect("offer flush");
       let _ = read_frontend(&mut server).await;
-      let refusal = backend(PgWireBackendMessage::ErrorResponse(ErrorResponse::new(vec![
+      let refusal = backend(&PgWireBackendMessage::ErrorResponse(ErrorResponse::new(vec![
         (b'S', "FATAL".into()),
         (b'C', "28P01".into()),
         (b'M', LEAK.into()),
@@ -661,14 +641,14 @@ mod tests {
   #[tokio::test]
   async fn sasl_without_scram_sha_256_is_forwarded_unchanged() {
     let mechanisms = vec![SCRAM_SHA_256_PLUS_METHOD.to_owned()];
-    let offer = backend(PgWireBackendMessage::Authentication(Authentication::SASL(mechanisms)));
+    let offer = backend(&PgWireBackendMessage::Authentication(Authentication::SASL(mechanisms)));
     let seen = forwarded_offer(&offer, &[grant()], Some("app")).await;
     assert_eq!(seen, offer);
   }
 
   #[tokio::test]
   async fn scram_without_a_grant_is_forwarded_unchanged() {
-    let offer = backend(PgWireBackendMessage::Authentication(Authentication::SASL(vec![
+    let offer = backend(&PgWireBackendMessage::Authentication(Authentication::SASL(vec![
       SCRAM_SHA_256_METHOD.to_owned(),
     ])));
     let seen = forwarded_offer(&offer, &[], Some("app")).await;
@@ -677,7 +657,7 @@ mod tests {
 
   #[tokio::test]
   async fn scram_without_a_user_is_forwarded_unchanged() {
-    let offer = backend(PgWireBackendMessage::Authentication(Authentication::SASL(vec![
+    let offer = backend(&PgWireBackendMessage::Authentication(Authentication::SASL(vec![
       SCRAM_SHA_256_METHOD.to_owned(),
     ])));
     let grants = [userless_grant()];
@@ -701,7 +681,7 @@ mod tests {
       read_startup(&mut server).await;
       server.write_all(&offer_bytes).await.expect("offer");
       server.flush().await.expect("flush");
-      std::future::pending::<()>().await
+      std::future::pending::<()>().await;
     });
     let plugins = registry();
     let ctx = PairCtx {
@@ -753,11 +733,11 @@ mod tests {
     let startup = startup_message(Some("app"));
     let guest_task = tokio::spawn(async move {
       prove_decoy(&mut guest, &startup).await;
-      std::future::pending::<()>().await
+      std::future::pending::<()>().await;
     });
     let server_task = tokio::spawn(async move {
       read_startup(&mut server).await;
-      let offer = backend(PgWireBackendMessage::Authentication(Authentication::SASL(vec![
+      let offer = backend(&PgWireBackendMessage::Authentication(Authentication::SASL(vec![
         SCRAM_SHA_256_METHOD.to_owned(),
       ])));
       server.write_all(&offer).await.expect("offer");
@@ -771,16 +751,16 @@ mod tests {
       let (server_first, _) = ScramServerAuth::new()
         .on_client_first_message(initial.data.as_deref().expect("client first"), Password::new(Some(salt), salted))
         .expect("server first");
-      let continue_message = backend(PgWireBackendMessage::Authentication(Authentication::SASLContinue(
+      let continue_message = backend(&PgWireBackendMessage::Authentication(Authentication::SASLContinue(
         bytes::Bytes::from(server_first),
       )));
       server.write_all(&continue_message).await.expect("continue");
       server.flush().await.expect("continue flush");
       let _ = read_frontend(&mut server).await;
-      let late = backend(PgWireBackendMessage::Authentication(authentication));
+      let late = backend(&PgWireBackendMessage::Authentication(authentication));
       server.write_all(&late).await.expect("late");
       server.flush().await.expect("late flush");
-      std::future::pending::<()>().await
+      std::future::pending::<()>().await;
     });
     let grants = [grant()];
     let plugins = registry();
