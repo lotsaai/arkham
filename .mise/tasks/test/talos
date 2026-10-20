@@ -32,7 +32,7 @@ cleanup() {
   set +e
   if [ "$status" -ne 0 ]; then
     echo "=== arkham proxy logs ===" >&2
-    docker logs "$proxy" 2>&1 | tail -200 >&2
+    docker logs "$proxy" 2>&1 | tail -400 >&2
     echo "=== talos node logs ===" >&2
     docker ps -a --filter name=arkham-talos- --format '{{.Names}}' | while read -r name; do
       echo "--- $name ---" >&2
@@ -231,7 +231,7 @@ prove_backend() {
     -v "${grant_toml}:/root/.config/arkham/config.toml:ro" \
     -v "${ca}:/certs/ca.pem:ro" \
     -e ARKHAM_CA_FILE=/certs/ca.pem \
-    -e RUST_LOG=info \
+    -e RUST_LOG=info,arkham_proxy=debug,arkham_tproxy=debug \
     "$arkham_image" \
     serve --proxy-backend "$backend"
   docker network connect "$staging_net" "$proxy"

@@ -119,9 +119,13 @@ impl Transport for TalosTransport {
       tracing::debug!(host = %identity, port, "talos client certificate matched no context");
       return Ok(());
     };
-    let server = self
-      .connect_upstream(label, scope, dial_host, port, &identity, state.fwmark)
-      .await?;
+    let server = match self.connect_upstream(label, scope, dial_host, port, &identity, state.fwmark).await {
+      Ok(server) => server,
+      Err(err) => {
+        tracing::warn!(%err, host = %identity, port, label, "talos upstream");
+        return Err(err);
+      }
+    };
     let mut downstream = Raw::from_pairs(Vec::new());
     let mut upstream = Raw::from_pairs(Vec::new());
     relay_guarded(guest_tls, server, &mut downstream, &mut upstream, &[], &[]).await
