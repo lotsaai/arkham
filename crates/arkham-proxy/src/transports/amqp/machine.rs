@@ -4,12 +4,12 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 
 use amq_protocol::auth::SASLMechanism;
-use amq_protocol::frame::parsing::{parse_channel, parse_content_header, parse_frame_type};
+use amq_protocol::frame::parsing::{parse_channel, parse_frame_type};
 use amq_protocol::frame::{AMQPFrame, AMQPFrameType, ParserError, ProtocolVersion, WriteContext, gen_frame, parse_frame};
-use amq_protocol::protocol::constants::{FRAME_BODY, FRAME_END, FRAME_METHOD};
+use amq_protocol::protocol::constants::{FRAME_BODY, FRAME_END, FRAME_HEADER, FRAME_METHOD};
 use amq_protocol::protocol::{AMQPClass, channel, connection};
 use amq_protocol::types::ShortString;
-use amq_protocol::types::parsing::{parse_id, parse_long_uint};
+use amq_protocol::types::parsing::{parse_id, parse_long_long_uint, parse_long_uint, parse_short_uint};
 use arkham_config::grants::Grant;
 use fe2o3_amqp_types::definitions::{Error as AmqpError, MAJOR, MINOR, REVISION};
 use fe2o3_amqp_types::performatives::{Close, Detach, End, MaxFrameSize, Open, Transfer};
@@ -167,6 +167,8 @@ pub(crate) struct Amqp {
   tail: Vec<u8>,
   /// Typed reason for the close, when the machine has one.
   fault: Option<crate::Error>,
+  /// The next AMQP frame is the guest Open and must be lowered.
+  lower_open: bool,
   closed: bool,
 }
 
@@ -191,28 +193,15 @@ enum Framer {
 enum Phase {
   Header(Vec<u8>),
   Head(Vec<u8>),
-  /// Bytes after the credential, until the guest Open is forwarded.
-  GuestOpen(Vec<u8>),
-  Frame {
-    buf: Vec<u8>,
-    total: usize,
-    kind: Kind,
-  },
+  Frame { buf: Vec<u8>, total: usize, kind: Kind },
   Forward(Fwd),
   Opaque,
 }
 
 enum Fwd {
   Copy { left: usize },
-  Scan { left: usize, note: Option<Note> },
+  Scan { left: usize },
   Delay { left: usize, delay: Delay },
-}
-
-/// First 12 payload bytes of a content header, collected before the property table.
-struct Note {
-  channel: u16,
-  got: Vec<u8>,
-  need: usize,
 }
 
 /// The unread tail of one body or transfer. `keep` is withheld. The frame on the wire is shorter.
@@ -243,6 +232,7 @@ enum Kind {
   StartOk,
   SaslInit,
   SaslResponse,
+  Open,
   Close091,
   CloseEndDetach(u64),
   Scan,
@@ -276,12 +266,6 @@ enum OpenRewrite {
   Close,
 }
 
-enum GuestFrame {
-  Hold,
-  Splice,
-  Ready(usize),
-}
-
 impl Amqp {
   /// # Errors
   ///
@@ -307,7 +291,7 @@ impl Amqp {
       _ => None,
     };
     let up = match found {
-      Some((scope, label)) if dir == Direction::Upstream => Some(CredentialPair {
+      Some((scope, label)) if dir == Direction::Upstream && scope.is_upstream_tls => Some(CredentialPair {
         needle: scope.upstream.password.expose_secret().as_bytes().to_vec(),
         replacement: scope.downstream.password.expose_secret().as_bytes().to_vec(),
         label,
@@ -327,6 +311,7 @@ impl Amqp {
       carries: HashMap::new(),
       tail: Vec::new(),
       fault: None,
+      lower_open: false,
       closed: false,
     })
   }
@@ -379,24 +364,30 @@ impl Amqp {
   }
 
   fn finish(&mut self) -> (Rewritten<'static>, Vec<Hit>) {
+    // An Open that never completed is still the guest's bytes. Emit them.
+    // Any other unfinished frame is a protocol error and closes.
+    let lower = std::mem::take(&mut self.lower_open);
     let phase = std::mem::replace(&mut self.phase, Phase::Opaque);
-    if let Phase::GuestOpen(buf) = phase {
-      if buf.is_empty() {
-        return (Rewritten::Hold, Vec::new());
+    let pending = match phase {
+      Phase::Header(buf) | Phase::Head(buf) | Phase::Frame { buf, .. } if lower => Some(buf),
+      other => {
+        self.phase = other;
+        None
       }
-      return (Rewritten::Emit(Cow::Owned(buf)), Vec::new());
+    };
+    if let Some(buf) = pending {
+      return if buf.is_empty() {
+        (Rewritten::Hold, Vec::new())
+      } else {
+        (Rewritten::Emit(Cow::Owned(buf)), Vec::new())
+      };
     }
-    self.phase = phase;
     let idle = match &self.phase {
       Phase::Header(buf) | Phase::Head(buf) => buf.is_empty(),
       Phase::Opaque => true,
-      Phase::GuestOpen(_) | Phase::Frame { .. } | Phase::Forward(_) => false,
+      Phase::Frame { .. } | Phase::Forward(_) => false,
     };
-    if !idle {
-      self.closed = true;
-      return (Rewritten::Close, Vec::new());
-    }
-    if self.carries.values().any(|carry| !carry.held.is_empty()) {
+    if !idle || self.carries.values().any(|carry| !carry.held.is_empty()) {
       self.closed = true;
       return (Rewritten::Close, Vec::new());
     }
@@ -412,7 +403,6 @@ impl Amqp {
     match std::mem::replace(&mut self.phase, Phase::Opaque) {
       Phase::Header(buf) => self.drive_header(buf, input, out, hits),
       Phase::Head(buf) => self.drive_head(buf, input, out, hits),
-      Phase::GuestOpen(buf) => self.drive_guest_open(buf, input, out),
       Phase::Frame { buf, total, kind } => self.drive_frame(buf, total, kind, input, out, hits),
       Phase::Forward(fwd) => {
         self.phase = self.forward_rest(fwd, input, out)?;
@@ -447,30 +437,39 @@ impl Amqp {
       return Ok(());
     }
     self.pass(&buf, out)?;
-    self.phase = match header_framer(self.down.is_some(), &buf) {
-      Some(framer) => {
-        self.framer = framer;
-        out.extend(std::mem::take(&mut self.tail));
-        if self.down.is_some() && matches!(framer, Framer::V10 { sasl: false }) {
-          Phase::GuestOpen(Vec::new())
-        } else {
-          Phase::Head(Vec::new())
-        }
+    let Some(framer) = header_framer(self.down.is_some(), &buf) else {
+      if self.lower_open {
+        self.refuse_open();
+        return Err(());
       }
-      None => Phase::Opaque,
+      self.phase = Phase::Opaque;
+      return Ok(());
     };
+    self.framer = framer;
+    out.extend(std::mem::take(&mut self.tail));
+    if self.down.is_some() && matches!(framer, Framer::V10 { sasl: false }) {
+      self.lower_open = true;
+    } else if self.lower_open {
+      self.refuse_open();
+      return Err(());
+    }
+    self.phase = Phase::Head(Vec::new());
     Ok(())
   }
 
   fn drive_head(&mut self, mut buf: Vec<u8>, input: &mut &[u8], out: &mut Vec<u8>, hits: &mut Vec<Hit>) -> Result<(), ()> {
     if buf.is_empty() && self.framer == (Framer::V10 { sasl: true }) && input.first() == Some(&protocol_lead()) {
-      if self.down.is_some() {
+      if self.down.is_some() && !self.lower_open {
         return self.opaque(input, out);
       }
       return self.drive_header(Vec::new(), input, out, hits);
     }
     loop {
-      match self.classify(&buf)? {
+      let Ok(classified) = self.classify(&buf) else {
+        self.refuse_open();
+        return Err(());
+      };
+      match classified {
         Classified::AbsoluteHead(need) => {
           if need <= buf.len() {
             return Err(());
@@ -539,6 +538,12 @@ impl Amqp {
       return Err(());
     }
     if total > MAX_CREDENTIAL_FRAME {
+      if self.up.is_some() && buf.first() == Some(&FRAME_HEADER) {
+        let need = TYPE_CHANNEL_AND_SIZE.saturating_add(12);
+        if buf.len() < need && need <= total {
+          return Ok(Classified::AbsoluteHead(need));
+        }
+      }
       return Ok(Classified::Forward { total });
     }
     if let Some(pair) = method {
@@ -565,6 +570,15 @@ impl Amqp {
     let Some((after_size, total)) = frame_len_10(buf)? else {
       return Ok(Classified::AbsoluteHead(FRAME_HEADER_10));
     };
+    if self.lower_open {
+      return if !(FRAME_HEADER_10..=MAX_CREDENTIAL_FRAME).contains(&total) {
+        Err(())
+      } else if buf.len() < total {
+        Ok(Classified::AbsoluteHead(total))
+      } else {
+        Ok(Classified::Hold { total, kind: Kind::Open })
+      };
+    }
     let Some((&doff, after_doff)) = after_size.split_first() else {
       return Ok(Classified::AbsoluteHead(FRAME_HEADER_10));
     };
@@ -718,10 +732,6 @@ impl Amqp {
     self.down.as_ref().map_or(0, |down| down.real.len().saturating_sub(1))
   }
 
-  fn buffered_message(&self, total: usize, payload_len: usize) -> bool {
-    total <= MAX_CREDENTIAL_FRAME || payload_len <= self.needle_room()
-  }
-
   fn drive_frame(
     &mut self,
     mut buf: Vec<u8>,
@@ -757,16 +767,27 @@ impl Amqp {
           InitRewrite::Unchanged | InitRewrite::AwaitResponse => buf,
         };
         out.extend_from_slice(&frame);
-        self.phase = if await_response {
-          Phase::Head(Vec::new())
+        if await_response {
+          self.phase = Phase::Head(Vec::new());
         } else {
-          Phase::GuestOpen(Vec::new())
-        };
+          self.lower_open = true;
+          self.phase = Phase::Header(Vec::new());
+        }
       }
       Kind::SaslResponse => {
         let rewritten = self.sasl_response(&buf, hits)?;
         out.extend_from_slice(rewritten.as_deref().unwrap_or(&buf));
-        self.phase = Phase::GuestOpen(Vec::new());
+        self.lower_open = true;
+        self.phase = Phase::Header(Vec::new());
+      }
+      Kind::Open => {
+        match self.rewrite_open(&buf) {
+          OpenRewrite::Rewritten(frame) => out.extend_from_slice(&frame),
+          OpenRewrite::Forward => out.extend_from_slice(&buf),
+          OpenRewrite::Close => return Err(()),
+        }
+        self.lower_open = false;
+        self.phase = Phase::Opaque;
       }
       Kind::Close091 => {
         self.forget_091(&buf);
@@ -965,7 +986,6 @@ impl Amqp {
       self.carries.remove(&link);
       return Ok(());
     }
-    let replacing = self.carries.contains_key(&link);
     let old = self.carries.get(&link).map_or(0, carry_weight);
     let bytes = self
       .carries
@@ -974,7 +994,7 @@ impl Amqp {
       .sum::<usize>()
       .saturating_sub(old)
       .saturating_add(kept.len());
-    let entries = self.carries.len() + usize::from(!replacing);
+    let entries = self.carries.len() + usize::from(!self.carries.contains_key(&link));
     if bytes > CARRY_BYTES || entries > CARRY_ENTRIES {
       self.fault = Some(crate::Error::AmqpCarryBudget { bytes, entries });
       return Err(());
@@ -994,113 +1014,50 @@ impl Amqp {
     self.fault.as_ref()
   }
 
-  /// The guest Open follows the credential. Lower its max-frame-size by the
-  /// withheld prefix. Anything else is spliced.
-  fn drive_guest_open(&mut self, mut buf: Vec<u8>, input: &mut &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
-    buf.extend_from_slice(input);
-    *input = &[];
-    let header_len = if matches!(self.framer, Framer::V10 { sasl: true }) {
-      if buf.len() < PROTOCOL_HEADER_LEN {
-        self.phase = Phase::GuestOpen(buf);
-        return Ok(());
-      }
-      let Some(header) = buf.get(..PROTOCOL_HEADER_LEN) else {
-        return Err(());
-      };
-      if header_framer(true, header).is_none() {
-        out.extend_from_slice(&buf);
-        self.phase = Phase::Opaque;
-        return Ok(());
-      }
-      PROTOCOL_HEADER_LEN
-    } else {
-      0
-    };
-    match guest_frame(&buf, header_len) {
-      GuestFrame::Hold => {
-        self.phase = Phase::GuestOpen(buf);
-        Ok(())
-      }
-      GuestFrame::Splice => {
-        out.extend_from_slice(&buf);
-        self.phase = Phase::Opaque;
-        Ok(())
-      }
-      GuestFrame::Ready(total) => self.emit_open(&buf, header_len, total, out),
+  /// Record [`crate::Error::AmqpOpenUnlowered`] when this leg still has to lower the Open.
+  fn refuse_open(&mut self) {
+    if self.lower_open && self.fault.is_none() {
+      self.fault = Some(crate::Error::AmqpOpenUnlowered);
     }
-  }
-
-  fn emit_open(&mut self, buf: &[u8], header_len: usize, total: usize, out: &mut Vec<u8>) -> Result<(), ()> {
-    let end = header_len.saturating_add(total);
-    let rewritten = {
-      let frame = buf.get(header_len..).and_then(|rest| rest.get(..total)).ok_or(())?;
-      self.rewrite_open(frame)
-    };
-    match rewritten {
-      OpenRewrite::Forward => out.extend_from_slice(buf),
-      OpenRewrite::Rewritten(frame) => {
-        if let Some(header) = buf.get(..header_len) {
-          out.extend_from_slice(header);
-        }
-        out.extend_from_slice(&frame);
-        if let Some(rest) = buf.get(end..) {
-          out.extend_from_slice(rest);
-        }
-      }
-      OpenRewrite::Close => return Err(()),
-    }
-    self.phase = Phase::Opaque;
-    Ok(())
   }
 
   /// Lower `max-frame-size` by the withheld prefix. A value that would fall
-  /// below the protocol minimum closes. A frame that is not an Open is forwarded.
+  /// below the protocol minimum closes. Any other failure to lower closes too.
   fn rewrite_open(&mut self, frame: &[u8]) -> OpenRewrite {
+    if let Ok(done) = self.lower_frame(frame) {
+      return done;
+    }
+    self.refuse_open();
+    OpenRewrite::Close
+  }
+
+  fn lower_frame(&mut self, frame: &[u8]) -> Result<OpenRewrite, ()> {
     if frame.get(5) != Some(&FRAME_AMQP) {
-      return OpenRewrite::Forward;
+      return Err(());
     }
-    let Ok(at) = data_offset(frame) else {
-      return OpenRewrite::Forward;
-    };
+    let at = data_offset(frame)?;
     if at < FRAME_HEADER_10 || at > frame.len() {
-      return OpenRewrite::Forward;
+      return Err(());
     }
-    let Some(body) = frame.get(at..) else {
-      return OpenRewrite::Forward;
-    };
-    let Ok(perf) = consume_value(body, PERFORMATIVE_NESTING) else {
-      return OpenRewrite::Forward;
-    };
-    let Some(encoded) = body.get(..perf) else {
-      return OpenRewrite::Forward;
-    };
-    let Ok(mut open) = serde_amqp::from_slice::<Open>(encoded) else {
-      return OpenRewrite::Forward;
-    };
+    let body = frame.get(at..).ok_or(())?;
+    let perf = consume_value(body, PERFORMATIVE_NESTING)?;
+    let mut open: Open = serde_amqp::from_slice(body.get(..perf).ok_or(())?).map_err(|_decode| ())?;
     let room = self.needle_room();
     if room == 0 {
-      return OpenRewrite::Forward;
+      return Ok(OpenRewrite::Forward);
     }
-    let Ok(offered) = u32::try_from(usize::from(open.max_frame_size)) else {
-      return OpenRewrite::Forward;
-    };
-    let Ok(room_u32) = u32::try_from(room) else {
-      self.fault = Some(crate::Error::AmqpFrameMax { offered, room });
-      return OpenRewrite::Close;
-    };
-    let lowered = offered
-      .checked_sub(room_u32)
-      .filter(|value| u32::try_from(MIN_FRAME_10).is_ok_and(|min| *value >= min));
+    let offered = u32::try_from(usize::from(open.max_frame_size)).map_err(|_wide| ())?;
+    let lowered = u32::try_from(room).ok().and_then(|room_u32| {
+      offered
+        .checked_sub(room_u32)
+        .filter(|value| u32::try_from(MIN_FRAME_10).is_ok_and(|min| *value >= min))
+    });
     let Some(lowered) = lowered else {
       self.fault = Some(crate::Error::AmqpFrameMax { offered, room });
-      return OpenRewrite::Close;
+      return Err(());
     };
     open.max_frame_size = MaxFrameSize(lowered);
-    let tail = body.get(perf..).unwrap_or(&[]);
-    match encode_10(frame, &open, tail) {
-      Ok(frame) => OpenRewrite::Rewritten(frame),
-      Err(()) => OpenRewrite::Forward,
-    }
+    Ok(OpenRewrite::Rewritten(encode_10(frame, &open, body.get(perf..).unwrap_or(&[]))?))
   }
 
   fn forget_091(&mut self, buf: &[u8]) {
@@ -1155,8 +1112,7 @@ impl Amqp {
     }
     if matches!(self.framer, Framer::V091) && matches!(parse_frame_type(frame), Ok((_, AMQPFrameType::Header))) {
       let payload = frame_payload(self.framer, frame)?;
-      let (_, header) = parse_content_header(payload).map_err(|_parse| ())?;
-      self.arm_size(channel_091(frame)?, header.body_size)?;
+      self.arm_size(channel_091(frame)?, content_body_size(payload)?)?;
     }
     self.pass(frame, out)?;
     out.extend(std::mem::take(&mut self.tail));
@@ -1173,11 +1129,6 @@ impl Amqp {
     self.store(link, body_size, Vec::new())
   }
 
-  /// One path for every body and transfer. A 1.0 transfer is sent when it
-  /// arrives; a payload that must stay withheld goes out empty and the bytes
-  /// ride the next frame on that link. A 0-9-1 prefix leaves as its own body
-  /// frame. A frame in hand withholds the matching suffix. A streamed frame
-  /// withholds needle-1.
   fn open_message(
     &mut self,
     buf: &[u8],
@@ -1187,102 +1138,37 @@ impl Amqp {
     input: &mut &[u8],
     out: &mut Vec<u8>,
   ) -> Result<Phase, ()> {
-    let opened = match transfer {
-      Some(transfer) => Opened {
-        link: Link {
-          channel: channel_10(buf)?,
-          handle: Some(transfer.handle.0),
-        },
-        payload_at,
-        payload_len: total.checked_sub(payload_at).ok_or(())?,
-        more_flag: transfer.more,
-        aborted: transfer.aborted,
-        transfer: Some(transfer),
-        lead: Vec::new(),
-        continues: false,
-        left: 0,
-      },
-      None => Opened {
-        link: Link {
-          channel: channel_091(buf)?,
-          handle: None,
-        },
-        payload_at,
-        payload_len: total.checked_sub(payload_at.saturating_add(1)).ok_or(())?,
-        more_flag: false,
-        aborted: false,
-        transfer: None,
-        lead: Vec::new(),
-        continues: false,
-        left: 0,
-      },
-    };
+    let mut opened = opened_message(buf, total, transfer, payload_at)?;
     if opened.aborted {
       self.carries.remove(&opened.link);
       return self.begin_forward(buf, total, input, out);
     }
-    let mut opened = opened;
     let Carry { held, left } = self.take_link(opened.link);
     let payload_u = u64::try_from(opened.payload_len).map_err(|_wide| ())?;
-    let (more, new_left) = match left {
+    (opened.continues, opened.left) = match left {
       Some(left) if payload_u > left => return Err(()),
       Some(left) => (left > payload_u, left.saturating_sub(payload_u)),
       None => (opened.more_flag, 0),
     };
-    let buffered = self.buffered_message(total, opened.payload_len);
-    let head_len = if buffered {
-      opened.payload_len
-    } else {
-      self.needle_room().min(opened.payload_len)
-    };
-    let Some(head) = buf.get(opened.payload_at..opened.payload_at.saturating_add(head_len)) else {
-      return Err(());
-    };
-    let mut joined = held.clone();
-    joined.extend_from_slice(head);
-    if self.has_needle(&joined) || self.has_needle(buf) {
-      return Err(());
-    }
-    if opened.transfer.is_some() {
-      opened.continues = more;
-      opened.left = new_left;
-      return self.relay_transfer(buf, total, &mut opened, held, input, out);
-    }
-    if !more {
-      if !held.is_empty() {
-        Self::write_held(&opened, &held, out)?;
-      }
-      self.store(opened.link, new_left, Vec::new())?;
-      return self.begin_forward(buf, total, input, out);
-    }
-    let k = if buffered {
-      let retain = self.suffix(&joined);
-      let release_at = joined.len().saturating_sub(retain);
-      if release_at <= held.len() {
-        if let Some(release) = held.get(..release_at).filter(|bytes| !bytes.is_empty()) {
-          Self::write_held(&opened, release, out)?;
-        }
-        self.store(opened.link, new_left, joined.split_off(release_at))?;
-        return Ok(Phase::Head(Vec::new()));
-      }
-      retain
-    } else {
-      self.needle_room().min(opened.payload_len)
-    };
-    if !held.is_empty() {
-      Self::write_held(&opened, &held, out)?;
-    }
-    if k == 0 {
-      self.store(opened.link, new_left, Vec::new())?;
-      return self.begin_forward(buf, total, input, out);
-    }
-    self.withhold(buf, total, &opened, (k, new_left), input, out)
+    self.relay(buf, total, &mut opened, held, input, out)
   }
 
-  /// Send this transfer now. A frame in hand withholds its matching suffix.
-  /// A frame still arriving withholds needle-1. A payload that is still a
-  /// secret prefix goes out empty; those bytes stay on the link.
-  fn relay_transfer(
+  /// Bytes to write now, and the suffix that stays on the link.
+  fn release(&self, opened: &Opened, held: &[u8], payload: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    let mut joined = Vec::with_capacity(held.len().saturating_add(payload.len()));
+    joined.extend_from_slice(held);
+    joined.extend_from_slice(payload);
+    if self.has_needle(&joined) {
+      return Err(());
+    }
+    let retain = if opened.continues { self.suffix(&joined) } else { 0 };
+    let keep = joined.split_off(joined.len().saturating_sub(retain));
+    Ok((joined, keep))
+  }
+
+  /// One release decision for a body and a transfer. The emitted bytes go out
+  /// in the same 1.0 transfer, or as their own 0-9-1 body frame.
+  fn relay(
     &mut self,
     buf: &[u8],
     total: usize,
@@ -1291,37 +1177,53 @@ impl Amqp {
     input: &mut &[u8],
     out: &mut Vec<u8>,
   ) -> Result<Phase, ()> {
-    let more = opened.continues;
+    if self.has_needle(buf) {
+      return Err(());
+    }
     let new_left = opened.left;
-    if buf.len() < total {
-      let k = if more { self.needle_room().min(opened.payload_len) } else { 0 };
+    let k = if buf.len() < total {
+      let watch = self.needle_room().min(opened.payload_len);
+      let end = opened.payload_at.saturating_add(watch);
+      let prefix = buf.get(opened.payload_at..end).ok_or(())?;
+      let mut joined = Vec::with_capacity(held.len().saturating_add(prefix.len()));
+      joined.extend_from_slice(&held);
+      joined.extend_from_slice(prefix);
+      if self.has_needle(&joined) {
+        return Err(());
+      }
+      if opened.continues { watch } else { 0 }
+    } else {
+      let end = opened.payload_at.saturating_add(opened.payload_len);
+      let payload = buf.get(opened.payload_at..end).ok_or(())?;
+      let held_empty = held.is_empty();
+      let (emit, keep) = self.release(opened, &held, payload)?;
+      if opened.transfer.is_some() {
+        if held_empty && keep.is_empty() {
+          self.store(opened.link, new_left, Vec::new())?;
+          return self.begin_forward(buf, total, input, out);
+        }
+        write_transfer(buf, opened, &emit, out)?;
+        self.store(opened.link, new_left, keep)?;
+        return Ok(Phase::Head(Vec::new()));
+      }
+      if opened.continues && emit.len() <= held.len() {
+        Self::write_held(opened, &emit, out)?;
+        self.store(opened.link, new_left, keep)?;
+        return Ok(Phase::Head(Vec::new()));
+      }
+      if opened.continues { keep.len() } else { 0 }
+    };
+    if opened.transfer.is_some() {
       opened.lead = held;
       return self.withhold(buf, total, opened, (k, new_left), input, out);
     }
-    let Some(payload) = buf.get(opened.payload_at..opened.payload_at.saturating_add(opened.payload_len)) else {
-      return Err(());
-    };
-    let held_empty = held.is_empty();
-    let mut joined = held;
-    joined.extend_from_slice(payload);
-    if self.has_needle(&joined) {
-      return Err(());
-    }
-    let retain = if more { self.suffix(&joined) } else { 0 };
-    let release_at = joined.len().saturating_sub(retain);
-    if held_empty && retain == 0 {
+    Self::write_held(opened, &held, out)?;
+    if k == 0 {
       self.store(opened.link, new_left, Vec::new())?;
-      return self.begin_forward(buf, total, input, out);
+      self.begin_forward(buf, total, input, out)
+    } else {
+      self.withhold(buf, total, opened, (k, new_left), input, out)
     }
-    if release_at == 0 {
-      self.store(opened.link, new_left, joined)?;
-      write_transfer(buf, opened, &[], out)?;
-      return Ok(Phase::Head(Vec::new()));
-    }
-    let kept = joined.split_off(release_at);
-    write_transfer(buf, opened, &joined, out)?;
-    self.store(opened.link, new_left, kept)?;
-    Ok(Phase::Head(Vec::new()))
   }
 
   fn write_held(opened: &Opened, held: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
@@ -1401,50 +1303,14 @@ impl Amqp {
       out.extend_from_slice(buf);
       return self.forward_rest(Fwd::Copy { left }, input, out);
     }
-    if matches!(self.framer, Framer::V091) && matches!(parse_frame_type(buf), Ok((_, AMQPFrameType::Header))) {
-      return self.begin_large_header(buf, total, input, out);
+    if matches!(self.framer, Framer::V091)
+      && buf.first() == Some(&FRAME_HEADER)
+      && let Some(payload) = buf.get(TYPE_CHANNEL_AND_SIZE..).filter(|payload| payload.len() >= 12)
+    {
+      self.arm_size(channel_091(buf)?, content_body_size(payload)?)?;
     }
     self.pass(buf, out)?;
-    self.forward_rest(Fwd::Scan { left, note: None }, input, out)
-  }
-
-  fn begin_large_header(&mut self, buf: &[u8], total: usize, input: &mut &[u8], out: &mut Vec<u8>) -> Result<Phase, ()> {
-    let channel = channel_091(buf)?;
-    let payload_end = total.saturating_sub(1);
-    let payload_have = buf.len().min(payload_end).saturating_sub(TYPE_CHANNEL_AND_SIZE);
-    let take = payload_have.min(12);
-    let start = TYPE_CHANNEL_AND_SIZE;
-    let mut note = Note {
-      channel,
-      got: buf.get(start..start.saturating_add(take)).unwrap_or(&[]).to_vec(),
-      need: 12,
-    };
-    if note.got.len() == 12 {
-      self.arm_fixed(channel, &note.got)?;
-      note.need = 0;
-    } else {
-      note.need = 12 - note.got.len();
-    }
-    self.pass(buf, out)?;
-    let note = (note.need > 0).then_some(note);
-    self.forward_rest(
-      Fwd::Scan {
-        left: total.checked_sub(buf.len()).ok_or(())?,
-        note,
-      },
-      input,
-      out,
-    )
-  }
-
-  /// `parse_content_header` also reads the property flags. A zero flags field lets it return the
-  /// real `body_size` from the first 12 payload bytes before the headers table is in hand.
-  fn arm_fixed(&mut self, channel: u16, fixed: &[u8]) -> Result<(), ()> {
-    let mut probe = [0u8; 14];
-    let head = fixed.get(..12).ok_or(())?;
-    probe.get_mut(..12).ok_or(())?.copy_from_slice(head);
-    let (_, header) = parse_content_header(probe.as_slice()).map_err(|_parse| ())?;
-    self.arm_size(channel, header.body_size)
+    self.forward_rest(Fwd::Scan { left }, input, out)
   }
 
   fn forward_rest(&mut self, mut fwd: Fwd, input: &mut &[u8], out: &mut Vec<u8>) -> Result<Phase, ()> {
@@ -1472,24 +1338,7 @@ impl Amqp {
         out.extend_from_slice(chunk);
         Ok(())
       }
-      Fwd::Scan { note, .. } => {
-        if let Some(pending) = note.as_mut()
-          && pending.need > 0
-        {
-          let n = chunk.len().min(pending.need);
-          let Some(bytes) = chunk.get(..n) else {
-            return Err(());
-          };
-          pending.got.extend_from_slice(bytes);
-          pending.need = pending.need.saturating_sub(n);
-          if pending.need == 0 {
-            let channel = pending.channel;
-            let fixed = pending.got.clone();
-            self.arm_fixed(channel, &fixed)?;
-          }
-        }
-        self.pass(chunk, out)
-      }
+      Fwd::Scan { .. } => self.pass(chunk, out),
       Fwd::Delay { delay, .. } => self.drive_delay(delay, chunk, out),
     }
   }
@@ -1529,7 +1378,7 @@ impl Amqp {
   fn finish_fwd(&mut self, fwd: Fwd, out: &mut Vec<u8>) -> Result<(), ()> {
     match fwd {
       Fwd::Copy { left } => (left == 0).then_some(()).ok_or(()),
-      Fwd::Scan { left, .. } => {
+      Fwd::Scan { left } => {
         if left != 0 {
           return Err(());
         }
@@ -1549,16 +1398,34 @@ impl Amqp {
 impl Fwd {
   fn left(&self) -> usize {
     match self {
-      Fwd::Copy { left } | Fwd::Scan { left, .. } | Fwd::Delay { left, .. } => *left,
+      Fwd::Copy { left } | Fwd::Scan { left } | Fwd::Delay { left, .. } => *left,
     }
   }
 
   fn reduce(&mut self, n: usize) {
     let left = match self {
-      Fwd::Copy { left } | Fwd::Scan { left, .. } | Fwd::Delay { left, .. } => left,
+      Fwd::Copy { left } | Fwd::Scan { left } | Fwd::Delay { left, .. } => left,
     };
     *left = left.saturating_sub(n);
   }
+}
+
+fn opened_message(buf: &[u8], total: usize, transfer: Option<Transfer>, payload_at: usize) -> Result<Opened, ()> {
+  let (channel, handle, tail, more_flag, aborted) = match &transfer {
+    Some(transfer) => (channel_10(buf)?, Some(transfer.handle.0), 0, transfer.more, transfer.aborted),
+    None => (channel_091(buf)?, None, 1, false, false),
+  };
+  Ok(Opened {
+    link: Link { channel, handle },
+    payload_at,
+    payload_len: total.checked_sub(payload_at.saturating_add(tail)).ok_or(())?,
+    more_flag,
+    aborted,
+    transfer,
+    lead: Vec::new(),
+    continues: false,
+    left: 0,
+  })
 }
 
 struct Opened {
@@ -1646,23 +1513,12 @@ fn sasl_header() -> [u8; PROTOCOL_HEADER_LEN] {
   bytes
 }
 
-fn guest_frame(buf: &[u8], header_len: usize) -> GuestFrame {
-  let Some(frame_buf) = buf.get(header_len..) else {
-    return GuestFrame::Splice;
-  };
-  let total = match frame_len_10(frame_buf) {
-    Ok(Some((_, total))) => total,
-    Ok(None) => return GuestFrame::Hold,
-    Err(()) => return GuestFrame::Splice,
-  };
-  let in_range = (FRAME_HEADER_10..=MAX_CREDENTIAL_FRAME).contains(&total);
-  if in_range && frame_buf.len() < total {
-    GuestFrame::Hold
-  } else if in_range {
-    GuestFrame::Ready(total)
-  } else {
-    GuestFrame::Splice
-  }
+/// Class id, weight, then body size. Property flags follow those 12 bytes.
+fn content_body_size(payload: &[u8]) -> Result<u64, ()> {
+  let (rest, _) = parse_id(payload).map_err(|_parse| ())?;
+  let (rest, _) = parse_short_uint(rest).map_err(|_parse| ())?;
+  let (_, body_size) = parse_long_long_uint(rest).map_err(|_parse| ())?;
+  Ok(body_size)
 }
 
 fn header_framer(downstream: bool, buf: &[u8]) -> Option<Framer> {
@@ -1781,8 +1637,8 @@ fn descriptor_width(body: &[u8], budget: usize) -> DescriptorWidth {
     Ok(EncodingCodes::Ulong0) => fixed_width(body, budget, 2),
     Ok(EncodingCodes::SmallUlong) => fixed_width(body, budget, 3),
     Ok(EncodingCodes::Ulong) => fixed_width(body, budget, 10),
-    Ok(EncodingCodes::Sym8) => sym8_width(body, budget),
-    Ok(EncodingCodes::Sym32) => sym32_width(body, budget),
+    Ok(EncodingCodes::Sym8) => sym_width(body, budget, 3),
+    Ok(EncodingCodes::Sym32) => sym_width(body, budget, 6),
     _ => DescriptorWidth::Forward,
   }
 }
@@ -1797,38 +1653,29 @@ fn fixed_width(body: &[u8], budget: usize, width: usize) -> DescriptorWidth {
   }
 }
 
-fn sym8_width(body: &[u8], budget: usize) -> DescriptorWidth {
-  const HEADER: usize = 3;
-  if HEADER > budget {
+fn sym_width(body: &[u8], budget: usize, header: usize) -> DescriptorWidth {
+  if header > budget {
     return DescriptorWidth::Forward;
   }
-  if body.len() < HEADER {
+  if body.len() < header {
     return DescriptorWidth::Need;
   }
-  let Some(len) = body.get(2).copied().map(usize::from) else {
-    return DescriptorWidth::Need;
+  let len = if header == 3 {
+    body.get(2).copied().map(usize::from)
+  } else {
+    body.get(2..header).and_then(|raw| {
+      let bytes = <[u8; 4]>::try_from(raw).ok()?;
+      usize::try_from(u32::from_be_bytes(bytes)).ok()
+    })
   };
-  counted_width(body, budget, HEADER, len)
-}
-
-fn sym32_width(body: &[u8], budget: usize) -> DescriptorWidth {
-  const HEADER: usize = 6;
-  if HEADER > budget {
-    return DescriptorWidth::Forward;
-  }
-  if body.len() < HEADER {
-    return DescriptorWidth::Need;
-  }
-  let Some(len_bytes) = body.get(2..HEADER) else {
-    return DescriptorWidth::Need;
+  let Some(len) = len else {
+    return if header == 3 {
+      DescriptorWidth::Need
+    } else {
+      DescriptorWidth::Forward
+    };
   };
-  let Ok(bytes) = <[u8; 4]>::try_from(len_bytes) else {
-    return DescriptorWidth::Forward;
-  };
-  let Ok(len) = usize::try_from(u32::from_be_bytes(bytes)) else {
-    return DescriptorWidth::Forward;
-  };
-  counted_width(body, budget, HEADER, len)
+  counted_width(body, budget, header, len)
 }
 
 fn counted_width(body: &[u8], budget: usize, header: usize, len: usize) -> DescriptorWidth {

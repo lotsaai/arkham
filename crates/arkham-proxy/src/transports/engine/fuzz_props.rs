@@ -1226,6 +1226,61 @@ fn amqp_splits_match(leg: AmqpLeg, data: &[u8], cuts: &[usize]) -> Result<(Vec<u
   Ok(once)
 }
 
+fn sasl_frame(data: &[u8]) -> Option<(&[u8], &[u8])> {
+  let size_bytes = <[u8; 4]>::try_from(data.get(..4)?).ok()?;
+  let total = usize::try_from(u32::from_be_bytes(size_bytes)).ok()?;
+  if total < 8 || data.len() < total || data.get(5) != Some(&1) {
+    return None;
+  }
+  Some((data.get(..total)?, data.get(total..)?))
+}
+
+fn sasl_plain_awaits_response(frame: &[u8]) -> bool {
+  let Some(body) = frame.get(8..) else {
+    return false;
+  };
+  let Ok(init) = serde_amqp::from_slice::<fe2o3_amqp_types::sasl::SaslInit>(body) else {
+    return false;
+  };
+  init.mechanism.as_str() == "PLAIN" && init.initial_response.is_none()
+}
+
+/// Bytes the downstream leg still has to read as the guest Open. A bad header
+/// or a frame that cannot be lowered closes. A short tail does not.
+fn amqp_open_refused(data: &[u8]) -> bool {
+  let Some(mut rest) = data.strip_prefix(AMQP_HEADER_SASL) else {
+    return false;
+  };
+  let Some((frame, next)) = sasl_frame(rest) else {
+    return false;
+  };
+  rest = next;
+  if sasl_plain_awaits_response(frame) {
+    let Some((_, next)) = sasl_frame(rest) else {
+      return false;
+    };
+    rest = next;
+  }
+  if rest.len() < AMQP_HEADER_10.len() {
+    return false;
+  }
+  if !rest.starts_with(AMQP_HEADER_10) {
+    return true;
+  }
+  let frame = &rest[AMQP_HEADER_10.len()..];
+  let Some(size_bytes) = frame.get(..4) else {
+    return false;
+  };
+  let Ok(size_bytes) = <[u8; 4]>::try_from(size_bytes) else {
+    return false;
+  };
+  let total = usize::try_from(u32::from_be_bytes(size_bytes)).unwrap_or(usize::MAX);
+  if !(8..=MAX_CREDENTIAL_FRAME).contains(&total) {
+    return true;
+  }
+  frame.len() >= total
+}
+
 fn amqp_091(frame: &amq_protocol::frame::AMQPFrame) -> Vec<u8> {
   let written = amq_protocol::frame::gen_frame(frame)(amq_protocol::frame::WriteContext::from(Vec::new())).expect("0-9-1 frame");
   written.into_inner().0
@@ -1728,7 +1783,20 @@ proptest! {
   ) {
     let data = if matches!(leg, AmqpLeg::Up) { guest_bound } else { server_bound };
     let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % data.len().max(1)).collect();
-    let (out, closed) = amqp_splits_match(leg, &data, &scaled)?;
+    let once = run_amqp(leg, &data, &[]);
+    let split = run_amqp(leg, &data, &scaled);
+    let byte_cuts: Vec<usize> = (1..data.len()).collect();
+    let byte = run_amqp(leg, &data, &byte_cuts);
+    prop_assert_eq!(once.1, split.1);
+    prop_assert_eq!(once.1, byte.1);
+    if once.1 {
+      prop_assert!(matches!(leg, AmqpLeg::DownSwap));
+      prop_assert!(amqp_open_refused(&data));
+      return Ok(());
+    }
+    prop_assert_eq!(&once.0, &split.0);
+    prop_assert_eq!(&once.0, &byte.0);
+    let (out, closed) = once;
     prop_assert!(!closed);
     let plain_fake = amqp_plain(AMQP_FAKE);
     let plain_real = [b"\0svc\0".as_slice(), AMQP_REAL.as_bytes()].concat();
