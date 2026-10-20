@@ -506,7 +506,7 @@ where
   Ok(None)
 }
 
-/// Drain queued notes, then feed one upstream chunk. A handoff still writes bytes this read took.
+/// Drain queued notes, then feed one upstream chunk. A handoff is decided after that chunk is written.
 async fn on_upstream_chunk<G, M>(
   guest: &mut WriteHalf<G>,
   upstream: &mut M,
@@ -519,18 +519,23 @@ where
   G: AsyncRead + AsyncWrite + Unpin,
   M: Wire,
 {
-  let drained = drain_requests(guest, upstream, requests, armed, upgrade_tx).await?;
-  if matches!(drained, ChunkStep::Stop) {
-    return Ok(ChunkStep::Stop);
+  let mut handoff = None;
+  while handoff.is_none() {
+    let Ok(msg) = requests.try_recv() else {
+      break;
+    };
+    match msg {
+      ToResponse::RequestsEnded => return Ok(ChunkStep::Stop),
+      ToResponse::Handoff(id) => handoff = Some(id),
+      ToResponse::ArmUpgrade(id) => {
+        *armed = true;
+        upstream.arm_upgrade(id);
+      }
+      other => apply_message(guest, upstream, other).await?,
+    }
   }
   let (rewritten, hits) = upstream.feed(chunk).await;
   log_hits(&hits);
-  if let ChunkStep::Upgrade(prefix) = drained {
-    if let Rewritten::Emit(out) = &rewritten {
-      write_guest_chunk(guest, out).await?;
-    }
-    return Ok(ChunkStep::Upgrade(prefix));
-  }
   if let Some(note) = upstream.take_upgrade() {
     return match response_upgrade(guest, &rewritten, upgrade_tx, note).await? {
       Some(prefix) => Ok(ChunkStep::Upgrade(prefix)),
@@ -540,10 +545,10 @@ where
   match rewritten {
     // A scan that cannot rewrite the chunk closes rather than forward it.
     Rewritten::Close => Ok(ChunkStep::Stop),
-    Rewritten::Hold => answer_handoff(guest, upstream, upgrade_tx, None).await,
+    Rewritten::Hold => answer_handoff(guest, upstream, upgrade_tx, handoff).await,
     Rewritten::Emit(out) => {
       write_guest_chunk(guest, &out).await?;
-      answer_handoff(guest, upstream, upgrade_tx, None).await
+      answer_handoff(guest, upstream, upgrade_tx, handoff).await
     }
   }
 }
