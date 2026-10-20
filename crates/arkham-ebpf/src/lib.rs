@@ -937,6 +937,16 @@ mod tests {
     assert_eq!(encode_port(TCP_LISTEN_PORT), u32::from(TCP_LISTEN_PORT.to_be()));
   }
 
+  /// Bits above the low 16 are dropped. A dirty high half still decodes to the port.
+  #[test]
+  fn decode_port_truncates_a_dirty_high_half() {
+    let port = 443u16;
+    let raw = encode_port(port) | 0xA5A5_0000;
+    assert_eq!(decode_port(raw), Some(port));
+    assert_eq!(decode_port(0), Some(0));
+    assert_eq!(decode_port(u32::MAX), Some(u16::MAX));
+  }
+
   /// The listener's own address must decode back to the loopback address the
   /// programs rewrite destinations to.
   #[test]
