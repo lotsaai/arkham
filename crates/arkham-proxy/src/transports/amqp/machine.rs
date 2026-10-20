@@ -3863,6 +3863,46 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn a_near_max_release_stays_inside_the_guest_open() {
+    let guest_max = 4_096usize;
+    let mut guest_side = down(true);
+    let mut client = sasl_init("PLAIN", Some(plain("agent", FAKE)));
+    client.extend(header_10());
+    client.extend(open_frame(u32::try_from(guest_max).unwrap()));
+    let _ = feed_open(&mut guest_side, &client).await;
+    let mut server = up();
+    let note = hand_guest_limit(&mut guest_side, &mut server);
+    assert_eq!(note, guest_max, "the guest open never reached the response leg");
+    let mut guest = feed_open(&mut server, &header_10()).await;
+    guest.extend(feed_open(&mut server, &open_frame(1_048_576)).await);
+    let (prefix, _) = password_split();
+    guest.extend(feed_open(&mut server, &transfer(1, true, prefix)).await);
+    let empty = transfer(1, false, b"");
+    let payload = vec![b'q'; guest_max.saturating_sub(empty.len()).saturating_sub(6)];
+    let near = transfer(1, false, &payload);
+    assert!(near.len() <= guest_max, "the server frame is {} bytes", near.len());
+    assert!(
+      near.len().saturating_add(prefix.len()) > guest_max,
+      "the released prefix still fits in the guest maximum"
+    );
+    match server.feed(&near).await.0 {
+      Rewritten::Close => {}
+      Rewritten::Emit(emitted) => guest.extend(emitted.into_owned()),
+      Rewritten::Hold => panic!("the near-max transfer was held"),
+    }
+    let mut rest = guest.strip_prefix(&header_10()).unwrap_or(&guest);
+    while rest.len() >= 8 {
+      let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
+      assert!(
+        size <= guest_max && size <= rest.len() && size >= 8,
+        "a frame of {size} bytes exceeds the guest max-frame-size"
+      );
+      rest = &rest[size..];
+    }
+    assert!(!contains(&guest, REAL));
+  }
+
+  #[tokio::test]
   async fn an_aborted_delivery_still_shows_the_transfer_already_sent() {
     let (prefix, _) = password_split();
     let mut machine = up();
@@ -3895,6 +3935,17 @@ mod tests {
       .expect("the detach was forwarded");
     assert!(transfer_at < detach_at, "the detach overtook the withheld transfer");
     assert!(!contains(&guest, std::str::from_utf8(prefix).unwrap()));
+    guest.extend(feed_open(&mut machine, &transfer_on(1, 8, false, b"other")).await);
+    assert_eq!(
+      count_transfers(&guest),
+      2,
+      "the guest saw a different number of transfers than the server sent"
+    );
+    assert!(
+      transfer_payloads(&guest).iter().any(|payload| payload.as_slice() == b"other"),
+      "the later link was rewritten with the detached prefix"
+    );
+    assert!(!contains(&guest, REAL));
     assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
   }
 
