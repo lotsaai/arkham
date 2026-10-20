@@ -1,5 +1,5 @@
 //! Policy routing via netlink (no `ip` CLI: the runtime image ships no
-//! iproute2): two fib rules and one local-default route for TPROXY
+//! iproute2): one fib rule and one local-default route for TPROXY
 //! delivery.
 
 use std::mem;

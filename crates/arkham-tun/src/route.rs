@@ -21,11 +21,9 @@ const RULE_PREF_CAPTURE: u32 = 200;
 /// Main routing table id.
 pub(super) const TABLE_MAIN: u8 = 254;
 
-/// One capture-table route: `dst/plen via gw dev oif`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutePlan {
   pub dst: Option<(Ipv4Addr, u8)>,
-  pub via: Option<Ipv4Addr>,
   pub oif: u32,
 }
 
@@ -97,15 +95,10 @@ async fn list_routes(handle: &rtnetlink::Handle) -> Result<Vec<RouteMessage>, Er
 /// separate mechanism, not a hardcoded RFC1918 bypass.
 pub(crate) fn capture_routes(tun: u32, lo: u32) -> Vec<RoutePlan> {
   vec![
-    RoutePlan {
-      dst: None,
-      via: None,
-      oif: tun,
-    },
+    RoutePlan { dst: None, oif: tun },
     RoutePlan {
       // Network, not LOCALHOST: host bits in a prefix are EINVAL in the kernel.
       dst: Some((Ipv4Addr::new(127, 0, 0, 0), 8)),
-      via: None,
       oif: lo,
     },
   ]
@@ -143,9 +136,6 @@ fn route_message(table: u8, plan: &RoutePlan) -> RouteMessage {
   let mut builder = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new();
   if let Some((dst, len)) = plan.dst {
     builder = builder.destination_prefix(dst, len);
-  }
-  if let Some(via) = plan.via {
-    builder = builder.gateway(via);
   }
   builder.output_interface(plan.oif).table_id(u32::from(table)).build()
 }
@@ -287,14 +277,9 @@ mod tests {
     assert_eq!(
       capture_routes(7, 1),
       vec![
-        RoutePlan {
-          dst: None,
-          via: None,
-          oif: 7
-        },
+        RoutePlan { dst: None, oif: 7 },
         RoutePlan {
           dst: Some((Ipv4Addr::new(127, 0, 0, 0), 8)),
-          via: None,
           oif: 1
         },
       ]

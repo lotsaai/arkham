@@ -30,7 +30,6 @@ struct TcpConn {
   from_proxy: mpsc::Receiver<TaskMsg>,
   /// Channel ends for the task, taken when ESTABLISHED.
   channels: Option<(mpsc::Receiver<Vec<u8>>, mpsc::Sender<TaskMsg>)>,
-  spawned: bool,
   read_pending: Option<Vec<u8>>,
   write_pending: Option<(Vec<u8>, usize)>,
 }
@@ -79,7 +78,6 @@ impl TcpTracker {
         to_proxy: Some(to_proxy_tx),
         from_proxy: from_proxy_rx,
         channels: Some((from_guest_rx, to_guest_tx)),
-        spawned: false,
         read_pending: None,
         write_pending: None,
       },
@@ -91,7 +89,7 @@ impl TcpTracker {
   pub(super) fn relay(&mut self, sockets: &mut SocketSet<'_>) {
     let mut buf = [0u8; RELAY_BUF];
     for (&handle, conn) in &mut self.conns {
-      if !conn.spawned {
+      if conn.channels.is_some() {
         continue;
       }
       let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -190,19 +188,18 @@ impl TcpTracker {
   pub(super) fn take_new(&mut self, sockets: &mut SocketSet<'_>) -> Vec<NewTcpConn> {
     let mut new = Vec::new();
     for (&handle, conn) in &mut self.conns {
-      if conn.spawned {
+      if conn.channels.is_none() {
         continue;
       }
       let socket = sockets.get::<tcp::Socket>(handle);
-      if matches!(socket.state(), tcp::State::Established | tcp::State::CloseWait) {
-        conn.spawned = true;
-        if let Some((from_guest, to_guest)) = conn.channels.take() {
-          new.push(NewTcpConn {
-            dst: conn.dst,
-            from_guest,
-            to_guest,
-          });
-        }
+      if matches!(socket.state(), tcp::State::Established | tcp::State::CloseWait)
+        && let Some((from_guest, to_guest)) = conn.channels.take()
+      {
+        new.push(NewTcpConn {
+          dst: conn.dst,
+          from_guest,
+          to_guest,
+        });
       }
     }
     new
