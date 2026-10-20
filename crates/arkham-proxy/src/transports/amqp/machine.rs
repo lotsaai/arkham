@@ -2331,7 +2331,7 @@ mod tests {
   use fe2o3_amqp_types::definitions::Error as AmqpError;
   use fe2o3_amqp_types::definitions::{Handle, MAJOR, MINOR, REVISION};
   use fe2o3_amqp_types::messaging::{DeliveryState, Rejected};
-  use fe2o3_amqp_types::performatives::{ChannelMax, Close, Detach, MaxFrameSize, Open, Transfer};
+  use fe2o3_amqp_types::performatives::{ChannelMax, Close, Detach, Flow, MaxFrameSize, Open, Transfer};
   use fe2o3_amqp_types::primitives::{Binary, Symbol};
   use fe2o3_amqp_types::sasl::SaslInit;
   use secrecy::SecretString;
@@ -2572,6 +2572,105 @@ mod tests {
         heartbeat: 60,
       })),
     ))
+  }
+
+  fn tune_ok(frame_max: u32) -> Vec<u8> {
+    encode_frame(&AMQPFrame::Method(
+      0,
+      AMQPClass::Connection(connection::AMQPMethod::TuneOk(connection::TuneOk {
+        channel_max: 2047,
+        frame_max,
+        heartbeat: 60,
+      })),
+    ))
+  }
+
+  /// The relay sends a peer note only when the request leg reports one.
+  fn hand_guest_limit(guest_side: &mut Amqp, server_side: &mut Amqp) -> usize {
+    let pending = guest_side.take_peer_note();
+    if pending > 0 {
+      server_side.apply_peer_note(pending);
+    }
+    pending
+  }
+
+  fn flow_frame(channel: u16) -> Vec<u8> {
+    let performative = serde_amqp::to_vec(&Flow {
+      next_incoming_id: None,
+      incoming_window: 8,
+      next_outgoing_id: 1,
+      outgoing_window: 8,
+      handle: None,
+      delivery_count: None,
+      link_credit: None,
+      available: None,
+      drain: false,
+      echo: false,
+      properties: None,
+    })
+    .unwrap();
+    frame_10(channel, 2, &performative, &[])
+  }
+
+  fn abort_transfer(channel: u16) -> Vec<u8> {
+    let performative = serde_amqp::to_vec(&Transfer {
+      handle: Handle(0),
+      delivery_id: Some(2),
+      delivery_tag: None,
+      message_format: None,
+      settled: None,
+      more: false,
+      rcv_settle_mode: None,
+      state: None,
+      resume: false,
+      aborted: true,
+      batchable: false,
+    })
+    .unwrap();
+    frame_10(channel, 2, &performative, &[])
+  }
+
+  fn count_transfers(bytes: &[u8]) -> usize {
+    let mut rest = bytes.strip_prefix(&header_10()).unwrap_or(bytes);
+    let mut count = 0usize;
+    while rest.len() >= 8 {
+      let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
+      if size < 8 || size > rest.len() {
+        break;
+      }
+      if frame_is_transfer(&rest[..size]) {
+        count += 1;
+      }
+      rest = &rest[size..];
+    }
+    count
+  }
+
+  fn first_transfer_at(bytes: &[u8]) -> Option<usize> {
+    let mut rest = bytes.strip_prefix(&header_10()).unwrap_or(bytes);
+    let mut at = bytes.len().saturating_sub(rest.len());
+    while rest.len() >= 8 {
+      let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
+      if size < 8 || size > rest.len() {
+        break;
+      }
+      if frame_is_transfer(&rest[..size]) {
+        return Some(at);
+      }
+      at = at.saturating_add(size);
+      rest = &rest[size..];
+    }
+    None
+  }
+
+  fn assert_091_within(bytes: &[u8], limit: usize) {
+    let mut rest = bytes;
+    while !rest.is_empty() {
+      let (next, _) = parse_frame(rest).unwrap();
+      let size = rest.len() - next.len();
+      assert!(size <= limit, "a delivered frame is {size} bytes, above the guest frame-max {limit}");
+      rest = next;
+    }
   }
 
   fn channel_close(channel: u16) -> Vec<u8> {
@@ -3660,5 +3759,149 @@ mod tests {
       Amqp::new(&grants, "mq", 5672, Direction::Upstream, false),
       Err(crate::Error::AmqpSecretTooLong { len }) if len == password.len()
     ));
+  }
+
+  #[tokio::test]
+  async fn a_guest_tune_ok_bounds_a_release_the_server_tune_would_allow() {
+    let real = format!("{}uniq", "z".repeat(70));
+    let held = "z".repeat(70);
+    let mut guest_side = down(true);
+    let mut client = start_ok("PLAIN", plain("agent", FAKE));
+    client.extend(tune_ok(64));
+    let _ = feed_open(&mut guest_side, &client).await;
+    let mut server = up_password(&real);
+    let _ = feed_open(&mut server, &tune(131_072)).await;
+    let note = hand_guest_limit(&mut guest_side, &mut server);
+    assert!(note > 0, "the client tune-ok never reached the response leg");
+    let mut guest = feed_open(&mut server, &content_header(1, 74)).await;
+    guest.extend(feed_open(&mut server, &body_091(&[b'z'; 50])).await);
+    guest.extend(feed_open(&mut server, &body_091(&[b'z'; 20])).await);
+    guest.extend(feed_open(&mut server, &body_091(b"bbbb")).await);
+    assert_091_within(&guest, 64);
+    assert!(
+      body_payloads(&guest).concat().windows(held.len()).any(|window| window == held.as_bytes()),
+      "the released prefix was not delivered"
+    );
+    assert!(matches!(server.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn a_tune_ok_frame_max_of_zero_stays_open_and_crosses_the_hand_over() {
+    let real = format!("{}uniq", "z".repeat(70));
+    let held = "z".repeat(70);
+    let mut guest_side = down(true);
+    let mut client = start_ok("PLAIN", plain("agent", FAKE));
+    client.extend(tune_ok(0));
+    let _ = feed_open(&mut guest_side, &client).await;
+    let mut server = up_password(&real);
+    let note = hand_guest_limit(&mut guest_side, &mut server);
+    let mut guest = feed_open(&mut server, &tune(0)).await;
+    guest.extend(feed_open(&mut server, &content_header(1, 74)).await);
+    guest.extend(feed_open(&mut server, &body_091(&[b'z'; 50])).await);
+    guest.extend(feed_open(&mut server, &body_091(&[b'z'; 20])).await);
+    match server.feed(&body_091(b"bbbb")).await.0 {
+      Rewritten::Emit(emitted) => guest.extend(emitted.into_owned()),
+      Rewritten::Hold => {}
+      Rewritten::Close => panic!("frame-max 0 closed the connection on the first release"),
+    }
+    assert!(note > 0, "tune-ok frame-max 0 did not cross the peer-note hand-over");
+    assert!(
+      body_payloads(&guest).iter().any(|payload| payload.as_slice() == held.as_bytes()),
+      "an unlimited frame-max split or dropped the release"
+    );
+    assert!(matches!(server.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn a_guest_max_frame_size_bounds_a_frame_the_server_open_would_allow() {
+    let mut guest_side = down(true);
+    let mut client = sasl_init("PLAIN", Some(plain("agent", FAKE)));
+    client.extend(header_10());
+    client.extend(open_frame(512));
+    let _ = feed_open(&mut guest_side, &client).await;
+    let mut server = up();
+    let mut guest = feed_open(&mut server, &header_10()).await;
+    let note = hand_guest_limit(&mut guest_side, &mut server);
+    assert!(note > 0, "the guest open never reached the response leg");
+    guest.extend(feed_open(&mut server, &open_frame(8_192)).await);
+    let (prefix, _) = password_split();
+    guest.extend(feed_open(&mut server, &transfer(1, true, prefix)).await);
+    let wide = wide_transfer(1, false, b"bbbb");
+    assert!(wide.len() > 512, "the fixture is {} bytes", wide.len());
+    match server.feed(&wide).await.0 {
+      Rewritten::Close => {}
+      Rewritten::Emit(emitted) => {
+        guest.extend(emitted.into_owned());
+        let mut rest = guest.strip_prefix(&header_10()).unwrap_or(&guest);
+        while !rest.is_empty() {
+          let size = usize::try_from(u32::from_be_bytes(rest[..4].try_into().unwrap())).unwrap();
+          assert!(
+            size <= 512 && size <= rest.len() && size >= 8,
+            "a frame of {size} bytes exceeds the guest max-frame-size"
+          );
+          rest = &rest[size..];
+        }
+      }
+      Rewritten::Hold => panic!("the wide transfer was held"),
+    }
+    assert!(!contains(&guest, REAL));
+  }
+
+  #[tokio::test]
+  async fn an_aborted_delivery_still_shows_the_transfer_already_sent() {
+    let (prefix, _) = password_split();
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header_10()).await;
+    guest.extend(feed_open(&mut machine, &transfer(1, true, prefix)).await);
+    assert_eq!(
+      count_transfers(&guest),
+      1,
+      "the withheld transfer was not sent before the abort"
+    );
+    guest.extend(feed_open(&mut machine, &abort_transfer(1)).await);
+    assert_eq!(
+      count_transfers(&guest),
+      2,
+      "the abort discarded the transfer the server already sent"
+    );
+    assert!(!contains(&guest, std::str::from_utf8(prefix).unwrap()));
+    assert!(!contains(&guest, REAL));
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn a_detach_does_not_drop_the_transfer_sent_ahead_of_it() {
+    let (prefix, _) = password_split();
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header_10()).await;
+    guest.extend(feed_open(&mut machine, &transfer_on(1, 7, true, prefix)).await);
+    let detach = detach_frame(1, 7);
+    guest.extend(feed_open(&mut machine, &detach).await);
+    let transfer_at = first_transfer_at(&guest).expect("the detach discarded the withheld transfer");
+    let detach_at = guest
+      .windows(detach.len())
+      .position(|window| window == detach.as_slice())
+      .expect("the detach was forwarded");
+    assert!(transfer_at < detach_at, "the detach overtook the withheld transfer");
+    assert!(!contains(&guest, std::str::from_utf8(prefix).unwrap()));
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+  }
+
+  #[tokio::test]
+  async fn a_flow_cannot_overtake_a_withheld_transfer() {
+    let (prefix, _) = password_split();
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header_10()).await;
+    guest.extend(feed_open(&mut machine, &transfer(1, true, prefix)).await);
+    let flow = flow_frame(1);
+    guest.extend(feed_open(&mut machine, &flow).await);
+    let transfer_at = first_transfer_at(&guest).expect("the flow was sent before the withheld transfer");
+    let flow_at = guest
+      .windows(flow.len())
+      .position(|window| window == flow.as_slice())
+      .expect("the flow was forwarded");
+    assert!(transfer_at < flow_at, "the flow overtook the withheld transfer");
+    assert!(!contains(&guest, std::str::from_utf8(prefix).unwrap()));
+    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
   }
 }
