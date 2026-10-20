@@ -1104,11 +1104,6 @@ fn ldap_safe_message() -> impl Strategy<Value = Vec<u8>> {
       let prefix = LDAP_REAL.get(..k).unwrap_or(LDAP_REAL);
       ldap_bind_response(u32::from(id), prefix)
     }),
-    (
-      proptest::collection::vec(any::<u8>(), 5..=8),
-      proptest::collection::vec(any::<u8>(), 0..16)
-    )
-      .prop_map(|(id, tail)| ldap_wide(&id, &tail)),
     (1u8..=127).prop_map(|id| ldap_starttls_response(u32::from(id))),
   ]
 }
@@ -1674,7 +1669,15 @@ proptest! {
       0 => {
         let frame = ldap_wide(&vec![0x11; id_len], &tail);
         let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % frame.len().max(1)).collect();
-        ldap_splits_match(|| ldap_leg(LdapLeg::DownSwap), &frame, &scaled)?;
+        let once = run_ldap(ldap_leg(LdapLeg::DownSwap), &frame, &[]);
+        let split = run_ldap(ldap_leg(LdapLeg::DownSwap), &frame, &scaled);
+        let byte_cuts: Vec<usize> = (1..frame.len()).collect();
+        let byte = run_ldap(ldap_leg(LdapLeg::DownSwap), &frame, &byte_cuts);
+        prop_assert!(once.closed);
+        prop_assert_eq!(once.closed, split.closed);
+        prop_assert_eq!(once.closed, byte.closed);
+        prop_assert_eq!(&once.out, &split.out);
+        prop_assert_eq!(&once.out, &byte.out);
         ldap_splits_match(|| ldap_leg(LdapLeg::Up), &frame, &scaled)?;
         let wide = run_ldap(ldap_leg(LdapLeg::Up), &frame, &[]);
         prop_assert_eq!(&wide.out, &frame);

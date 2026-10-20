@@ -8,8 +8,8 @@ use arkham_config::grants::{Grant, Scheme};
 use arkham_plugin::{Head as PluginHead, Header as PluginHeader, RewriteHook, Verdict};
 
 use crate::transports::engine::{
-  CredentialPair, Direction, Hit, Location, MAX_MINT_BODY, MintPlan, Rewritten, Wire, eligible_pairs, max_tail_size, mint_and_redact,
-  mint_plan_for, minted_pairs, needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
+  CredentialPair, Direction, Hit, Location, MAX_MINT_BODY, MintPlan, PeerFact, Rewritten, Wire, eligible_pairs, max_tail_size,
+  mint_and_redact, mint_plan_for, minted_pairs, needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
 };
 
 /// Max buffered header block before degrading to opaque scan-only.
@@ -1447,11 +1447,14 @@ impl Wire for Http {
     };
     (rewritten, hits)
   }
-  fn take_peer_note(&mut self) -> usize {
-    std::mem::take(&mut self.head_requests)
+  fn take_peer_note(&mut self) -> Option<PeerFact> {
+    let n = std::mem::take(&mut self.head_requests);
+    (n > 0).then_some(PeerFact::Heads(n))
   }
-  fn apply_peer_note(&mut self, n: usize) {
-    self.suppress_body += n;
+  fn apply_peer_note(&mut self, fact: PeerFact) {
+    if let PeerFact::Heads(n) = fact {
+      self.suppress_body = self.suppress_body.saturating_add(n);
+    }
   }
 }
 
