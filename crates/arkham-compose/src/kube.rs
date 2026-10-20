@@ -22,114 +22,12 @@ use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, Prese
 use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::Deserialize;
+use kube_client::config::{Kubeconfig, NamedAuthInfo, NamedCluster, NamedContext};
+use secrecy::ExposeSecret;
 use serde_yaml::{Mapping, Value, from_str};
 
 use crate::adapt::{GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, decode, render_decoy, render_fragment};
 use crate::error::Error;
-
-/// A kubeconfig document; unknown fields ignored.
-///
-/// `kind` is checked on the merged `kube_client` document before this parse.
-#[derive(Debug, Deserialize, Default)]
-struct KubeDoc {
-  /// Active context name.
-  #[serde(rename = "current-context", default)]
-  current_context: String,
-  /// Named context refs.
-  #[serde(default)]
-  contexts: Vec<KubeContextEntry>,
-  /// Named clusters.
-  #[serde(default)]
-  clusters: Vec<KubeClusterEntry>,
-  /// Named users.
-  #[serde(default)]
-  users: Vec<KubeUserEntry>,
-}
-
-/// One `contexts` entry: a name over a cluster/user pair.
-#[derive(Debug, Deserialize, Default)]
-struct KubeContextEntry {
-  /// Entry name, matched against `current-context`.
-  #[serde(default)]
-  name: String,
-  /// The referenced cluster and user.
-  #[serde(default)]
-  context: KubeContextRef,
-}
-
-/// The cluster/user a context points at.
-#[derive(Debug, Deserialize, Default)]
-struct KubeContextRef {
-  /// Referenced cluster name.
-  #[serde(default)]
-  cluster: String,
-  /// Referenced user name.
-  #[serde(default)]
-  user: String,
-}
-
-/// One `clusters` entry.
-#[derive(Debug, Deserialize, Default)]
-struct KubeClusterEntry {
-  /// Entry name, matched against the context's `cluster`.
-  #[serde(default)]
-  name: String,
-  /// The server and its trust anchor.
-  #[serde(default)]
-  cluster: KubeCluster,
-}
-
-/// A cluster's server and CA, inline or by file.
-#[derive(Debug, Deserialize, Default)]
-struct KubeCluster {
-  /// API server URL.
-  #[serde(default)]
-  server: String,
-  /// Inline base64 CA bundle.
-  #[serde(rename = "certificate-authority-data", default)]
-  ca_data: Option<String>,
-  /// CA bundle file path: inline it first, the container cannot see it.
-  #[serde(rename = "certificate-authority", default)]
-  ca_file: Option<String>,
-}
-
-/// One `users` entry.
-#[derive(Debug, Deserialize, Default)]
-struct KubeUserEntry {
-  /// Entry name, matched against the context's `user`.
-  #[serde(default)]
-  name: String,
-  /// The credential.
-  #[serde(default)]
-  user: KubeUser,
-}
-
-/// A user's credential: bearer token and/or client pair, inline or by file.
-#[derive(Debug, Deserialize, Default)]
-struct KubeUser {
-  /// Bearer token.
-  #[serde(default)]
-  token: Option<String>,
-  /// Cloud auth-provider block. Presence is enough: the token inside is not a grant.
-  #[serde(rename = "auth-provider", default)]
-  auth_provider: Option<Mapping>,
-  /// Exec credential plugin. A user with only this block is skipped.
-  #[serde(default)]
-  exec: Option<Mapping>,
-  /// Inline base64 client certificate.
-  #[serde(rename = "client-certificate-data", default)]
-  cert_data: Option<String>,
-  /// Client certificate file path: inline it first.
-  #[serde(rename = "client-certificate", default)]
-  cert_file: Option<String>,
-  /// Inline base64 client key.
-  #[serde(rename = "client-key-data", default)]
-  key_data: Option<String>,
-  /// Client key file path: inline it first.
-  #[serde(rename = "client-key", default)]
-  key_file: Option<String>,
-}
 
 /// One named kubeconfig entry and the file that defined it.
 struct Sourced<T> {
@@ -143,9 +41,9 @@ struct Merged {
   origin: PathBuf,
   /// First non-empty `current-context`. Empty when every file left it empty.
   current: String,
-  contexts: Vec<Sourced<KubeContextEntry>>,
-  clusters: Vec<Sourced<KubeClusterEntry>>,
-  users: Vec<Sourced<KubeUserEntry>>,
+  contexts: Vec<Sourced<NamedContext>>,
+  clusters: Vec<Sourced<NamedCluster>>,
+  users: Vec<Sourced<NamedAuthInfo>>,
   /// Merged document, unknown fields included, ready for the decoy pass.
   root: Value,
 }
@@ -231,14 +129,14 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
 }
 
 fn merge_sources(sources: &[(&Path, &[u8])]) -> Result<Option<Merged>, Error> {
-  let mut combined: Option<kube_client::config::Kubeconfig> = None;
+  let mut combined: Option<Kubeconfig> = None;
   let mut origin = PathBuf::new();
   let mut context_paths = BTreeMap::new();
   let mut cluster_paths = BTreeMap::new();
   let mut user_paths = BTreeMap::new();
   for (path, bytes) in sources {
     let text = String::from_utf8_lossy(bytes);
-    let doc: kube_client::config::Kubeconfig = from_str(&text).map_err(|source| Error::RewriteYaml {
+    let doc: Kubeconfig = from_str(&text).map_err(|source| Error::RewriteYaml {
       file: path.to_path_buf(),
       source,
     })?;
@@ -270,15 +168,11 @@ fn merge_sources(sources: &[(&Path, &[u8])]) -> Result<Option<Merged>, Error> {
     file: origin.clone(),
     source,
   })?;
-  let doc: KubeDoc = from_str(&yaml).map_err(|source| Error::RewriteYaml {
-    file: origin.clone(),
-    source,
-  })?;
   Ok(Some(Merged {
-    current: doc.current_context,
-    contexts: sourced(&origin, &context_paths, doc.contexts, |entry| &entry.name)?,
-    clusters: sourced(&origin, &cluster_paths, doc.clusters, |entry| &entry.name)?,
-    users: sourced(&origin, &user_paths, doc.users, |entry| &entry.name)?,
+    current: combined.current_context.unwrap_or_default(),
+    contexts: sourced(&origin, &context_paths, combined.contexts, |entry| &entry.name)?,
+    clusters: sourced(&origin, &cluster_paths, combined.clusters, |entry| &entry.name)?,
+    users: sourced(&origin, &user_paths, combined.auth_infos, |entry| &entry.name)?,
     origin,
     root,
   }))
@@ -343,43 +237,57 @@ fn classify_merged(merged: &Merged) -> Result<Vec<Pending>, Error> {
 }
 
 fn classify_context(
-  context: &Sourced<KubeContextEntry>,
-  clusters: &[Sourced<KubeClusterEntry>],
-  users: &[Sourced<KubeUserEntry>],
+  context: &Sourced<NamedContext>,
+  clusters: &[Sourced<NamedCluster>],
+  users: &[Sourced<NamedAuthInfo>],
 ) -> Result<Classified, Error> {
   let name = context.item.name.as_str();
-  let fail = |detail: String| {
-    Classified::Skip(KubeSkip {
-      context: name.to_string(),
-      detail,
-    })
+  let fail = |detail: String| Classified::Skip(KubeSkip { context: name.to_string(), detail });
+  let Some(spec) = context.item.context.as_ref() else {
+    return Ok(fail("names no `cluster` or no `user`".to_string()));
   };
-  if context.item.context.cluster.is_empty() || context.item.context.user.is_empty() {
+  let Some(user_name) = spec.user.as_deref().filter(|user| !user.is_empty()) else {
+    return Ok(fail("names no `cluster` or no `user`".to_string()));
+  };
+  if spec.cluster.is_empty() {
     return Ok(fail("names no `cluster` or no `user`".to_string()));
   }
-  let Some(cluster) = clusters.iter().find(|entry| entry.item.name == context.item.context.cluster) else {
-    return Ok(fail(format!("unknown cluster `{}`", context.item.context.cluster)));
+  let Some(cluster) = clusters.iter().find(|entry| entry.item.name == spec.cluster) else {
+    return Ok(fail(format!("unknown cluster `{}`", spec.cluster)));
   };
-  let Some(user) = users.iter().find(|entry| entry.item.name == context.item.context.user) else {
-    return Ok(fail(format!("unknown user `{}`", context.item.context.user)));
+  let Some(user) = users.iter().find(|entry| entry.item.name == user_name) else {
+    return Ok(fail(format!("unknown user `{user_name}`")));
   };
-  if user.item.user.cert_file.is_some() || user.item.user.key_file.is_some() || cluster.item.cluster.ca_file.is_some() {
+  let Some(cluster_body) = cluster.item.cluster.as_ref() else {
+    return Ok(fail(format!("cluster `{}` states no `server`", cluster.item.name)));
+  };
+  let Some(auth) = user.item.auth_info.as_ref() else {
+    return Ok(fail(format!(
+      "user `{}` carries neither `token` nor a client pair: nothing to substitute",
+      user.item.name
+    )));
+  };
+  if auth.client_certificate.is_some() || auth.client_key.is_some() || cluster_body.certificate_authority.is_some() {
     return Ok(fail(
       "uses file references; inline them first: `kubectl config view --flatten`".to_string(),
     ));
   }
-  let token = user.item.user.token.clone().filter(|token| !token.is_empty());
-  let pair_stated = stated(user.item.user.cert_data.as_ref()) || stated(user.item.user.key_data.as_ref());
-  if user.item.user.exec.is_some() && token.is_none() && !pair_stated {
+  let token = auth
+    .token
+    .as_ref()
+    .map(|token| token.expose_secret().to_string())
+    .filter(|token| !token.is_empty());
+  let pair_stated =
+    stated(auth.client_certificate_data.as_deref()) || stated(auth.client_key_data.as_ref().map(ExposeSecret::expose_secret));
+  if auth.exec.is_some() && token.is_none() && !pair_stated {
     return Ok(fail("exec credential plugins are not supported".to_string()));
   }
-  if user.item.user.auth_provider.is_some() && token.is_none() && !pair_stated {
+  if auth.auth_provider.is_some() && token.is_none() && !pair_stated {
     return Ok(fail("auth-provider users are not supported".to_string()));
   }
-  if cluster.item.cluster.server.is_empty() {
+  let Some(server) = cluster_body.server.as_deref().filter(|server| !server.is_empty()) else {
     return Ok(fail(format!("cluster `{}` states no `server`", cluster.item.name)));
-  }
-  let server = cluster.item.cluster.server.as_str();
+  };
   let scope: EndpointScope = match server.parse() {
     Ok(scope) => scope,
     Err(detail) => return Ok(fail(format!("server `{server}` is not an allow entry: {detail}"))),
@@ -393,13 +301,13 @@ fn classify_context(
   let cert = decode(
     &user.source,
     RewriteFormat::Kubeconfig,
-    user.item.user.cert_data.as_deref(),
+    auth.client_certificate_data.as_deref(),
     "client-certificate-data",
   )?;
   let key = decode(
     &user.source,
     RewriteFormat::Kubeconfig,
-    user.item.user.key_data.as_deref(),
+    auth.client_key_data.as_ref().map(ExposeSecret::expose_secret),
     "client-key-data",
   )?;
   if cert.is_some() != key.is_some() {
@@ -414,7 +322,7 @@ fn classify_context(
   let ca = decode(
     &cluster.source,
     RewriteFormat::Kubeconfig,
-    cluster.item.cluster.ca_data.as_deref(),
+    cluster_body.certificate_authority_data.as_deref(),
     "certificate-authority-data",
   )?;
   Ok(Classified::Grant(Pending {
@@ -432,7 +340,7 @@ fn classify_context(
   }))
 }
 
-fn stated(value: Option<&String>) -> bool {
+fn stated(value: Option<&str>) -> bool {
   value.is_some_and(|text| !text.is_empty())
 }
 
@@ -1281,81 +1189,61 @@ users:
   }
 
   #[test]
-  fn skipped_context_name_cannot_inject_a_rule() {
-    let name = format!("eks{COMMENT_BREAKOUT}");
+  fn skipped_text_cannot_inject_a_rule() {
+    let context_name = format!("eks{COMMENT_BREAKOUT}");
+    let user_name = format!("ghost{COMMENT_BREAKOUT}");
+    let server = format!("https://k8s.example:6443{COMMENT_BREAKOUT}");
+    let prod = named(
+      "cluster",
+      "prod",
+      &[
+        ("server", text("https://k8s.example:6443")),
+        ("certificate-authority-data", text("Q0E=")),
+      ],
+    );
+    let ivan = named("user", "ivan", &[("token", text("ivan-real-token"))]);
     let mut exec = Mapping::new();
     exec.insert(text("command"), text("aws-iam-authenticator"));
-    let doc = kubeconfig(
-      "prod",
-      vec![
-        named("context", &name, &[("cluster", text("prod")), ("user", text("exec-user"))]),
-        named("context", "prod", &[("cluster", text("prod")), ("user", text("ivan"))]),
-      ],
-      vec![named(
-        "cluster",
+    let docs = [
+      kubeconfig(
         "prod",
-        &[
-          ("server", text("https://k8s.example:6443")),
-          ("certificate-authority-data", text("Q0E=")),
+        vec![
+          named("context", &context_name, &[("cluster", text("prod")), ("user", text("exec-user"))]),
+          named("context", "prod", &[("cluster", text("prod")), ("user", text("ivan"))]),
         ],
-      )],
-      vec![
-        named("user", "ivan", &[("token", text("ivan-real-token"))]),
-        named("user", "exec-user", &[("exec", Value::Mapping(exec))]),
-      ],
-    );
-    assert_fragment_is_only(&adapt_doc(&doc), &user_identity("ivan").label);
-  }
-
-  #[test]
-  fn skipped_user_name_cannot_inject_a_rule() {
-    let user = format!("ghost{COMMENT_BREAKOUT}");
-    let doc = kubeconfig(
-      "prod",
-      vec![
-        named("context", "prod", &[("cluster", text("prod")), ("user", text("ivan"))]),
-        named("context", "broken", &[("cluster", text("prod")), ("user", text(&user))]),
-      ],
-      vec![named(
-        "cluster",
+        vec![prod.clone()],
+        vec![ivan.clone(), named("user", "exec-user", &[("exec", Value::Mapping(exec))])],
+      ),
+      kubeconfig(
         "prod",
-        &[
-          ("server", text("https://k8s.example:6443")),
-          ("certificate-authority-data", text("Q0E=")),
+        vec![
+          named("context", "prod", &[("cluster", text("prod")), ("user", text("ivan"))]),
+          named("context", "broken", &[("cluster", text("prod")), ("user", text(&user_name))]),
         ],
-      )],
-      vec![named("user", "ivan", &[("token", text("ivan-real-token"))])],
-    );
-    assert_fragment_is_only(&adapt_doc(&doc), &user_identity("ivan").label);
-  }
-
-  #[test]
-  fn skipped_server_cannot_inject_a_rule() {
-    let server = format!("https://k8s.example:6443{COMMENT_BREAKOUT}");
-    let doc = kubeconfig(
-      "prod",
-      vec![
-        named("context", "prod", &[("cluster", text("prod")), ("user", text("ivan"))]),
-        named("context", "broken", &[("cluster", text("evil")), ("user", text("ivan"))]),
-      ],
-      vec![
-        named(
-          "cluster",
-          "prod",
-          &[
-            ("server", text("https://k8s.example:6443")),
-            ("certificate-authority-data", text("Q0E=")),
-          ],
-        ),
-        named(
-          "cluster",
-          "evil",
-          &[("server", text(&server)), ("certificate-authority-data", text("Q0E="))],
-        ),
-      ],
-      vec![named("user", "ivan", &[("token", text("ivan-real-token"))])],
-    );
-    assert_fragment_is_only(&adapt_doc(&doc), &user_identity("ivan").label);
+        vec![prod.clone()],
+        vec![ivan.clone()],
+      ),
+      kubeconfig(
+        "prod",
+        vec![
+          named("context", "prod", &[("cluster", text("prod")), ("user", text("ivan"))]),
+          named("context", "broken", &[("cluster", text("evil")), ("user", text("ivan"))]),
+        ],
+        vec![
+          prod,
+          named(
+            "cluster",
+            "evil",
+            &[("server", text(&server)), ("certificate-authority-data", text("Q0E="))],
+          ),
+        ],
+        vec![ivan],
+      ),
+    ];
+    let label = user_identity("ivan").label;
+    for doc in docs {
+      assert_fragment_is_only(&adapt_doc(&doc), &label);
+    }
   }
 
   /// A later `KUBECONFIG` file does not replace a context, cluster, or user
