@@ -171,7 +171,7 @@ impl TalosTransport {
         source: err,
       })?;
     config.alpn_protocols = vec![ALPN_H2.to_vec()];
-    let name = ServerName::try_from(identity.to_string()).map_err(|err| Error::TalosServerName { source: err.into() })?;
+    let name = upstream_server_name(identity)?;
     let tcp = dial_marked(dial_host, port, fwmark).await?;
     TlsConnector::from(Arc::new(config))
       .connect(name, tcp)
@@ -232,6 +232,12 @@ fn guest_leaf_matches(scope: &EndpointScope, label: &str, peer: &[u8]) -> Result
   Ok(false)
 }
 
+/// The upstream TLS name. An IP endpoint parses as an IP server name, and a
+/// hostname stays a DNS name.
+fn upstream_server_name(identity: &str) -> Result<ServerName<'static>, Error> {
+  ServerName::try_from(identity.to_string()).map_err(|err| Error::TalosServerName { source: err.into() })
+}
+
 /// Zero matches closes. Two or more is an error naming every label.
 fn one_match<'a>(host: &str, port: u16, matched: Vec<(&'a str, &'a EndpointScope)>) -> Result<Option<(&'a str, &'a EndpointScope)>, Error> {
   match matched.len() {
@@ -245,5 +251,26 @@ fn one_match<'a>(host: &str, port: u16, matched: Vec<(&'a str, &'a EndpointScope
         port,
       })
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::upstream_server_name;
+  use rustls::pki_types::ServerName;
+
+  #[test]
+  fn ip_endpoint_is_an_ip_server_name() {
+    let name = upstream_server_name("10.5.0.2").expect("ip endpoint");
+    let ServerName::IpAddress(ip) = name else {
+      panic!("expected an IP server name");
+    };
+    assert_eq!(ip, std::net::Ipv4Addr::new(10, 5, 0, 2).into());
+  }
+
+  #[test]
+  fn hostname_endpoint_stays_a_dns_name() {
+    let name = upstream_server_name("talos.example").expect("hostname");
+    assert!(matches!(name, ServerName::DnsName(_)));
   }
 }
