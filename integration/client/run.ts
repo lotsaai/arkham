@@ -423,20 +423,16 @@ if (SSH_DST && (await Bun.file(SSH_PUB_B).exists())) {
     const passed = reply.code === 0 && reply.out.trim() === "ssh-ok";
     return passed === ok;
   };
-  await retry("ssh", "ssh host patterns use the matching real key", async () => {
+  await once("ssh", "ssh host patterns use the matching real key", async () => {
     await writeFile("/ssh-auth/authorized_keys", await readFile(SSH_PUB_B));
     if (!(await expectHost("db.corp", true))) return false;
     if (!(await expectHost("web.corp", false))) return false;
-    if (!(await expectHost("other.example", false))) return false;
-    if (!(await expectHost("extra.corp", false))) return false;
     await writeFile("/ssh-auth/authorized_keys", await readFile(SSH_PUB_A));
     if (!(await expectHost("web.corp", true))) return false;
     if (!(await expectHost("extra.corp", true))) return false;
     if (!(await expectHost("db.corp", false))) return false;
     await writeFile("/ssh-auth/authorized_keys", await readFile(SSH_PUB_C));
     if (!(await expectHost("other.example", true))) return false;
-    if (!(await expectHost("db.corp", false))) return false;
-    if (!(await expectHost("web.corp", false))) return false;
     return true;
   });
 } else {

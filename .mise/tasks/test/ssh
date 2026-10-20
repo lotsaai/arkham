@@ -361,13 +361,15 @@ EOF
     return 1
   fi
   for key in id_a id_b id_c; do
-    # The armor header is shared with every decoy. The first body line is not.
-    body=$(awk 'NR>1 && !/^-----/ && !/^$/ { print; exit }' "$home/.ssh/$key")
-    if [ -z "$body" ]; then
+    # The first OpenSSH body line is the shared magic prefix. The next line
+    # and the public key are unique to this file.
+    body=$(awk 'NR>1 && !/^-----/ && !/^$/ { c++; if (c==2) { print; exit } }' "$home/.ssh/$key")
+    pub=$(ssh-keygen -y -f "$home/.ssh/$key")
+    if [ -z "$body" ] || [ -z "$pub" ]; then
       echo "could not read ${key}"
       return 1
     fi
-    if grep -R -F -q -- "$body" "$dest/guest"; then
+    if grep -R -F -q -- "$body" "$dest/guest" || grep -R -F -q -- "$pub" "$dest/guest"; then
       echo "discovered ssh guest tree contains the real ${key}"
       return 1
     fi
