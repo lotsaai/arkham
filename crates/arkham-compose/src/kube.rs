@@ -22,7 +22,7 @@ use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, Prese
 use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use kube_client::config::{Kubeconfig, NamedAuthInfo, NamedCluster, NamedContext};
+use kube_client::config::{AuthInfo, Cluster, Kubeconfig, NamedAuthInfo, NamedCluster, NamedContext};
 use secrecy::ExposeSecret;
 use serde_yaml::{Mapping, Value, from_str};
 
@@ -236,40 +236,50 @@ fn classify_merged(merged: &Merged) -> Result<Vec<Pending>, Error> {
   Ok(pending)
 }
 
+fn skipped(context: &str, detail: impl Into<String>) -> Classified {
+  Classified::Skip(KubeSkip {
+    context: context.to_string(),
+    detail: detail.into(),
+  })
+}
+
 fn classify_context(
   context: &Sourced<NamedContext>,
   clusters: &[Sourced<NamedCluster>],
   users: &[Sourced<NamedAuthInfo>],
 ) -> Result<Classified, Error> {
   let name = context.item.name.as_str();
-  let fail = |detail: String| Classified::Skip(KubeSkip { context: name.to_string(), detail });
   let Some(spec) = context.item.context.as_ref() else {
-    return Ok(fail("names no `cluster` or no `user`".to_string()));
+    return Ok(skipped(name, "names no `cluster` or no `user`"));
   };
   let Some(user_name) = spec.user.as_deref().filter(|user| !user.is_empty()) else {
-    return Ok(fail("names no `cluster` or no `user`".to_string()));
+    return Ok(skipped(name, "names no `cluster` or no `user`"));
   };
   if spec.cluster.is_empty() {
-    return Ok(fail("names no `cluster` or no `user`".to_string()));
+    return Ok(skipped(name, "names no `cluster` or no `user`"));
   }
   let Some(cluster) = clusters.iter().find(|entry| entry.item.name == spec.cluster) else {
-    return Ok(fail(format!("unknown cluster `{}`", spec.cluster)));
+    return Ok(skipped(name, format!("unknown cluster `{}`", spec.cluster)));
   };
   let Some(user) = users.iter().find(|entry| entry.item.name == user_name) else {
-    return Ok(fail(format!("unknown user `{user_name}`")));
+    return Ok(skipped(name, format!("unknown user `{user_name}`")));
   };
   let Some(cluster_body) = cluster.item.cluster.as_ref() else {
-    return Ok(fail(format!("cluster `{}` states no `server`", cluster.item.name)));
+    return Ok(skipped(name, format!("cluster `{}` states no `server`", cluster.item.name)));
   };
   let Some(auth) = user.item.auth_info.as_ref() else {
-    return Ok(fail(format!(
-      "user `{}` carries neither `token` nor a client pair: nothing to substitute",
-      user.item.name
-    )));
+    return Ok(skipped(
+      name,
+      format!(
+        "user `{}` carries neither `token` nor a client pair: nothing to substitute",
+        user.item.name
+      ),
+    ));
   };
   if auth.client_certificate.is_some() || auth.client_key.is_some() || cluster_body.certificate_authority.is_some() {
-    return Ok(fail(
-      "uses file references; inline them first: `kubectl config view --flatten`".to_string(),
+    return Ok(skipped(
+      name,
+      "uses file references; inline them first: `kubectl config view --flatten`",
     ));
   }
   let token = auth
@@ -280,23 +290,42 @@ fn classify_context(
   let pair_stated =
     stated(auth.client_certificate_data.as_deref()) || stated(auth.client_key_data.as_ref().map(ExposeSecret::expose_secret));
   if auth.exec.is_some() && token.is_none() && !pair_stated {
-    return Ok(fail("exec credential plugins are not supported".to_string()));
+    return Ok(skipped(name, "exec credential plugins are not supported"));
   }
   if auth.auth_provider.is_some() && token.is_none() && !pair_stated {
-    return Ok(fail("auth-provider users are not supported".to_string()));
+    return Ok(skipped(name, "auth-provider users are not supported"));
   }
+  grant_pending(name, cluster, cluster_body, user, auth, token)
+}
+
+fn grant_pending(
+  context_name: &str,
+  cluster: &Sourced<NamedCluster>,
+  cluster_body: &Cluster,
+  user: &Sourced<NamedAuthInfo>,
+  auth: &AuthInfo,
+  token: Option<String>,
+) -> Result<Classified, Error> {
   let Some(server) = cluster_body.server.as_deref().filter(|server| !server.is_empty()) else {
-    return Ok(fail(format!("cluster `{}` states no `server`", cluster.item.name)));
+    return Ok(skipped(context_name, format!("cluster `{}` states no `server`", cluster.item.name)));
   };
   let scope: EndpointScope = match server.parse() {
     Ok(scope) => scope,
-    Err(detail) => return Ok(fail(format!("server `{server}` is not an allow entry: {detail}"))),
+    Err(detail) => {
+      return Ok(skipped(context_name, format!("server `{server}` is not an allow entry: {detail}")));
+    }
   };
   if scope.scheme != Scheme::Https {
-    return Ok(fail(format!("server `{server}` is plain HTTP: the API server is TLS-only")));
+    return Ok(skipped(
+      context_name,
+      format!("server `{server}` is plain HTTP: the API server is TLS-only"),
+    ));
   }
   let HostPat::Exact(host) = scope.host else {
-    return Ok(fail(format!("server `{server}` is not an allow entry: host is not exact")));
+    return Ok(skipped(
+      context_name,
+      format!("server `{server}` is not an allow entry: host is not exact"),
+    ));
   };
   let cert = decode(
     &user.source,
@@ -311,13 +340,19 @@ fn classify_context(
     "client-key-data",
   )?;
   if cert.is_some() != key.is_some() {
-    return Ok(fail(format!("user `{}` carries half of the client pair", user.item.name)));
+    return Ok(skipped(
+      context_name,
+      format!("user `{}` carries half of the client pair", user.item.name),
+    ));
   }
   if token.is_none() && cert.is_none() {
-    return Ok(fail(format!(
-      "user `{}` carries neither `token` nor a client pair: nothing to substitute",
-      user.item.name
-    )));
+    return Ok(skipped(
+      context_name,
+      format!(
+        "user `{}` carries neither `token` nor a client pair: nothing to substitute",
+        user.item.name
+      ),
+    ));
   }
   let ca = decode(
     &cluster.source,
