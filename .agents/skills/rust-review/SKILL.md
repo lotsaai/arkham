@@ -6,8 +6,7 @@ Strict, evidence-based Rust review. No praise, no summary fluff, no hedging. Eve
 
 1. This repo's `AGENTS.md` and the actual crate boundaries in `Cargo.toml` files.
 2. Actual call graph over claimed architecture.
-3. `write-rust` skill, then `rust-expert` skill.
-4. Upstream Rust conventions.
+3. Upstream Rust conventions.
 
 No internet fetching. No guessing at upstream docs. Read the code in front of you.
 
@@ -95,7 +94,7 @@ Hard violations: any `allow` attribute, undocumented `pub` item, debug print lef
 
 ## General Rust lenses
 
-Apply `write-rust` sections 1-8 and `rust-expert` as written; do not fork them here. Repo-frequent reminders only:
+Repo-frequent reminders only:
 
 - Encode invariants in types (typed `HostPat`, typed errors with context) instead of re-checking strings at each layer.
 - Keep keygen and allocation off locks (`DashMap` leaf cache: keygen on caller).
