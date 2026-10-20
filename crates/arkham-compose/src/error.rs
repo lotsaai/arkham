@@ -103,13 +103,6 @@ pub enum Error {
     /// Expansion failure, Debug-rendered (xpanda reports no std error).
     detail: String,
   },
-  /// An async lookup cannot block on a runtime.
-  #[error("failed to run fnox lookup: {source}")]
-  BlockOn {
-    /// Underlying runtime failure.
-    #[source]
-    source: IoError,
-  },
   /// A fnox secret resolves to no value.
   #[error("fnox secret `{name}` resolved to no value")]
   SecretNoValue {

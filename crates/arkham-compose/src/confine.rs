@@ -450,7 +450,7 @@ pub(crate) async fn init_workspace(
     (false, Some(existing)) => existing,
     _ => backend,
   };
-  let stack = generate_stack(workspace.root(), backend, arkham_version)?;
+  let stack = generate_stack(workspace.root(), backend, arkham_version).await?;
   tokio::fs::write(&ws_compose, stack).await.map_err(|source| Error::WriteFile {
     path: ws_compose.clone(),
     source,

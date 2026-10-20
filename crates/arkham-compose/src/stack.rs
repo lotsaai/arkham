@@ -16,7 +16,7 @@ use crate::adapt::{self, GRANTS_STATE_DIR, RewriteAdapted};
 use crate::ambient::{DeriveInputs, derive_sources};
 use crate::decoys::{Decoy, Selection, validate_passthrough};
 use crate::error::Error;
-use crate::expand::{block_on, build_expander, expand_path, expand_value, resolution_env};
+use crate::expand::{build_expander, expand_path, expand_value, resolution_env};
 use crate::mounts::{BYPASS_CONTAINER_PATH, FnoxBinds, Layout};
 use crate::paths::{Mount, translate};
 use crate::profiles::{ProfileRoots, profile_mounts};
@@ -98,13 +98,13 @@ impl<'a> StackBuilder<'a> {
   ///
   /// Returns an error when the registry or config fails to load, when value
   /// resolution fails, or when a path fails to expand.
-  fn resolve(root: &'a Path, backend: ProxyBackend, version: &'a str) -> Result<Self, Error> {
+  async fn resolve(root: &'a Path, backend: ProxyBackend, version: &'a str) -> Result<Self, Error> {
     let workspace = Workspace::new(root);
     let config = workspace.config()?;
     let selection = workspace.selection()?;
     let raw_home = config.workspace.container_home().to_string();
     let referenced = config.workspace.referenced_variables(&[raw_home.as_str()]);
-    let env = block_on(resolution_env(&selection.registry, selection.fnox.as_ref(), &referenced))??;
+    let env = resolution_env(&selection.registry, selection.fnox.as_ref(), &referenced).await?;
     let expander = build_expander(env.clone());
     let home = expand_value(&expander, &raw_home)?;
     let layout = Layout::new(root, home, home_dir());
@@ -359,8 +359,9 @@ impl<'a> StackBuilder<'a> {
 /// Returns whatever step fails: config or registry loading, value
 /// resolution, rewrites, ambient derivation, grant state, profiles, guest
 /// identities, or the agent build.
-pub(crate) fn generate_stack(root: &Path, backend: ProxyBackend, arkham_version: &str) -> Result<String, Error> {
-  let stack = StackBuilder::resolve(root, backend, arkham_version)?
+pub(crate) async fn generate_stack(root: &Path, backend: ProxyBackend, arkham_version: &str) -> Result<String, Error> {
+  let stack = StackBuilder::resolve(root, backend, arkham_version)
+    .await?
     .secrets()?
     .rewrites()?
     .ambient()?
