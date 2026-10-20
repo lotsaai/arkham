@@ -115,6 +115,7 @@ httparse = "1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jwt = "0.16"
+lettre = { version = "0.11.23", default-features = false, features = ["aws-lc-rs", "smtp-transport", "tokio1", "tokio1-rustls", "webpki-roots"] }
 libc = "0.2"
 memchr = "2"
 miette = { version = "7", features = ["fancy"] }
