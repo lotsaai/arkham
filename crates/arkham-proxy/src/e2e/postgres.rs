@@ -134,6 +134,8 @@ async fn postgres_real_client_and_server_round_trip() {
 /// states its own transport, so the same proxy is exercised in all four
 /// combinations.
 mod pg_tls {
+  use std::sync::atomic::{AtomicBool, Ordering};
+
   use futures::Sink;
   use futures::stream;
   use pgwire::api::query::SimpleQueryHandler;
@@ -222,6 +224,9 @@ mod pg_tls {
   struct PgConnect {
     connector: TlsConnector,
     server_name: rustls::pki_types::ServerName<'static>,
+    /// Set when this connector's `connect` runs. tokio-postgres calls that
+    /// only after the server answers `S`.
+    saw_s: Option<Arc<AtomicBool>>,
   }
 
   impl tokio_postgres::tls::MakeTlsConnect<TcpStream> for PgTls {
@@ -235,6 +240,7 @@ mod pg_tls {
       Ok(PgConnect {
         connector: self.connector.clone(),
         server_name,
+        saw_s: None,
       })
     }
   }
@@ -245,6 +251,9 @@ mod pg_tls {
     type Future = Pin<Box<dyn Future<Output = Result<PgTlsStream, std::io::Error>> + Send>>;
 
     fn connect(self, stream: TcpStream) -> Self::Future {
+      if let Some(saw_s) = &self.saw_s {
+        saw_s.store(true, Ordering::Relaxed);
+      }
       Box::pin(async move { Ok(PgTlsStream(self.connector.connect(self.server_name, stream).await?)) })
     }
   }
@@ -507,16 +516,16 @@ mod pg_tls {
     let mut head = [0u8; 19];
     guest.read_exact(&mut head).await.unwrap();
     assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
-    // A cleartext guest greeting settles the guest leg; the arm then asks
-    // the silent upstream for TLS and must hit the 1s budget.
-    guest.write_all(&[0u8; 8]).await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(3), async {
-      let mut buf = [0u8; 1];
-      guest.read(&mut buf).await
-    })
-    .await
-    .expect("the budget must close the leg");
-    assert_eq!(result.unwrap(), 0, "the guest must see EOF, not silence");
+    let config: tokio_postgres::Config = format!("host=localhost port={stub_port} user=stubuser dbname=stubdb sslmode=disable")
+      .parse()
+      .unwrap();
+    let opened = tokio::time::timeout(Duration::from_secs(3), config.connect_raw(guest, tokio_postgres::NoTls))
+      .await
+      .expect("the budget must close the leg");
+    assert!(
+      opened.is_err(),
+      "a cleartext guest must see the leg close while the upstream stays silent"
+    );
   }
 
   /// `guest_tls_mode = "mtls"` on a postgres entry: arkham asks the guest
@@ -588,7 +597,7 @@ mod pg_tls {
     let seen = tokio::spawn(async move {
       let (mut stream, _) = spy.accept().await.unwrap();
       let mut buf = [0u8; 8];
-      let _ = stream.read_exact(&mut buf).await;
+      stream.read_exact(&mut buf).await.expect("the upstream must receive 8 bytes");
       buf
     });
     let grants = vec![Grant::Postgres {
@@ -610,17 +619,19 @@ mod pg_tls {
     let mut head = [0u8; 19];
     guest.read_exact(&mut head).await.unwrap();
     assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
-    // A real cleartext startup: length 23, protocol 3.0, user stubuser.
-    let mut startup = Vec::new();
-    startup.extend(23u32.to_be_bytes());
-    startup.extend(196_608u32.to_be_bytes());
-    startup.extend(b"user\0stubuser\0\0");
-    guest.write_all(&startup).await.unwrap();
-    let upstream_first8 = seen.await.unwrap();
-    assert_ne!(
+    let config: tokio_postgres::Config = format!("host=localhost port={spy_port} user=stubuser dbname=stubdb sslmode=disable")
+      .parse()
+      .unwrap();
+    let opened = config.connect_raw(guest, tokio_postgres::NoTls).await;
+    let upstream_first8 = tokio::time::timeout(Duration::from_secs(5), seen)
+      .await
+      .expect("the spy must see the opening")
+      .unwrap();
+    assert!(opened.is_err(), "the spy closes after the startup, so the session cannot finish");
+    assert_eq!(
       &upstream_first8[4..8],
-      &pgwire::messages::startup::SslRequest::BODY_MAGIC_NUMBER.to_be_bytes(),
-      "allow with a cleartext guest must not ask the server for TLS"
+      &196_608u32.to_be_bytes(),
+      "allow with a cleartext guest must relay a protocol 3.0 startup"
     );
   }
 
@@ -656,24 +667,27 @@ mod pg_tls {
     let mut head = [0u8; 19];
     guest.read_exact(&mut head).await.unwrap();
     assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
-    // libpq's escalation shape: SSLRequest, one 'S' answer, then TLS.
-    let mut request = Vec::new();
-    request.extend(8u32.to_be_bytes());
-    request.extend(pgwire::messages::startup::SslRequest::BODY_MAGIC_NUMBER.to_be_bytes());
-    guest.write_all(&request).await.unwrap();
-    let mut answer = [0u8; 1];
-    guest.read_exact(&mut answer).await.unwrap();
-    assert_eq!(answer[0], b'S');
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.cert_der().clone()).unwrap();
-    let connector = TlsConnector::from(guest_client_config(roots, Alpn::None));
-    let result = connector
-      .connect(rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap(), guest)
-      .await;
-    // The spy never answers its SSLRequest, so the arm fails closed — but
-    // the escalation ask is already on record.
-    assert!(result.is_err(), "the silent upstream must close the leg");
-    let upstream_first8 = seen.await.unwrap();
+    let mut connector = PgTls {
+      connector: TlsConnector::from(guest_client_config(roots, Alpn::None)),
+    };
+    let mut tls = connector.make_tls_connect("localhost").unwrap();
+    let saw_s = Arc::new(AtomicBool::new(false));
+    tls.saw_s = Some(Arc::clone(&saw_s));
+    let config: tokio_postgres::Config = format!("host=localhost port={spy_port} user=stubuser dbname=stubdb sslmode=require")
+      .parse()
+      .unwrap();
+    let opened = config.connect_raw(guest, tls).await;
+    let upstream_first8 = tokio::time::timeout(Duration::from_secs(5), seen)
+      .await
+      .expect("the spy must see the opening")
+      .unwrap();
+    assert!(saw_s.load(Ordering::Relaxed), "the proxy must answer S before the guest starts TLS");
+    assert!(
+      opened.is_err(),
+      "the guest's TLS handshake cannot finish because the spy never answers upstream"
+    );
     assert_eq!(
       &upstream_first8[4..8],
       &pgwire::messages::startup::SslRequest::BODY_MAGIC_NUMBER.to_be_bytes(),
