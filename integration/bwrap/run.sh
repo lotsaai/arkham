@@ -175,10 +175,11 @@ body=$(client curl -sS --max-time 10 --cacert /certs/ca.crt \
 reply=$(client timeout 10 bash -c "exec 3<>/dev/tcp/$API_IP/9000; printf 'AUTH $FAKE\n' >&3; head -n1 <&3")
 [ "$reply" = "OK $FAKE" ] || fail "tcp scenario: got '$reply', want 'OK $FAKE'"
 
-# The api log slices auth to 14 chars: 'Bearer ghp_de' proves the real
-# token arrived; the fake's 14-char slice ('Bearer ghp_26') must be absent.
-grep -q "auth=Bearer ghp_de" "$work/api.log" || fail "api never saw the real token"
-if grep -q "auth=Bearer ghp_26" "$work/api.log"; then
+api_log_auth_prefix_len=14
+real_auth="Bearer ${REAL}"
+fake_auth="Bearer ${FAKE}"
+grep -q "auth=${real_auth:0:api_log_auth_prefix_len}" "$work/api.log" || fail "api never saw the real token"
+if grep -q "auth=${fake_auth:0:api_log_auth_prefix_len}" "$work/api.log"; then
   fail "api saw the fake token: capture did not substitute"
 fi
 
