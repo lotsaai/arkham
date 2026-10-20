@@ -15,12 +15,12 @@ fi
 
 talos_version="${ARKHAM_TALOS_VERSION:-v1.14.4}"
 image="ghcr.io/siderolabs/talos:${talos_version}"
-prod_name=arkham-talos-prod
-staging_name=arkham-talos-staging
+prod_name="arkham-talos-prod"
+staging_name="arkham-talos-staging"
 prod_subnet=172.31.10.0/24
 staging_subnet=172.31.11.0/24
-proxy=arkham-talos-proxy
-arkham_image=arkham-talos-e2e:local
+proxy="arkham-talos-proxy"
+arkham_image="arkham-talos-e2e:local"
 
 scratch=$proj_dir/target/talos-e2e
 arkham=$proj_dir/target/debug/arkham
@@ -41,8 +41,8 @@ cleanup() {
   fi
   docker rm -f "$proxy" >/dev/null 2>&1
   if [ -n "$talosctl" ] && [ -x "$talosctl" ] && [ -n "$state" ]; then
-    "$talosctl" --state "$state" cluster destroy --name "$prod_name" >/dev/null 2>&1
-    "$talosctl" --state "$state" cluster destroy --name "$staging_name" >/dev/null 2>&1
+    "$talosctl" cluster destroy --name "$prod_name" --state "$state" >/dev/null 2>&1
+    "$talosctl" cluster destroy --name "$staging_name" --state "$state" >/dev/null 2>&1
   fi
   exit "$status"
 }
@@ -91,8 +91,9 @@ node_network() {
 create_cluster() {
   local name=$1 subnet=$2 dest=$3
   echo "creating ${name} on ${subnet}" >&2
-  "$talosctl" --state "$state" cluster create docker \
+  "$talosctl" cluster create docker \
     --name "$name" \
+    --state "$state" \
     --workers 0 \
     --subnet "$subnet" \
     --cpus-controlplanes 1.0 \
@@ -203,8 +204,8 @@ run_guest() {
 }
 
 wait_serving() {
-  local i
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  local _
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     if ! docker inspect -f '{{.State.Running}}' "$proxy" 2>/dev/null | grep -qx true; then
       echo "arkham proxy is not running" >&2
       return 1
