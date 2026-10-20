@@ -1789,9 +1789,8 @@ proptest! {
     let byte = run_amqp(leg, &data, &byte_cuts);
     prop_assert_eq!(once.1, split.1);
     prop_assert_eq!(once.1, byte.1);
+    prop_assert_eq!(once.1, matches!(leg, AmqpLeg::DownSwap) && amqp_open_refused(&data));
     if once.1 {
-      prop_assert!(matches!(leg, AmqpLeg::DownSwap));
-      prop_assert!(amqp_open_refused(&data));
       return Ok(());
     }
     prop_assert_eq!(&once.0, &split.0);

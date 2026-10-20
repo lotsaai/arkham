@@ -2944,18 +2944,35 @@ mod tests {
     assert!(header.len() > super::MAX_CREDENTIAL_FRAME, "the header exceeds the whole-frame cap");
     let mut machine = up();
     let mut guest = feed_open(&mut machine, &header).await;
-    assert!(guest.starts_with(&header), "the wide header is delivered");
-    guest.extend(feed_open(&mut machine, &body_091(prefix)).await);
-    assert_no_secret_prefix(&guest);
+    assert_wide_header_holds(&mut machine, &header, &mut guest, prefix, rest).await;
+  }
+
+  #[tokio::test]
+  async fn a_wide_content_header_split_inside_its_body_size_still_arms_hold_back() {
+    let (prefix, rest) = password_split();
+    let header = wide_header(1, u64::try_from(prefix.len() + rest.len()).unwrap());
+    assert!(header.len() > super::MAX_CREDENTIAL_FRAME, "the header exceeds the whole-frame cap");
+    let split = super::TYPE_CHANNEL_AND_SIZE + 3;
+    assert!(split < super::TYPE_CHANNEL_AND_SIZE + 12, "the cut is inside the body size");
+    let mut machine = up();
+    let mut guest = feed_open(&mut machine, &header[..split]).await;
+    guest.extend(feed_open(&mut machine, &header[split..]).await);
+    assert_wide_header_holds(&mut machine, &header, &mut guest, prefix, rest).await;
+  }
+
+  async fn assert_wide_header_holds(machine: &mut Amqp, header: &[u8], guest: &mut Vec<u8>, prefix: &[u8], rest: &[u8]) {
+    assert!(guest.starts_with(header), "the wide header is delivered");
+    guest.extend(feed_open(machine, &body_091(prefix)).await);
+    assert_no_secret_prefix(guest);
     assert!(
-      !contains(&guest, std::str::from_utf8(prefix).unwrap()),
+      !contains(guest, std::str::from_utf8(prefix).unwrap()),
       "the real prefix was delivered"
     );
     assert!(
       matches!(machine.feed(&body_091(rest)).await.0, Rewritten::Close),
       "the completing body was delivered"
     );
-    assert!(!bodies_spell_password(&guest), "body payloads concatenate to the password");
+    assert!(!bodies_spell_password(guest), "body payloads concatenate to the password");
   }
 
   #[tokio::test]
@@ -3627,9 +3644,52 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn a_frame_in_place_of_the_open_header_closes() {
+    let mut guest_side = down(true);
+    let sasl = sasl_init("PLAIN", Some(plain("agent", FAKE)));
+    assert!(
+      matches!(guest_side.feed(&sasl).await.0, Rewritten::Emit(_)),
+      "sasl was not forwarded"
+    );
+    let frame = [0, 0, 0, 8, 2, 1, 0, 0];
+    assert!(
+      matches!(guest_side.feed(&frame).await.0, Rewritten::Close),
+      "a frame where the open header belongs was forwarded"
+    );
+    assert!(
+      matches!(guest_side.close_reason(), Some(crate::Error::AmqpOpenUnlowered)),
+      "the close was not the unlowered open"
+    );
+  }
+
+  #[tokio::test]
   async fn a_bad_open_doff_closes() {
     let frame = vec![0, 0, 0, 8, 0, 0, 0, 0];
     assert_open_unlowered(&frame).await;
+  }
+
+  #[tokio::test]
+  async fn a_non_amqp_open_closes() {
+    for frame_type in [1, 2] {
+      let mut frame = open_frame(4_096);
+      frame[5] = frame_type;
+      assert_open_unlowered(&frame).await;
+    }
+  }
+
+  #[tokio::test]
+  async fn a_guest_without_sasl_lowers_the_open() {
+    let room = u32::try_from(hold_room()).unwrap();
+    let offered = 4_096u32;
+    let mut guest_side = down(true);
+    let mut client = header_10().to_vec();
+    client.extend(open_frame(offered));
+    let forwarded = feed_open(&mut guest_side, &client).await;
+    assert_eq!(
+      forwarded_open_max(&forwarded),
+      offered - room,
+      "a 1.0 open without sasl was not lowered"
+    );
   }
 
   #[tokio::test]
