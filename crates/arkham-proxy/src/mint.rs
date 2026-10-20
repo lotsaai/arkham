@@ -30,9 +30,19 @@ pub struct MintedPair {
 /// agents reuse tokens across connections.
 // ponytail: process-memory only; restart orphans decoys the agent still
 // holds and forces re-auth. Persist beside the CA if that ceiling bites.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MintStore {
   pairs: DashMap<String, MintedPair>,
+}
+
+impl std::fmt::Debug for MintStore {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let labels: Vec<String> = self.pairs.iter().map(|entry| entry.label.clone()).collect();
+    f.debug_struct("MintStore")
+      .field("len", &self.pairs.len())
+      .field("labels", &labels)
+      .finish()
+  }
 }
 
 /// A handle to the store handed to each substitution machine.
