@@ -19,8 +19,10 @@ Serve the proxy.
 | `--proxy-backend <BACKEND>` | `ARKHAM_PROXY_BACKEND` | Transparent capture backend: `none` (default, explicit listener only), `tun`, `tproxy`, or `ebpf`. Linux only; every backend is compiled in, so no build flags are needed. |
 | `--tproxy-allow-root-netns` | `ARKHAM_TPROXY_ALLOW_ROOT_NETNS` | With `--proxy-backend tproxy`, allow unscoped capture rules in the host network namespace. Disposable machines only. |
 | `--ebpf-cgroup <PATH>` | `ARKHAM_EBPF_CGROUP` | With `--proxy-backend ebpf`, the cgroup v2 directory whose member processes get captured, or the literal `enclosing` for the cgroup this process's own cgroup lives under (what a compose stack with one `cgroup_parent` per service uses). Required for that backend; otherwise arkham itself must live outside the named cgroup. |
+| `--ebpf-bypass <CIDR>` | `ARKHAM_EBPF_BYPASS` | With `--proxy-backend ebpf`, extra CIDRs that are never captured. Repeat the flag, or separate values with commas. Linux only. |
+| `--ebpf-bypass-file <PATH>` | `ARKHAM_EBPF_BYPASS_FILE` | With `--proxy-backend ebpf`, a file of bypass CIDRs, one per line, re-read while capture runs. |
 
-`--proxy-backend`, `--tproxy-allow-root-netns`, and `--ebpf-cgroup` are CLI and environment only, deliberately absent from config files: capture mutates host routes, nft rules, and kernel programs, so enabling it is an explicit act, not ambient configuration.
+`--proxy-backend`, `--tproxy-allow-root-netns`, `--ebpf-cgroup`, `--ebpf-bypass`, and `--ebpf-bypass-file` are CLI and environment only, deliberately absent from config files. Capture mutates host routes, nft rules, and kernel programs, so enabling it is an explicit act, not ambient configuration.
 
 What each backend does:
 
@@ -52,6 +54,10 @@ Generate or load the CA, print its certificate PEM to stdout, and write `ca.crt`
 
 Print `[rules.*]` blocks for the secrets this workspace can get: the intersection of fnox declarations and the known-host registry. Values resolve from fnox at serve time; the output carries env names only. Names the registry knows but states no hosts for are printed commented out; fnox declarations no registry entry covers are listed at the end.
 
+## `arkham config`
+
+Print a reference config. Each setting appears with its default and its doc comment. Load errors surface first. Secrets never appear.
+
 ## `arkham registry from-oidc <FILE> <SLUG> <ENV>` / `arkham registry from-openapi <FILE> <SLUG> <ENV>`
 
 Curate an `oauth2` registry fragment from a saved discovery or OpenAPI document. `from-oidc` maps `token_endpoint` and `grant_types_supported`; `from-openapi` maps every `type: oauth2` security scheme and reports `openIdConnect` schemes as skipped. Both print a complete `[providers.<slug>]` TOML fragment to stdout for review and placement in `rules.d`; they never fetch, never write files, and never touch the bundled table. See [the registry reference](registry.md).
@@ -67,6 +73,10 @@ The whole lifecycle in one idempotent run: what `init` does, then `up`, then the
 ## `arkham up [WORKSPACE]`
 
 Start the layered compose project `arkham init` generated, creating the CA and entrypoint if they are still missing. `WORKSPACE` defaults to the current directory; when no layer file exists, the compose command refuses rather than guess.
+
+## `arkham expose <PORT> [--host <HOST>] [--workspace <PATH>]` / `arkham expose --list`
+
+Publish container port `PORT` on `127.0.0.1`. `--host` defaults to `PORT`. `--workspace` defaults to the current directory. The command claims that host port across workspaces, adds `[[workspace.expose]]` when that mapping is absent, regenerates, and runs `up`. A host port another workspace already claimed fails and names that workspace. `--list` prints this workspace's publishings and every workspace's claims, and changes nothing.
 
 ## `arkham down [WORKSPACE]`
 

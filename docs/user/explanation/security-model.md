@@ -24,7 +24,7 @@ The proxy translates and never participates in the protocol: it does not initiat
 | Edge | Consequence |
 | --- | --- |
 | Proxy restart | Minted decoys are memory-only. A restarted proxy does not know the decoys the agent still holds; the next request sends an unknown decoy, the upstream rejects it, and the agent re-authenticates. |
-| Authorization-code browser leg | Covered when the agent drives a headless browser through the proxy (the redirect `code` is minted like a token). A human logging in interactively on their own machine is outside the model. |
+| Authorization-code browser leg | The redirect `code` reaches the agent unchanged. A human login on their own machine is outside the model. |
 | Compressed token responses | Not rewritten (opaque to the proxy). Coverage gap, not a leak direction. |
 | Mint-failure passthrough | A body that is JSON but unparseable, or a mint error, passes through with the field it could not mint. Rare and logged. |
 

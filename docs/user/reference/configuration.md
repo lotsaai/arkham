@@ -19,8 +19,10 @@ Every configuration layer, file, and key. Values merge across layers; a higher l
 | --- | --- | --- | --- |
 | `listen` | `127.0.0.1:8080` | `ARKHAM_LISTEN` | Address the explicit proxy listens on. |
 | `ca_file` | `/certs/ca.pem` when mounted there, else `<config-dir>/arkham/ca.pem` | `ARKHAM_CA_FILE` | Path to the CA file, which holds the certificate followed by the key. `arkham ca` also writes `ca.crt` and `ca.key` beside it. |
+| `ssh_host_key` | `<config-dir>/arkham/ssh_host_ed25519` | `ARKHAM_SSH_HOST_KEY` | Host key the guest leg presents. Generated on first run. |
+| `ssh_known_hosts` | `<config-dir>/arkham/ssh_known_hosts` | `ARKHAM_SSH_KNOWN_HOSTS` | Upstream `known_hosts`. First-seen keys are recorded. Arkham rejects a changed key on a known host. |
 | `root_certs` | `[]` | — | Extra upstream CA bundles trusted on egress, additive to webpki roots. Config file only, one path per bundle. Entries extend this further with their own `root_cert`. |
-| `handshake_timeout_secs` | `10` | — | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, the Redis command, the LDAP StartTLS reply, and the upstream `SSLRequest` answer all share this budget. The NATS server's INFO line is not on this budget. |
+| `handshake_timeout_secs` | `10` | `ARKHAM_HANDSHAKE_TIMEOUT_SECS` | Seconds the pre-auth or handshake reads may wait on a peer before the connection closes: the TLS `ClientHello`, the HTTP head, the Postgres greeting, the Redis command, the LDAP StartTLS reply, and the upstream `SSLRequest` answer all share this budget. The NATS server's INFO line is not on this budget. |
 
 ## `[rules.<label>]`
 

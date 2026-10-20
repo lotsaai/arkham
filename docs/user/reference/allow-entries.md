@@ -1,6 +1,6 @@
 # Allow entry reference
 
-An allow entry names the one authority a rule's real value may travel to. Grammar and semantics, as `grants.rs` enforces them.
+An allow entry names the one authority a rule's real value may travel to. Grammar and semantics, as `EndpointScope` parses them in `crates/arkham-config/src/grants/mod.rs`.
 
 ## Form
 
@@ -8,8 +8,8 @@ An allow entry names the one authority a rule's real value may travel to. Gramma
 scheme://host[:port]
 ```
 
-- **Schemes**: `http`, `https`, `tcp`.
-- **Default ports**: 80 for `http`, 443 for `https`. A `tcp` entry requires an explicit port.
+- **Schemes**: `http`, `https`, `tcp`, and `ssh`.
+- **Default ports**: 80 for `http`, 443 for `https`, and 22 for `ssh`. A `tcp` entry requires an explicit port.
 - **Hosts**: an exact name, a `*.`-prefixed suffix, or `*`.
 - The entry is authority only. A path, a query, or userinfo is rejected.
 - An IPv6 address goes in brackets and matches the bare form.
@@ -21,6 +21,7 @@ allow = [
   "https://*.githubusercontent.com",
   "http://127.0.0.1:8000",
   "tcp://10.0.0.8:5432",
+  "ssh://bastion.example",
 ]
 ```
 

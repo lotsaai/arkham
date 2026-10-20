@@ -19,12 +19,11 @@ Two capture paths feed the same machinery.
 Then, per connection:
 
 1. **Gate.** arkham parses the connection head and checks the destination against the rules' allow entries. No match means splice: both directions are pumped through byte for byte, the client sees the real upstream certificate, and the decoy travels untouched. This is the default for the internet at large, and it is why non-matching traffic keeps working.
-2. **SNI.** For a matching TLS connection, arkham parses the ClientHello for the server name (a hand-rolled parser, `sni.rs`, bounded at 16 KiB) and looks up a per-domain leaf certificate in a lock-free cache. An expired leaf rotates on the next lookup.
-3. **Terminate.** arkham terminates TLS with that leaf, signed by its own CA. This is why granted HTTPS hosts require client trust in the CA.
-4. **Sniff.** arkham peeks at the plaintext stream to tell HTTP/1 from HTTP/2 (h2 preface) from raw bytes.
-5. **Substitute.** Guest-to-server chunks pass through a request machine that swaps decoy for real; server-to-guest chunks pass through a response machine that swaps real back to decoy. The substitution engine walks HTTP/1 headers and bodies, and HTTP/2 headers via an hpack frame walker. Raw TCP (a `tcp://` grant) gets a byte-level scan-and-forward: framing uncertainty degrades to opaque scanning, never blocks.
-6. **Mint (token issuers).** When the rule's registry entry declares an OAuth2 flow for this endpoint, the response machine buffers a token response whole, mints a decoy for each flow field (`access_token`, `refresh_token`), rewrites the body and its `Content-Length`, and records the pair in a process-lifetime store. Later request machines union the minted pairs, so a decoy minted on one connection substitutes on the next.
-7. **Log.** A substitution logs its rule label and the location (`Header`, `BasicAuth`, `Body`), never a value.
+2. **Terminate.** For a matching TLS connection, arkham terminates TLS with a leaf signed by its own CA. This is why granted HTTPS hosts require client trust in the CA.
+3. **Sniff.** arkham peeks at the plaintext stream to tell HTTP/1 from HTTP/2 (h2 preface) from raw bytes.
+4. **Substitute.** Guest-to-server chunks pass through a request machine that swaps decoy for real; server-to-guest chunks pass through a response machine that swaps real back to decoy. The substitution engine walks HTTP/1 headers and bodies, and HTTP/2 headers via an hpack frame walker. Raw TCP (a `tcp://` grant) gets a byte-level scan-and-forward: framing uncertainty degrades to opaque scanning, never blocks.
+5. **Mint (token issuers).** When the rule's registry entry declares an OAuth2 flow for this endpoint, the response machine buffers a token response whole, mints a decoy for each flow field (`access_token`, `refresh_token`), rewrites the body and its `Content-Length`, and records the pair in a process-lifetime store. Later request machines union the minted pairs, so a decoy minted on one connection substitutes on the next.
+6. **Log.** A substitution logs its rule label and the location (`Header`, `BasicAuth`, `Body`), never a value.
 
 ## Why the pieces are shaped this way
 
@@ -34,7 +33,7 @@ Then, per connection:
 
 **Splice is byte-identical.** Non-granted traffic is not re-serialised or re-framed. Performance and correctness both depend on the non-matching path being a pipe.
 
-**Write-once state.** `ProxyState` is built once at startup behind an `Arc`; there is no reload. Certificates live in a `DashMap` so lookups are lock-free and keygen happens on the caller's thread, never under a lock. Per-connection work is a `tokio::spawn`, with a 10-second budget on pre-auth and dial phases.
+**Write-once state.** `ProxyState` is built once at startup behind an `Arc`; there is no reload. A `DashMap` holds `ServerConfig` for the Postgres, Redis, SMTP, LDAP, NATS, and AMQP transports, and the minted pairs. Per-connection work is a `tokio::spawn`, with a 10-second budget on pre-auth and dial phases.
 
 **Capture opts in at the CLI only.** Capture mutates host routes, and TPROXY also host nft rules. Reading it from a config file would make it ambient; arkham requires the explicit flag, binds its listener before touching the host, and tears the rules down on exit.
 
