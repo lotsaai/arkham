@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "arkham"
-version = "0.3.26"
+version = "0.3.27"
 dependencies = [
  "arkham-compose",
  "arkham-config",
