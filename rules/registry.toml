@@ -1779,17 +1779,6 @@ pattern = "{base62:32}"
 # source: https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api
 # note: the host embeds the account identifier (`<account>.snowflakecomputing.com`, underscores written as hyphens) and Cortex REST lives under `/api/v2/cortex/`.
 
-[providers.spinnaker]
-env = ["ACCESS_TOKEN", "REFRESH_TOKEN"]
-pattern = "eyJ{base62:32}.{base62:32}.{base62:32}"
-# source: https://spinnaker.io/docs/setup/other_config/spin/
-# source: https://github.com/spinnaker/spinnaker/issues/3558
-# note: spin's config substitutes `${ACCESS_TOKEN}`/`${REFRESH_TOKEN}` into the `cachedToken` block; the docs' own example acquires them with `gcloud auth print-access-token`.
-# note: the names are unprefixed and collision-prone across tools; scope rules to the Gate host tightly.
-# note: Gate (the API server) is self-hosted (`--gate-endpoint`); rules carry explicit allow entries.
-# note: issue #3558 reports env substitution broken in some spin versions; the cached-token config file is the fallback.
-# note: tokens are OAuth2 access/refresh pairs, commonly JWTs; the pattern approximates a JWT.
-
 [providers.stackit]
 env = ["STACKIT_API_KEY"]
 hosts = ["https://api.openai-compat.model-serving.eu01.onstackit.cloud"]
