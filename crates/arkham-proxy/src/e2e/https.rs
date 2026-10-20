@@ -1219,3 +1219,222 @@ async fn https_shared_destination_selects_the_presented_guest_cert() {
   );
   proxy.abort();
 }
+
+const CERT_FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const CERT_VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const BEARER_FAKE: &str = "ghp_cccccccccccccccccccccccccccccccccccccccc";
+const BEARER_VALUE: &str = "ghp_dddddddddddddddddddddddddddddddddddddddd";
+
+fn anonymous_connector(ca: &CertAuthority) -> TlsConnector {
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(ca.cert_der().clone()).unwrap();
+  let mut config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+  config.alpn_protocols = vec![b"http/1.1".to_vec()];
+  TlsConnector::from(Arc::new(config))
+}
+
+fn shared_server(ca: &CertAuthority) -> Arc<rustls::ServerConfig> {
+  use arkham_pki::ca::generate_domain_pair;
+
+  let (server_chain, server_key) = generate_domain_pair(ca, "localhost").unwrap();
+  let mut trust = rustls::RootCertStore::empty();
+  trust.add(ca.cert_der().clone()).unwrap();
+  let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(trust))
+    .allow_unauthenticated()
+    .build()
+    .unwrap();
+  Arc::new(
+    rustls::ServerConfig::builder()
+      .with_client_cert_verifier(verifier)
+      .with_single_cert(server_chain, server_key)
+      .unwrap(),
+  )
+}
+
+fn shared_grants(port: u16, pairs: &SharedPairs) -> Vec<Grant> {
+  vec![
+    https_grant(
+      "cert-user",
+      CERT_FAKE,
+      CERT_VALUE,
+      https_scope(
+        port,
+        GuestTlsMode::Mtls,
+        Some(pairs.client_cert.clone()),
+        Some(pairs.client_key.clone()),
+        pairs.bundle.clone(),
+      ),
+    ),
+    https_grant(
+      "bearer-user",
+      BEARER_FAKE,
+      BEARER_VALUE,
+      https_scope(port, GuestTlsMode::Tls, None, None, pairs.bearer_bundle.clone()),
+    ),
+  ]
+}
+
+async fn exchange(
+  state: Arc<ProxyState>,
+  stub: TcpListener,
+  server: Arc<rustls::ServerConfig>,
+  connector: TlsConnector,
+  port: u16,
+  request: &[u8],
+) -> (Vec<u8>, Option<rustls::pki_types::CertificateDer<'static>>) {
+  let stub_task = tokio::spawn(async move {
+    let (stream, _) = stub.accept().await.unwrap();
+    let mut tls = TlsAcceptor::from(server).accept(stream).await.unwrap();
+    let peer = tls.get_ref().1.peer_certificates().and_then(|certs| certs.first().cloned());
+    let head = read_head_from(&mut tls).await;
+    tls.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await.unwrap();
+    (peer, head)
+  });
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+  let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
+  guest
+    .write_all(format!("CONNECT localhost:{port} HTTP/1.1\r\n\r\n").as_bytes())
+    .await
+    .unwrap();
+  let mut ok = [0u8; 19];
+  guest.read_exact(&mut ok).await.unwrap();
+  assert_eq!(&ok, b"HTTP/1.1 200 OK\r\n\r\n");
+  let mut tls = connector
+    .connect(ServerName::try_from("localhost".to_string()).unwrap(), guest)
+    .await
+    .unwrap();
+  tls.write_all(request).await.unwrap();
+  let head = read_head_from(&mut tls).await;
+  assert!(head.starts_with(b"HTTP/1.1 200 OK"), "{}", head.escape_ascii());
+  let (peer, upstream) = stub_task.await.unwrap();
+  proxy.abort();
+  (upstream, peer)
+}
+
+/// No client certificate selects the bearer grant. The files are removed
+/// after the proxy state is built, so a later connection cannot be reading
+/// them again.
+#[tokio::test]
+async fn https_without_a_certificate_sends_the_bearer_secret() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let pairs = shared_pairs(&ca, dir.path());
+  let server = shared_server(&ca);
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let port = stub.local_addr().unwrap().port();
+  let grants = shared_grants(port, &pairs);
+  let connector = anonymous_connector(&ca);
+  let state = test_state_with_plugins(grants, Vec::new(), &ca);
+  for path in [
+    &pairs.client_cert,
+    &pairs.client_key,
+    &pairs.bundle,
+    &pairs.bearer_bundle,
+    &dir.path().join("kube-user-shared.guest.crt"),
+  ] {
+    std::fs::remove_file(path).unwrap();
+  }
+  let request = format!("GET / HTTP/1.1\r\nhost: localhost\r\nAuthorization: Bearer {BEARER_FAKE}\r\n\r\n");
+  let (upstream, peer) = exchange(state, stub, server, connector, port, request.as_bytes()).await;
+  assert!(peer.is_none(), "a bearer grant presents no client certificate");
+  assert!(
+    upstream.windows(BEARER_VALUE.len()).any(|window| window == BEARER_VALUE.as_bytes()),
+    "upstream must see the bearer secret: {}",
+    upstream.escape_ascii()
+  );
+  assert!(
+    !upstream.windows(CERT_VALUE.len()).any(|window| window == CERT_VALUE.as_bytes()),
+    "the certificate grant's secret must stay off this connection"
+  );
+}
+
+/// Sending the certificate grant's decoy as a bearer, with no client
+/// certificate, must not substitute that grant's real secret.
+#[tokio::test]
+async fn https_without_a_certificate_keeps_the_mtls_secret() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let pairs = shared_pairs(&ca, dir.path());
+  let server = shared_server(&ca);
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let port = stub.local_addr().unwrap().port();
+  let state = test_state_with_plugins(shared_grants(port, &pairs), Vec::new(), &ca);
+  let request = format!("GET / HTTP/1.1\r\nhost: localhost\r\nAuthorization: Bearer {CERT_FAKE}\r\n\r\n");
+  let (upstream, _) = exchange(state, stub, server, anonymous_connector(&ca), port, request.as_bytes()).await;
+  assert!(
+    !upstream.windows(CERT_VALUE.len()).any(|window| window == CERT_VALUE.as_bytes()),
+    "mtls secret leaked without a client certificate: {}",
+    upstream.escape_ascii()
+  );
+  assert!(
+    upstream.windows(CERT_FAKE.len()).any(|window| window == CERT_FAKE.as_bytes()),
+    "the unmatched decoy stays literal: {}",
+    upstream.escape_ascii()
+  );
+}
+
+/// A certificate this CA signed, which no grant's guest leaf is, is closed
+/// before a request completes. The upstream request must not carry the
+/// certificate grant's secret.
+#[tokio::test]
+async fn https_unknown_client_certificate_fails_the_handshake() {
+  use arkham_pki::ca::load_or_generate_client_pair;
+
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let pairs = shared_pairs(&ca, dir.path());
+  let (other_pem, other_key) = load_or_generate_client_pair(&ca, dir.path(), "kube-user-other").unwrap();
+  let connector = guest_connector(&ca, &other_pem, &other_key);
+  let server = shared_server(&ca);
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let port = stub.local_addr().unwrap().port();
+  let state = test_state_with_plugins(shared_grants(port, &pairs), Vec::new(), &ca);
+  let stub_task = tokio::spawn(async move {
+    let accepted = tokio::time::timeout(Duration::from_secs(3), stub.accept()).await;
+    let Ok(Ok((stream, _))) = accepted else {
+      return None;
+    };
+    let upstream = tokio::time::timeout(Duration::from_secs(2), async move {
+      let mut tls = TlsAcceptor::from(server).accept(stream).await.ok()?;
+      Some(read_head_from(&mut tls).await)
+    })
+    .await;
+    upstream.ok().flatten()
+  });
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+  let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
+  guest
+    .write_all(format!("CONNECT localhost:{port} HTTP/1.1\r\n\r\n").as_bytes())
+    .await
+    .unwrap();
+  let mut ok = [0u8; 19];
+  guest.read_exact(&mut ok).await.unwrap();
+  assert_eq!(&ok, b"HTTP/1.1 200 OK\r\n\r\n");
+  let connected = connector
+    .connect(ServerName::try_from("localhost".to_string()).unwrap(), guest)
+    .await;
+  let exchanged = match connected {
+    Err(_) => false,
+    Ok(mut tls) => {
+      use tokio::io::AsyncReadExt as _;
+      if tls.write_all(b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n").await.is_err() {
+        false
+      } else {
+        let mut buf = [0u8; 8];
+        let got = tokio::time::timeout(Duration::from_secs(2), tls.read(&mut buf)).await;
+        matches!(got, Ok(Ok(n)) if n > 0 && buf[..n].starts_with(b"HTTP/"))
+      }
+    }
+  };
+  assert!(!exchanged, "an unknown client certificate must not complete a request");
+  if let Some(head) = stub_task.await.unwrap() {
+    assert!(
+      !head.windows(CERT_VALUE.len()).any(|window| window == CERT_VALUE.as_bytes()),
+      "unknown certificate must not swap in the mtls secret"
+    );
+  }
+  proxy.abort();
+}

@@ -24,8 +24,9 @@ use rama::tls::client::ServerVerifyMode;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
-use crate::connection::{dial_marked, trust_anchors};
+use crate::connection::dial_marked;
 use crate::identity::{Expect, expect};
+use crate::material::GrantMaterial;
 use crate::mint::{MintBucket, MintHandle, MintStore};
 use crate::transports::PairCtx;
 use crate::transports::http::{MAX_HEAD, http_pair};
@@ -38,6 +39,7 @@ mod connection;
 mod e2e;
 mod error;
 mod identity;
+mod material;
 mod mint;
 mod transports;
 
@@ -69,6 +71,7 @@ pub use error::Error;
 /// egress trust with that bundle; everything else shares `relay`.
 pub struct ProxyState {
   config: Arc<ResolvedConfig>,
+  material: Arc<GrantMaterial>,
   relay: HttpsRelay,
   extra_relays: HashMap<PathBuf, HttpsRelay>,
   mtls_trust: X509Store,
@@ -148,15 +151,16 @@ impl ProxyState {
   /// when a configured plugin cannot be loaded.
   pub fn new(resolved: ResolvedConfig, ca: &CertAuthority) -> Result<Self, Error> {
     let plugins = Arc::new(arkham_plugin::Registry::load(&resolved.plugins)?);
+    let material = Arc::new(GrantMaterial::load(&resolved)?);
     let mut global = Vec::new();
     for path in &resolved.proxy.root_certs {
-      global.extend(trust_anchors(path)?);
+      global.extend(material.anchors(path)?.iter().cloned());
     }
     let relay = https_relay(ca, &global)?;
     let mut extra_relays = HashMap::new();
     for path in entry_anchors(&resolved) {
       let mut anchors = global.clone();
-      anchors.extend(trust_anchors(&path)?);
+      anchors.extend(material.anchors(&path)?.iter().cloned());
       let extra_relay = https_relay(ca, &anchors).map_err(|source| Error::EntryTrustBundle {
         path: path.clone(),
         source: Box::new(source),
@@ -179,6 +183,7 @@ impl ProxyState {
     let amqp = Arc::new(AmqpTransport::new(ca)?);
     Ok(Self {
       config: Arc::new(resolved),
+      material,
       relay,
       extra_relays,
       mtls_trust,

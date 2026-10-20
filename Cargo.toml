@@ -115,6 +115,10 @@ httparse = "1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jwt = "0.16"
+# crates.io 4.2.0 pulls serde-saphyr 0.0.29, which caps smallvec below 1.16.
+# rama-utils requires smallvec ^1.16, so that release does not resolve.
+# This rev is still package version 4.2.0 and moves serde-saphyr to 1.x.
+kube-client = { git = "https://github.com/kube-rs/kube", rev = "1be7f0d96c3b211680b173c1fc83aa6ad4adba34", default-features = false, features = ["config"] }
 lettre = { version = "0.11.23", default-features = false, features = ["aws-lc-rs", "smtp-transport", "tokio1", "tokio1-rustls", "webpki-roots"] }
 libc = "0.2"
 memchr = "2"

@@ -26,9 +26,7 @@ use rama::net::tls::ApplicationProtocol;
 use super::PairCtx;
 use super::{ServeStream, Transport};
 use crate::Error;
-use crate::connection::{
-  GuestIo, HttpsCandidate, Prefixed, client_auth_policy, dial_marked, guest_leaf_der, optional_client_auth_policy, trust_anchors,
-};
+use crate::connection::{GuestIo, HttpsCandidate, Prefixed, client_auth_policy, dial_marked, optional_client_auth_policy};
 use crate::identity::{CandidateParams, Hello, read_client_hello, read_http_head};
 use crate::into_box_error;
 use crate::mint::MintHandle;
@@ -94,7 +92,7 @@ impl Transport for HttpsTransport {
       // No https scope names this identity: nothing to substitute.
       return tcp::splice(guest, dial_host, port, state.fwmark, &buf).await;
     }
-    let root_cert = shared_root(&hits, identity, port)?;
+    let root_cert = shared_root(&state.material, &hits, identity, port)?;
     let identity = identity.to_string();
     if !state.mint.allow() {
       return Err(Error::BurstExceeded {
@@ -105,15 +103,16 @@ impl Transport for HttpsTransport {
     let policy = if hits.len() == 1 {
       let (grant, scope) = &hits[0];
       *selected.lock().unwrap_or_else(PoisonError::into_inner) = vec![grant.clone()];
-      client_auth_policy(scope, &state.mtls_trust)?
+      client_auth_policy(&state.material, scope, &state.mtls_trust)?
     } else {
-      let candidates = https_candidates(&hits)?;
+      let candidates = https_candidates(&state.material, &hits);
       Some(optional_client_auth_policy(
         candidates,
         &state.mtls_trust,
         &identity,
         port,
         Arc::clone(&selected),
+        Arc::clone(&state.material),
       ))
     };
     let upstream = dial_marked(dial_host, port, state.fwmark).await?;
@@ -226,7 +225,12 @@ pub(crate) struct SubstitutionService {
 /// Equal paths are one bundle and are not read again. Two different paths
 /// are one bundle when they hold the same certificates. A hit with a bundle
 /// and a hit without one are different bundles.
-fn shared_root(hits: &[(Grant, EndpointScope)], host: &str, port: u16) -> Result<Option<std::path::PathBuf>, Error> {
+fn shared_root(
+  material: &crate::material::GrantMaterial,
+  hits: &[(Grant, EndpointScope)],
+  host: &str,
+  port: u16,
+) -> Result<Option<std::path::PathBuf>, Error> {
   let mut missing = false;
   let mut chosen: Option<std::path::PathBuf> = None;
   for (_, scope) in hits {
@@ -243,17 +247,11 @@ fn shared_root(hits: &[(Grant, EndpointScope)], host: &str, port: u16) -> Result
     match &chosen {
       None => chosen = Some(path.clone()),
       Some(seen) if seen == path => {}
-      Some(seen) if anchor_bytes(seen)? == anchor_bytes(path)? => {}
+      Some(seen) if material.anchor_bytes(seen)? == material.anchor_bytes(path)? => {}
       Some(_) => return Err(split_trust(host, port)),
     }
   }
   Ok(chosen)
-}
-
-fn anchor_bytes(path: &std::path::Path) -> Result<Vec<Vec<u8>>, Error> {
-  let mut anchors: Vec<Vec<u8>> = trust_anchors(path)?.into_iter().map(|cert| cert.as_ref().to_vec()).collect();
-  anchors.sort_unstable();
-  Ok(anchors)
 }
 
 fn split_trust(host: &str, port: u16) -> Error {
@@ -263,20 +261,17 @@ fn split_trust(host: &str, port: u16) -> Error {
   }
 }
 
-fn https_candidates(hits: &[(Grant, EndpointScope)]) -> Result<Vec<HttpsCandidate>, Error> {
+fn https_candidates(material: &crate::material::GrantMaterial, hits: &[(Grant, EndpointScope)]) -> Vec<HttpsCandidate> {
   let mut candidates = Vec::with_capacity(hits.len());
   for (grant, scope) in hits {
-    let leaf = match &scope.client_cert {
-      Some(path) => guest_leaf_der(path)?,
-      None => None,
-    };
+    let leaf = scope.client_cert.as_ref().and_then(|path| material.guest_leaf(path));
     candidates.push(HttpsCandidate {
       grant: grant.clone(),
       guest_tls: scope.guest_tls,
       leaf,
     });
   }
-  Ok(candidates)
+  candidates
 }
 
 impl<GI, GE> Service<BridgeIo<TlsStream<GI>, TlsStream<GE>>> for SubstitutionService
@@ -485,8 +480,9 @@ mod tests {
     let second = dir.path().join("b.pem");
     std::fs::write(&first, ca.cert_pem()).unwrap();
     std::fs::write(&second, ca.cert_pem()).unwrap();
-    let hits = vec![hit(6443, Some(first.clone())), hit(6443, Some(second))];
-    let chosen = shared_root(&hits, "127.0.0.1", 6443).expect("identical certificates agree");
+    let hits = vec![hit(6443, Some(first.clone())), hit(6443, Some(second.clone()))];
+    let material = crate::material::GrantMaterial::from_anchor_files(&[first.clone(), second]).expect("bundles load");
+    let chosen = shared_root(&material, &hits, "127.0.0.1", 6443).expect("identical certificates agree");
     assert_eq!(chosen.as_deref(), Some(first.as_path()));
   }
 
@@ -497,8 +493,9 @@ mod tests {
     let second = dir.path().join("b.pem");
     std::fs::write(&first, CertAuthority::generate().unwrap().cert_pem()).unwrap();
     std::fs::write(&second, CertAuthority::generate().unwrap().cert_pem()).unwrap();
-    let hits = vec![hit(6443, Some(first)), hit(6443, Some(second))];
-    let err = shared_root(&hits, "127.0.0.1", 6443).expect_err("different certificates disagree");
+    let hits = vec![hit(6443, Some(first.clone())), hit(6443, Some(second.clone()))];
+    let material = crate::material::GrantMaterial::from_anchor_files(&[first, second]).expect("bundles load");
+    let err = shared_root(&material, &hits, "127.0.0.1", 6443).expect_err("different certificates disagree");
     assert!(matches!(err, Error::SplitTrustBundle { port: 6443, .. }), "{err}");
   }
 }

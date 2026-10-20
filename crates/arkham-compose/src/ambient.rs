@@ -280,16 +280,20 @@ impl AmbientDeriver<'_> {
       }
     };
     let refs: Vec<(&Path, &[u8])> = loaded.iter().map(|(path, bytes)| (path.as_path(), bytes.as_slice())).collect();
-    let adapted = kube::adapt_sources(&refs, ca, guests_dir)
-      .ok()
-      .flatten()
-      .into_iter()
-      .collect::<Vec<_>>();
-    if adapted.is_empty() {
+    let adapted = match kube::adapt_sources(&refs, ca, guests_dir) {
+      Ok(adapted) => adapted,
+      Err(err) => {
+        tracing::warn!(source = %source.display(), %err, "kubeconfig source skipped");
+        return Ok(());
+      }
+    };
+    let Some(adapted) = adapted else {
       tracing::warn!(source = %source.display(), "kubeconfig source skipped: it does not map onto a grant");
       return Ok(());
-    }
-    self.collector.twin(adapted, "kube-config", &format!("{}/.kube/config", self.home))
+    };
+    self
+      .collector
+      .twin(vec![adapted], "kube-config", &format!("{}/.kube/config", self.home))
   }
 
   /// The talosconfig at `TALOSCONFIG` or `~/.talos/config`.
@@ -367,7 +371,7 @@ fn kubeconfig_paths(host_home: &Path) -> Vec<PathBuf> {
   let Ok(value) = env::var("KUBECONFIG") else {
     return vec![host_home.join(".kube/config")];
   };
-  let paths: Vec<PathBuf> = value.split(':').filter(|part| !part.is_empty()).map(PathBuf::from).collect();
+  let paths: Vec<PathBuf> = env::split_paths(&value).filter(|path| !path.as_os_str().is_empty()).collect();
   if paths.is_empty() {
     vec![host_home.join(".kube/config")]
   } else {
@@ -714,5 +718,19 @@ mod moved_suite {
       !containers.contains(&"/home/eng/.kube/config".to_string()),
       "the broken kubeconfig derives nothing: {containers:?}"
     );
+  }
+
+  #[test]
+  fn kubeconfig_paths_follow_the_platform_list() {
+    let home = Path::new("/home/ivan");
+    let listed = env::join_paths([Path::new("/a/config"), Path::new("/b/config")]).expect("paths");
+    set_env("KUBECONFIG", &listed);
+    let paths = kubeconfig_paths(home);
+    unset_env("KUBECONFIG");
+    assert_eq!(paths, vec![PathBuf::from("/a/config"), PathBuf::from("/b/config")]);
+    set_env("KUBECONFIG", "");
+    let empty = kubeconfig_paths(home);
+    unset_env("KUBECONFIG");
+    assert_eq!(empty, vec![home.join(".kube/config")]);
   }
 }

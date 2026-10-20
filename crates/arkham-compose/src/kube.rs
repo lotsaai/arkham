@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::{HostTlsCfg, RewriteFormat, fake_for};
-use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, Presented, identities, require_distinct};
+use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, Presented, guest_cert_file, identities, require_distinct};
 use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -29,11 +29,10 @@ use crate::adapt::{GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, decode, rend
 use crate::error::Error;
 
 /// A kubeconfig document; unknown fields ignored.
+///
+/// `kind` is checked on the merged `kube_client` document before this parse.
 #[derive(Debug, Deserialize, Default)]
 struct KubeDoc {
-  /// Document kind: `Config` for kubeconfigs.
-  #[serde(default)]
-  kind: String,
   /// Active context name.
   #[serde(rename = "current-context", default)]
   current_context: String,
@@ -232,115 +231,87 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
 }
 
 fn merge_sources(sources: &[(&Path, &[u8])]) -> Result<Option<Merged>, Error> {
-  let mut merged: Option<Merged> = None;
+  let mut combined: Option<kube_client::config::Kubeconfig> = None;
+  let mut origin = PathBuf::new();
+  let mut context_paths = BTreeMap::new();
+  let mut cluster_paths = BTreeMap::new();
+  let mut user_paths = BTreeMap::new();
   for (path, bytes) in sources {
     let text = String::from_utf8_lossy(bytes);
-    let value: Value = from_str(&text).map_err(|err| Error::RewriteYaml {
+    let doc: kube_client::config::Kubeconfig = from_str(&text).map_err(|source| Error::RewriteYaml {
       file: path.to_path_buf(),
-      source: err,
+      source,
     })?;
-    let doc: KubeDoc = from_str(&text).map_err(|err| Error::RewriteYaml {
-      file: path.to_path_buf(),
-      source: err,
-    })?;
-    if doc.kind != "Config" {
+    if doc.kind.as_deref() != Some("Config") {
       continue;
     }
-    match merged.as_mut() {
+    remember(&mut context_paths, path, doc.contexts.iter().map(|entry| entry.name.as_str()));
+    remember(&mut cluster_paths, path, doc.clusters.iter().map(|entry| entry.name.as_str()));
+    remember(&mut user_paths, path, doc.auth_infos.iter().map(|entry| entry.name.as_str()));
+    combined = Some(match combined {
       None => {
-        let mut seen_contexts = BTreeSet::new();
-        let mut seen_clusters = BTreeSet::new();
-        let mut seen_users = BTreeSet::new();
-        merged = Some(Merged {
-          origin: path.to_path_buf(),
-          current: doc.current_context,
-          contexts: take_new(path, doc.contexts, &mut seen_contexts, |entry| &entry.name),
-          clusters: take_new(path, doc.clusters, &mut seen_clusters, |entry| &entry.name),
-          users: take_new(path, doc.users, &mut seen_users, |entry| &entry.name),
-          root: value,
-        });
+        origin = path.to_path_buf();
+        doc
       }
-      Some(existing) => {
-        if existing.current.is_empty() {
-          existing.current = doc.current_context;
-        }
-        let seen_contexts = names_of(&existing.contexts, |entry| &entry.name);
-        let seen_clusters = names_of(&existing.clusters, |entry| &entry.name);
-        let seen_users = names_of(&existing.users, |entry| &entry.name);
-        append_named(&mut existing.root, "contexts", &value, &seen_contexts);
-        append_named(&mut existing.root, "clusters", &value, &seen_clusters);
-        append_named(&mut existing.root, "users", &value, &seen_users);
-        let mut seen_contexts = seen_contexts;
-        let mut seen_clusters = seen_clusters;
-        let mut seen_users = seen_users;
-        existing
-          .contexts
-          .extend(take_new(path, doc.contexts, &mut seen_contexts, |entry| &entry.name));
-        existing
-          .clusters
-          .extend(take_new(path, doc.clusters, &mut seen_clusters, |entry| &entry.name));
-        existing
-          .users
-          .extend(take_new(path, doc.users, &mut seen_users, |entry| &entry.name));
-      }
-    }
+      Some(existing) => existing.merge(doc).map_err(|source| Error::KubeconfigMerge {
+        file: path.to_path_buf(),
+        source,
+      })?,
+    });
   }
-  if let Some(merged) = merged.as_mut() {
-    set_current(&mut merged.root, &merged.current);
-  }
-  Ok(merged)
+  let Some(combined) = combined else {
+    return Ok(None);
+  };
+  let yaml = serde_yaml::to_string(&combined).map_err(|source| Error::RewriteYaml {
+    file: origin.clone(),
+    source,
+  })?;
+  let root: Value = from_str(&yaml).map_err(|source| Error::RewriteYaml {
+    file: origin.clone(),
+    source,
+  })?;
+  let doc: KubeDoc = from_str(&yaml).map_err(|source| Error::RewriteYaml {
+    file: origin.clone(),
+    source,
+  })?;
+  Ok(Some(Merged {
+    current: doc.current_context,
+    contexts: sourced(&origin, &context_paths, doc.contexts, |entry| &entry.name)?,
+    clusters: sourced(&origin, &cluster_paths, doc.clusters, |entry| &entry.name)?,
+    users: sourced(&origin, &user_paths, doc.users, |entry| &entry.name)?,
+    origin,
+    root,
+  }))
 }
 
-fn take_new<T>(path: &Path, items: Vec<T>, seen: &mut BTreeSet<String>, name_of: impl Fn(&T) -> &str) -> Vec<Sourced<T>> {
-  let mut out = Vec::new();
+fn remember<'a>(seen: &mut BTreeMap<String, PathBuf>, path: &Path, names: impl Iterator<Item = &'a str>) {
+  for name in names {
+    seen.entry(name.to_string()).or_insert_with(|| path.to_path_buf());
+  }
+}
+
+fn sourced<T>(
+  origin: &Path,
+  paths: &BTreeMap<String, PathBuf>,
+  items: Vec<T>,
+  name_of: impl Fn(&T) -> &str,
+) -> Result<Vec<Sourced<T>>, Error> {
+  let mut out = Vec::with_capacity(items.len());
   for item in items {
-    if !seen.insert(name_of(&item).to_string()) {
-      continue;
-    }
+    let name = name_of(&item);
+    let Some(source) = paths.get(name) else {
+      return Err(Error::RewriteInvalid {
+        file: origin.to_path_buf(),
+        format: RewriteFormat::Kubeconfig,
+        detail: format!("merged entry `{name}` has no source file"),
+      });
+    };
     out.push(Sourced {
-      source: path.to_path_buf(),
+      source: source.clone(),
       item,
     });
   }
-  out
-}
-
-fn names_of<T>(items: &[Sourced<T>], name_of: impl Fn(&T) -> &str) -> BTreeSet<String> {
-  items.iter().map(|entry| name_of(&entry.item).to_string()).collect()
-}
-
-fn append_named(root: &mut Value, key: &str, incoming: &Value, seen: &BTreeSet<String>) {
-  let Some(seq) = incoming.get(yaml_key(key)).and_then(Value::as_sequence) else {
-    return;
-  };
-  let additions: Vec<Value> = seq
-    .iter()
-    .filter(|entry| {
-      entry
-        .get(yaml_key("name"))
-        .and_then(Value::as_str)
-        .is_some_and(|name| !name.is_empty() && !seen.contains(name))
-    })
-    .cloned()
-    .collect();
-  if additions.is_empty() {
-    return;
-  }
-  let Some(map) = root.as_mapping_mut() else {
-    return;
-  };
-  let dest = map.entry(yaml_key(key)).or_insert_with(|| Value::Sequence(Vec::new()));
-  let Some(dest_seq) = dest.as_sequence_mut() else {
-    return;
-  };
-  dest_seq.extend(additions);
-}
-
-fn set_current(root: &mut Value, current: &str) {
-  let Some(map) = root.as_mapping_mut() else {
-    return;
-  };
-  map.insert(yaml_key("current-context"), Value::String(current.to_string()));
+  Ok(out)
 }
 
 fn yaml_key(name: &str) -> Value {
@@ -697,12 +668,7 @@ fn push_user_blobs(user: &LiveUser, materialized: &mut Vec<(String, Vec<u8>)>, s
   if let (Some(cert), Some(key)) = (&user.cert, &user.key) {
     push_blob(materialized, seen, format!("{}.client.crt", user.identity.label), cert.clone());
     push_blob(materialized, seen, format!("{}.client.key", user.identity.label), key.clone());
-    push_blob(
-      materialized,
-      seen,
-      format!("{}.guest.crt", user.identity.label),
-      user.guest_cert.clone(),
-    );
+    push_blob(materialized, seen, guest_cert_file(&user.identity.label), user.guest_cert.clone());
   }
   for server in &user.servers {
     let Some(ca) = &server.ca else {
@@ -719,7 +685,7 @@ fn push_blob(materialized: &mut Vec<(String, Vec<u8>)>, seen: &mut BTreeSet<Stri
 }
 
 /// The agent's decoy kubeconfig. Every cluster carries arkham's CA.
-/// Every user loses `exec`, file paths, and auth-provider tokens.
+/// Every user loses `exec`, file paths, and the whole auth-provider block.
 /// A granted user receives that user's decoy credential.
 fn decoy_document(mut root: Value, ca: &CertAuthority, granted: &BTreeMap<String, UserFace>) -> Result<String, Error> {
   let guest_ca = Value::String(STANDARD.encode(ca.cert_pem()));
@@ -773,16 +739,7 @@ fn scrub_user_secrets(inner: &mut Mapping, placeholder: &str) {
   inner.remove(yaml_key("client-certificate"));
   inner.remove(yaml_key("client-key"));
   inner.remove(yaml_key("exec"));
-  let auth_provider = yaml_key("auth-provider");
-  if let Some(config) = inner
-    .get_mut(&auth_provider)
-    .and_then(Value::as_mapping_mut)
-    .and_then(|provider| provider.get_mut(yaml_key("config")))
-    .and_then(Value::as_mapping_mut)
-    && config.contains_key(yaml_key("access-token"))
-  {
-    config.insert(yaml_key("access-token"), Value::String(placeholder.to_string()));
-  }
+  inner.remove(yaml_key("auth-provider"));
   if inner.contains_key(yaml_key("password")) {
     inner.insert(yaml_key("password"), Value::String(placeholder.to_string()));
   }
@@ -1015,6 +972,87 @@ users:
     );
     assert!(!decoy.contains("Q0VSVA=="), "no real pair survives: {decoy}");
     assert_eq!(decoy.matches("token: ").count(), 2, "each user keeps a decoy token: {decoy}");
+  }
+
+  /// A granted user that also carries an auth-provider keeps the token grant.
+  /// The guest file still lists the user, and none of the provider's secrets,
+  /// the password, or the real token appear in it.
+  #[test]
+  fn decoy_drops_auth_provider_secrets() {
+    const ID_TOKEN: &str = "oidc-id-token-9f3c1a";
+    const REFRESH: &str = "oidc-refresh-token-9f3c1a";
+    const CLIENT_SECRET: &str = "oidc-client-secret-9f3c1a";
+    const IDP_CA: &str = "oidc-idp-certificate-authority-data-9f3c1a";
+    const PASSWORD: &str = "ivan-basic-password-9f3c1a";
+    let mut config = Mapping::new();
+    config.insert(text("id-token"), text(ID_TOKEN));
+    config.insert(text("refresh-token"), text(REFRESH));
+    config.insert(text("client-secret"), text(CLIENT_SECRET));
+    config.insert(text("idp-certificate-authority-data"), text(IDP_CA));
+    config.insert(text("access-token"), text("oidc-access-token-9f3c1a"));
+    let mut provider = Mapping::new();
+    provider.insert(text("name"), text("oidc"));
+    provider.insert(text("config"), Value::Mapping(config));
+    let doc = kubeconfig(
+      "prod",
+      vec![named("context", "prod", &[("cluster", text("prod")), ("user", text("ivan"))])],
+      vec![named(
+        "cluster",
+        "prod",
+        &[
+          ("server", text("https://k8s.example:6443")),
+          ("certificate-authority-data", text("Q0E=")),
+        ],
+      )],
+      vec![named(
+        "user",
+        "ivan",
+        &[
+          ("token", text("ivan-real-token")),
+          ("password", text(PASSWORD)),
+          ("auth-provider", Value::Mapping(provider)),
+        ],
+      )],
+    );
+    let adapted = adapt_doc(&doc);
+    for secret in [
+      ID_TOKEN,
+      REFRESH,
+      CLIENT_SECRET,
+      IDP_CA,
+      "oidc-access-token-9f3c1a",
+      PASSWORD,
+      "ivan-real-token",
+      "Q0E=",
+    ] {
+      assert!(!adapted.decoy.contains(secret), "{secret} in the guest file: {}", adapted.decoy);
+    }
+    for secret in [
+      ID_TOKEN,
+      REFRESH,
+      CLIENT_SECRET,
+      IDP_CA,
+      "oidc-access-token-9f3c1a",
+      PASSWORD,
+      "Q0E=",
+    ] {
+      assert!(
+        !adapted.fragment.contains(secret),
+        "{secret} in the grant fragment: {}",
+        adapted.fragment
+      );
+    }
+    assert!(
+      adapted.fragment.contains("ivan-real-token"),
+      "the token grant keeps the real token: {}",
+      adapted.fragment
+    );
+    assert!(adapted.decoy.contains("name: ivan"), "guest file lists the user: {}", adapted.decoy);
+    assert!(
+      !adapted.decoy.contains("auth-provider"),
+      "guest file keeps the provider block: {}",
+      adapted.decoy
+    );
   }
 
   #[test]

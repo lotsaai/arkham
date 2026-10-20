@@ -13,6 +13,7 @@ cluster_b="arkham-k3s-test-b"
 scratch=$proj_dir/target/k3s-e2e
 arkham=$proj_dir/target/debug/arkham
 serve_pid=""
+capture_proxy="arkham-k3s-proxy"
 # One budget for /readyz, node Ready, and coredns Ready. Cluster create
 # (image pull included) is outside it. Override when a runner is slower.
 ready_timeout=${ARKHAM_K3S_READY_TIMEOUT:-600}
@@ -90,6 +91,10 @@ dump_k3s_diagnostics() {
     ip route show 2>&1 || true
     echo "=== ip route show table 100 ==="
     ip route show table 100 2>&1 || true
+    echo "=== capture proxy logs ==="
+    if [ -n "${capture_proxy:-}" ]; then
+      docker logs --tail 400 "$capture_proxy" 2>&1 || true
+    fi
     echo "=== bpftool cgroup tree ==="
     if bin=$(bpftool_bin); then
       run_privileged "$bin" cgroup tree 2>&1 || echo "bpftool cgroup tree failed"
@@ -107,6 +112,7 @@ cleanup() {
   if [ -n "$serve_pid" ]; then
     kill "$serve_pid" 2>/dev/null || true
   fi
+  docker rm -f "$capture_proxy" >/dev/null 2>&1 || true
   k3d cluster delete "$cluster" >/dev/null 2>&1 || true
   k3d cluster delete "$cluster_b" >/dev/null 2>&1 || true
 }
@@ -358,7 +364,7 @@ run_leg() {
 run_leg cert "$scratch/cert-kubeconfig" 18099
 run_leg bearer "$scratch/token-kubeconfig" 18100
 
-# A bearer is not valid on both apiservers, so the shared-user case stays in the kube unit tests.
+# prod-system shares ivan's user on the prod cluster. One user is one grant.
 export KUBECONFIG="$scratch/staging-kubeconfig"
 k3d cluster create "$cluster_b" \
   --wait \
@@ -399,10 +405,21 @@ kubectl --kubeconfig "$merged" config set-context prod --cluster=prod --user=iva
 kubectl --kubeconfig "$merged" config set-cluster staging --server="$server_b" --certificate-authority="$scratch/staging-pair/ca.crt" --embed-certs=true >/dev/null
 kubectl --kubeconfig "$merged" config set-credentials staging-user --token="$staging_token" >/dev/null
 kubectl --kubeconfig "$merged" config set-context staging --cluster=staging --user=staging-user >/dev/null
+kubectl --kubeconfig "$merged" config set-context prod-system --cluster=prod --user=ivan --namespace=kube-system >/dev/null
+oidc_id_token=oidc-id-token-9f3c1a
+oidc_refresh=oidc-refresh-token-9f3c1a
+oidc_client_secret=oidc-client-secret-9f3c1a
+oidc_idp_ca=oidc-idp-certificate-authority-data-9f3c1a
+kubectl --kubeconfig "$merged" config set-credentials oidc-leak \
+  --auth-provider=oidc \
+  --auth-provider-arg=id-token="$oidc_id_token" \
+  --auth-provider-arg=refresh-token="$oidc_refresh" \
+  --auth-provider-arg=client-secret="$oidc_client_secret" \
+  --auth-provider-arg=idp-certificate-authority-data="$oidc_idp_ca" >/dev/null
 kubectl --kubeconfig "$merged" config use-context prod >/dev/null
 
 echo "--- contexts: each real credential reaches its own server"
-for ctx in prod prod-admin staging; do
+for ctx in prod prod-admin staging prod-system; do
   kubectl --kubeconfig "$merged" --context "$ctx" get ns --request-timeout=30s >/dev/null
 done
 
@@ -424,6 +441,11 @@ if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
 fi
 kubedir=${kubedirs[0]}
 decoy=${decoys[0]}
+rule_count=$(grep -c '^\[rules\.' "$kubedir/arkham.toml" || true)
+if [ "$rule_count" -ne 3 ]; then
+  echo "expected 3 grants for 4 contexts that share ivan, got ${rule_count}" >&2
+  exit 1
+fi
 sed "s|/arkham/grants|$kubedir|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
 cp "$decoy" "$scratch/proxy-$name.yaml"
 KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster prod --proxy-url="http://127.0.0.1:18101" >/dev/null
@@ -433,7 +455,7 @@ paths=()
 for index in 0 1; do
   paths+=("{.clusters[${index}].cluster.certificate-authority-data}")
 done
-for index in 0 1 2; do
+for index in 0 1 2 3; do
   paths+=(
     "{.users[${index}].user.token}"
     "{.users[${index}].user.client-certificate-data}"
@@ -444,6 +466,12 @@ for path in "${paths[@]}"; do
   secret=$(kubectl --kubeconfig "$merged" config view --raw -o "jsonpath=${path}")
   if [ -n "$secret" ] && grep -F -q -- "$secret" "$decoy"; then
     echo "decoy still contains a real kubeconfig field ${path}" >&2
+    exit 1
+  fi
+done
+for secret in "$oidc_id_token" "$oidc_refresh" "$oidc_client_secret" "$oidc_idp_ca"; do
+  if grep -F -q -- "$secret" "$decoy"; then
+    echo "decoy contains an auth-provider secret" >&2
     exit 1
   fi
 done
@@ -458,9 +486,10 @@ if env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy KUBECONFIG="$de
   exit 1
 fi
 echo "--- contexts: kubectl --context through the proxy"
-for ctx in prod prod-admin staging; do
+for ctx in prod prod-admin staging prod-system; do
   KUBECONFIG="$scratch/proxy-$name.yaml" kubectl --context "$ctx" get ns --request-timeout=30s
 done
+KUBECONFIG="$scratch/proxy-$name.yaml" kubectl --context prod-system get ns kube-system --request-timeout=30s
 echo "--- contexts: kubectl config use-context"
 KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context staging >/dev/null
 KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get ns --request-timeout=30s
@@ -470,4 +499,163 @@ KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get ns --request-timeout=30s
 kill "$serve_pid" 2>/dev/null || true
 serve_pid=""
 
-echo "k3s substitution proven: bearer + cert auth, three contexts"
+# tun does not capture loopback, so the proxy-url legs above never enter it.
+# This leg puts the proxy on the clusters' docker networks and drives kubectl
+# with the decoy kubeconfig, server URLs unchanged after init.
+if [ ! -e /dev/net/tun ]; then
+  run_privileged modprobe tun || {
+    echo "tun device is missing" >&2
+    exit 1
+  }
+fi
+
+# Prints "<ip> <network>" for the docker address named by the apiserver
+# certificate. A node can sit on more than one network; the address has to
+# be one the certificate actually presents.
+apiserver_host() {
+  local container=$1
+  local cert=$scratch/${container}.crt
+  local sans net ip
+  docker cp "$container:/var/lib/rancher/k3s/server/tls/serving-kube-apiserver.crt" "$cert"
+  sans=$(openssl x509 -in "$cert" -noout -ext subjectAltName)
+  while IFS=$'\t' read -r net ip; do
+    if [ -n "$ip" ] && printf '%s\n' "$sans" | grep -F -q -- "$ip"; then
+      printf '%s %s\n' "$ip" "$net"
+      return 0
+    fi
+  done < <(docker inspect -f '{{range $name, $net := .NetworkSettings.Networks}}{{$name}}{{"\t"}}{{$net.IPAddress}}{{"\n"}}{{end}}' "$container")
+  echo "apiserver certificate for ${container} includes none of its docker addresses" >&2
+  printf '%s\n' "$sans" >&2
+  exit 1
+}
+
+case "$(uname -m)" in
+  x86_64) kube_arch=amd64 ;;
+  aarch64) kube_arch=arm64 ;;
+  *)
+    echo "unsupported architecture $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+kube_version=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+curl -fsSL -o "$scratch/kubectl" "https://dl.k8s.io/release/${kube_version}/bin/linux/${kube_arch}/kubectl"
+curl -fsSL -o "$scratch/kubectl.sha256" "https://dl.k8s.io/release/${kube_version}/bin/linux/${kube_arch}/kubectl.sha256"
+echo "$(tr -d '[:space:]' <"$scratch/kubectl.sha256")  kubectl" | (cd "$scratch" && sha256sum -c -)
+chmod +x "$scratch/kubectl"
+mkdir -p "$scratch/image"
+cp "$arkham" "$scratch/image/arkham"
+docker build -t arkham-k3s-e2e:local -f "$proj_dir/Dockerfile" "$scratch/image"
+
+prod_container="k3d-${cluster}-server-0"
+staging_container="k3d-${cluster_b}-server-0"
+read -r prod_ip prod_net < <(apiserver_host "$prod_container")
+read -r staging_ip staging_net < <(apiserver_host "$staging_container")
+if [ -z "$prod_net" ] || [ -z "$staging_net" ]; then
+  echo "k3d node is missing a docker network" >&2
+  exit 1
+fi
+
+capture_source=$scratch/capture.yaml
+cp "$merged" "$capture_source"
+kubectl --kubeconfig "$capture_source" config set-cluster prod --server="https://${prod_ip}:6443" >/dev/null
+kubectl --kubeconfig "$capture_source" config set-cluster staging --server="https://${staging_ip}:6443" >/dev/null
+
+capture_name=capture
+capture_ws=$scratch/ws-$capture_name
+mkdir -p "$capture_ws/.config/arkham"
+printf '%s\n' '[[workspace.file_rewrite]]' "source = \"$capture_source\"" 'dest = "{home}/.kube/config"' 'format = "kubeconfig"' >"$capture_ws/.config/arkham/config.toml"
+capture_state=$scratch/state-$capture_name
+XDG_STATE_HOME=$capture_state XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$capture_ws"
+shopt -s nullglob
+capture_dirs=()
+capture_decoys=()
+for d in "$capture_state"/arkham/ws/*/grants; do capture_dirs+=("$d"); done
+for d in "$capture_state"/arkham/ws/*/files/00-*; do capture_decoys+=("$d"); done
+shopt -u nullglob
+if [ "${#capture_dirs[@]}" -ne 1 ] || [ "${#capture_decoys[@]}" -ne 1 ]; then
+  echo "init generated no capture kube state" >&2
+  exit 1
+fi
+capture_grants=${capture_dirs[0]}
+capture_decoy=${capture_decoys[0]}
+capture_rules=$(grep -c '^\[rules\.' "$capture_grants/arkham.toml" || true)
+if [ "$capture_rules" -ne 3 ]; then
+  echo "capture grant file has ${capture_rules} rules; shared user ivan should stay one grant" >&2
+  exit 1
+fi
+for secret in "$oidc_id_token" "$oidc_refresh" "$oidc_client_secret" "$oidc_idp_ca"; do
+  if grep -F -q -- "$secret" "$capture_decoy"; then
+    echo "capture decoy contains an auth-provider secret" >&2
+    exit 1
+  fi
+done
+if grep -q 'proxy-url' "$capture_decoy"; then
+  echo "capture decoy was rewritten with proxy-url" >&2
+  exit 1
+fi
+
+run_capture_guest() {
+  local dir=$1
+  shift
+  timeout -k 15 90 docker run --rm --network "container:${capture_proxy}" \
+    -v "${dir}:/work" \
+    -v "${scratch}/kubectl:/kubectl:ro" \
+    -e KUBECONFIG=/work/config \
+    --entrypoint /kubectl \
+    arkham-k3s-e2e:local \
+    "$@"
+}
+
+wait_capture() {
+  local _
+  for _ in $(seq 1 30); do
+    if ! docker inspect -f '{{.State.Running}}' "$capture_proxy" 2>/dev/null | grep -qx true; then
+      echo "arkham capture proxy is not running" >&2
+      return 1
+    fi
+    if docker logs "$capture_proxy" 2>&1 | grep -q 'serving'; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "arkham capture proxy did not report serving" >&2
+  return 1
+}
+
+prove_capture() {
+  local backend=$1
+  echo "=== ${backend}: unmodified decoy through the proxy ==="
+  docker rm -f "$capture_proxy" >/dev/null 2>&1 || true
+  docker run -d --name "$capture_proxy" \
+    --cap-add NET_ADMIN \
+    --device /dev/net/tun \
+    --network "$prod_net" \
+    -v "${capture_grants}:/arkham/grants:ro" \
+    -v "${capture_grants}/arkham.toml:/root/.config/arkham/config.toml:ro" \
+    -v "${scratch}/config/arkham/ca.pem:/certs/ca.pem:ro" \
+    -e ARKHAM_CA_FILE=/certs/ca.pem \
+    -e RUST_LOG=info,arkham_proxy=debug,arkham_tproxy=debug,arkham_tun=debug \
+    arkham-k3s-e2e:local \
+    serve --proxy-backend "$backend"
+  docker network connect "$staging_net" "$capture_proxy"
+  wait_capture
+  local explicit=$scratch/guest-${backend}-explicit
+  local switched=$scratch/guest-${backend}-switched
+  mkdir -p "$explicit" "$switched"
+  cp "$capture_decoy" "$explicit/config"
+  cp "$capture_decoy" "$switched/config"
+  run_capture_guest "$explicit" --context prod get ns --request-timeout=30s >/dev/null
+  run_capture_guest "$explicit" --context prod-admin get ns --request-timeout=30s >/dev/null
+  run_capture_guest "$explicit" --context staging get ns --request-timeout=30s >/dev/null
+  run_capture_guest "$explicit" --context prod-system get ns kube-system --request-timeout=30s >/dev/null
+  run_capture_guest "$switched" config use-context staging >/dev/null
+  run_capture_guest "$switched" get ns --request-timeout=30s >/dev/null
+  run_capture_guest "$switched" config use-context prod >/dev/null
+  run_capture_guest "$switched" get ns --request-timeout=30s >/dev/null
+  docker rm -f "$capture_proxy" >/dev/null
+}
+
+prove_capture tproxy
+prove_capture tun
+
+echo "k3s substitution proven: bearer + cert auth, four contexts, tproxy and tun"

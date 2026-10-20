@@ -176,6 +176,15 @@ pub enum Error {
     /// The format that took the adapter path.
     format: RewriteFormat,
   },
+  /// Two kubeconfig documents disagree on kind or apiVersion.
+  #[error("kubeconfig `{file}`: {source}", file = file.display())]
+  KubeconfigMerge {
+    /// The later file.
+    file: PathBuf,
+    /// The merge failure.
+    #[source]
+    source: kube_client::config::KubeconfigError,
+  },
   /// An adapted rewrite is not valid YAML.
   #[error("file rewrite `{}`: does not parse as YAML: {source}", file.display())]
   RewriteYaml {

@@ -1,3 +1,10 @@
+# kube-client (config feature) always links k8s-openapi, and that crate
+# refuses to build until one Kubernetes version is selected. Arkham does not
+# call the API types. This is k8s-openapi's own switch for a graph that
+# enables no v1_* feature.
+[env]
+K8S_OPENAPI_ENABLED_VERSION = "1.34"
+
 # `clang-<major>` must resolve to the same LLVM major rustc was built
 # with — rustc 1.99.0 = LLVM 23. Locally: /usr/bin/clang-23. CI: installed by
 # the llvm.sh step in ci.yml. Container: Dockerfile.rustbuilder derives it from

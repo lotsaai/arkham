@@ -8,14 +8,15 @@ repository = "https://github.com/casualjim/arkham"
 publish = false
 
 [dependencies]
+arkham-config = { workspace = true }
+arkham-fnox = { workspace = true }
+arkham-pki = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
 gix-config = { workspace = true }
 gix-discover = { workspace = true }
-arkham-config = { workspace = true }
-arkham-fnox = { workspace = true }
-arkham-pki = { workspace = true }
+kube-client = { workspace = true }
 libc = { workspace = true }
 regex = { workspace = true }
 secrecy = { workspace = true }
