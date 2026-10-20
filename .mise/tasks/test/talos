@@ -60,9 +60,15 @@ case "$(uname -m)" in
     exit 1
     ;;
 esac
-talosctl=$scratch/talosctl
+binary_name="talosctl-linux-${talos_arch}"
+talosctl=$scratch/$binary_name
 state=$scratch/state
-curl -fsSL -o "$talosctl" "https://github.com/siderolabs/talos/releases/download/${talos_version}/talosctl-linux-${talos_arch}"
+curl -fsSL -o "$talosctl" "https://github.com/siderolabs/talos/releases/download/${talos_version}/${binary_name}"
+curl -fsSL -o "$scratch/sha256sum.txt" "https://github.com/siderolabs/talos/releases/download/${talos_version}/sha256sum.txt"
+(
+  cd "$scratch"
+  sha256sum -c --ignore-missing sha256sum.txt >/dev/null
+)
 chmod +x "$talosctl"
 
 if [ ! -e /dev/net/tun ]; then

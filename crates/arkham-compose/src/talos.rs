@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::{HostTlsCfg, RewriteFormat};
-use arkham_config::context::{AmbientProtocol, ContextRef, Presented, identities, require_distinct};
+use arkham_config::context::{AmbientProtocol, ContextRef, Presented, guest_cert_file, identities, require_distinct};
 use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -347,6 +347,31 @@ fn decoy_doc(
   render_decoy(&root)
 }
 
+const ED25519_PRIVATE_KEY: &str = "ED25519 PRIVATE KEY";
+
+/// Talos writes PKCS#8 under `ED25519 PRIVATE KEY`. rustls reads that encoding
+/// from a `PRIVATE KEY` section. Other labels pass through.
+fn client_key_pem(raw: &[u8]) -> Vec<u8> {
+  let Ok(blocks) = pem::parse_many(raw) else {
+    return raw.to_vec();
+  };
+  if !blocks.iter().any(|block| block.tag() == ED25519_PRIVATE_KEY) {
+    return raw.to_vec();
+  }
+  let renamed = blocks
+    .into_iter()
+    .map(|block| {
+      let tag = if block.tag() == ED25519_PRIVATE_KEY {
+        "PRIVATE KEY".to_string()
+      } else {
+        block.tag().to_string()
+      };
+      pem::Pem::new(tag, block.into_contents())
+    })
+    .collect::<Vec<_>>();
+  pem::encode_many(&renamed).into_bytes()
+}
+
 /// One context's fragment, its materialized blobs, and the shared decoy.
 ///
 /// # Errors
@@ -364,10 +389,10 @@ fn one_grant(
   let cert_name = format!("{label}.client.crt");
   let key_name = format!("{label}.client.key");
   let ca_name = format!("{label}.ca.crt");
-  let guest_name = format!("{label}.guest.crt");
+  let guest_name = guest_cert_file(label);
   let materialized = vec![
     (cert_name.clone(), item.crt.clone()),
-    (key_name.clone(), item.key.clone()),
+    (key_name.clone(), client_key_pem(&item.key)),
     (ca_name.clone(), item.ca.clone()),
     (guest_name, guest_cert.to_vec()),
   ];
@@ -446,6 +471,42 @@ mod tests {
     .label
   }
 
+  fn ed25519_pkcs8() -> Vec<u8> {
+    let mut der = vec![
+      0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+    ];
+    der.extend(std::iter::repeat_n(0x11, 32));
+    der
+  }
+
+  fn ed25519_private_key_pem() -> String {
+    let body = STANDARD.encode(ed25519_pkcs8());
+    format!("-----BEGIN ED25519 PRIVATE KEY-----\n{body}\n-----END ED25519 PRIVATE KEY-----\n")
+  }
+
+  #[test]
+  fn talos_ed25519_client_key_loads_as_pkcs8() {
+    use rustls::pki_types::pem::PemObject as _;
+
+    let key_pem = ed25519_private_key_pem();
+    let body = format!(
+      "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n",
+      STANDARD.encode(b"CA"),
+      STANDARD.encode(b"CRT"),
+      STANDARD.encode(key_pem.as_bytes()),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let adapted = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).unwrap();
+    let (_, key) = adapted.grants[0]
+      .materialized
+      .iter()
+      .find(|(name, _)| name.ends_with(".client.key"))
+      .expect("client key");
+    let parsed = rustls::pki_types::PrivateKeyDer::from_pem_slice(key).expect("rustls reads the written key");
+    let signing = rustls::crypto::aws_lc_rs::sign::any_supported_type(&parsed).expect("signing key");
+    assert_eq!(signing.algorithm(), rustls::SignatureAlgorithm::ED25519);
+  }
+
   #[test]
   fn bare_endpoint_gains_talos_port() {
     assert_eq!(normalize_endpoint("10.5.0.6"), "https://10.5.0.6:50000");
@@ -469,7 +530,12 @@ mod tests {
     assert!(decoy.contains("endpoints:\n    - 10.5.0.6"), "{decoy}");
     assert!(decoy.contains("context: prod"), "{decoy}");
     assert_eq!(adapted.grants[0].materialized.len(), 4);
-    assert!(adapted.grants[0].materialized.iter().any(|(name, _)| name.ends_with(".guest.crt")));
+    assert!(
+      adapted.grants[0]
+        .materialized
+        .iter()
+        .any(|(name, _)| name == &guest_cert_file(&label))
+    );
   }
 
   #[test]

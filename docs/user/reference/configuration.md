@@ -248,7 +248,7 @@ Host files rewritten with decoys and mounted read-only into the agent — the es
 | Key | Required | Purpose |
 | --- | --- | --- |
 | `source` | yes | Host file to read. `~` and `$VAR` expand; relative paths resolve against the workspace root. |
-| `dest` | yes | Container path the rewritten file mounts at, read-only. `{home}` expands to `[workspace] home` and `$VAR` expands first. |
+| `dest` | yes | Container path the rewritten file mounts at, read-only, except a talos document, which mounts writable. `{home}` expands to `[workspace] home` and `$VAR` expands first. |
 | `envs` | no | Env names whose real values are replaced by their decoys in the file. Empty for the structural formats — `kubeconfig` (kubectl), `talos` (talosctl): the adapter knows where the secrets live. |
 | `format` | no | Declared format, skipping detection. Known: `format = "kubeconfig"` and `format = "talos"`, each failing closed when the file does not parse as one. Absent, both are detected by content and other files keep the raw byte-swap. A source matching an automatic location stays with its declaration; the automatic pass skips it. A `talos` document mounts writable so `talosctl config context` can update the active context. Other rewrites stay read-only. |
 

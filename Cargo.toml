@@ -124,6 +124,7 @@ netlink-packet-core = "0.9"
 netlink-packet-netfilter = "0.4"
 netlink-sys = "0.8"
 nkeys = "0.4.5"
+pem = "3.0.6"
 percent-encoding = "2.3"
 pgwire = { version = "0.41", default-features = false }
 pretty_assertions = "1"
