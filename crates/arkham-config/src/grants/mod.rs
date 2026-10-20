@@ -77,16 +77,25 @@ impl HostPat {
     }
   }
 
-  /// Rank used when several ssh patterns cover one host. Lower is more specific.
+  /// Rank used when several ssh patterns cover one host. Lower is more
+  /// specific. An exact host is `0`. `*` is [`u32::MAX`]. Every other
+  /// pattern ranks by how many characters are not `*` or `?`, so more
+  /// literals sort first. Equal ranks keep file order at the call site.
   #[must_use]
-  pub fn specificity(&self) -> u8 {
+  pub fn specificity(&self) -> u32 {
     match self {
       HostPat::Exact(_) => 0,
-      HostPat::Glob(_) => 1,
-      HostPat::Wildcard(_) => 2,
-      HostPat::Any => 3,
+      HostPat::Any => u32::MAX,
+      HostPat::Wildcard(pattern) | HostPat::Glob(pattern) => pattern_specificity(pattern),
     }
   }
+}
+
+/// Non-exact rank. `0` is reserved for an exact host and [`u32::MAX`] for `*`.
+fn pattern_specificity(pattern: &str) -> u32 {
+  let literals = pattern.chars().filter(|ch| *ch != '*' && *ch != '?').count();
+  let literals = u32::try_from(literals).unwrap_or(u32::MAX - 2);
+  (u32::MAX - 1).saturating_sub(literals.min(u32::MAX - 2))
 }
 
 /// Parse a host token the way an allow entry spells it.
@@ -624,14 +633,16 @@ impl Grant {
     (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
   }
 
-  /// The ssh scope whose port and host cover a destination, `host` optional
-  /// as above: transparent capture knows the port before it knows the host.
+  /// The most specific ssh scope whose port and host cover a destination,
+  /// `host` optional as above: transparent capture knows the port before it
+  /// knows the host. Routing uses this one scope. Key selection uses
+  /// [`ssh_candidates`], which keeps every match.
   #[must_use]
   pub fn ssh(&self, host: Option<&str>, port: u16) -> Option<&SshScope> {
     let Grant::Ssh { allow } = self else {
       return None;
     };
-    let mut best: Option<(u8, &SshScope)> = None;
+    let mut best: Option<(u32, &SshScope)> = None;
     for entry in allow {
       if entry.port != port {
         continue;
@@ -651,13 +662,16 @@ impl Grant {
   }
 }
 
-/// Every ssh scope on `port`. When `host` is known, only the most specific
-/// matching rank is returned, and every scope at that rank stays so a block
-/// with several identity files is still offered. Negation is applied.
+/// Every ssh scope on `port` that can cover `host`, most specific first.
+///
+/// When `host` is known, an exact host leads, then other patterns by
+/// literal-character count, and `*` is last. Equal ranks keep file order.
+/// Every match is returned. The offered decoy selects the real key, so a
+/// broader pattern that also matches is still accepted. Negation is applied.
 /// When `host` is absent the destination is an address, which is what a
 /// transparent capture has, and neither the pattern nor the negation can
-/// be applied. Every scope on the port stays, and the offered decoy selects
-/// the real key.
+/// be applied. Every scope on the port stays, in file order, and the
+/// offered decoy selects the real key.
 #[must_use]
 pub fn ssh_candidates<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) -> Vec<&'a SshScope> {
   let mut matched = Vec::new();
@@ -675,13 +689,10 @@ pub fn ssh_candidates<'a>(grants: &'a [Grant], host: Option<&str>, port: u16) ->
       matched.push(entry);
     }
   }
-  if host.is_none() {
-    return matched;
+  if host.is_some() {
+    matched.sort_by_key(|entry| entry.host.specificity());
   }
-  let Some(best) = matched.iter().map(|entry| entry.host.specificity()).min() else {
-    return Vec::new();
-  };
-  matched.into_iter().filter(|entry| entry.host.specificity() == best).collect()
+  matched
 }
 
 fn ssh_negated(entry: &str) -> Result<Vec<HostPat>, String> {
@@ -2573,6 +2584,70 @@ mod tests {
       1,
       "no hostname means the pattern cannot be applied"
     );
+  }
+
+  #[test]
+  fn ssh_candidates_rank_patterns_by_literal_count_and_keep_the_rest() {
+    let broad = "ssh://*.*";
+    let narrow = "ssh://*.prod.corp";
+    let mut ssh = BTreeMap::new();
+    ssh.insert(broad.to_string(), ssh_blob("/keys/broad"));
+    ssh.insert(narrow.to_string(), ssh_blob("/keys/narrow"));
+    let grants = resolve(&cfg_with_ssh(&[broad, narrow], ssh)).unwrap().grants;
+    assert!(host_pat("*.prod.corp").specificity() < host_pat("*.*").specificity());
+    assert!(host_pat("*.*").specificity() < host_pat("*").specificity());
+    let paths: Vec<_> = ssh_candidates(&grants, Some("db.prod.corp"), 22)
+      .iter()
+      .map(|entry| entry.identity.clone())
+      .collect();
+    assert_eq!(
+      paths,
+      vec![PathBuf::from("/keys/narrow"), PathBuf::from("/keys/broad")],
+      "the longer literal pattern leads, and the broader match stays"
+    );
+  }
+
+  #[test]
+  fn ssh_candidates_break_equal_literal_counts_by_file_order() {
+    let first = "ssh://a*";
+    let second = "ssh://*b";
+    let mut ssh = BTreeMap::new();
+    ssh.insert(first.to_string(), ssh_blob("/keys/first"));
+    ssh.insert(second.to_string(), ssh_blob("/keys/second"));
+    let grants = resolve(&cfg_with_ssh(&[first, second], ssh)).unwrap().grants;
+    let paths: Vec<_> = ssh_candidates(&grants, Some("ab"), 22)
+      .iter()
+      .map(|entry| entry.identity.clone())
+      .collect();
+    assert_eq!(paths, vec![PathBuf::from("/keys/first"), PathBuf::from("/keys/second")]);
+  }
+
+  #[test]
+  fn ssh_candidates_keep_later_ranks_when_an_exact_hostname_matches() {
+    let wildcard = "ssh://*.corp#!bastion.corp";
+    let exact = "ssh://bastion.corp";
+    let any = "ssh://*";
+    let mut ssh = BTreeMap::new();
+    ssh.insert(wildcard.to_string(), ssh_blob("/keys/alias"));
+    ssh.insert(exact.to_string(), ssh_blob("/keys/exact"));
+    ssh.insert(any.to_string(), ssh_blob("/keys/any"));
+    let grants = resolve(&cfg_with_ssh(&[wildcard, exact, any], ssh)).unwrap().grants;
+    let paths: Vec<_> = ssh_candidates(&grants, Some("bastion.corp"), 22)
+      .iter()
+      .map(|entry| entry.identity.clone())
+      .collect();
+    assert_eq!(
+      paths,
+      vec![PathBuf::from("/keys/exact"), PathBuf::from("/keys/any")],
+      "the negated wildcard stays out, and the catch-all key is still accepted"
+    );
+  }
+
+  fn ssh_blob(path: &str) -> HostSshCfg {
+    HostSshCfg {
+      identity: Some(PathBuf::from(path)),
+      guest_key: Some(PathBuf::from(format!("{path}.pub"))),
+    }
   }
 
   #[test]

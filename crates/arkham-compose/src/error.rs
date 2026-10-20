@@ -335,6 +335,12 @@ pub enum Error {
   /// expose the parent pattern, so the adapter refuses it.
   #[error("ssh config include under a Host block cannot be derived")]
   SshNestedInclude,
+  /// `HostName` contains a `%` token this adapter cannot turn into a host.
+  #[error("ssh config HostName `{pattern}` cannot be derived")]
+  SshHostname {
+    /// `HostName` value that was refused.
+    pattern: String,
+  },
   /// An `Include` names a file that includes it back.
   #[error("ssh config include cycle at `{}`", path.display())]
   SshIncludeCycle {

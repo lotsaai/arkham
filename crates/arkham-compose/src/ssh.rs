@@ -12,11 +12,12 @@
 //! is the more specific block even when the source listed a wildcard first.
 //! Real keys stay in the grant blobs.
 //!
-//! A known destination prefers the more specific pattern (exact, then a
-//! glob, then `*.suffix`, then `*`). The same rank keeps file order. That
-//! is how `Host *.corp` then `Host db.corp` then `Host *` selects the exact
-//! block for `db.corp`. OpenSSH's own first-obtained value would keep the
-//! earlier wildcard.
+//! A known destination orders every matching pattern: an exact host, then
+//! other patterns by how many characters are not `*` or `?`, then `*`.
+//! File order breaks ties. Every match stays a candidate, and the offered
+//! decoy selects the real key. `HostName` `%h` expands against each concrete
+//! `Host` token. A `%` token on a wildcard block, or any other `%` token,
+//! is [`Error::SshHostname`].
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -42,7 +43,7 @@ const INCLUDE_LIMIT: u8 = 16;
 struct ParsedBlock {
   name: String,
   port: u16,
-  hostname: Option<String>,
+  hostnames: Vec<String>,
   positives: Vec<String>,
   negated: Vec<String>,
   files: Vec<PathBuf>,
@@ -64,8 +65,9 @@ struct Claimed {
 /// # Errors
 ///
 /// Returns an error when the config cannot be parsed, when `Include` cycles
-/// or nests too deep, when a refused keyword is present, or when two
-/// contexts share a destination and a decoy.
+/// or nests too deep, when a refused keyword is present, when `HostName`
+/// contains a `%` token that cannot be expanded, or when two contexts share
+/// a destination and a decoy.
 pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path) -> Result<Vec<RewriteAdapted>, Error> {
   let text = String::from_utf8_lossy(content);
   let stage = tempfile::TempDir::new().map_err(|err| Error::CreateDir {
@@ -82,7 +84,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], home: &str, host_home: &Path)
       source: err,
     })?;
   reject_unsupported(parsed.get_hosts())?;
-  let blocks = blocks_from(parsed.get_hosts(), source, home, host_home);
+  let blocks = blocks_from(parsed.get_hosts(), source, home, host_home)?;
   if blocks.is_empty() {
     return Ok(Vec::new());
   }
@@ -115,7 +117,7 @@ fn render_adapted(
         hosts.push(pattern.clone());
       }
     }
-    if let Some(hostname) = &block.hostname {
+    for hostname in &block.hostnames {
       hosts.push(hostname.clone());
     }
     for host in hosts {
@@ -157,7 +159,7 @@ fn render_adapted(
     for pattern in &block.positives {
       push_entries(&mut out, pattern, &block.negated, block.port, &block.files);
     }
-    if let Some(hostname) = &block.hostname {
+    for hostname in &block.hostnames {
       push_entries(&mut out, hostname, &[], block.port, &block.files);
     }
   }
@@ -206,7 +208,7 @@ fn render_adapted(
 /// Guest ssh config. Specificity order is in front of the source so the
 /// first identity OpenSSH obtains is the more specific block's decoy.
 fn decoy_config(text: &str, blocks: &[ParsedBlock], claimed: &BTreeMap<PathBuf, Claimed>) -> String {
-  let mut ranked: Vec<(u8, usize)> = blocks
+  let mut ranked: Vec<(u32, usize)> = blocks
     .iter()
     .enumerate()
     .map(|(index, block)| {
@@ -215,7 +217,7 @@ fn decoy_config(text: &str, blocks: &[ParsedBlock], claimed: &BTreeMap<PathBuf, 
         .iter()
         .map(|pattern| host_pat(pattern).specificity())
         .min()
-        .unwrap_or(u8::MAX);
+        .unwrap_or(u32::MAX);
       (rank, index)
     })
     .collect();
@@ -353,7 +355,7 @@ fn encode_ssh_host(pattern: &str) -> String {
   out
 }
 
-fn blocks_from(hosts: &[ssh2_config::Host], source: &Path, home: &str, host_home: &Path) -> Vec<ParsedBlock> {
+fn blocks_from(hosts: &[ssh2_config::Host], source: &Path, home: &str, host_home: &Path) -> Result<Vec<ParsedBlock>, Error> {
   let mut blocks = Vec::new();
   for host in hosts {
     let positives: Vec<String> = host
@@ -395,16 +397,65 @@ fn blocks_from(hosts: &[ssh2_config::Host], source: &Path, home: &str, host_home
     if readable.is_empty() {
       continue;
     }
+    let hostnames = match host.params.host_name.as_deref() {
+      Some(template) => hostname_entries(template, &positives)?,
+      None => Vec::new(),
+    };
     blocks.push(ParsedBlock {
       name,
       port: host.params.port.unwrap_or(22),
-      hostname: host.params.host_name.clone(),
+      hostnames,
       positives,
       negated,
       files: readable,
     });
   }
-  blocks
+  Ok(blocks)
+}
+
+/// Hosts a `HostName` value contributes. `%h` is the concrete `Host` token
+/// and `%%` is a literal `%`. Any other `%` token, or `%h` on a pattern
+/// that is not a single host, is refused: the grant would never match.
+fn hostname_entries(template: &str, positives: &[String]) -> Result<Vec<String>, Error> {
+  if !template.contains('%') {
+    return Ok(vec![template.to_string()]);
+  }
+  if positives.is_empty() || positives.iter().any(|pattern| !is_concrete(pattern)) {
+    return Err(Error::SshHostname {
+      pattern: template.to_string(),
+    });
+  }
+  let mut hosts = Vec::with_capacity(positives.len());
+  for host in positives {
+    hosts.push(expand_hostname(template, host)?);
+  }
+  Ok(hosts)
+}
+
+fn expand_hostname(template: &str, host: &str) -> Result<String, Error> {
+  let mut out = String::with_capacity(template.len().saturating_add(host.len()));
+  let mut chars = template.chars();
+  while let Some(ch) = chars.next() {
+    if ch != '%' {
+      out.push(ch);
+      continue;
+    }
+    match chars.next() {
+      Some('%') => out.push('%'),
+      Some('h') => out.push_str(host),
+      _ => {
+        return Err(Error::SshHostname {
+          pattern: template.to_string(),
+        });
+      }
+    }
+  }
+  if out.is_empty() {
+    return Err(Error::SshHostname {
+      pattern: template.to_string(),
+    });
+  }
+  Ok(out)
 }
 
 fn reject_unsupported(hosts: &[ssh2_config::Host]) -> Result<(), Error> {
@@ -483,6 +534,14 @@ fn fresh_stem(label: &str, claimed: &BTreeMap<PathBuf, Claimed>) -> String {
   format!("{label}-last")
 }
 
+/// Rewrite `Include` and `IdentityFile` before `ssh2-config` parses the file.
+///
+/// The parser keeps its tokenizer private
+/// (<https://github.com/veeso/ssh2-config/issues/63>), resolves `~` and
+/// `Include` against `dirs::home_dir()` and does not detect a cycle
+/// (<https://github.com/veeso/ssh2-config/issues/64>), and keeps only the
+/// first `Include` argument
+/// (<https://github.com/veeso/ssh2-config/issues/65>). This pass covers those three.
 fn stage_text(origin: &Path, content: &str, host_home: &Path, stage: &Path, stack: &mut Vec<PathBuf>, depth: u8) -> Result<String, Error> {
   if depth >= INCLUDE_LIMIT {
     return Err(Error::SshIncludeDepth {
@@ -602,6 +661,12 @@ struct SshDirective<'a> {
 
 /// One `ssh_config` line. The keyword ends at whitespace or `=`. Arguments
 /// split on whitespace outside quotes, and `#` starts a comment there.
+///
+/// `ssh2-config`'s tokenizer is private
+/// (<https://github.com/veeso/ssh2-config/issues/63>), so this is the copy
+/// the staging pass can call. `Include` arguments are all kept here;
+/// the parser itself keeps the first
+/// (<https://github.com/veeso/ssh2-config/issues/65>).
 fn ssh_directive(line: &str) -> Option<SshDirective<'_>> {
   let trimmed = line.trim();
   if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -672,7 +737,11 @@ fn split_ssh_args(input: &str) -> Vec<String> {
 
 /// `~` expands against the host home. A relative path resolves under
 /// `~/.ssh`, which is where ssh itself looks.
-fn ssh_path(raw: &str, host_home: &Path) -> PathBuf {
+///
+/// `ssh2-config` expands the same prefixes against `dirs::home_dir()`
+/// (<https://github.com/veeso/ssh2-config/issues/64>). The config being
+/// adapted belongs to `host_home`, so the expansion stays here.
+pub(crate) fn ssh_path(raw: &str, host_home: &Path) -> PathBuf {
   if let Some(rest) = raw.strip_prefix("~/") {
     host_home.join(rest)
   } else if raw == "~" {
@@ -682,11 +751,6 @@ fn ssh_path(raw: &str, host_home: &Path) -> PathBuf {
   } else {
     host_home.join(".ssh").join(raw)
   }
-}
-
-/// Where the real identity lives on the host.
-pub(crate) fn host_identity_path(identity: &str, host_home: &Path) -> PathBuf {
-  ssh_path(identity, host_home)
 }
 
 /// The container path the decoy identity mounts at, mirroring the source
@@ -971,7 +1035,85 @@ mod tests {
     fs::write(&other, format!("Include {}\n", config.display())).unwrap();
     fs::write(&config, "Include ~/.ssh/other\n").unwrap();
     let err = adapt(&config, &fs::read(&config).unwrap(), "/home/agent", dir.path()).expect_err("cycle");
-    assert!(err.to_string().contains("cycle"), "{err}");
+    assert!(matches!(err, Error::SshIncludeCycle { .. }), "{err:?}");
+  }
+
+  #[test]
+  fn include_nested_under_host_is_rejected() {
+    let (dir, _) = host_home_with_key();
+    let config = dir.path().join(".ssh").join("config");
+    let text = "Host x\n Include other\n";
+    fs::write(&config, text).unwrap();
+    let err = adapt(&config, text.as_bytes(), "/home/agent", dir.path()).expect_err("nested include");
+    assert!(matches!(err, Error::SshNestedInclude), "{err:?}");
+  }
+
+  #[test]
+  fn include_nested_under_host_in_an_included_file_is_rejected() {
+    let (dir, _) = host_home_with_key();
+    let ssh = dir.path().join(".ssh");
+    fs::write(ssh.join("nested"), "Host x\n Include ~/.ssh/more\n").unwrap();
+    fs::write(ssh.join("more"), "Host y\n IdentityFile ~/.ssh/id_ed25519\n").unwrap();
+    let config = ssh.join("config");
+    let text = "Include ~/.ssh/nested\n";
+    fs::write(&config, text).unwrap();
+    let err = adapt(&config, text.as_bytes(), "/home/agent", dir.path()).expect_err("nested include in a child file");
+    assert!(matches!(err, Error::SshNestedInclude), "{err:?}");
+  }
+
+  #[test]
+  fn longer_literal_pattern_is_offered_first() {
+    let (dir, _) = host_home_with_key();
+    let other = SshKey::generate().unwrap();
+    fs::write(dir.path().join(".ssh").join("narrow"), other.to_openssh().unwrap()).unwrap();
+    let config = "Host *.*\n IdentityFile ~/.ssh/id_ed25519\nHost *.prod.corp\n IdentityFile ~/.ssh/narrow\n";
+    let adapted = adapt_in(&dir, config);
+    let decoy = &adapted[0].decoy;
+    let broad = decoy.find("IdentityFile /home/agent/.ssh/id_ed25519").expect("broad key");
+    let narrow = decoy.find("IdentityFile /home/agent/.ssh/narrow").expect("narrow key");
+    assert!(narrow < broad, "the longer literal pattern is offered first:\n{decoy}");
+  }
+
+  #[test]
+  fn hostname_on_a_negated_block_still_emits_the_catch_all() {
+    let (dir, _) = host_home_with_key();
+    let other = SshKey::generate().unwrap();
+    fs::write(dir.path().join(".ssh").join("other"), other.to_openssh().unwrap()).unwrap();
+    let config = "Host !bastion.corp *.corp\n IdentityFile ~/.ssh/id_ed25519\n HostName bastion.corp\nHost *\n IdentityFile ~/.ssh/other\n";
+    let fragment = &adapt_in(&dir, config)[0].fragment;
+    assert!(fragment.contains("\"ssh://*.corp#!bastion.corp\""), "{fragment}");
+    assert!(fragment.contains("\"ssh://bastion.corp\""), "{fragment}");
+    assert!(fragment.contains("\"ssh://*\""), "{fragment}");
+  }
+
+  #[test]
+  fn hostname_percent_h_expands_for_a_concrete_host() {
+    let (dir, _) = host_home_with_key();
+    let config = "Host web.corp\n HostName %h.internal\n IdentityFile ~/.ssh/id_ed25519\n";
+    let adapted = adapt_in(&dir, config);
+    let fragment = &adapted[0].fragment;
+    assert!(fragment.contains("ssh://web.corp.internal"), "{fragment}");
+    assert!(!fragment.contains("%h"), "{fragment}");
+  }
+
+  #[test]
+  fn hostname_percent_h_on_a_wildcard_is_rejected() {
+    let (dir, _) = host_home_with_key();
+    let config = dir.path().join(".ssh").join("config");
+    let text = "Host *.corp\n HostName %h.internal\n IdentityFile ~/.ssh/id_ed25519\n";
+    fs::write(&config, text).unwrap();
+    let err = adapt(&config, text.as_bytes(), "/home/agent", dir.path()).expect_err("wildcard percent");
+    assert!(matches!(err, Error::SshHostname { .. }), "{err:?}");
+  }
+
+  #[test]
+  fn hostname_unknown_percent_token_is_rejected() {
+    let (dir, _) = host_home_with_key();
+    let config = dir.path().join(".ssh").join("config");
+    let text = "Host web.corp\n HostName %n\n IdentityFile ~/.ssh/id_ed25519\n";
+    fs::write(&config, text).unwrap();
+    let err = adapt(&config, text.as_bytes(), "/home/agent", dir.path()).expect_err("unknown token");
+    assert!(matches!(err, Error::SshHostname { .. }), "{err:?}");
   }
 
   #[test]
@@ -983,8 +1125,8 @@ mod tests {
     let (root, content) = include_chain(&dir, 17);
     let failed = adapt(&root, content.as_bytes(), "/home/agent", dir.path());
     assert!(
-      matches!(failed, Err(ref err) if err.to_string().contains("16")),
-      "17 files exceed the limit"
+      matches!(failed, Err(Error::SshIncludeDepth { limit: 16, .. })),
+      "17 files exceed the limit: {failed:?}"
     );
   }
 

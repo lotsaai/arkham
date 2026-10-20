@@ -44,7 +44,7 @@ use url::Url;
 use crate::adapt::{BLOB_PREFIX_GIT, DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment, rewrite_label};
 use crate::decoys::Decoy;
 use crate::error::Error;
-use crate::ssh::{host_identity_path, mirror_container_path};
+use crate::ssh::{mirror_container_path, ssh_path};
 
 /// One forge endpoint a remote or credential scope names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -418,7 +418,7 @@ fn ssh_mint(source: &Path, config: &GitConfig, endpoint: &ForgeEndpoint, home: &
     tracing::warn!(host = %endpoint.host, command = %command, "core.sshCommand states no -i identity: the ssh-config adapter covers identity selection");
     return Ok(None);
   };
-  let real_path = host_identity_path(&identity, host_home);
+  let real_path = ssh_path(&identity, host_home);
   let Ok(real) = fs::read_to_string(&real_path) else {
     tracing::warn!(host = %endpoint.host, identity = %real_path.display(), "ssh remote skipped: the identity is unreadable");
     return Ok(None);
