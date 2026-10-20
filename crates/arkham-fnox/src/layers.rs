@@ -714,6 +714,21 @@ mod tests {
   }
 
   #[test]
+  fn project_local_under_a_profile_keeps_root_keys_and_prefers_the_profile_table() {
+    let host = Host::new();
+    host.write(
+      "work/fnox.local.toml",
+      &(secret("TOKEN", "from-root") + &secret("ONLY_ROOT", "root") + "[profiles.staging.secrets.TOKEN]\ndefault = \"from-profile\"\n"),
+    );
+    set_profile("staging");
+    let _cwd = host.enter("work");
+
+    let config = discover().unwrap();
+    assert_eq!(value(&config, "TOKEN").as_deref(), Some("from-profile"));
+    assert_eq!(value(&config, "ONLY_ROOT").as_deref(), Some("root"));
+  }
+
+  #[test]
   fn root_true_stops_the_walk_above_it() {
     let host = Host::new();
     host.write("arkham/fnox.toml", &secret("GITHUB_TOKEN", "arkham"));
