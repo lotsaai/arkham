@@ -1,7 +1,7 @@
 
 [package]
 name = "arkham"
-version = "0.3.29"
+version = "0.3.30"
 edition = "2024"
 description = "Secure your coding agent: decoy credentials that work, real secrets swapped in only on granted hosts"
 license = "Apache-2.0"
