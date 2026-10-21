@@ -34,6 +34,21 @@ ignore = [
   "RUSTSEC-2026-0346",
   "RUSTSEC-2026-0349",
 
+  # webpki-roots 0.26.11 is a semver shim that re-exports webpki-roots 1.x,
+  # and Cargo.lock resolves that to 1.0.10, which already removes the
+  # distrusted emSign ECC Root CA - G3. Only the shim's version number
+  # matches; no distrusted root ships. Delete if the shim stops resolving
+  # to >=1.0.10.
+  "RUSTSEC-2026-0381",
+
+  # rustls-webpki 0.101.7 has no 0.101 backport of the emSign intermediate
+  # distrust. It rides rustls 0.21 in aws-smithy-http-client's
+  # legacy-rustls-ring client under fnox-core, which trusts the OS root
+  # store via rustls-native-certs, not a bundled one, and is used only for
+  # AWS SDK calls. Direct rustls uses rustls-webpki >=0.103.16. Unblock
+  # when fnox-core stops enabling the aws-sdk legacy rustls default.
+  "RUSTSEC-2026-0382",
+
   # Marvinattack on rsa; no fixed release exists upstream, both locked
   # versions are affected. Revisit when a fix ships.
   "RUSTSEC-2023-0071",
