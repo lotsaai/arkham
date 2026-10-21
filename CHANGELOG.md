@@ -1,8 +1,22 @@
+## [0.3.30] - 2026-10-21
+
+### 🐛 Bug Fixes
+
+- *(face)* Fail closed when eBPF has no cgroup (#105)
+
+### 🚜 Refactor
+
+- *(config)* Validate rules through the validator derive (#99)
 ## [0.3.29] - 2026-10-21
 
 ### 🧪 Testing
 
 - *(amqp)* Drive the guest with lapin and fe2o3-amqp (#86)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.29 [ci skip]
+- Release
 ## [0.3.28] - 2026-10-21
 
 ### 🚀 Features
