@@ -9,9 +9,6 @@ repository = "https://github.com/casualjim/arkham"
 keywords = ["agents", "secrets", "mitm", "proxy", "tls"]
 categories = ["network-programming", "command-line-utilities"]
 
-[package.metadata.dist]
-# arkham is a single static-friendly binary; container + tarballs ship from CI.
-
 [package.metadata.release]
 sign-commit = false
 sign-tag = false
@@ -185,7 +182,6 @@ confique = { workspace = true }
 dirs = { workspace = true }
 eyre = { workspace = true }
 libc = { workspace = true }
-miette = { workspace = true }
 mimalloc = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -197,7 +193,6 @@ arkham-tproxy = { workspace = true }
 arkham-tun = { workspace = true }
 
 [dev-dependencies]
-pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

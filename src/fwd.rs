@@ -150,7 +150,9 @@ fn desired_listeners() -> eyre::Result<BTreeMap<u16, IpAddr>> {
       );
       continue;
     }
-    let row = &group[0];
+    let Some(row) = group.first() else {
+      continue;
+    };
     if !attributable(row.inode) {
       tracing::trace!(port, inode = row.inode, "loopback listener is not agent-owned; not forwarded");
       continue;

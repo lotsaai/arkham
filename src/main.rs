@@ -282,3 +282,24 @@ where
     }
   }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+  use arkham_config::cli::{Cli, ProxyBackend};
+
+  use super::{ServeArgs, serve};
+
+  #[tokio::test]
+  async fn ebpf_without_a_cgroup_is_rejected() {
+    let cli = Cli { config: None };
+    let args = ServeArgs {
+      proxy_backend: ProxyBackend::Ebpf,
+      ..Default::default()
+    };
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), serve(&cli, args))
+      .await
+      .expect("ebpf without a cgroup served the explicit listener")
+      .unwrap_err();
+    assert_eq!(err.to_string(), "--ebpf-cgroup is required for --proxy-backend ebpf");
+  }
+}
