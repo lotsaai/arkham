@@ -30,6 +30,7 @@ static USER_CONFIG_RE: LazyLock<Regex> = LazyLock::new(|| {
 use crate::adapt::{BLOB_PREFIX_NATS, DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment};
 use crate::error::Error;
 use crate::paths::{normalize, path_under_home};
+use crate::rewrites::RewriteCollector;
 
 const DROPPED_KEYS: &[&str] = &[
   "cert",
@@ -48,12 +49,35 @@ const DROPPED_KEYS: &[&str] = &[
 
 /// One discovered context directory, ready for the ambient pass.
 pub(crate) struct AdaptedNats {
-  /// One grant per derived context. The first entry carries every guest file.
-  pub(crate) adapted: Vec<RewriteAdapted>,
-  /// Container path of the selected context JSON.
-  pub(crate) context_dest: String,
+  /// One grant per derived context. The selected context is first. Each entry's decoy is that context's JSON.
+  pub(crate) grants: Vec<NatsGrant>,
+  /// The one `context.txt`, naming the selected context.
+  pub(crate) context_txt: DecoyFile,
   /// Contexts that were named and left out.
   pub(crate) skipped: Vec<NatsSkip>,
+}
+
+/// One context's grant. `adapted.decoy` is that context's JSON. `adapted.decoy_files` are its credential files.
+pub(crate) struct NatsGrant {
+  /// Grant fragment, decoy JSON, and credential files.
+  pub(crate) adapted: RewriteAdapted,
+  /// Container path of this context's JSON.
+  pub(crate) dest: String,
+}
+
+impl AdaptedNats {
+  /// Mount every context JSON, its credential files, and the one `context.txt`.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a guest file cannot be written.
+  pub(crate) fn install(self, collector: &mut RewriteCollector) -> Result<(), Error> {
+    collector.mount_decoy_file(&self.context_txt)?;
+    for (index, grant) in self.grants.into_iter().enumerate() {
+      collector.twin(vec![grant.adapted], &format!("{BLOB_PREFIX_NATS}context-{index}"), &grant.dest)?;
+    }
+    Ok(())
+  }
 }
 
 /// Why one context file did not become a grant.
@@ -144,7 +168,7 @@ impl NatsContextTree<'_> {
       })
       .collect::<Vec<_>>();
     let ids = identities(&refs)?;
-    let mut selected_grant = None;
+    let mut primary = None;
     let mut others = Vec::new();
     let mut skipped = Vec::new();
     for (name, path) in &files {
@@ -162,18 +186,36 @@ impl NatsContextTree<'_> {
           tracing::warn!(%skip, "nats context skipped");
           skipped.push(skip);
         }
-        ContextOutcome::Grant(grant) if name == &selected => selected_grant = Some(grant),
-        ContextOutcome::Grant(grant) => others.push((name.clone(), grant)),
+        ContextOutcome::Grant(grant) if name == &selected => primary = Some(grant),
+        ContextOutcome::Grant(grant) => others.push(grant),
       }
     }
-    let Some(primary) = selected_grant else {
+    let Some(primary) = primary else {
       return Err(self.missing_selected(&selected));
     };
-    let found = finish(primary, others, skipped);
+    let found = self.assemble(&selected, primary, others, skipped);
     if !found.skipped.is_empty() {
       tracing::debug!(skipped = found.skipped.len(), "nats contexts left out of the grant set");
     }
     Ok(Some(found))
+  }
+
+  fn assemble(&self, selected: &str, primary: NatsGrant, others: Vec<NatsGrant>, skipped: Vec<NatsSkip>) -> AdaptedNats {
+    let mut grants = vec![primary];
+    grants.extend(others);
+    AdaptedNats {
+      grants,
+      context_txt: self.context_txt(selected),
+      skipped,
+    }
+  }
+
+  fn context_txt(&self, selected: &str) -> DecoyFile {
+    DecoyFile {
+      name: format!("{BLOB_PREFIX_NATS}context-txt"),
+      bytes: format!("{selected}\n").into_bytes(),
+      container: format!("{}/.config/nats/context.txt", self.home),
+    }
   }
 
   fn missing_selected(&self, selected: &str) -> Error {
@@ -244,45 +286,8 @@ impl NatsContextTree<'_> {
 }
 
 enum ContextOutcome {
-  Grant(AdaptedNats),
+  Grant(NatsGrant),
   Skip(NatsSkip),
-}
-
-fn finish(primary: AdaptedNats, others: Vec<(String, AdaptedNats)>, skipped: Vec<NatsSkip>) -> AdaptedNats {
-  let mut adapted = primary.adapted;
-  let mut extra_files = Vec::new();
-  let mut rest = Vec::new();
-  for (name, other) in others {
-    let Some(entry) = other.adapted.into_iter().next() else {
-      continue;
-    };
-    extra_files.push(DecoyFile {
-      name: format!("{BLOB_PREFIX_NATS}context-{name}.json"),
-      bytes: entry.decoy.into_bytes(),
-      container: other.context_dest,
-    });
-    for file in entry.decoy_files {
-      if file.name == format!("{BLOB_PREFIX_NATS}context-txt") {
-        continue;
-      }
-      extra_files.push(file);
-    }
-    rest.push(RewriteAdapted {
-      fragment: entry.fragment,
-      decoy: String::new(),
-      materialized: entry.materialized,
-      decoy_files: Vec::new(),
-    });
-  }
-  if let Some(carrier) = adapted.first_mut() {
-    carrier.decoy_files.extend(extra_files);
-  }
-  adapted.extend(rest);
-  AdaptedNats {
-    adapted,
-    context_dest: primary.context_dest,
-    skipped,
-  }
 }
 
 fn context_name(text: &str) -> Option<&str> {
@@ -380,27 +385,19 @@ impl NatsContextTree<'_> {
       file: path.to_path_buf(),
       detail: format!("context json: {err}"),
     })?;
-    let mut decoy_files = vec![DecoyFile {
-      name: format!("{BLOB_PREFIX_NATS}context-txt"),
-      bytes: format!("{name}\n").into_bytes(),
-      container: format!("{}/.config/nats/context.txt", self.home),
-    }];
-    if let Some(guest) = guest {
-      decoy_files.push(DecoyFile {
-        name: format!("{BLOB_PREFIX_NATS}{label}.credential"),
-        bytes: guest.bytes.into_bytes(),
-        container: guest.container,
-      });
-    }
-    Ok(ContextOutcome::Grant(AdaptedNats {
-      context_dest: format!("{}/.config/nats/context/{name}.json", self.home),
-      adapted: vec![RewriteAdapted {
+    let decoy_files = Vec::from_iter(guest.map(|guest| DecoyFile {
+      name: format!("{BLOB_PREFIX_NATS}{label}.credential"),
+      bytes: guest.bytes.into_bytes(),
+      container: guest.container,
+    }));
+    Ok(ContextOutcome::Grant(NatsGrant {
+      adapted: RewriteAdapted {
         fragment,
         decoy,
         materialized,
         decoy_files,
-      }],
-      skipped: Vec::new(),
+      },
+      dest: format!("{}/.config/nats/context/{name}.json", self.home),
     }))
   }
 }
@@ -695,8 +692,12 @@ mod tests {
     adapt(root, "/home/eng", home).expect("adapt").expect("selected context maps")
   }
 
+  fn primary(found: &AdaptedNats) -> &RewriteAdapted {
+    &found.grants[0].adapted
+  }
+
   fn rule_of(found: &AdaptedNats) -> RuleCfg {
-    let doc: RulesDoc = toml::from_str(&found.adapted[0].fragment).expect("fragment");
+    let doc: RulesDoc = toml::from_str(&primary(found).fragment).expect("fragment");
     doc.rules.into_values().next().expect("one rule")
   }
 
@@ -749,13 +750,13 @@ mod tests {
     assert!(!fake.contains("real-nats-pass"), "{fake}");
     assert!(real.contains("handshake_first=true"), "{real}");
     assert!(!fake.contains("handshake_first"), "{fake}");
-    let decoy: Value = serde_json::from_str(&found.adapted[0].decoy).unwrap();
+    let decoy: Value = serde_json::from_str(&primary(&found).decoy).unwrap();
     assert_eq!(decoy["user"], "agent");
     assert_eq!(decoy["tls_first"], true);
     assert_eq!(decoy["jetstream_domain"], "app");
     assert_ne!(decoy["password"], "real-nats-pass");
-    assert!(!found.adapted[0].decoy.contains("real-nats-pass"));
-    assert!(!found.adapted[0].decoy.contains("other-real-pass"));
+    assert!(!primary(&found).decoy.contains("real-nats-pass"));
+    assert!(!primary(&found).decoy.contains("other-real-pass"));
     assert!(
       found.skipped.iter().any(|skip| matches!(
         skip,
@@ -765,18 +766,10 @@ mod tests {
       "{:?}",
       found.skipped
     );
-    assert!(
-      !found.adapted[0]
-        .decoy_files
-        .iter()
-        .any(|file| file.container.ends_with("other.json"))
-    );
-    let mounted = found.adapted[0]
-      .decoy_files
-      .iter()
-      .any(|file| file.container == "/home/eng/.config/nats/context.txt");
-    assert!(mounted);
-    assert_eq!(found.context_dest, "/home/eng/.config/nats/context/demo.json");
+    assert!(found.grants.iter().all(|grant| !grant.dest.ends_with("other.json")));
+    assert_eq!(found.context_txt.container, "/home/eng/.config/nats/context.txt");
+    assert_eq!(found.context_txt.bytes, b"demo\n");
+    assert_eq!(found.grants[0].dest, "/home/eng/.config/nats/context/demo.json");
   }
 
   #[test]
@@ -801,7 +794,7 @@ mod tests {
     NatsScope::from_strings(&fake, &real).expect("creds grant");
     assert!(real.contains(&seed), "the grant holds the real seed");
     assert!(real.contains(&jwt), "the grant holds the real jwt");
-    let guest = found.adapted[0]
+    let guest = primary(&found)
       .decoy_files
       .iter()
       .find(|file| file.container.contains("user.creds"))
@@ -811,9 +804,9 @@ mod tests {
     assert!(guest_text.contains(SEED_BEGIN));
     assert!(!guest_text.contains(&seed));
     assert!(!guest_text.contains(&jwt));
-    assert!(!found.adapted[0].decoy.contains(&seed));
-    assert!(!found.adapted[0].decoy.contains(&jwt));
-    let decoy: Value = serde_json::from_str(&found.adapted[0].decoy).unwrap();
+    assert!(!primary(&found).decoy.contains(&seed));
+    assert!(!primary(&found).decoy.contains(&jwt));
+    let decoy: Value = serde_json::from_str(&primary(&found).decoy).unwrap();
     assert!(decoy["creds"].as_str().unwrap().contains(".nkeys/user.creds"));
   }
 
@@ -834,7 +827,7 @@ mod tests {
     let rule = rule_of(&found);
     let real = rule.real.unwrap().expose_secret().to_string();
     assert!(real.contains(&seed));
-    let guest = &found.adapted[0]
+    let guest = &primary(&found)
       .decoy_files
       .iter()
       .find(|file| file.container.ends_with("operator.nk"))
@@ -852,7 +845,7 @@ mod tests {
     let real = rule.real.unwrap();
     assert!(real.expose_secret().contains("real-token"));
     assert!(real.expose_secret().contains("localhost"));
-    assert!(!found.adapted[0].decoy.contains("real-token"));
+    assert!(!primary(&found).decoy.contains("real-token"));
 
     write_context(&root, "bad", r#"{"url":"nats://a:4222,nats://b:4222","token":"real-token"}"#);
     assert!(adapt(&root, "/home/eng", home.path()).is_err());
@@ -876,13 +869,13 @@ mod tests {
     fs::write(ssh.join("config"), decorate_creds(&jwt, &seed)).unwrap();
     write_context(&root, "demo", r#"{"url":"nats://nats.internal:4222","creds":"../../.ssh/config"}"#);
     let found = adapted(&root, home.path());
-    let containers: Vec<&str> = found.adapted[0].decoy_files.iter().map(|file| file.container.as_str()).collect();
+    let containers: Vec<&str> = primary(&found).decoy_files.iter().map(|file| file.container.as_str()).collect();
     assert!(containers.iter().all(|path| !path.contains("..")), "{containers:?}");
     assert!(
       containers.iter().any(|path| path.starts_with("/home/eng/.config/nats/decoy/")),
       "{containers:?}"
     );
-    let guest = found.adapted[0]
+    let guest = primary(&found)
       .decoy_files
       .iter()
       .find(|file| file.container.contains("decoy"))
@@ -904,7 +897,7 @@ mod tests {
     fs::write(creds.join("user.creds"), decorate_creds(&jwt, &seed)).unwrap();
     write_context(&root, "demo", r#"{"url":"nats://nats.internal:4222","creds":"creds/user.creds"}"#);
     let found = adapted(&root, home.path());
-    let guest = found.adapted[0]
+    let guest = primary(&found)
       .decoy_files
       .iter()
       .find(|file| file.container.ends_with("/.config/nats/creds/user.creds"))
@@ -927,7 +920,7 @@ mod tests {
     std::os::unix::fs::symlink(&outside, creds.join("link.creds")).unwrap();
     write_context(&root, "demo", r#"{"url":"nats://nats.internal:4222","creds":"creds/link.creds"}"#);
     let found = adapted(&root, home.path());
-    let guest = found.adapted[0]
+    let guest = primary(&found)
       .decoy_files
       .iter()
       .find(|file| file.container == "/home/eng/.config/nats/creds/link.creds")
@@ -936,7 +929,7 @@ mod tests {
     assert!(!guest_text.contains(&seed));
     assert!(rule_of(&found).real.unwrap().expose_secret().contains(&seed));
     assert!(
-      !found.adapted[0]
+      !primary(&found)
         .decoy_files
         .iter()
         .any(|file| file.container.contains("outside.creds"))
@@ -953,13 +946,13 @@ mod tests {
       r#"{"url":"nats://nats.internal:4222","user":"agent","password":"real-token","description":"kept","name":"demo","operator_note":"kept-too","windows_cert_match":"subject","user_jwt":"eyJhbGci.e30.sig"}"#, // betterleaks:allow
     );
     let found = adapted(&root, home.path());
-    let decoy: Value = serde_json::from_str(&found.adapted[0].decoy).unwrap();
+    let decoy: Value = serde_json::from_str(&primary(&found).decoy).unwrap();
     assert_eq!(decoy["description"], "kept");
     assert_eq!(decoy["name"], "demo");
     assert_eq!(decoy["operator_note"], "kept-too");
     assert!(decoy.get("windows_cert_match").is_none());
     assert!(decoy.get("user_jwt").is_none());
-    assert!(!found.adapted[0].decoy.contains("real-token"));
+    assert!(!primary(&found).decoy.contains("real-token"));
     assert_ne!(decoy["password"], "real-token");
   }
 
@@ -1026,7 +1019,7 @@ mod tests {
       .find(|field| <&str>::from(field.name) == "pass")
       .expect("pass");
     assert_eq!(pass.pair.real.expose_secret(), password);
-    assert!(!found.adapted[0].decoy.contains(password));
+    assert!(!primary(&found).decoy.contains(password));
 
     write_context(
       &root,
@@ -1092,7 +1085,7 @@ mod tests {
       &format!(r#"{{"url":"nats://nats.internal:4222","creds":"{}"}}"#, creds.display()),
     );
     let found = adapted(&root, home.path());
-    let containers: Vec<&str> = found.adapted[0].decoy_files.iter().map(|file| file.container.as_str()).collect();
+    let containers: Vec<&str> = primary(&found).decoy_files.iter().map(|file| file.container.as_str()).collect();
     assert!(
       containers.iter().any(|path| path.starts_with("/home/eng/.config/nats/decoy/")),
       "{containers:?}"
@@ -1103,7 +1096,7 @@ mod tests {
         .all(|path| !path.contains(outside.path().to_string_lossy().as_ref())),
       "{containers:?}"
     );
-    let guest = found.adapted[0]
+    let guest = primary(&found)
       .decoy_files
       .iter()
       .find(|file| file.container.contains("decoy"))
@@ -1132,7 +1125,7 @@ mod tests {
     let real = rule_of(&found).real.unwrap().expose_secret().to_string();
     assert!(real.contains(&seed));
     assert!(real.contains(&jwt));
-    let guest = found.adapted[0]
+    let guest = primary(&found)
       .decoy_files
       .iter()
       .find(|file| {
@@ -1146,8 +1139,8 @@ mod tests {
     assert!(guest_text.contains(JWT_BEGIN));
     assert!(!guest_text.contains(&seed));
     assert!(!guest_text.contains(&jwt));
-    assert!(!found.adapted[0].decoy.contains(&seed));
-    assert!(!found.adapted[0].decoy.contains(&jwt));
+    assert!(!primary(&found).decoy.contains(&seed));
+    assert!(!primary(&found).decoy.contains(&jwt));
     let scope = NatsScope::from_strings(rule_of(&found).value.unwrap().expose_secret(), &real).expect("inline user jwt");
     assert!(scope.auth.signer().is_some());
   }
@@ -1252,6 +1245,16 @@ mod tests {
     }
     let selected = guest.iter().find(|(path, _)| path.ends_with("context.txt")).expect("context.txt");
     assert_eq!(selected.1, "pass\n");
+    assert_eq!(found.context_txt.bytes, b"pass\n");
+    assert_eq!(found.grants.len(), 3);
+    assert!(found.grants.iter().all(|grant| !grant.adapted.decoy.is_empty()));
+    assert!(found.grants.iter().all(|grant| {
+      grant
+        .adapted
+        .decoy_files
+        .iter()
+        .all(|file| !file.container.ends_with("context.txt") && !file.container.contains("/context/"))
+    }));
     for (_, text) in &guest {
       assert!(!text.contains("real-nats-pass"), "{text}");
       assert!(!text.contains(&nkey_seed), "{text}");
@@ -1308,18 +1311,21 @@ mod tests {
 
   fn rules_of(found: &AdaptedNats) -> Vec<(String, RuleCfg)> {
     let mut rules = Vec::new();
-    for adapted in &found.adapted {
-      let doc: RulesDoc = toml::from_str(&adapted.fragment).expect("fragment");
+    for grant in &found.grants {
+      let doc: RulesDoc = toml::from_str(&grant.adapted.fragment).expect("fragment");
       rules.extend(doc.rules);
     }
     rules
   }
 
   fn guest_tree(found: &AdaptedNats) -> Vec<(String, String)> {
-    let mut guest = Vec::new();
-    if let Some(first) = found.adapted.first() {
-      guest.push((found.context_dest.clone(), first.decoy.clone()));
-      for file in &first.decoy_files {
+    let mut guest = vec![(
+      found.context_txt.container.clone(),
+      String::from_utf8(found.context_txt.bytes.clone()).expect("context.txt is utf-8"),
+    )];
+    for grant in &found.grants {
+      guest.push((grant.dest.clone(), grant.adapted.decoy.clone()));
+      for file in &grant.adapted.decoy_files {
         guest.push((
           file.container.clone(),
           String::from_utf8(file.bytes.clone()).expect("guest file is utf-8"),

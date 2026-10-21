@@ -10,7 +10,7 @@ use arkham_config::config::{FileRewrite, RewriteFormat, config_dir};
 use arkham_pki::ca::{CertAuthority, load_or_generate};
 use xpanda::Xpanda;
 
-use crate::adapt::{RewriteAdapted, sniff};
+use crate::adapt::{DecoyFile, RewriteAdapted, sniff};
 use crate::decoys::Decoy;
 use crate::error::Error;
 use crate::expand::{apply_rewrites, expand_path, expand_value, rewrite_file_name};
@@ -167,17 +167,27 @@ impl RewriteCollector {
   /// Returns an error when a side file cannot be written.
   fn decoy_files(&mut self, first: &RewriteAdapted) -> Result<(), Error> {
     for file in &first.decoy_files {
-      let file_path = self.files_dir.join(&file.name);
-      fs::write(&file_path, &file.bytes).map_err(|source| Error::WriteFile {
-        path: file_path.clone(),
-        source,
-      })?;
-      self.mounts.push(Mount {
-        host: file_path,
-        container: PathBuf::from(&file.container),
-        ro: true,
-      });
+      self.mount_decoy_file(file)?;
     }
+    Ok(())
+  }
+
+  /// Write one decoy side file and mount it read-only at its container path.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the file cannot be written.
+  pub(crate) fn mount_decoy_file(&mut self, file: &DecoyFile) -> Result<(), Error> {
+    let file_path = self.files_dir.join(&file.name);
+    fs::write(&file_path, &file.bytes).map_err(|source| Error::WriteFile {
+      path: file_path.clone(),
+      source,
+    })?;
+    self.mounts.push(Mount {
+      host: file_path,
+      container: PathBuf::from(&file.container),
+      ro: true,
+    });
     Ok(())
   }
 

@@ -231,7 +231,7 @@ impl AmbientDeriver<'_> {
       return Ok(());
     }
     match nats::adapt(&root, self.home, self.host_home) {
-      Ok(Some(found)) => self.collector.twin(found.adapted, "nats-context", &found.context_dest),
+      Ok(Some(found)) => found.install(&mut self.collector),
       Ok(None) => Ok(()),
       Err(err) => {
         tracing::warn!(source = %root.display(), %err, "nats source skipped");
