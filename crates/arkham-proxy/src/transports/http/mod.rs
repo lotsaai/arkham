@@ -18,7 +18,7 @@ use rama::tls::client::NegotiatedTlsParameters;
 use rama::tls::server::InputWithClientHello;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use arkham_config::grants::{ResolvedConfig, Scheme};
+use arkham_config::grants::{Grant, ResolvedConfig, Scheme};
 
 use arkham_plugin::Direction as HookDirection;
 use rama::net::tls::ApplicationProtocol;
@@ -31,7 +31,7 @@ use crate::identity::{CandidateParams, Hello, read_client_hello, read_http_head}
 use crate::into_box_error;
 use crate::mint::MintHandle;
 use crate::relay::relay_guarded;
-use crate::transports::engine::{Direction, H2, Http, Raw};
+use crate::transports::engine::{Direction, H2, Http, Raw, mint_plan_for};
 use crate::transports::tcp;
 use crate::transports::tcp::raw_tcp_pair;
 
@@ -238,8 +238,9 @@ where
 
   async fn serve(&self, input: BridgeIo<TlsStream<GI>, TlsStream<GE>>) -> Result<Self::Output, Self::Error> {
     let BridgeIo(mut guest_tls, mut server_tls) = input;
-    // The handshake records which grants this connection may swap. A single
-    // grant leaves that record absent and the full list stands.
+    // The handshake records which grants may replace a decoy on the request.
+    // A single grant leaves that record absent. Response redaction always
+    // scans the full snapshot, so a sibling real value still becomes its decoy.
     let selected = guest_tls.extensions().get_ref::<SelectedHttps>().map(|selected| {
       selected
         .indices
@@ -253,10 +254,11 @@ where
         port: self.port,
       }));
     }
-    let grants = selected.as_deref().unwrap_or(self.snapshot.grants.as_slice());
+    let request_grants = selected.as_deref().unwrap_or(self.snapshot.grants.as_slice());
+    let redact_grants = self.snapshot.grants.as_slice();
     // Schemes below are grant scopes (authorization), never selection.
     let ctx = PairCtx {
-      grants,
+      grants: request_grants,
       host: &self.identity,
       port: self.port,
       plugins: &self.plugins,
@@ -277,7 +279,7 @@ where
     // an unnegotiated connection is never HTTP/2.
     match negotiated {
       Some(proto) if proto.as_bytes() == ApplicationProtocol::HTTP_2.as_bytes() => {
-        let (mut downstream_machine, mut upstream_machine) = https_h2_pair(&ctx);
+        let (mut downstream_machine, mut upstream_machine) = https_h2_pair(&ctx, redact_grants);
         relay_guarded(
           &mut guest_tls,
           &mut server_tls,
@@ -290,7 +292,7 @@ where
         .map_err(|err| into_box_error(&err))
       }
       Some(proto) if proto.as_bytes() == ApplicationProtocol::HTTP_11.as_bytes() => {
-        let (mut downstream_machine, mut upstream_machine) = https_pair(&ctx);
+        let (mut downstream_machine, mut upstream_machine) = https_pair(&ctx, redact_grants);
         relay_guarded(
           &mut guest_tls,
           &mut server_tls,
@@ -303,7 +305,7 @@ where
         .map_err(|err| into_box_error(&err))
       }
       _ => {
-        let (mut downstream_machine, mut upstream_machine) = raw_tls_pair(&ctx);
+        let (mut downstream_machine, mut upstream_machine) = raw_tls_pair(&ctx, redact_grants);
         relay_guarded(
           &mut guest_tls,
           &mut server_tls,
@@ -344,7 +346,20 @@ pub(crate) fn http_pair(ctx: &PairCtx<'_>) -> (Http, Http) {
 }
 
 /// Both directions behind terminated TLS, HTTP/1 framing.
-pub(crate) fn https_pair(ctx: &PairCtx<'_>) -> (Http, Http) {
+///
+/// `redact` is the grant list scanned on the response. It is the full
+/// snapshot, wider than `ctx.grants` when the handshake selected a subset.
+pub(crate) fn https_pair(ctx: &PairCtx<'_>, redact: &[Grant]) -> (Http, Http) {
+  let mut upstream = Http::new(
+    redact,
+    Scheme::Https,
+    ctx.host,
+    ctx.port,
+    Direction::Upstream,
+    ctx.plugins.select(Scheme::Https, ctx.host, ctx.port, HookDirection::Response),
+    ctx.mint.clone(),
+  );
+  upstream.set_mint_plan(mint_plan_for(ctx.grants, Scheme::Https, ctx.host, ctx.port));
   (
     Http::new(
       ctx.grants,
@@ -355,20 +370,25 @@ pub(crate) fn https_pair(ctx: &PairCtx<'_>) -> (Http, Http) {
       ctx.plugins.select(Scheme::Https, ctx.host, ctx.port, HookDirection::Request),
       ctx.mint.clone(),
     ),
-    Http::new(
-      ctx.grants,
-      Scheme::Https,
-      ctx.host,
-      ctx.port,
-      Direction::Upstream,
-      ctx.plugins.select(Scheme::Https, ctx.host, ctx.port, HookDirection::Response),
-      ctx.mint.clone(),
-    ),
+    upstream,
   )
 }
 
 /// Both directions behind terminated TLS, HTTP/2 framing.
-pub(crate) fn https_h2_pair(ctx: &PairCtx<'_>) -> (H2, H2) {
+///
+/// `redact` is the grant list scanned on the response. It is the full
+/// snapshot, wider than `ctx.grants` when the handshake selected a subset.
+pub(crate) fn https_h2_pair(ctx: &PairCtx<'_>, redact: &[Grant]) -> (H2, H2) {
+  let mut upstream = H2::new(
+    redact,
+    Scheme::Https,
+    ctx.host,
+    ctx.port,
+    Direction::Upstream,
+    ctx.plugins.select(Scheme::Https, ctx.host, ctx.port, HookDirection::Response),
+    ctx.mint.clone(),
+  );
+  upstream.set_mint_plan(mint_plan_for(ctx.grants, Scheme::Https, ctx.host, ctx.port));
   (
     H2::new(
       ctx.grants,
@@ -379,24 +399,19 @@ pub(crate) fn https_h2_pair(ctx: &PairCtx<'_>) -> (H2, H2) {
       ctx.plugins.select(Scheme::Https, ctx.host, ctx.port, HookDirection::Request),
       ctx.mint.clone(),
     ),
-    H2::new(
-      ctx.grants,
-      Scheme::Https,
-      ctx.host,
-      ctx.port,
-      Direction::Upstream,
-      ctx.plugins.select(Scheme::Https, ctx.host, ctx.port, HookDirection::Response),
-      ctx.mint.clone(),
-    ),
+    upstream,
   )
 }
 
 /// Terminated TLS without HTTP structure: raw equal-length swap on https
 /// grants.
-pub(crate) fn raw_tls_pair(ctx: &PairCtx<'_>) -> (Raw, Raw) {
+///
+/// `redact` is the grant list scanned on the response. It is the full
+/// snapshot, wider than `ctx.grants` when the handshake selected a subset.
+pub(crate) fn raw_tls_pair(ctx: &PairCtx<'_>, redact: &[Grant]) -> (Raw, Raw) {
   (
     Raw::new(ctx.grants, Scheme::Https, ctx.host, ctx.port, Direction::Downstream),
-    Raw::new(ctx.grants, Scheme::Https, ctx.host, ctx.port, Direction::Upstream),
+    Raw::new(redact, Scheme::Https, ctx.host, ctx.port, Direction::Upstream),
   )
 }
 

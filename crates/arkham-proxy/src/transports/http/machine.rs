@@ -179,6 +179,14 @@ impl Http {
     wire
   }
 
+  /// Point minting at `plan` when redaction pairs came from a wider grant list.
+  ///
+  /// Request selection narrows which decoys become real values. Response
+  /// redaction still scans every grant, and minting stays on the selected ones.
+  pub(crate) fn set_mint_plan(&mut self, plan: Option<MintPlan>) {
+    self.mint_plan = plan;
+  }
+
   /// Rebuild the active pair set: static grants plus every minted decoy.
   /// Called at construction and at each message head, so pairs minted
   /// mid-connection go live immediately.

@@ -1342,6 +1342,126 @@ async fn https_guest_cert_selects_cert_user_beside_token_user() {
   proxy.abort();
 }
 
+/// A selected identity still sees sibling real values rewritten to their decoys.
+/// The request path keeps swapping only the selected grants.
+#[tokio::test]
+async fn https_response_redacts_sibling_grant_values() {
+  const TOKEN_FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const TOKEN_VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const CERT_FAKE: &str = "ghp_cccccccccccccccccccccccccccccccccccccccc";
+  const CERT_VALUE: &str = "ghp_dddddddddddddddddddddddddddddddddddddddd";
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let bundle = dir.path().join("arkham-ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let cert_user = guest_material(&ca, dir.path(), "cert-user");
+  let body = format!("{TOKEN_VALUE}{CERT_VALUE}");
+  let reply = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = listener.local_addr().unwrap().port();
+  let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+  let seen_task = Arc::clone(&seen);
+  let acceptor = TlsAcceptor::from(upstream_config(&ca, false));
+  let stub_task = tokio::spawn(async move {
+    loop {
+      let Ok((conn, _)) = listener.accept().await else { return };
+      let seen = Arc::clone(&seen_task);
+      let acceptor = acceptor.clone();
+      let reply = reply.clone();
+      tokio::spawn(async move {
+        let Ok(mut tls) = acceptor.accept(conn).await else { return };
+        let head = read_head_from(&mut tls).await;
+        seen.lock().await.push(head);
+        let _ = tls.write_all(reply.as_bytes()).await;
+      });
+    }
+  });
+  let grants = vec![
+    https_user_grant("token-user", TOKEN_FAKE, TOKEN_VALUE, stub_port, None, &bundle, GuestTlsMode::Tls),
+    https_user_grant(
+      &cert_user.label,
+      CERT_FAKE,
+      CERT_VALUE,
+      stub_port,
+      Some((cert_user.cert.clone(), cert_user.key.clone())),
+      &bundle,
+      GuestTlsMode::Mtls,
+    ),
+  ];
+  let state = test_state_with_plugins(grants, Vec::new(), &ca);
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+
+  let cert_response = sibling_exchange(
+    proxy_addr,
+    stub_port,
+    client_config(&ca, Some((cert_user.guest_chain.clone(), cert_user.guest_key.clone_key()))),
+    &format!("x-cert: {CERT_FAKE}\r\nauthorization: Bearer {TOKEN_FAKE}\r\n"),
+    body.len(),
+  )
+  .await;
+  let token_response = sibling_exchange(
+    proxy_addr,
+    stub_port,
+    client_config(&ca, None),
+    &format!("authorization: Bearer {TOKEN_FAKE}\r\n"),
+    body.len(),
+  )
+  .await;
+
+  let redacted = format!("{TOKEN_FAKE}{CERT_FAKE}");
+  assert_eq!(
+    cert_response,
+    redacted.as_bytes(),
+    "cert user must not receive the token user's real value"
+  );
+  assert_eq!(
+    token_response,
+    redacted.as_bytes(),
+    "token user must not receive the cert user's real value"
+  );
+  let seen = seen.lock().await;
+  assert_eq!(seen.len(), 2);
+  assert!(
+    seen[0].windows(CERT_VALUE.len()).any(|window| window == CERT_VALUE.as_bytes()),
+    "cert user still swaps their own decoy"
+  );
+  assert!(
+    !seen[0].windows(TOKEN_VALUE.len()).any(|window| window == TOKEN_VALUE.as_bytes()),
+    "cert user must not swap the token user's bearer"
+  );
+  assert!(seen[1].windows(TOKEN_VALUE.len()).any(|window| window == TOKEN_VALUE.as_bytes()));
+  drop(seen);
+  stub_task.abort();
+  proxy.abort();
+}
+
+async fn sibling_exchange(
+  proxy_addr: SocketAddr,
+  stub_port: u16,
+  config: Arc<rustls::ClientConfig>,
+  headers: &str,
+  body_len: usize,
+) -> Vec<u8> {
+  let mut guest = TcpStream::connect(proxy_addr).await.unwrap();
+  guest
+    .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\n\r\n").as_bytes())
+    .await
+    .unwrap();
+  let mut ok = [0u8; 19];
+  guest.read_exact(&mut ok).await.unwrap();
+  let mut tls = TlsConnector::from(config)
+    .connect(ServerName::try_from("localhost".to_string()).unwrap(), guest)
+    .await
+    .unwrap();
+  tls
+    .write_all(format!("GET / HTTP/1.1\r\nhost: localhost\r\n{headers}\r\n").as_bytes())
+    .await
+    .unwrap();
+  let head = read_head_from(&mut tls).await;
+  read_body(&mut tls, &head, body_len).await
+}
+
 /// An arkham-CA guest certificate that matches no grant is rejected. It does
 /// not authenticate as the first grant.
 #[tokio::test]
