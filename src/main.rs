@@ -292,8 +292,10 @@ mod tests {
   #[tokio::test]
   async fn ebpf_without_a_cgroup_is_rejected() {
     let cli = Cli { config: None };
-    let mut args = ServeArgs::default();
-    args.proxy_backend = ProxyBackend::Ebpf;
+    let args = ServeArgs {
+      proxy_backend: ProxyBackend::Ebpf,
+      ..Default::default()
+    };
     let err = tokio::time::timeout(std::time::Duration::from_secs(5), serve(&cli, args))
       .await
       .expect("ebpf without a cgroup served the explicit listener")
