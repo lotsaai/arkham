@@ -1,6 +1,6 @@
 [package]
 name = "arkham-ebpf"
-version = "0.3.30"
+version = "0.3.31"
 edition = "2024"
 description = "grant-scoped MITM proxy: eBPF capture backend"
 license = "Apache-2.0"

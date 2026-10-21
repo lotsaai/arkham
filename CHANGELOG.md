@@ -7,6 +7,11 @@
 ### 🚜 Refactor
 
 - *(config)* Validate rules through the validator derive (#99)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.30 [ci skip]
+- Release
 ## [0.3.29] - 2026-10-21
 
 ### 🧪 Testing
