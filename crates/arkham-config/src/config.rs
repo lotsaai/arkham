@@ -475,9 +475,8 @@ pub struct HostTlsCfg {
 }
 
 /// Per-entry SSH key material, keyed by the rule's own `allow` entry string.
-/// All three paths are required for an `ssh://` entry: the resolve step
-/// fails closed when any is missing. Compose writes the blobs; the proxy
-/// reads them at startup.
+/// Both paths are required for an `ssh://` entry: the resolve step
+/// fails closed when either is missing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostSshCfg {
@@ -840,30 +839,21 @@ impl AppConfig {
           env: rule.env.clone(),
         });
       }
-      if rule.env.is_empty() {
-        return Err(Error::EmptyEnv { label: label.clone() });
-      }
+      rule.validate().map_err(|source| Error::InvalidRule {
+        label: label.clone(),
+        source,
+      })?;
       if let Some(value) = &rule.value
         && value.expose_secret().is_empty()
       {
         return Err(Error::EmptyValue { label: label.clone() });
       }
       for entry in &rule.allow {
-        let scope: EndpointScope = entry.parse().map_err(|err| Error::BadAllow {
-          label: label.clone(),
-          entry: entry.clone(),
-          detail: err,
-        })?;
-        if matches!(scope.host, HostPat::Any) {
+        if let Ok(scope) = entry.parse::<EndpointScope>()
+          && matches!(scope.host, HostPat::Any)
+        {
           tracing::warn!(label, entry, "grant matches any host; secret is exfil-risky");
         }
-      }
-      if let Some(pattern) = rule.pattern.as_deref().filter(|p| !p.is_empty()) {
-        validate_pattern(pattern).map_err(|err| Error::BadPattern {
-          label: label.clone(),
-          pattern: pattern.to_string(),
-          detail: err,
-        })?;
       }
       if let Some(flow) = &rule.oauth2 {
         validate_flow(flow, "config", label)?;
@@ -1102,11 +1092,7 @@ pub fn reference_samples() -> Result<String, Error> {
     real: None,
     generated: false,
     fnox_key: Some("EXAMPLE_FNOX_KEY".to_string()),
-    allow: vec![
-      "https://api.example".to_string(),
-      "postgres://db.example:5432/app?sslmode=verify-full&sslrootcert=/certs/bundle.pem".to_string(),
-      "ssh://git.example".to_string(),
-    ],
+    allow: vec!["https://api.example".to_string(), "ssh://git.example".to_string()],
     pattern: Some("example_{hex:32}".to_string()),
     oauth2: Some(OAuthFlow {
       flow: FlowKind::ClientCredentials,
@@ -1586,6 +1572,51 @@ guest_key = "/arkham/grants/rules.d/t.guest_key"
     set_env("ARKHAM_CONFIG", &global);
     let err = load(&cli_for(&["arkham"]), None).unwrap_err();
     assert!(err.to_string().contains("gopher://h"), "{err:?}");
+    scrub_env();
+  }
+
+  #[test]
+  fn validate_rejects_empty_env() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    write_file(&global, "[rules.bad]\nenv = \"\"\nvalue = \"v\"\nallow = [\"https://h.example\"]\n");
+    set_env("ARKHAM_CONFIG", &global);
+    let message = load(&cli_for(&["arkham"]), None).unwrap_err().to_string();
+    assert!(message.contains("rule `bad`"), "{message}");
+    assert!(message.contains("env: env must not be empty"), "{message}");
+    scrub_env();
+  }
+
+  #[test]
+  fn validate_rejects_a_bad_pattern() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    write_file(
+      &global,
+      "[rules.bad]\nenv = \"B\"\nvalue = \"v\"\nallow = [\"https://h.example\"]\npattern = \"{bogus:10}\"\n",
+    );
+    set_env("ARKHAM_CONFIG", &global);
+    let message = load(&cli_for(&["arkham"]), None).unwrap_err().to_string();
+    assert!(message.contains("rule `bad`"), "{message}");
+    assert!(message.contains("pattern: bad pattern"), "{message}");
+    assert!(message.contains("{bogus:10}"), "{message}");
+    scrub_env();
+  }
+
+  #[test]
+  fn any_host_allow_still_loads() {
+    let _guard = lock_env();
+    scrub_env();
+    let dir = tempfile::tempdir().unwrap();
+    let global = dir.path().join("global.toml");
+    write_file(&global, "[rules.wide]\nenv = \"W\"\nvalue = \"v\"\nallow = [\"https://*\"]\n");
+    set_env("ARKHAM_CONFIG", &global);
+    let (config, _) = load(&cli_for(&["arkham"]), None).unwrap();
+    assert_eq!(config.rules["wide"].allow, ["https://*"]);
     scrub_env();
   }
 

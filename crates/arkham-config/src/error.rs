@@ -10,6 +10,7 @@ use serde_json::Error as JsonError;
 use toml::de::Error as TomlError;
 use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
+use validator::ValidationErrors;
 
 use crate::grants::{AmqpUriError, LdapUriError, NatsUriError, Scheme, SmtpUriError};
 
@@ -67,11 +68,14 @@ pub enum Error {
     /// Shared env name.
     env: String,
   },
-  /// A rule names an empty env var.
-  #[error("rule `{label}`: `env` must not be empty")]
-  EmptyEnv {
+  /// A rule fails the field checks on [`crate::RuleCfg`].
+  #[error("rule `{label}`: {source}")]
+  InvalidRule {
     /// Rule label.
     label: String,
+    /// Field errors from the rule validator.
+    #[source]
+    source: ValidationErrors,
   },
   /// A rule states an empty inline value.
   #[error("rule `{label}`: `value` must not be empty")]
@@ -94,16 +98,6 @@ pub enum Error {
     /// Offending entry.
     entry: String,
     /// Parse failure.
-    detail: String,
-  },
-  /// A fake `pattern` does not compile as a template.
-  #[error("rule `{label}`: bad pattern `{pattern}`: {detail}")]
-  BadPattern {
-    /// Rule label.
-    label: String,
-    /// Offending pattern.
-    pattern: String,
-    /// Validation failure.
     detail: String,
   },
   /// Port 0 cannot be published.
