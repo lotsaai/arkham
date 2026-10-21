@@ -360,7 +360,7 @@ fn local_ipv4_addrs() -> Vec<Ipv4Addr> {
     let Some(sa) = (unsafe { entry.ifa_addr.cast::<libc::sockaddr_in>().as_ref() }) else {
       continue;
     };
-    let addr = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+    let addr = decode_addr(sa.sin_addr.s_addr);
     if !addr.is_loopback() && !out.contains(&addr) {
       out.push(addr);
     }
@@ -670,9 +670,9 @@ impl Config {
   ///
   /// # Errors
   ///
-  /// Returns [`Error::ListenPortsZero`] for a zero listen port and
-  /// [`Error::InvalidBypassPrefix`] for a prefix outside `1..=32` or more
-  /// entries than [`MAX_BYPASS`].
+  /// Returns [`Error::ListenPortsZero`] for a zero listen port,
+  /// [`Error::InvalidBypassPrefix`] for a prefix outside `1..=32`, and
+  /// [`Error::TooManyBypasses`] for more entries than [`MAX_BYPASS`].
   fn from_bypass(
     proxy_pid: u32,
     proxy_cgroup: u64,
@@ -684,9 +684,10 @@ impl Config {
     if tcp_port == 0 || udp_port == 0 {
       return Err(Error::ListenPortsZero);
     }
-    if bypass.len() > MAX_BYPASS {
-      return Err(Error::TooManyBypasses { count: bypass.len() });
-    }
+    let bypass_count = match u8::try_from(bypass.len()) {
+      Ok(count) if usize::from(count) <= MAX_BYPASS => u32::from(count),
+      _ => return Err(Error::TooManyBypasses { count: bypass.len() }),
+    };
     let mut nets = [0u32; MAX_BYPASS];
     let mut lens = [0u8; MAX_BYPASS];
     for (i, (addr, len)) in bypass.iter().enumerate() {
@@ -703,9 +704,7 @@ impl Config {
       tcp_port: u32::from(tcp_port),
       udp_port: u32::from(udp_port),
       netns_cookie,
-      // `from_bypass` already bounds the list at `MAX_BYPASS`; the fallback
-      // is unreachable and keeps the constructor total.
-      bypass_count: u32::try_from(bypass.len()).unwrap_or(u32::MAX),
+      bypass_count,
       bypass_nets: nets,
       bypass_lens: lens,
       _pad2: [0; 4],
@@ -733,12 +732,10 @@ pub(crate) fn encode_addr(addr: Ipv4Addr) -> u32 {
 
 /// Port encoding the kernel uses in `bpf_sock_addr.user_port`, which holds
 /// the port in network byte order in its low 16 bits.
-pub(crate) fn decode_port(raw: u32) -> Option<u16> {
-  // The kernel writes this field with a 2-byte store, so the upper half is
-  // always zero; a value outside that shape decodes to `None` and callers
-  // treat it as "not this flow" instead of truncating.
+pub(crate) fn decode_port(raw: u32) -> u16 {
   let low = raw & u32::from(u16::MAX);
-  u16::try_from(low).ok().map(u16::from_be)
+  let [lo, hi, _, _] = low.to_le_bytes();
+  u16::from_be(u16::from_le_bytes([lo, hi]))
 }
 
 /// Inverse of [`decode_port`].
@@ -773,9 +770,8 @@ pub(crate) struct OrigDst {
 unsafe impl aya::Pod for OrigDst {}
 
 impl OrigDst {
-  /// The destination as a socket address, when the recorded port decodes.
-  pub(crate) fn socket_addr(&self) -> Option<SocketAddr> {
-    Some(SocketAddr::from((decode_addr(self.ip), decode_port(self.port)?)))
+  pub(crate) fn socket_addr(&self) -> SocketAddr {
+    SocketAddr::from((decode_addr(self.ip), decode_port(self.port)))
   }
 }
 
@@ -932,9 +928,18 @@ mod tests {
   #[test]
   fn port_encoding_round_trips_through_the_kernel_layout() {
     for port in [1u16, 53, 443, TCP_LISTEN_PORT, UDP_LISTEN_PORT, u16::MAX] {
-      assert_eq!(decode_port(encode_port(port)), Some(port));
+      assert_eq!(decode_port(encode_port(port)), port);
     }
     assert_eq!(encode_port(TCP_LISTEN_PORT), u32::from(TCP_LISTEN_PORT.to_be()));
+  }
+
+  #[test]
+  fn decode_port_truncates_a_dirty_high_half() {
+    let port = 443u16;
+    let raw = encode_port(port) | 0xA5A5_0000;
+    assert_eq!(decode_port(raw), port);
+    assert_eq!(decode_port(0), 0);
+    assert_eq!(decode_port(u32::MAX), u16::MAX);
   }
 
   /// The listener's own address must decode back to the loopback address the
@@ -947,7 +952,7 @@ mod tests {
       proto: 6,
       _pad: [0; 3],
     };
-    assert_eq!(orig.socket_addr(), Some(SocketAddr::from(([127, 0, 0, 1], TCP_LISTEN_PORT))));
+    assert_eq!(orig.socket_addr(), SocketAddr::from(([127, 0, 0, 1], TCP_LISTEN_PORT)));
   }
 
   /// A flow key built from an accepted connection's peer must decode back to
