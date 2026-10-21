@@ -1,22 +1,25 @@
 //! Kubeconfig adapter for `file_rewrite`: a kubectl config file is a
 //! differently structured form of the same information a rule holds, so the
 //! adapter derives the grant from the file instead of asking the operator to
-//! state it twice. Only the `current-context` maps; the file is the secret
-//! source, so a kube entry stating `envs` is an error rather than a second
-//! source.
+//! state it twice. Every derivable context maps onto one grant per user. The
+//! file is the secret source, so a kube entry stating `envs` is an error
+//! rather than a second source.
 //!
 //! Detection is structural: a YAML mapping with `kind: Config` and a
 //! `clusters:` table takes the adapter path, everything else keeps the raw
-//! byte-swap. The decoy twin keeps the server (transparent capture makes the
-//! destination the identity) and swaps the trust and identity: arkham's CA,
-//! the minted guest pair, and the decoy token.
+//! byte-swap. The decoy twin keeps every context and the server (transparent
+//! capture makes the destination the identity) and swaps the trust and
+//! identity: arkham's CA, a minted guest pair per user, and that user's decoy
+//! token. Two client-certificate users of one API server host and port fail
+//! the file. Any other context that cannot be derived is skipped. The
+//! `current-context` failing still fails the file.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::{HostTlsCfg, RewriteFormat, fake_for};
-use arkham_config::grants::{EndpointScope, GuestTlsMode, Scheme, decoy_for_rule};
+use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme, decoy_for_rule};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
@@ -145,41 +148,93 @@ struct KubeProviderConfig {
   access_token: Option<String>,
 }
 
-/// The selection `current-context` resolves to, validated: its cluster and
-/// user, the server scope, and the bearer token if any.
-struct Selected<'a> {
-  cluster: &'a KubeClusterEntry,
-  user: &'a KubeUserEntry,
-  scope: EndpointScope,
-  token: Option<&'a str>,
+impl KubeUser {
+  fn bearer(&self) -> Option<&str> {
+    self
+      .token
+      .as_deref()
+      .or_else(|| {
+        self
+          .auth_provider
+          .as_ref()
+          .and_then(|provider| provider.config.access_token.as_deref())
+      })
+      .filter(|token| !token.is_empty())
+  }
 }
 
-impl KubeDoc {
-  /// Resolve and validate the `current-context` selection: known context,
-  /// known cluster with an HTTPS server, known user.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the context is missing or unknown, names no
-  /// cluster or user, the cluster states no server or a non-HTTPS one, or
-  /// the user is unknown.
-  fn selected(&self, invalid: impl Fn(String) -> Error) -> Result<Selected<'_>, Error> {
-    if self.current_context.is_empty() {
-      return Err(invalid("missing `current-context`".to_string()));
+/// One context resolved to a server and a credential.
+struct Derived<'a> {
+  context: &'a str,
+  user: &'a str,
+  /// API server URL, as written.
+  server: &'a str,
+  /// Parsed server.
+  scope: EndpointScope,
+  /// Bearer, when the user has one.
+  token: Option<&'a str>,
+  /// Decoded client certificate.
+  cert: Option<Vec<u8>>,
+  /// Decoded client key.
+  key: Option<Vec<u8>>,
+  /// Decoded cluster CA.
+  ca: Option<Vec<u8>>,
+}
+
+impl Derived<'_> {
+  fn cert_endpoint(&self) -> Option<(&str, u16)> {
+    self.cert.as_ref()?;
+    match &self.scope.host {
+      HostPat::Exact(host) => Some((host.as_str(), self.scope.port)),
+      HostPat::Wildcard(_) | HostPat::Any => None,
     }
-    let context = self
-      .contexts
-      .iter()
-      .find(|entry| entry.name == self.current_context)
-      .ok_or_else(|| invalid(format!("unknown context `{}`", self.current_context)))?;
-    if context.context.cluster.is_empty() || context.context.user.is_empty() {
-      return Err(invalid(format!("context `{}` names no `cluster` or no `user`", context.name)));
+  }
+
+  /// The https arm offers the first grant's client certificate during the
+  /// upstream handshake, before it can read a bearer. Token users of one
+  /// server stay distinct: the decoy bearer selects the real token.
+  fn shared_client_cert(opened: &[Self]) -> Option<String> {
+    let mut by_endpoint: BTreeMap<(String, u16), BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
+    for derived in opened {
+      let Some((host, port)) = derived.cert_endpoint() else {
+        continue;
+      };
+      by_endpoint
+        .entry((host.to_string(), port))
+        .or_default()
+        .entry(derived.user)
+        .or_default()
+        .push(derived.context);
     }
-    let cluster = self
+    for ((host, port), users) in by_endpoint {
+      if users.len() < 2 {
+        continue;
+      }
+      let mut contexts: Vec<&str> = users.into_values().flatten().collect();
+      contexts.sort_unstable();
+      contexts.dedup();
+      let listed = contexts.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", ");
+      return Some(format!("contexts {listed} at {host}:{port} present client certificates"));
+    }
+    None
+  }
+}
+
+impl KubeContextEntry {
+  fn derive<'a>(&'a self, doc: &'a KubeDoc, source: &Path) -> Result<Derived<'a>, Error> {
+    let invalid = |detail: String| Error::RewriteInvalid {
+      file: source.to_path_buf(),
+      format: RewriteFormat::Kubeconfig,
+      detail,
+    };
+    if self.context.cluster.is_empty() || self.context.user.is_empty() {
+      return Err(invalid(format!("context `{}` names no `cluster` or no `user`", self.name)));
+    }
+    let cluster = doc
       .clusters
       .iter()
-      .find(|entry| entry.name == context.context.cluster)
-      .ok_or_else(|| invalid(format!("unknown cluster `{}`", context.context.cluster)))?;
+      .find(|entry| entry.name == self.context.cluster)
+      .ok_or_else(|| invalid(format!("unknown cluster `{}`", self.context.cluster)))?;
     if cluster.cluster.server.is_empty() {
       return Err(invalid(format!("cluster `{}` states no `server`", cluster.name)));
     }
@@ -194,41 +249,193 @@ impl KubeDoc {
         cluster.cluster.server
       )));
     }
-    let user = self
+    let user = doc
       .users
       .iter()
-      .find(|entry| entry.name == context.context.user)
-      .ok_or_else(|| invalid(format!("unknown user `{}`", context.context.user)))?;
-    let token = user
-      .user
-      .token
-      .as_deref()
-      .or_else(|| {
-        user
-          .user
-          .auth_provider
-          .as_ref()
-          .and_then(|provider| provider.config.access_token.as_deref())
-      })
-      .filter(|token| !token.is_empty());
-    Ok(Selected {
-      cluster,
-      user,
+      .find(|entry| entry.name == self.context.user)
+      .ok_or_else(|| invalid(format!("unknown user `{}`", self.context.user)))?;
+    if user.user.cert_file.is_some() || user.user.key_file.is_some() || cluster.cluster.ca_file.is_some() {
+      return Err(invalid(
+        "uses file references; inline them first: `kubectl config view --flatten`".to_string(),
+      ));
+    }
+    let token = user.user.bearer();
+    if user.user.exec.is_some() && token.is_none() && user.user.cert_data.is_none() && user.user.key_data.is_none() {
+      return Err(invalid("exec credential plugins are not supported".to_string()));
+    }
+    let cert = decode(
+      source,
+      RewriteFormat::Kubeconfig,
+      user.user.cert_data.as_deref(),
+      "client-certificate-data",
+    )?;
+    let key = decode(source, RewriteFormat::Kubeconfig, user.user.key_data.as_deref(), "client-key-data")?;
+    if cert.is_some() != key.is_some() {
+      return Err(invalid(format!("user `{}` carries half of the client pair", user.name)));
+    }
+    if token.is_none() && cert.is_none() {
+      return Err(invalid(format!(
+        "user `{}` carries neither `token` nor a client pair: nothing to substitute",
+        user.name
+      )));
+    }
+    let ca = decode(
+      source,
+      RewriteFormat::Kubeconfig,
+      cluster.cluster.ca_data.as_deref(),
+      "certificate-authority-data",
+    )?;
+    Ok(Derived {
+      context: &self.name,
+      user: &user.name,
+      server: &cluster.cluster.server,
       scope,
       token,
+      cert,
+      key,
+      ca,
     })
   }
 }
 
-/// Map a kubeconfig onto its grant fragment and decoy twin. Returns `None`
-/// when the document is not a kubeconfig after all, leaving the caller on
-/// the raw path.
+/// One grant: every server a single user reaches, labeled by the first context.
+struct UserGrant<'a> {
+  /// First context name. The grant label is built from it.
+  context: &'a str,
+  user: &'a str,
+  /// Bearer, when the user has one.
+  token: Option<&'a str>,
+  cert: Option<Vec<u8>>,
+  key: Option<Vec<u8>>,
+  /// Servers in first-seen order: URL, scope, and CA.
+  servers: Vec<(&'a str, EndpointScope, Option<Vec<u8>>)>,
+}
+
+impl<'a> UserGrant<'a> {
+  fn include(grants: &mut Vec<Self>, derived: Derived<'a>) {
+    if let Some(grant) = grants.iter_mut().find(|grant| grant.user == derived.user) {
+      if grant.servers.iter().all(|(server, _, _)| *server != derived.server) {
+        grant.servers.push((derived.server, derived.scope, derived.ca));
+      }
+      return;
+    }
+    grants.push(Self {
+      context: derived.context,
+      user: derived.user,
+      token: derived.token,
+      cert: derived.cert,
+      key: derived.key,
+      servers: vec![(derived.server, derived.scope, derived.ca)],
+    });
+  }
+
+  fn render(self, source: &Path, ca: &CertAuthority, guests_dir: &Path) -> Result<Rendered, Error> {
+    let Self {
+      context,
+      user,
+      token,
+      cert,
+      key,
+      servers,
+    } = self;
+    let label = rewrite_label(source, context)?;
+    let env = label.to_uppercase().replace('-', "_");
+    // Identity-only grants (cert auth, no bearer) still need a value to
+    // resolve; the certificate never reaches the wire as application data, so
+    // it can never match the swap.
+    let value = token.map_or_else(
+      || String::from_utf8_lossy(cert.as_deref().unwrap_or_default()).into_owned(),
+      str::to_string,
+    );
+    let mut servers = servers.into_iter();
+    let Some((first_server, first_scope, first_ca)) = servers.next() else {
+      return Err(Error::RewriteInvalid {
+        file: source.to_path_buf(),
+        format: RewriteFormat::Kubeconfig,
+        detail: format!("user `{user}` has no server"),
+      });
+    };
+    let mut scopes = vec![first_scope];
+    let mut allow = vec![first_server.to_string()];
+    let blobs = kube_blobs(&label, cert, key, first_ca, ca, guests_dir)?;
+    let mut tls = BTreeMap::from([(first_server.to_string(), blobs.tls.clone())]);
+    let mut materialized = blobs.materialized;
+    for (index, (server, scope, bundle)) in servers.enumerate() {
+      let n = index.checked_add(1).ok_or_else(|| Error::RewriteInvalid {
+        file: source.to_path_buf(),
+        format: RewriteFormat::Kubeconfig,
+        detail: format!("user `{user}` has too many clusters"),
+      })?;
+      let mut entry = blobs.tls.clone();
+      entry.root_cert = None;
+      if let Some(bytes) = bundle {
+        let name = format!("{label}-{n}.ca.crt");
+        entry.root_cert = Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{name}")));
+        materialized.push((name, bytes));
+      }
+      allow.push(server.to_string());
+      tls.insert(server.to_string(), entry);
+      scopes.push(scope);
+    }
+    let (decoy, _) = decoy_for_rule(&env, None, &scopes, value.len());
+    let fragment = render_fragment(
+      source,
+      &label,
+      &GrantFragment {
+        env,
+        registry: false,
+        allow,
+        value: Some(value),
+        real: None,
+        generated: false,
+        if_missing: None,
+        tls,
+        ssh: BTreeMap::new(),
+      },
+    )?;
+    Ok(Rendered {
+      user: user.to_string(),
+      fragment,
+      materialized,
+      guest: GuestUser {
+        token: token.map(|_| decoy),
+        cert: STANDARD.encode(blobs.guest_cert),
+        key: STANDARD.encode(blobs.guest_key),
+      },
+    })
+  }
+}
+
+/// Grant text plus the identity the guest file writes for one user.
+struct Rendered {
+  user: String,
+  /// `[rules.{label}]` fragment.
+  fragment: String,
+  /// Blobs beside the fragment.
+  materialized: Vec<(String, Vec<u8>)>,
+  /// Decoy identity embedded in the guest kubeconfig.
+  guest: GuestUser,
+}
+
+/// Decoy bearer and guest pair for one user in the guest kubeconfig.
+struct GuestUser {
+  /// Decoy bearer. Absent when the user has no token.
+  token: Option<String>,
+  /// Base64 guest certificate.
+  cert: String,
+  /// Base64 guest key.
+  key: String,
+}
+
+/// Map a kubeconfig onto one fragment per derivable user and a decoy twin
+/// that keeps every context. Returns `None` when the document is not a
+/// kubeconfig after all, leaving the caller on the raw path.
 ///
 /// # Errors
 ///
-/// Returns an error when the document does not parse, names no usable
-/// current context, states a non-HTTPS server, or carries no substitutable
-/// credential.
+/// Returns an error when the document does not parse, the current context
+/// cannot be derived, two client-certificate users share an API server host
+/// and port, or a credential field is malformed.
 pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Path) -> Result<Option<RewriteAdapted>, Error> {
   let text = String::from_utf8_lossy(content);
   let doc: KubeDoc = from_str(&text).map_err(|err| Error::RewriteYaml {
@@ -243,81 +450,41 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     format: RewriteFormat::Kubeconfig,
     detail,
   };
-  let Selected {
-    cluster,
-    user,
-    scope,
-    token,
-  } = doc.selected(invalid)?;
-  if user.user.cert_file.is_some() || user.user.key_file.is_some() || cluster.cluster.ca_file.is_some() {
-    return Err(invalid(
-      "uses file references; inline them first: `kubectl config view --flatten --minify`".to_string(),
-    ));
+  if doc.current_context.is_empty() {
+    return Err(invalid("missing `current-context`".to_string()));
   }
-  if user.user.exec.is_some() && token.is_none() && user.user.cert_data.is_none() && user.user.key_data.is_none() {
-    return Err(invalid("exec credential plugins are not supported".to_string()));
+  if !doc.contexts.iter().any(|entry| entry.name == doc.current_context) {
+    return Err(invalid(format!("unknown context `{}`", doc.current_context)));
   }
-  let cert = decode(
-    source,
-    RewriteFormat::Kubeconfig,
-    user.user.cert_data.as_deref(),
-    "client-certificate-data",
-  )?;
-  let key = decode(source, RewriteFormat::Kubeconfig, user.user.key_data.as_deref(), "client-key-data")?;
-  if cert.is_some() != key.is_some() {
-    return Err(invalid(format!("user `{}` carries half of the client pair", user.name)));
+  let mut opened = Vec::with_capacity(doc.contexts.len());
+  for entry in &doc.contexts {
+    match entry.derive(&doc, source) {
+      Ok(derived) => opened.push(derived),
+      Err(err) if entry.name == doc.current_context => return Err(err),
+      Err(err) => tracing::warn!(context = %entry.name, %err, "kube context skipped"),
+    }
   }
-  if token.is_none() && cert.is_none() {
-    return Err(invalid(format!(
-      "user `{}` carries neither `token` nor a client pair: nothing to substitute",
-      user.name
-    )));
+  if let Some(detail) = Derived::shared_client_cert(&opened) {
+    tracing::warn!(%detail, "kube client certificates share one API server");
+    return Err(invalid(detail));
   }
-  let ca_bundle = decode(
-    source,
-    RewriteFormat::Kubeconfig,
-    cluster.cluster.ca_data.as_deref(),
-    "certificate-authority-data",
-  )?;
-  let label = rewrite_label(source, &doc.current_context)?;
-  let env = label.to_uppercase().replace('-', "_");
-  // Identity-only grants (cert auth, no bearer) still need a value to
-  // resolve; the certificate never reaches the wire as application data, so
-  // it can never match the swap.
-  let value = token.map_or_else(
-    || String::from_utf8_lossy(&cert.clone().unwrap_or_default()).into_owned(),
-    str::to_string,
-  );
-  let (decoy_token, _) = decoy_for_rule(&env, None, &[scope], value.len());
-  let blobs = kube_blobs(&label, cert, key, ca_bundle, ca, guests_dir)?;
-  let fragment = render_fragment(
-    source,
-    &label,
-    &GrantFragment {
-      env,
-      registry: false,
-      allow: vec![cluster.cluster.server.clone()],
-      value: Some(value),
-      real: None,
-      generated: false,
-      if_missing: None,
-      tls: BTreeMap::from([(cluster.cluster.server.clone(), blobs.tls)]),
-      ssh: BTreeMap::new(),
-    },
-  )?;
-  let decoy = decoy_doc(
-    &text,
-    source,
-    ca,
-    &blobs.guest_cert,
-    &blobs.guest_key,
-    &user.name,
-    token.map(|_| decoy_token.as_str()),
-  )?;
+  let mut grants = Vec::with_capacity(opened.len());
+  for derived in opened {
+    UserGrant::include(&mut grants, derived);
+  }
+  let mut fragment = String::new();
+  let mut materialized = Vec::new();
+  let mut guests = BTreeMap::new();
+  for grant in grants {
+    let rendered = grant.render(source, ca, guests_dir)?;
+    fragment.push_str(&rendered.fragment);
+    materialized.extend(rendered.materialized);
+    guests.insert(rendered.user, rendered.guest);
+  }
   Ok(Some(RewriteAdapted {
     fragment,
-    decoy,
-    materialized: blobs.materialized,
+    decoy: decoy_doc(&text, source, ca, &guests)?,
+    materialized,
     decoy_files: Vec::new(),
   }))
 }
@@ -391,27 +558,18 @@ fn kube_blobs(
 
 /// The agent's decoy kubeconfig: the parsed document verbatim, with trust
 /// and identity swapped in every entry — arkham's CA under every cluster,
-/// the guest pair and a decoy token in every user — because only decoys may
-/// cross into the agent. `exec` blocks and file-reference credentials are
-/// dropped from every user: they run host binaries or point at host paths
+/// and each granted user's own guest pair and decoy token — because only
+/// decoys may cross into the agent. A user with no grant gets placeholders,
+/// never another user's pair. `exec` blocks and file-reference credentials
+/// are dropped from every user: they run host binaries or point at host paths
 /// the agent cannot see. Every other field, spec'd or not, round-trips
 /// unchanged.
-fn decoy_doc(
-  text: &str,
-  source: &Path,
-  ca: &CertAuthority,
-  guest_cert: &[u8],
-  guest_key: &[u8],
-  active_user: &str,
-  active_decoy: Option<&str>,
-) -> Result<String, Error> {
+fn decoy_doc(text: &str, source: &Path, ca: &CertAuthority, guests: &BTreeMap<String, GuestUser>) -> Result<String, Error> {
   let mut root: Value = from_str(text).map_err(|err| Error::RewriteYaml {
     file: source.to_path_buf(),
     source: err,
   })?;
   let guest_ca = Value::String(STANDARD.encode(ca.cert_pem()));
-  let guest_cert = Value::String(STANDARD.encode(guest_cert));
-  let guest_key = Value::String(STANDARD.encode(guest_key));
   for cluster in entries_mut(&mut root, "clusters") {
     let Some(inner) = cluster
       .get_mut(Value::String("cluster".to_string()))
@@ -434,33 +592,46 @@ fn decoy_doc(
     let Some(inner) = user.get_mut(Value::String("user".to_string())).and_then(Value::as_mapping_mut) else {
       continue;
     };
+    let guest = guests.get(&name);
     let placeholder = || fake_for(&format!("KUBE_{}", name.to_uppercase().replace(['-', '.'], "_")), None);
-    if inner.contains_key(Value::String("token".to_string())) {
-      let decoy = if name == active_user {
-        active_decoy.map(str::to_string)
-      } else {
-        None
-      }
-      .unwrap_or_else(placeholder);
-      inner.insert(Value::String("token".to_string()), Value::String(decoy));
+    let token_key = Value::String("token".to_string());
+    if inner.contains_key(&token_key) {
+      let decoy = guest.and_then(|guest| guest.token.clone()).unwrap_or_else(placeholder);
+      inner.insert(token_key, Value::String(decoy));
     }
     let cert_data = Value::String("client-certificate-data".to_string());
     let key_data = Value::String("client-key-data".to_string());
     if inner.contains_key(&cert_data) || inner.contains_key(&key_data) {
-      inner.insert(cert_data, guest_cert.clone());
-      inner.insert(key_data, guest_key.clone());
+      let (cert, key) = guest.map_or_else(
+        || {
+          let filler = placeholder();
+          (filler.clone(), filler)
+        },
+        |guest| (guest.cert.clone(), guest.key.clone()),
+      );
+      inner.insert(cert_data, Value::String(cert));
+      inner.insert(key_data, Value::String(key));
     }
     inner.remove(Value::String("client-certificate".to_string()));
     inner.remove(Value::String("client-key".to_string()));
+    let token_present = inner.contains_key(Value::String("token".to_string()));
     let auth_provider = Value::String("auth-provider".to_string());
     if let Some(config) = inner
       .get_mut(&auth_provider)
       .and_then(Value::as_mapping_mut)
       .and_then(|provider| provider.get_mut(Value::String("config".to_string())))
       .and_then(Value::as_mapping_mut)
-      && config.contains_key(Value::String("access-token".to_string()))
     {
-      config.insert(Value::String("access-token".to_string()), Value::String(placeholder()));
+      let access = Value::String("access-token".to_string());
+      if config.contains_key(&access) {
+        let decoy = if token_present {
+          None
+        } else {
+          guest.and_then(|guest| guest.token.clone())
+        }
+        .unwrap_or_else(placeholder);
+        config.insert(access, Value::String(decoy));
+      }
     }
     if inner.contains_key(Value::String("password".to_string())) {
       inner.insert(Value::String("password".to_string()), Value::String(placeholder()));
@@ -720,6 +891,274 @@ users:
     assert!(err.to_string().contains("plain HTTP"), "{err}");
   }
 
+  fn rule_decoy(rule: &RuleCfg) -> String {
+    use secrecy::ExposeSecret as _;
+
+    let value = rule.value.as_ref().expect("grant value").expose_secret();
+    let scopes: Vec<EndpointScope> = rule.allow.iter().map(|entry| entry.parse().expect("allow entry")).collect();
+    decoy_for_rule(&rule.env, None, &scopes, value.len()).0
+  }
+
+  #[test]
+  fn two_contexts_on_different_servers_grant_each_user() {
+    let doc = "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {cluster: prod, user: alice}
+- name: staging
+  context: {cluster: staging, user: bob}
+clusters:
+- name: prod
+  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}
+- name: staging
+  cluster: {server: https://10.2.0.1:6443, certificate-authority-data: Q1RFU1Q=}
+users:
+- name: alice
+  user: {token: alice-token}
+- name: bob
+  user: {client-certificate-data: Q0VSVA==, client-key-data: S0VZ}
+";
+    let adapted = adapt_doc(doc);
+    let rules = rules_from(&adapted.fragment);
+    assert_eq!(rules.len(), 2, "one grant per user: {}", adapted.fragment);
+    let mut modes = Vec::new();
+    let mut decoys = Vec::new();
+    for rule in rules.values() {
+      let tls = rule.tls.values().next().expect("tls entry");
+      modes.push(tls.guest_tls_mode);
+      decoys.push(rule_decoy(rule));
+    }
+    assert!(modes.contains(&GuestTlsMode::Tls), "bearer user stays plain TLS: {modes:?}");
+    assert!(modes.contains(&GuestTlsMode::Mtls), "client pair stays mutual TLS: {modes:?}");
+    let allows: Vec<&str> = rules.values().flat_map(|rule| rule.allow.iter().map(String::as_str)).collect();
+    assert!(allows.contains(&"https://10.0.0.1:6443"), "{allows:?}");
+    assert!(allows.contains(&"https://10.2.0.1:6443"), "{allows:?}");
+    assert_ne!(decoys[0], decoys[1], "each user has its own decoy");
+    let token_decoy = rules
+      .values()
+      .find(|rule| rule.tls.values().any(|tls| tls.guest_tls_mode == GuestTlsMode::Tls))
+      .map(rule_decoy)
+      .expect("bearer grant");
+    assert!(
+      adapted.decoy.contains(&token_decoy),
+      "guest file carries the bearer decoy: {}",
+      adapted.decoy
+    );
+    assert!(adapted.decoy.contains("name: prod"), "{}", adapted.decoy);
+    assert!(adapted.decoy.contains("name: staging"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("alice-token"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("Q0VSVA=="), "{}", adapted.decoy);
+    assert!(
+      !adapted.decoy.contains("Q0E=") && !adapted.decoy.contains("Q1RFU1Q="),
+      "{}",
+      adapted.decoy
+    );
+  }
+
+  #[test]
+  fn two_token_users_on_one_server_each_get_a_grant() {
+    let doc = "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {cluster: shared, user: alice}
+- name: staging
+  context: {cluster: shared, user: bob}
+clusters:
+- name: shared
+  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}
+users:
+- name: alice
+  user: {token: alice-token}
+- name: bob
+  user: {token: bob-token}
+";
+    let adapted = adapt_doc(doc);
+    let rules = rules_from(&adapted.fragment);
+    assert_eq!(rules.len(), 2, "token users on one server are two grants: {}", adapted.fragment);
+    let decoys: Vec<String> = rules.values().map(rule_decoy).collect();
+    assert_ne!(decoys[0], decoys[1]);
+    assert!(decoys.iter().all(|decoy| adapted.decoy.contains(decoy)), "{}", adapted.decoy);
+    assert!(
+      !adapted.decoy.contains("alice-token") && !adapted.decoy.contains("bob-token"),
+      "{}",
+      adapted.decoy
+    );
+    assert!(adapted.decoy.contains("name: staging"), "{}", adapted.decoy);
+  }
+
+  #[test]
+  fn token_user_beside_a_client_cert_on_one_server_is_granted() {
+    let doc = "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {cluster: shared, user: alice}
+- name: staging
+  context: {cluster: shared, user: bob}
+clusters:
+- name: shared
+  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}
+users:
+- name: alice
+  user: {token: alice-token}
+- name: bob
+  user: {client-certificate-data: Q0VSVA==, client-key-data: S0VZ}
+";
+    let adapted = adapt_doc(doc);
+    let rules = rules_from(&adapted.fragment);
+    assert_eq!(
+      rules.len(),
+      2,
+      "a token user beside one client certificate is two grants: {}",
+      adapted.fragment
+    );
+    let decoys: Vec<String> = rules.values().map(rule_decoy).collect();
+    assert_ne!(decoys[0], decoys[1]);
+    let bearer = rules
+      .values()
+      .find(|rule| rule.tls.values().any(|tls| tls.guest_tls_mode == GuestTlsMode::Tls))
+      .map(rule_decoy)
+      .expect("bearer grant");
+    assert!(adapted.decoy.contains(&bearer), "{}", adapted.decoy);
+    assert!(
+      !adapted.decoy.contains("alice-token") && !adapted.decoy.contains("Q0VSVA=="),
+      "{}",
+      adapted.decoy
+    );
+    assert!(adapted.decoy.contains("name: staging"), "{}", adapted.decoy);
+  }
+
+  #[test]
+  fn one_user_on_two_servers_is_one_grant() {
+    let doc = "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {cluster: a, user: alice}
+- name: staging
+  context: {cluster: b, user: alice}
+clusters:
+- name: a
+  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}
+- name: b
+  cluster: {server: https://10.2.0.1:6443, certificate-authority-data: Q1RFU1Q=}
+users:
+- name: alice
+  user: {token: alice-token}
+";
+    let adapted = adapt_doc(doc);
+    let rules = rules_from(&adapted.fragment);
+    assert_eq!(rules.len(), 1, "a shared user is one grant: {}", adapted.fragment);
+    let rule = rules.values().next().expect("grant");
+    assert!(rule.allow.iter().any(|entry| entry == "https://10.0.0.1:6443"), "{:?}", rule.allow);
+    assert!(rule.allow.iter().any(|entry| entry == "https://10.2.0.1:6443"), "{:?}", rule.allow);
+    assert!(adapted.decoy.contains("name: staging"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("alice-token"), "{}", adapted.decoy);
+  }
+
+  #[test]
+  fn two_client_cert_users_on_one_server_fail_closed() {
+    let doc = "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {cluster: shared, user: alice}
+- name: staging
+  context: {cluster: shared, user: bob}
+clusters:
+- name: shared
+  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}
+users:
+- name: alice
+  user: {client-certificate-data: Q0VSVA==, client-key-data: S0VZ}
+- name: bob
+  user: {client-certificate-data: Qk9C, client-key-data: S0VZ}
+";
+    let dir = tempfile::tempdir().unwrap();
+    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("shared client certificates fail closed");
+    let text = err.to_string();
+    assert!(text.contains("prod") && text.contains("staging"), "{text}");
+    assert!(text.contains("10.0.0.1") && text.contains("6443"), "{text}");
+  }
+
+  #[test]
+  fn inactive_exec_context_is_skipped() {
+    let doc = "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {cluster: prod, user: alice}
+- name: staging
+  context: {cluster: staging, user: plugin}
+clusters:
+- name: prod
+  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}
+- name: staging
+  cluster: {server: https://10.9.0.1:6443, certificate-authority-data: Q1RFU1Q=}
+users:
+- name: alice
+  user: {token: alice-token}
+- name: plugin
+  user: {exec: {command: aws-iam-authenticator}}
+";
+    let adapted = adapt_doc(doc);
+    let rules = rules_from(&adapted.fragment);
+    assert_eq!(rules.len(), 1, "the exec context is not a grant: {}", adapted.fragment);
+    assert!(!adapted.fragment.contains("https://10.9.0.1:6443"), "{}", adapted.fragment);
+    assert!(adapted.decoy.contains("name: staging"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("aws-iam-authenticator"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("alice-token"), "{}", adapted.decoy);
+  }
+
+  #[test]
+  fn access_token_is_a_bearer_grant() {
+    let doc = "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {cluster: prod, user: alice}
+- name: staging
+  context: {cluster: staging, user: gcp}
+clusters:
+- name: prod
+  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}
+- name: staging
+  cluster: {server: https://10.2.0.1:6443, certificate-authority-data: Q1RFU1Q=}
+users:
+- name: alice
+  user: {token: alice-token}
+- name: gcp
+  user: {auth-provider: {name: gcp, config: {access-token: gcp-token}}}
+";
+    let adapted = adapt_doc(doc);
+    let rules = rules_from(&adapted.fragment);
+    assert_eq!(rules.len(), 2, "an access-token is a bearer: {}", adapted.fragment);
+    assert!(
+      !adapted.decoy.contains("gcp-token") && !adapted.decoy.contains("alice-token"),
+      "{}",
+      adapted.decoy
+    );
+    let gcp = rules
+      .values()
+      .find(|rule| rule.allow.iter().any(|entry| entry.contains("10.2.0.1")))
+      .expect("gcp grant");
+    assert!(
+      adapted.decoy.contains(&rule_decoy(gcp)),
+      "access-token carries its decoy: {}",
+      adapted.decoy
+    );
+    assert!(adapted.decoy.contains("name: staging"), "{}", adapted.decoy);
+  }
+
   #[test]
   fn credentialless_user_is_an_error() {
     let doc = BEARER_DOC.replace(
@@ -729,6 +1168,18 @@ users:
     let dir = tempfile::tempdir().unwrap();
     let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("nothing to swap fails closed");
     assert!(err.to_string().contains("nothing to substitute"), "{err}");
+  }
+
+  #[test]
+  fn empty_token_does_not_read_the_access_token() {
+    let doc = BEARER_DOC.replace(
+      "user: {token: k3s-token, client-certificate-data: Q0VSVA==, client-key-data: S0VZ}",
+      "user: {token: \"\", auth-provider: {config: {access-token: gcp-token}}}",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("empty token is not a bearer");
+    assert!(err.to_string().contains("nothing to substitute"), "{err}");
+    assert!(!err.to_string().contains("gcp-token"), "{err}");
   }
 
   #[test]
