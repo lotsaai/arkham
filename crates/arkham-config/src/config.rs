@@ -475,9 +475,8 @@ pub struct HostTlsCfg {
 }
 
 /// Per-entry SSH key material, keyed by the rule's own `allow` entry string.
-/// All three paths are required for an `ssh://` entry: the resolve step
-/// fails closed when any is missing. Compose writes the blobs; the proxy
-/// reads them at startup.
+/// Both paths are required for an `ssh://` entry: the resolve step
+/// fails closed when either is missing.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostSshCfg {
@@ -1102,11 +1101,7 @@ pub fn reference_samples() -> Result<String, Error> {
     real: None,
     generated: false,
     fnox_key: Some("EXAMPLE_FNOX_KEY".to_string()),
-    allow: vec![
-      "https://api.example".to_string(),
-      "postgres://db.example:5432/app?sslmode=verify-full&sslrootcert=/certs/bundle.pem".to_string(),
-      "ssh://git.example".to_string(),
-    ],
+    allow: vec!["https://api.example".to_string(), "ssh://git.example".to_string()],
     pattern: Some("example_{hex:32}".to_string()),
     oauth2: Some(OAuthFlow {
       flow: FlowKind::ClientCredentials,
