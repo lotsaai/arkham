@@ -146,16 +146,12 @@ fn sweep(table: &FlowTable, now: Instant) {
 
 #[cfg(test)]
 mod tests {
-  use std::time::UNIX_EPOCH;
-
   use super::*;
 
-  /// A monotonic instant this long ago, for aging entries in tests.
   fn idle_now() -> Instant {
-    // `Instant` cannot be constructed directly, so this anchors on the epoch
-    // the process started from: only the difference matters.
-    let base = Instant::now();
-    base.checked_sub(FLOW_IDLE * 2).unwrap_or(base)
+    Instant::now()
+      .checked_sub(FLOW_IDLE * 2)
+      .expect("clock is past twice the idle limit")
   }
 
   async fn flow_at(dst: &str, last_active: Instant) -> Arc<Mutex<Flow>> {
@@ -214,11 +210,8 @@ mod tests {
     assert!(table.contains_key(&at_limit), "flow exactly at the limit is still live");
   }
 
-  /// `idle_now` must actually be older than the idle limit, or the sweep tests
-  /// above would pass vacuously.
   #[test]
   fn idle_now_is_older_than_the_limit() {
-    let _ = UNIX_EPOCH;
     assert!(Instant::now().duration_since(idle_now()) > FLOW_IDLE);
   }
 }

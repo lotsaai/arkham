@@ -476,10 +476,16 @@ fn profile_name_from_file(path: &Path) -> Option<String> {
 /// insert is skipped because that field is private in fnox, so profile
 /// inheritance expansion is left to fnox's own `resolve_profiles`.
 fn scope_to_profile(config: &mut Config, profile_name: String) {
-  scope_root_entries_to_profile(config, profile_name);
+  scope_root_entries_to_profile(config, profile_name, true);
 }
 
-fn scope_root_entries_to_profile(config: &mut Config, profile_name: String) {
+fn scope_root_entries_to_profile(
+  config: &mut Config,
+  profile_name: String,
+  include_secrets: bool,
+) -> &mut fnox_core::config::ProfileConfig {
+  let root_secrets = (!include_secrets).then(|| std::mem::take(&mut config.secrets));
+  let root_secret_sources = (!include_secrets).then(|| std::mem::take(&mut config.secret_sources));
   let profile = config.profiles.entry(profile_name).or_default();
   profile.leases.extend(std::mem::take(&mut config.leases));
   profile.providers.extend(std::mem::take(&mut config.providers));
@@ -491,19 +497,18 @@ fn scope_root_entries_to_profile(config: &mut Config, profile_name: String) {
   if config.default_provider_source.is_some() {
     profile.default_provider_source = config.default_provider_source.take();
   }
-}
-
-fn scope_root_entries_to_profile_as_base(config: &mut Config, profile_name: &str, include_secrets: bool) {
-  let overlay = config.profiles.shift_remove(profile_name);
-  let root_secrets = (!include_secrets).then(|| std::mem::take(&mut config.secrets));
-  let root_secret_sources = (!include_secrets).then(|| std::mem::take(&mut config.secret_sources));
-  scope_root_entries_to_profile(config, profile_name.to_string());
   if let Some(root_secrets) = root_secrets {
     config.secrets = root_secrets;
   }
   if let Some(root_secret_sources) = root_secret_sources {
     config.secret_sources = root_secret_sources;
   }
+  profile
+}
+
+fn scope_root_entries_to_profile_as_base(config: &mut Config, profile_name: &str, include_secrets: bool) {
+  let overlay = config.profiles.shift_remove(profile_name);
+  let profile = scope_root_entries_to_profile(config, profile_name.to_string(), include_secrets);
 
   if let Some(mut overlay) = overlay {
     // arkham: ProfileConfig default_provider is a private fnox field, so its name
@@ -511,7 +516,6 @@ fn scope_root_entries_to_profile_as_base(config: &mut Config, profile_name: &str
     // before the fields below are moved out of `overlay`.
     let has_default_provider = overlay.default_provider().is_some();
     let default_provider_source = overlay.default_provider_source.take();
-    let profile = config.profiles.get_mut(profile_name).unwrap();
     if overlay.inherits.is_some() {
       profile.inherits = overlay.inherits;
     }
@@ -711,6 +715,21 @@ mod tests {
     let config = discover().unwrap();
     assert_eq!(value(&config, "GITHUB_TOKEN").as_deref(), Some("local"));
     assert_eq!(value(&config, "ONLY_PLAIN").as_deref(), Some("plain"));
+  }
+
+  #[test]
+  fn project_local_under_a_profile_keeps_root_keys_and_prefers_the_profile_table() {
+    let host = Host::new();
+    host.write(
+      "work/fnox.local.toml",
+      &(secret("TOKEN", "from-root") + &secret("ONLY_ROOT", "root") + "[profiles.staging.secrets.TOKEN]\ndefault = \"from-profile\"\n"),
+    );
+    set_profile("staging");
+    let _cwd = host.enter("work");
+
+    let config = discover().unwrap();
+    assert_eq!(value(&config, "TOKEN").as_deref(), Some("from-profile"));
+    assert_eq!(value(&config, "ONLY_ROOT").as_deref(), Some("root"));
   }
 
   #[test]
