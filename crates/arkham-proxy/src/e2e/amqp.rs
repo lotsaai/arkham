@@ -1,16 +1,21 @@
+use std::sync::Mutex;
+
 use super::*;
 use amq_protocol::frame::{AMQPFrame, WriteContext, gen_frame, parse_frame};
 use amq_protocol::protocol::{AMQPClass, connection};
 use amq_protocol::types::FieldTable;
 use arkham_config::grants::AmqpScope;
-use fe2o3_amqp_types::primitives::Binary;
-use fe2o3_amqp_types::sasl::{SaslCode, SaslInit, SaslOutcome};
+use fe2o3_amqp::acceptor::sasl_acceptor::SaslServerFrame;
+use fe2o3_amqp::acceptor::{ConnectionAcceptor, SaslAcceptor};
+use fe2o3_amqp::connection::{ConnectionHandle, OpenError};
+use fe2o3_amqp::sasl_profile::SaslProfile;
+use fe2o3_amqp_types::primitives::{Array, Binary, Symbol};
+use fe2o3_amqp_types::sasl::{SaslCode, SaslInit, SaslOutcome, SaslResponse};
 use secrecy::ExposeSecret as _;
 
 const FAKE: &str = "arkham_fake_amqp_pass"; // betterleaks:allow
 const VALUE: &str = "arkham_real_amqp_pass_longer_01"; // betterleaks:allow
 const HEADER_091: &[u8] = b"AMQP\x00\x00\x09\x01";
-const HEADER_SASL: &[u8] = b"AMQP\x03\x01\x00\x00";
 
 fn amqp_grant(fake: &str, real: &str) -> Grant {
   let scope = AmqpScope::from_strings(fake, real).unwrap();
@@ -94,27 +99,89 @@ fn start_ok_response(frame: AMQPFrame) -> Vec<u8> {
   ok.response.as_bytes().to_vec()
 }
 
-fn close_text(frame: AMQPFrame) -> String {
-  let AMQPFrame::Method(0, AMQPClass::Connection(connection::AMQPMethod::Close(close))) = frame else {
-    panic!("connection.close");
-  };
-  close.reply_text.as_str().to_string()
+#[derive(Clone)]
+struct RecordPlain {
+  seen: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
-fn sasl_frame(body: &[u8]) -> Vec<u8> {
-  let mut out = u32::try_from(body.len() + 8).unwrap().to_be_bytes().to_vec();
-  out.extend([2, 1, 0, 0]);
-  out.extend_from_slice(body);
-  out
+impl SaslAcceptor for RecordPlain {
+  fn mechanisms(&self) -> Array<Symbol> {
+    Array::from(vec![Symbol::from("PLAIN")])
+  }
+
+  fn on_init(&mut self, init: SaslInit) -> SaslServerFrame {
+    assert_eq!(init.mechanism.as_str(), "PLAIN");
+    *self.seen.lock().unwrap() = init.initial_response.map(Binary::into_vec);
+    SaslServerFrame::Outcome(SaslOutcome {
+      code: SaslCode::Ok,
+      additional_data: None,
+    })
+  }
+
+  fn on_response(&mut self, _response: SaslResponse) -> SaslServerFrame {
+    SaslServerFrame::Outcome(SaslOutcome {
+      code: SaslCode::Sys,
+      additional_data: None,
+    })
+  }
 }
 
-async fn read_frame_10<S: AsyncRead + Unpin>(conn: &mut S) -> Vec<u8> {
-  let mut head = [0u8; 8];
-  conn.read_exact(&mut head).await.unwrap();
-  let size = usize::try_from(u32::from_be_bytes(head[..4].try_into().unwrap())).unwrap();
-  let mut body = vec![0u8; size - 8];
-  conn.read_exact(&mut body).await.unwrap();
-  body
+async fn guest_sasl<S>(stream: S) -> Result<ConnectionHandle<()>, OpenError>
+where
+  S: AsyncRead + AsyncWrite + std::fmt::Debug + Unpin + Send + 'static,
+{
+  fe2o3_amqp::Connection::builder()
+    .container_id("arkham-guest")
+    .scheme("amqp")
+    .sasl_profile(SaslProfile::Plain {
+      username: "agent".into(),
+      password: FAKE.into(),
+    })
+    .open_with_stream(stream)
+    .await
+}
+
+async fn guest_lapin(stream: TcpStream) -> lapin::Result<lapin::Connection> {
+  let uri = format!("amqp://agent:{FAKE}@127.0.0.1/%2f").parse::<lapin::uri::AMQPUri>().unwrap();
+  let held = Arc::new(Mutex::new(Some(async_compat::Compat::new(stream))));
+  lapin::Connection::connector(
+    uri,
+    lapin::runtime::default_runtime()?,
+    async move |_uri, _runtime| {
+      let Some(sock) = held.lock().unwrap().take() else {
+        return Err(lapin::ErrorKind::InvalidConnectionState(lapin::ConnectionState::Error).into());
+      };
+      Ok(lapin::AsyncTcpStream::Plain(sock))
+    },
+    lapin::ConnectionProperties::default(),
+  )
+  .await
+}
+
+// Lapin's connector stream is Compat<tokio::net::TcpStream>. A rustls
+// TlsStream is not that type. Enabling lapin's rustls feature would also
+// enable TLS on the shared amq-protocol crate. The URI password is the decoy.
+async fn guest_lapin_tls<S>(guest: S) -> lapin::Result<lapin::Connection>
+where
+  S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let port = local_addr(&listener).port();
+  let accept = listener.accept();
+  let dial = TcpStream::connect(("127.0.0.1", port));
+  let (accepted, dialed) = tokio::join!(accept, dial);
+  let (accepted, _) = accepted.unwrap();
+  let dialed = dialed.unwrap();
+  tokio::spawn(async move {
+    let (mut reader, mut writer) = tokio::io::split(accepted);
+    let (mut guest_reader, mut guest_writer) = tokio::io::split(guest);
+    let outbound = tokio::io::copy(&mut reader, &mut guest_writer);
+    let inbound = tokio::io::copy(&mut guest_reader, &mut writer);
+    let (copied_out, copied_in) = tokio::join!(outbound, inbound);
+    let _ = copied_out.ok();
+    let _ = copied_in.ok();
+  });
+  guest_lapin(dialed).await
 }
 
 async fn connect_through_proxy(proxy_addr: SocketAddr, stub_port: u16) -> TcpStream {
@@ -177,13 +244,17 @@ async fn plaintext_guest_with_mtls_does_not_get_the_real_password() {
         );
         tls.write_all(&close("ACCESS_REFUSED")).await.unwrap();
       });
-      let mut stream = connect_through_proxy(proxy_addr, stub_port).await;
-      stream.write_all(HEADER_091).await.unwrap();
-      let _ = read_frame(&mut stream).await;
-      stream.write_all(&start_ok(plain("agent", FAKE))).await.unwrap();
-      let _ = read_frame(&mut stream).await;
-      drop(stream);
+      let stream = connect_through_proxy(proxy_addr, stub_port).await;
+      let guest = tokio::spawn(guest_lapin(stream));
       tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+      let err = tokio::time::timeout(Duration::from_secs(10), guest)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+      let text = err.to_string();
+      assert!(text.contains("ACCESS_REFUSED"), "{text}");
+      assert!(!text.contains(VALUE), "{text}");
       proxy.abort();
     }
   }
@@ -259,16 +330,17 @@ async fn amqp_cleartext_start_ok_forwards_the_decoy() {
     assert_eq!(start_ok_response(read_frame(&mut conn).await), plain("agent", FAKE));
     conn.write_all(&close("ACCESS_REFUSED")).await.unwrap();
   });
-  let mut stream = connect_through_proxy(fx.proxy_addr, fx.stub_port).await;
-  stream.write_all(HEADER_091).await.unwrap();
-  assert!(matches!(
-    read_frame(&mut stream).await,
-    AMQPFrame::Method(0, AMQPClass::Connection(connection::AMQPMethod::Start(_)))
-  ));
-  stream.write_all(&start_ok(plain("agent", FAKE))).await.unwrap();
-  assert_eq!(close_text(read_frame(&mut stream).await), "ACCESS_REFUSED");
-  drop(stream);
+  let stream = connect_through_proxy(fx.proxy_addr, fx.stub_port).await;
+  let guest = tokio::spawn(guest_lapin(stream));
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  let err = tokio::time::timeout(Duration::from_secs(10), guest)
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap_err();
+  let text = err.to_string();
+  assert!(text.contains("ACCESS_REFUSED"), "{text}");
+  assert!(!text.contains(VALUE), "{text}");
   fx.proxy.abort();
 }
 
@@ -296,16 +368,17 @@ async fn amqps_start_ok_swaps_to_the_real_password_after_tls() {
   });
   let stream = connect_through_proxy(proxy_addr, stub_port).await;
   let name = ServerName::try_from("localhost".to_string()).unwrap();
-  let mut tls = guest_tls(&ca, true).connect(name, stream).await.unwrap();
-  tls.write_all(HEADER_091).await.unwrap();
-  assert!(matches!(
-    read_frame(&mut tls).await,
-    AMQPFrame::Method(0, AMQPClass::Connection(connection::AMQPMethod::Start(_)))
-  ));
-  tls.write_all(&start_ok(plain("agent", FAKE))).await.unwrap();
-  assert_eq!(close_text(read_frame(&mut tls).await), format!("ACCESS_REFUSED - password {FAKE}"));
-  drop(tls);
+  let tls = guest_tls(&ca, true).connect(name, stream).await.unwrap();
+  let guest = tokio::spawn(guest_lapin_tls(tls));
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  let err = tokio::time::timeout(Duration::from_secs(10), guest)
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap_err();
+  let text = err.to_string();
+  assert!(text.contains(&format!("ACCESS_REFUSED - password {FAKE}")), "{text}");
+  assert!(!text.contains(VALUE), "{text}");
   proxy.abort();
 }
 
@@ -324,20 +397,17 @@ async fn amqps_without_sni_mints_and_swaps_for_the_grant_host() {
   )];
   let state = test_state_with(grants, &ca);
   let snapshot = state.snapshot();
+  let seen = Arc::new(Mutex::new(None));
+  let stub_seen = Arc::clone(&seen);
   let stub_task = tokio::spawn(async move {
     let (conn, _) = stub.accept().await.unwrap();
-    let mut tls = acceptor.accept(conn).await.unwrap();
-    assert_eq!(read_header(&mut tls).await, HEADER_SASL);
-    let init: SaslInit = serde_amqp::from_slice(&read_frame_10(&mut tls).await).unwrap();
-    assert_eq!(init.mechanism.as_str(), "PLAIN");
-    assert_eq!(init.initial_response.unwrap().into_vec(), plain("svc", VALUE));
-    let outcome = SaslOutcome {
-      code: SaslCode::Ok,
-      additional_data: None,
-    };
-    let mut reply = HEADER_SASL.to_vec();
-    reply.extend(sasl_frame(&serde_amqp::to_vec(&outcome).unwrap()));
-    tls.write_all(&reply).await.unwrap();
+    let tls = acceptor.accept(conn).await.unwrap();
+    let broker = ConnectionAcceptor::builder()
+      .container_id("amqp-stub")
+      .sasl_acceptor(RecordPlain { seen: stub_seen })
+      .build();
+    let mut connection = broker.accept(tls).await.unwrap();
+    connection.close().await.unwrap();
   });
   let (guest, client_end) = tokio::io::duplex(64 * 1024);
   let serve = tokio::spawn({
@@ -346,23 +416,17 @@ async fn amqps_without_sni_mints_and_swaps_for_the_grant_host() {
     async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await }
   });
   let name = ServerName::try_from("localhost".to_string()).unwrap();
-  let mut tls = tokio::time::timeout(Duration::from_secs(10), guest_tls(&ca, false).connect(name, client_end))
+  let tls = tokio::time::timeout(Duration::from_secs(10), guest_tls(&ca, false).connect(name, client_end))
     .await
     .unwrap()
     .unwrap();
-  let init = SaslInit {
-    mechanism: "PLAIN".into(),
-    initial_response: Some(Binary::from(plain("agent", FAKE))),
-    hostname: Some("localhost".into()),
-  };
-  let mut opening = HEADER_SASL.to_vec();
-  opening.extend(sasl_frame(&serde_amqp::to_vec(&init).unwrap()));
-  tls.write_all(&opening).await.unwrap();
-  assert_eq!(read_header(&mut tls).await, HEADER_SASL);
-  let outcome: SaslOutcome = serde_amqp::from_slice(&read_frame_10(&mut tls).await).unwrap();
-  assert_eq!(outcome.code, SaslCode::Ok);
-  drop(tls);
+  let mut connection = tokio::time::timeout(Duration::from_secs(10), guest_sasl(tls))
+    .await
+    .unwrap()
+    .unwrap();
+  connection.close().await.unwrap();
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  assert_eq!(seen.lock().unwrap().as_deref(), Some(plain("svc", VALUE).as_slice()));
   serve.await.unwrap().unwrap();
 }
 
@@ -383,6 +447,8 @@ async fn amqps_broker_stalls_tls_and_the_leg_closes_within_budget() {
     let (_conn, _) = stub.accept().await.unwrap();
     std::future::pending::<()>().await;
   });
+  // A client writes a protocol header while it waits. This guest stays silent
+  // so only the handshake budget can close the leg.
   let (guest, client_end) = tokio::io::duplex(8 * 1024);
   let serve =
     tokio::spawn(async move { serve_transparent_stream(guest, &state, snapshot.as_ref(), "127.0.0.1", stub_port, "127.0.0.1").await });
@@ -400,6 +466,8 @@ async fn amqp_without_a_grant_splices_byte_identical() {
   let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let stub_port = local_addr(&stub).port();
   let (proxy_addr, proxy) = run_proxy().await;
+  // lapin cannot produce these bytes. It waits for Connection.Start before
+  // Start-Ok, and that Start-Ok carries client properties.
   let mut opening = HEADER_091.to_vec();
   opening.extend(start_ok(plain("agent", FAKE)));
   let reply = close(&format!("ACCESS_REFUSED - password {VALUE}"));
