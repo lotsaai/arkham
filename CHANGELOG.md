@@ -1,3 +1,8 @@
+## [0.3.29] - 2026-10-21
+
+### 🧪 Testing
+
+- *(amqp)* Drive the guest with lapin and fe2o3-amqp (#86)
 ## [0.3.28] - 2026-10-21
 
 ### 🚀 Features
@@ -31,6 +36,8 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(audit)* Accept emSign distrust advisories with rationale (#112)
+- Update changelog for v0.3.28 [ci skip]
+- Release
 ## [0.3.27] - 2026-10-20
 
 ### ⚙️ Miscellaneous Tasks
