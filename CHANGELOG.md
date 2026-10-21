@@ -1,3 +1,42 @@
+## [0.3.28] - 2026-10-21
+
+### 🚀 Features
+
+- *(proxy)* Terminate postgres SCRAM for the pg client (#83)
+
+### 🐛 Bug Fixes
+
+- *(integration)* Boot api listeners without oidc env (#96)
+- *(proxy)* Omit issued tokens from MintStore Debug (#95)
+- *(pki)* Return Io when known_hosts cannot be read (#101)
+- *(registry)* Drop wrong-site and duplicate provider rows (#107)
+
+### 📚 Documentation
+
+- *(agentic-devenv)* Correct stale stack sentences (#94)
+- *(user)* Correct stale claims in the user guide (#104)
+
+### 🚜 Refactor
+
+- *(compose)* Make generate_stack async (#98)
+- *(tun)* Drop dead route and tracker state (#108)
+- Drop unused member crate dependencies (#109)
+- *(ebpf)* Drop dead port and bypass fallbacks (#106)
+
+### 🧪 Testing
+
+- *(proxy)* Drive NATS e2e guests with async-nats (#88)
+- *(ldap)* Drive e2e guests with ldap3 (#93)
+
+### ⚙️ Miscellaneous Tasks
+
+- *(audit)* Accept emSign distrust advisories with rationale (#112)
+## [0.3.27] - 2026-10-20
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.27 [ci skip]
+- Release
 ## [0.3.26] - 2026-10-20
 
 ### 🐛 Bug Fixes
