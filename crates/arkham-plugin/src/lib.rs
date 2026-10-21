@@ -289,12 +289,6 @@ impl Registry {
     Ok(Self { engine, plugins: loaded })
   }
 
-  /// No plugins configured or loaded.
-  #[must_use]
-  pub fn is_empty(&self) -> bool {
-    self.plugins.is_empty()
-  }
-
   /// First plugin whose grants, direction gate, and world support match this
   /// leg, as a fresh per-connection hook.
   ///
@@ -618,9 +612,8 @@ mod tests {
   }
 
   #[test]
-  fn empty_registry_is_empty_and_selects_nothing() {
+  fn empty_registry_selects_nothing() {
     let registry = empty_registry();
-    assert!(registry.is_empty());
     assert!(registry.select(Scheme::Https, "api.example.com", 443, Direction::Request).is_none());
   }
 

@@ -490,11 +490,9 @@ dependencies = [
  "miette",
  "pretty_assertions",
  "secrecy",
- "serde",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "toml 0.8.23",
  "toml_edit 0.25.17+spec-1.1.0",
  "tracing",
 ]
@@ -503,7 +501,6 @@ dependencies = [
 name = "arkham-pki"
 version = "0.3.27"
 dependencies = [
- "pretty_assertions",
  "rama",
  "rand 0.8.8",
  "rcgen",
@@ -520,8 +517,6 @@ name = "arkham-plugin"
 version = "0.3.27"
 dependencies = [
  "arkham-config",
- "pretty_assertions",
- "tempfile",
  "thiserror 2.0.21",
  "tracing",
  "wasmtime",
@@ -594,7 +589,6 @@ dependencies = [
  "netlink-packet-core",
  "netlink-packet-netfilter",
  "netlink-sys 0.8.8",
- "pretty_assertions",
  "rama",
  "rtnetlink",
  "rustls 0.23.46",
@@ -615,7 +609,6 @@ dependencies = [
  "arkham-proxy",
  "futures-sink",
  "futures-util",
- "pretty_assertions",
  "rtnetlink",
  "rustls 0.23.46",
  "secrecy",
