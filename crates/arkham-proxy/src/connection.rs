@@ -193,9 +193,15 @@ impl Extension for SelectedHttps {}
 /// Client-auth policy for several https grants on one server. A guest
 /// certificate selects the mutual-TLS grant whose decoy leaf matches.
 /// No certificate selects the plain TLS grants. An unknown certificate
-/// fails the handshake.
-pub(crate) fn selecting_client_auth(candidates: Vec<HttpsCandidate>, trust: &X509Store, host: &str, port: u16) -> TlsMitmClientAuthPolicy {
-  let ask = candidates.iter().any(|candidate| candidate.guest_tls == GuestTlsMode::Mtls);
+/// fails the handshake. `ask` requests a certificate even when `candidates`
+/// holds none, so a leaf for a grant left out of this bundle is rejected.
+pub(crate) fn selecting_client_auth(
+  candidates: Vec<HttpsCandidate>,
+  trust: &X509Store,
+  host: &str,
+  port: u16,
+  ask: bool,
+) -> TlsMitmClientAuthPolicy {
   let trust = trust.clone();
   let host = host.to_string();
   TlsMitmClientAuthPolicy::new(service_fn(move |input: TlsMitmClientAuthInput| {

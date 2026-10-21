@@ -5,6 +5,7 @@
 pub(crate) mod h2;
 pub(crate) mod machine;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,7 @@ use rama::tls::client::NegotiatedTlsParameters;
 use rama::tls::server::InputWithClientHello;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use arkham_config::grants::{Grant, ResolvedConfig, Scheme};
+use arkham_config::grants::{EndpointScope, Grant, GuestTlsMode, ResolvedConfig, Scheme};
 
 use arkham_plugin::Direction as HookDirection;
 use rama::net::tls::ApplicationProtocol;
@@ -93,13 +94,10 @@ impl Transport for HttpsTransport {
       return tcp::splice(guest, dial_host, port, state.fwmark, &buf).await;
     };
     // The relay's upstream trust is chosen before the guest certificate
-    // arrives, so every grant for this server has to name the same bundle.
-    if hits.len() > 1 && hits.iter().any(|(_, _, scope)| scope.root_cert != first.root_cert) {
-      return Err(Error::HttpsRootSplit {
-        host: identity.to_string(),
-        port,
-      });
-    }
+    // arrives. One shared bundle is that trust. Otherwise the bundle the
+    // plain TLS grants share is the trust a bearer can use, and grants on
+    // any other bundle are not candidates for this connection.
+    let relay_root = https_trust_root(hits.iter().map(|(_, _, scope)| *scope), identity, port)?;
     let identity = identity.to_string();
     if !state.mint.allow() {
       return Err(Error::BurstExceeded {
@@ -117,8 +115,10 @@ impl Transport for HttpsTransport {
         guest_io = guest_io.with_client_auth_policy(policy);
       }
     } else {
+      let ask = hits.iter().any(|(_, _, scope)| scope.guest_tls == GuestTlsMode::Mtls);
       let candidates = hits
         .iter()
+        .filter(|(_, _, scope)| scope.root_cert == relay_root)
         .map(|(index, label, scope)| HttpsCandidate {
           index: *index,
           label: (*label).to_string(),
@@ -127,7 +127,7 @@ impl Transport for HttpsTransport {
           guest_tls: scope.guest_tls,
         })
         .collect();
-      guest_io = guest_io.with_client_auth_policy(selecting_client_auth(candidates, &state.mtls_trust, &identity, port));
+      guest_io = guest_io.with_client_auth_policy(selecting_client_auth(candidates, &state.mtls_trust, &identity, port, ask));
     }
     let bridge = BridgeIo(guest_io, GuestIo::bare(upstream));
     let pump = SubstitutionService {
@@ -140,7 +140,7 @@ impl Transport for HttpsTransport {
     // Entries naming `root_cert` ride their own relay extending the global
     // egress trust; the map was built from this same config, so a miss is
     // a bug, failed closed.
-    let relay = match &first.root_cert {
+    let relay = match &relay_root {
       None => state.relay.clone(),
       Some(path) => state
         .extra_relays
@@ -160,6 +160,53 @@ impl Transport for HttpsTransport {
       None => relay.serve(bridge).await.map_err(|err| Error::MitmRelay { source: err.into() }),
     }
   }
+}
+
+/// Upstream trust for one server, chosen before the guest certificate arrives.
+///
+/// One path shared by every grant is that path. Otherwise the path shared by
+/// every plain TLS grant is the trust a bearer can use. No such path is
+/// [`Error::HttpsRootSplit`].
+///
+/// # Errors
+///
+/// Returns [`Error::HttpsRootSplit`] when the grants name more than one bundle
+/// and the plain TLS grants do not agree on one.
+fn https_trust_root<'a>(scopes: impl IntoIterator<Item = &'a EndpointScope>, host: &str, port: u16) -> Result<Option<PathBuf>, Error> {
+  let mut scopes = scopes.into_iter();
+  let Some(first) = scopes.next() else {
+    return Err(Error::HttpsRootSplit {
+      host: host.to_string(),
+      port,
+    });
+  };
+  let mut same = true;
+  let mut tls_root = (first.guest_tls == GuestTlsMode::Tls).then(|| first.root_cert.clone());
+  for scope in scopes {
+    if scope.root_cert != first.root_cert {
+      same = false;
+    }
+    if scope.guest_tls != GuestTlsMode::Tls {
+      continue;
+    }
+    match tls_root.as_ref() {
+      None => tls_root = Some(scope.root_cert.clone()),
+      Some(seen) if seen == &scope.root_cert => {}
+      Some(_) => {
+        return Err(Error::HttpsRootSplit {
+          host: host.to_string(),
+          port,
+        });
+      }
+    }
+  }
+  if same {
+    return Ok(first.root_cert.clone());
+  }
+  tls_root.ok_or(Error::HttpsRootSplit {
+    host: host.to_string(),
+    port,
+  })
 }
 
 /// The `http://` transport: cleartext, the `Host` head names the peer.

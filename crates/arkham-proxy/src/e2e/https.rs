@@ -1342,6 +1342,69 @@ async fn https_guest_cert_selects_cert_user_beside_token_user() {
   proxy.abort();
 }
 
+/// The certificate grant is listed first and names a different bundle path
+/// that holds the same CA. A bearer with no certificate still selects the
+/// token user. The certificate user's leaf is rejected: that grant's bundle
+/// is not the one this connection trusted.
+#[tokio::test]
+async fn https_bearer_selects_token_user_when_trust_bundles_differ() {
+  const TOKEN_FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const TOKEN_VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let token_bundle = dir.path().join("token-ca.pem");
+  let cert_bundle = dir.path().join("cert-ca.pem");
+  std::fs::write(&token_bundle, ca.cert_pem()).unwrap();
+  std::fs::write(&cert_bundle, ca.cert_pem()).unwrap();
+  let cert_user = guest_material(&ca, dir.path(), "cert-user");
+  let PeerStub {
+    port: stub_port,
+    seen,
+    task: stub_task,
+  } = spawn_peer_stub(upstream_config(&ca, false));
+  let grants = vec![
+    https_user_grant(
+      &cert_user.label,
+      "ghp_cccccccccccccccccccccccccccccccccccccccc",
+      "ghp_dddddddddddddddddddddddddddddddddddddddd",
+      stub_port,
+      Some((cert_user.cert.clone(), cert_user.key.clone())),
+      &cert_bundle,
+      GuestTlsMode::Mtls,
+    ),
+    https_user_grant(
+      "token-user",
+      TOKEN_FAKE,
+      TOKEN_VALUE,
+      stub_port,
+      None,
+      &token_bundle,
+      GuestTlsMode::Tls,
+    ),
+  ];
+  let state = test_state_with_plugins(grants, Vec::new(), &ca);
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+  https_round_trip(proxy_addr, stub_port, client_config(&ca, None), Some(TOKEN_FAKE))
+    .await
+    .unwrap();
+  https_round_trip(
+    proxy_addr,
+    stub_port,
+    client_config(&ca, Some((cert_user.guest_chain.clone(), cert_user.guest_key.clone_key()))),
+    None,
+  )
+  .await
+  .expect_err("a certificate for the other trust bundle must not round-trip");
+  let seen = seen.lock().await;
+  assert_eq!(seen.len(), 1, "the other bundle's certificate opened no upstream request");
+  assert!(seen[0].0.is_none(), "token user presents no client certificate");
+  assert!(seen[0].1.windows(TOKEN_VALUE.len()).any(|window| window == TOKEN_VALUE.as_bytes()));
+  drop(seen);
+  stub_task.abort();
+  proxy.abort();
+}
+
 /// A selected identity still sees sibling real values rewritten to their decoys.
 /// The request path keeps swapping only the selected grants.
 #[tokio::test]
