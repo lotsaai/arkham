@@ -309,6 +309,21 @@ kubectl config unset "users.$user.client-key-data" >/dev/null
 kubectl config set-credentials arkham-other --token="$token_other" >/dev/null
 kubectl config set-context arkham-other --cluster="$cluster_name" --user=arkham-other >/dev/null
 
+# Second client-cert user on the cert kubeconfig only. The token file was
+# copied before this, so it does not gain the user. The cluster client CA
+# signs the certificate, which is what the apiserver accepts.
+client_ca_crt=$scratch/client-ca.crt
+client_ca_key=$scratch/client-ca.key
+docker exec "k3d-${cluster}-server-0" cat /var/lib/rancher/k3s/server/tls/client-ca.crt >"$client_ca_crt"
+docker exec "k3d-${cluster}-server-0" cat /var/lib/rancher/k3s/server/tls/client-ca.key >"$client_ca_key"
+chmod 600 "$client_ca_key"
+openssl req -new -newkey rsa:2048 -nodes -keyout "$scratch/arkham-cert.key" -out "$scratch/arkham-cert.csr" -subj "/CN=arkham-cert/O=system:masters" >/dev/null 2>&1
+openssl x509 -req -in "$scratch/arkham-cert.csr" -CA "$client_ca_crt" -CAkey "$client_ca_key" -CAcreateserial -out "$scratch/arkham-cert.crt" -days 1 >/dev/null 2>&1
+export KUBECONFIG="$scratch/cert-kubeconfig"
+kubectl config set-credentials arkham-cert --client-certificate="$scratch/arkham-cert.crt" --client-key="$scratch/arkham-cert.key" --embed-certs=true >/dev/null
+kubectl config set-context arkham-cert --cluster="$cluster_name" --user=arkham-cert >/dev/null
+rm -f "$client_ca_key" "$scratch/arkham-cert.key" "$scratch/arkham-cert.csr" "$scratch/client-ca.srl"
+
 # One leg: init a workspace against a kubeconfig source, serve host-side, and
 # prove the three states — real works direct, decoy fails direct, decoy works
 # through the proxy. Host-side serve cannot resolve the /arkham/grants container
@@ -363,6 +378,13 @@ run_leg() {
     KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context arkham-other >/dev/null
     KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get nodes --request-timeout=30s
     echo "--- bearer: --context selects the original user"
+    KUBECONFIG="$scratch/proxy-$name.yaml" kubectl --context "$context" get nodes --request-timeout=30s
+  fi
+  if [ "$name" = cert ]; then
+    echo "--- cert: use-context selects the other user"
+    KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context arkham-cert >/dev/null
+    KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get nodes --request-timeout=30s
+    echo "--- cert: --context selects the original user"
     KUBECONFIG="$scratch/proxy-$name.yaml" kubectl --context "$context" get nodes --request-timeout=30s
   fi
 

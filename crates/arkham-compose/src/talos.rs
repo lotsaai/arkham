@@ -423,6 +423,7 @@ fn one_grant(source: &Path, item: &Prepared, id: &arkham_config::context::Contex
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::test_support::WarnCapture;
 
   const SOURCE: &str = "/home/ivan/.talos/config";
 
@@ -716,41 +717,6 @@ mod tests {
       .values()
       .filter_map(|context| context.get("crt").and_then(serde_yaml::Value::as_str).map(str::to_string))
       .collect()
-  }
-
-  struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-  impl tracing::Subscriber for WarnCapture {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-      *metadata.level() <= tracing::Level::WARN
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-      tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-      let mut message = String::new();
-      event.record(&mut WarnVisit(&mut message));
-      self.0.lock().unwrap().push(message);
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-  }
-
-  struct WarnVisit<'a>(&'a mut String);
-
-  impl tracing::field::Visit for WarnVisit<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-      use std::fmt::Write as _;
-      let _ = write!(self.0, "{}={value:?};", field.name());
-    }
   }
 }
 

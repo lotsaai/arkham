@@ -2,8 +2,8 @@
 //! differently structured form of the same information a rule holds, so the
 //! adapter derives one grant per distinct user instead of asking the operator
 //! to state it twice. `current-context` is copied into the guest file and is
-//! not how a credential is chosen. The decoy that user presents selects the
-//! real credential. Contexts
+//! not how a credential is chosen. A presented guest certificate selects a
+//! cert user. A decoy bearer selects a token user. Contexts
 //! that share a user share that grant. Contexts that share a cluster share
 //! that cluster's CA file. The file is the secret source, so a kube entry
 //! stating `envs` is an error rather than a second source.
@@ -19,7 +19,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::{HostTlsCfg, RewriteFormat};
-use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, Presented, identities, require_distinct};
+use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, identities};
 use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -264,8 +264,6 @@ struct Prepared {
   user: String,
   cluster: String,
   server: String,
-  host: String,
-  port: u16,
   token: Option<String>,
   cert: Option<Vec<u8>>,
   key: Option<Vec<u8>>,
@@ -282,8 +280,6 @@ struct UserGrant {
 /// One allow entry for a user: the cluster that first named this server.
 struct ServerUse {
   cluster: String,
-  host: String,
-  port: u16,
   ca: Option<Vec<u8>>,
 }
 
@@ -336,16 +332,12 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     ));
   }
   let ids = user_identities(source, &users)?;
-  if ids.len() != users.len() {
-    return Err(invalid(source, "kube user identities did not cover every granted user".to_string()));
-  }
   let cluster_labels = cluster_labels(source, &users)?;
   let pairs = guest_pairs(ca, guests_dir, &users, &ids)?;
-  distinct(&users, &ids)?;
   let decoy = decoy_doc(&text, source, ca, &users, &ids, &pairs)?;
   let mut grants = Vec::with_capacity(users.len());
   for ((name, user), id) in users.iter().zip(ids.iter()) {
-    grants.push(one_grant(source, name, user, id, &cluster_labels, &decoy)?);
+    grants.push(one_grant(source, name, user, id, &cluster_labels, &decoy, pairs.get(name))?);
   }
   Ok(Some(KubeAdapted { grants, skipped }))
 }
@@ -394,9 +386,9 @@ fn classify(source: &Path, doc: &KubeDoc, entry: &KubeContextEntry) -> Result<Pr
   if scope.scheme != Scheme::Https {
     return Ok(Prep::Skip(KubeSkip::NotTls { name, server }));
   }
-  let HostPat::Exact(host) = scope.host else {
+  if !matches!(scope.host, HostPat::Exact(_)) {
     return Ok(Prep::Skip(KubeSkip::NotExact { name, server }));
-  };
+  }
   if user.user.cert_file.is_some() || user.user.key_file.is_some() || cluster.cluster.ca_file.is_some() {
     return Ok(Prep::Skip(KubeSkip::FileRef { name }));
   }
@@ -430,8 +422,6 @@ fn classify(source: &Path, doc: &KubeDoc, entry: &KubeContextEntry) -> Result<Pr
     user: user_name,
     cluster: cluster_name,
     server,
-    host,
-    port: scope.port,
     token,
     cert,
     key,
@@ -446,8 +436,6 @@ fn group_users(prepared: Vec<Prepared>) -> BTreeMap<String, UserGrant> {
   for item in prepared {
     let usage = ServerUse {
       cluster: item.cluster,
-      host: item.host,
-      port: item.port,
       ca: item.ca,
     };
     match users.entry(item.user) {
@@ -519,28 +507,6 @@ fn guest_pairs(
     pairs.insert(name.clone(), (cert, key));
   }
   Ok(pairs)
-}
-
-/// Two users of one apiserver stay distinct because each decoy differs.
-///
-/// # Errors
-///
-/// Returns an error when two identities present the same host, port, and decoy.
-fn distinct(users: &BTreeMap<String, UserGrant>, ids: &[ContextIdentity]) -> Result<(), Error> {
-  let decoys = ids.iter().map(ContextIdentity::secret).collect::<Vec<_>>();
-  let mut presented = Vec::new();
-  for (user, (id, decoy)) in users.values().zip(ids.iter().zip(decoys.iter())) {
-    for server in user.servers.values() {
-      presented.push(Presented {
-        identity: id,
-        host: server.host.as_str(),
-        port: server.port,
-        decoy: decoy.as_bytes(),
-      });
-    }
-  }
-  require_distinct(&presented)?;
-  Ok(())
 }
 
 /// The agent's decoy kubeconfig. Every cluster trusts arkham's CA. A granted
@@ -619,8 +585,8 @@ fn yaml_string(text: &str) -> Value {
 
 /// # Errors
 ///
-/// Returns an error when the grant value would be empty, a cluster CA has no
-/// label, or the fragment fails to serialize.
+/// Returns an error when the grant value would be empty, a client certificate
+/// has no guest pair, a cluster CA has no label, or the fragment fails to serialize.
 fn one_grant(
   source: &Path,
   name: &str,
@@ -628,6 +594,7 @@ fn one_grant(
   id: &ContextIdentity,
   cluster_labels: &BTreeMap<String, String>,
   decoy: &str,
+  pair: Option<&GuestMaterial>,
 ) -> Result<RewriteAdapted, Error> {
   let value = match &user.token {
     Some(token) => token.clone(),
@@ -640,10 +607,15 @@ fn one_grant(
   let mut materialized = Vec::new();
   let (client_cert, client_key, mode) = match user.cert.as_ref().zip(user.key.as_ref()) {
     Some((cert, key)) => {
+      let Some((guest_cert, _)) = pair else {
+        return Err(invalid(source, format!("user `{name}` has a client certificate and no guest pair")));
+      };
       let cert_name = format!("{label}.client.crt");
       let key_name = format!("{label}.client.key");
+      let guest_name = format!("{label}.guest.crt");
       materialized.push((cert_name.clone(), cert.clone()));
       materialized.push((key_name.clone(), key.clone()));
+      materialized.push((guest_name, guest_cert.clone()));
       (
         Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}"))),
         Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{key_name}"))),
@@ -730,6 +702,7 @@ mod tests {
 
   use super::*;
   use crate::adapt::write_state;
+  use crate::test_support::WarnCapture;
 
   const BEARER_DOC: &str = r"apiVersion: v1
 kind: Config
@@ -824,7 +797,17 @@ users:
         .is_some_and(|name| name.starts_with("kube-cluster-") && name.ends_with(".ca.crt"))
     }));
     assert_eq!(tls.guest_tls_mode, GuestTlsMode::Mtls);
-    assert_eq!(adapted.materialized.len(), 3, "pair plus CA materialize beside the fragment");
+    assert_eq!(
+      adapted.materialized.len(),
+      4,
+      "pair, guest certificate, and CA materialize beside the fragment"
+    );
+    assert!(
+      adapted
+        .materialized
+        .iter()
+        .any(|(name, bytes)| { name.ends_with(".guest.crt") && !bytes.is_empty() })
+    );
   }
 
   #[test]
@@ -1127,41 +1110,6 @@ users:
     assert!(text.contains("auth-provider"), "{text}");
     assert!(text.contains("k3s-local"), "{text}");
     assert!(!text.contains("real-cloud-token"), "{text}");
-  }
-
-  struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-  impl tracing::Subscriber for WarnCapture {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-      *metadata.level() <= tracing::Level::WARN
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-      tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-      let mut message = String::new();
-      event.record(&mut WarnVisit(&mut message));
-      self.0.lock().unwrap().push(message);
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-  }
-
-  struct WarnVisit<'a>(&'a mut String);
-
-  impl tracing::field::Visit for WarnVisit<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-      use std::fmt::Write as _;
-      let _ = write!(self.0, "{}={value:?};", field.name());
-    }
   }
 
   #[test]

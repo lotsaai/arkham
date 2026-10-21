@@ -26,7 +26,7 @@ use rama::net::tls::ApplicationProtocol;
 use super::PairCtx;
 use super::{ServeStream, Transport};
 use crate::Error;
-use crate::connection::{GuestIo, Prefixed, client_auth_policy, dial_marked};
+use crate::connection::{GuestIo, HttpsCandidate, Prefixed, SelectedHttps, client_auth_policy, dial_marked, selecting_client_auth};
 use crate::identity::{CandidateParams, Hello, read_client_hello, read_http_head};
 use crate::into_box_error;
 use crate::mint::MintHandle;
@@ -79,14 +79,27 @@ impl Transport for HttpsTransport {
     // address) carries no SNI, so the captured destination is the identity
     // to mint for. A grant that does not name it still splices below.
     let identity = host.or(sni.as_deref()).unwrap_or(dial_host);
-    let Some(scope) = snapshot
+    let hits = snapshot
       .grants
       .iter()
-      .find_map(|grant| grant.endpoint(Scheme::Https, Some(identity), port))
-    else {
-      // No https scope names this identity: nothing to substitute.
+      .enumerate()
+      .filter_map(|(index, grant)| {
+        let scope = grant.endpoint(Scheme::Https, Some(identity), port)?;
+        Some((index, grant.credential()?.label.as_str(), scope))
+      })
+      .collect::<Vec<_>>();
+    // No https scope names this identity: nothing to substitute.
+    let Some((_, _, first)) = hits.first().copied() else {
       return tcp::splice(guest, dial_host, port, state.fwmark, &buf).await;
     };
+    // The relay's upstream trust is chosen before the guest certificate
+    // arrives, so every grant for this server has to name the same bundle.
+    if hits.len() > 1 && hits.iter().any(|(_, _, scope)| scope.root_cert != first.root_cert) {
+      return Err(Error::HttpsRootSplit {
+        host: identity.to_string(),
+        port,
+      });
+    }
     let identity = identity.to_string();
     if !state.mint.allow() {
       return Err(Error::BurstExceeded {
@@ -95,12 +108,26 @@ impl Transport for HttpsTransport {
     }
     let upstream = dial_marked(dial_host, port, state.fwmark).await?;
     let guest_io = GuestIo::with_target(Prefixed::new(buf, guest), &identity, port)?;
-    // The entry can name the proxy's upstream client identity, and the rule
-    // can demand a guest certificate: the relay reads the resulting policy
-    // off the guest leg's extensions and enforces it on both legs.
+    // One grant keeps the policy it already had. Several grants ask for a
+    // guest certificate when any of them is mutual TLS, then the handshake
+    // picks the grant.
     let mut guest_io = guest_io;
-    if let Some(policy) = client_auth_policy(scope, &state.mtls_trust)? {
-      guest_io = guest_io.with_client_auth_policy(policy);
+    if hits.len() == 1 {
+      if let Some(policy) = client_auth_policy(first, &state.mtls_trust)? {
+        guest_io = guest_io.with_client_auth_policy(policy);
+      }
+    } else {
+      let candidates = hits
+        .iter()
+        .map(|(index, label, scope)| HttpsCandidate {
+          index: *index,
+          label: (*label).to_string(),
+          client_cert: scope.client_cert.clone(),
+          client_key: scope.client_key.clone(),
+          guest_tls: scope.guest_tls,
+        })
+        .collect();
+      guest_io = guest_io.with_client_auth_policy(selecting_client_auth(candidates, &state.mtls_trust, &identity, port));
     }
     let bridge = BridgeIo(guest_io, GuestIo::bare(upstream));
     let pump = SubstitutionService {
@@ -113,7 +140,7 @@ impl Transport for HttpsTransport {
     // Entries naming `root_cert` ride their own relay extending the global
     // egress trust; the map was built from this same config, so a miss is
     // a bug, failed closed.
-    let relay = match &scope.root_cert {
+    let relay = match &first.root_cert {
       None => state.relay.clone(),
       Some(path) => state
         .extra_relays
@@ -211,10 +238,25 @@ where
 
   async fn serve(&self, input: BridgeIo<TlsStream<GI>, TlsStream<GE>>) -> Result<Self::Output, Self::Error> {
     let BridgeIo(mut guest_tls, mut server_tls) = input;
-    // The scope that matched selected TLS termination; framing picks the legs.
+    // The handshake records which grants this connection may swap. A single
+    // grant leaves that record absent and the full list stands.
+    let selected = guest_tls.extensions().get_ref::<SelectedHttps>().map(|selected| {
+      selected
+        .indices
+        .iter()
+        .filter_map(|index| self.snapshot.grants.get(*index).cloned())
+        .collect::<Vec<_>>()
+    });
+    if selected.as_ref().is_some_and(Vec::is_empty) {
+      return Err(into_box_error(&Error::UnmappedGuestCert {
+        host: self.identity.clone(),
+        port: self.port,
+      }));
+    }
+    let grants = selected.as_deref().unwrap_or(self.snapshot.grants.as_slice());
     // Schemes below are grant scopes (authorization), never selection.
     let ctx = PairCtx {
-      grants: &self.snapshot.grants,
+      grants,
       host: &self.identity,
       port: self.port,
       plugins: &self.plugins,

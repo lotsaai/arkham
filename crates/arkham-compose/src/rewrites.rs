@@ -129,14 +129,14 @@ pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutput
   Ok(pass.collector.outputs())
 }
 
-/// Grants and decoy mounts collected from adapted documents. Emitting one
+/// Grants and decoy mounts collected from adapted documents: emitting one
 /// document writes its decoy side files into the state directory and mounts
-/// each at its stated container path. A kubeconfig or talosconfig is writable.
-/// The declared pass and the ambient pass share this collector.
+/// each at its stated container path. Shared by the declared pass
+/// and the ambient pass, which is why the collected vecs stay crate-visible.
 pub(crate) struct RewriteCollector {
   /// State directory the decoy files land in.
   files_dir: PathBuf,
-  /// Mounts collected with the grants. A kubeconfig or talosconfig is writable.
+  /// Mounts collected with the grants.
   pub(crate) mounts: Vec<Mount>,
   /// Grants adapted from the documents.
   pub(crate) grants: Vec<RewriteAdapted>,

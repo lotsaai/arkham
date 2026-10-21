@@ -150,9 +150,9 @@ impl<'a> StackBuilder<'a> {
     Ok(self)
   }
 
-  /// The declared `[workspace] file_rewrite` entries. Decoy twins are written
-  /// under the state directory and mounted into the agent, plus the grants
-  /// their adapters derive. A kubeconfig or talosconfig mounts writable.
+  /// The declared `[workspace] file_rewrite` entries: decoy twins written
+  /// under the state directory and mounted into the agent, plus
+  /// the grants their adapters derive.
   ///
   /// # Errors
   ///
@@ -202,9 +202,9 @@ impl<'a> StackBuilder<'a> {
     })
   }
 
-  /// The ambient sources. gitconfig, jj, ssh, nats, kube, and talos come from
-  /// their default locations. Decoy twins and the grants they derive join the
-  /// declared rewrites. A kubeconfig or talosconfig mounts writable.
+  /// The ambient sources — gitconfig, jj, ssh, nats, kube, talos from their
+  /// default locations: decoy twins plus the grants they
+  /// derive, joined onto the declared rewrites.
   ///
   /// # Errors
   ///
@@ -457,8 +457,8 @@ pub(crate) struct Stack {
   /// Env names forwarded as `${NAME}` interpolation in the agent
   /// environment, from `[workspace] passthrough`.
   pub(crate) passthrough: Vec<String>,
-  /// Rewritten files mounted at their dests, from `[workspace] file_rewrite`.
-  /// A kubeconfig or talosconfig is writable. These follow workspace mounts so they win.
+  /// Rewritten files mounted at their dests, from
+  /// `[workspace] file_rewrite`; after workspace mounts so they win.
   pub(crate) file_mounts: Vec<Mount>,
   /// Upstream identity files adapter grants materialize: mounted into the
   /// arkham service at their absolute paths, so host and container serve

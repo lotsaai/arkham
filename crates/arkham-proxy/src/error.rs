@@ -515,4 +515,36 @@ pub enum Error {
     /// Missing bundle path.
     path: PathBuf,
   },
+  /// A presented guest certificate matches no https grant for this server.
+  #[error("guest certificate matches no grant for {host}:{port}")]
+  UnmappedGuestCert {
+    /// Server the guest addressed.
+    host: String,
+    /// Server port.
+    port: u16,
+  },
+  /// More than one https grant matches the presented guest certificate.
+  #[error("guest certificate matches more than one grant for {host}:{port}")]
+  AmbiguousGuestCert {
+    /// Server the guest addressed.
+    host: String,
+    /// Server port.
+    port: u16,
+  },
+  /// https grants for one server name different upstream CA paths.
+  #[error("https grants for {host}:{port} name different trust bundles")]
+  HttpsRootSplit {
+    /// Server the guest addressed.
+    host: String,
+    /// Server port.
+    port: u16,
+  },
+  /// https grants for one server name different upstream client certificates.
+  #[error("https grants for {host}:{port} name different client certificates")]
+  HttpsClientSplit {
+    /// Server the guest addressed.
+    host: String,
+    /// Server port.
+    port: u16,
+  },
 }

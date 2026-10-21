@@ -1,6 +1,9 @@
 use super::*;
 
+use std::path::{Path, PathBuf};
+
 use bytes::Bytes;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 #[tokio::test]
 async fn mitm_terminates_both_ends_verbatim() {
@@ -1029,5 +1032,375 @@ async fn http2_real_client_and_server_round_trip_split_data() {
   let stub_result = tokio::time::timeout(Duration::from_secs(10), stub_task).await;
   client_task.abort();
   stub_result.unwrap().unwrap().unwrap();
+  proxy.abort();
+}
+
+struct GuestMaterial {
+  label: String,
+  cert: PathBuf,
+  key: PathBuf,
+  real_leaf: CertificateDer<'static>,
+  guest_chain: Vec<CertificateDer<'static>>,
+  guest_key: PrivateKeyDer<'static>,
+}
+
+fn pem_chain(chain: &[CertificateDer<'_>]) -> Vec<u8> {
+  use rama::crypto::pem::PemEncode as _;
+  let mut pem = Vec::new();
+  for cert in chain {
+    pem.extend_from_slice(cert.to_pem().as_bytes());
+  }
+  pem
+}
+
+/// Real upstream pair at `{label}.client.crt`, decoy leaf at `{label}.guest.crt`.
+fn guest_material(ca: &CertAuthority, dir: &Path, label: &str) -> GuestMaterial {
+  use rama::crypto::pem::PemEncode as _;
+  let (real_chain, real_key) = arkham_pki::ca::generate_client_pair(ca, &format!("{label}-real")).unwrap();
+  let (guest_chain, guest_key) = arkham_pki::ca::generate_client_pair(ca, &format!("{label}-guest")).unwrap();
+  let cert = dir.join(format!("{label}.client.crt"));
+  let key = dir.join(format!("{label}.client.key"));
+  std::fs::write(&cert, pem_chain(&real_chain)).unwrap();
+  std::fs::write(&key, real_key.to_pem()).unwrap();
+  std::fs::write(dir.join(format!("{label}.guest.crt")), pem_chain(&guest_chain)).unwrap();
+  let real_leaf = real_chain.into_iter().next().unwrap();
+  GuestMaterial {
+    label: label.to_string(),
+    cert,
+    key,
+    real_leaf,
+    guest_chain,
+    guest_key,
+  }
+}
+
+fn https_user_grant(
+  label: &str,
+  fake: &str,
+  value: &str,
+  port: u16,
+  identity: Option<(PathBuf, PathBuf)>,
+  bundle: &Path,
+  mode: GuestTlsMode,
+) -> Grant {
+  let (client_cert, client_key) = match identity {
+    Some((cert, key)) => (Some(cert), Some(key)),
+    None => (None, None),
+  };
+  Grant::Token {
+    credential: Credential {
+      label: label.into(),
+      fake: fake.into(),
+      value: secrecy::SecretString::from(value.to_string()),
+    },
+    allow: vec![EndpointScope {
+      scheme: Scheme::Https,
+      host: "localhost".parse().unwrap(),
+      port,
+      client_cert,
+      client_key,
+      root_cert: Some(bundle.to_path_buf()),
+      guest_tls: mode,
+    }],
+    pattern: None,
+    oauth2: None,
+  }
+}
+
+fn client_config(ca: &CertAuthority, auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>) -> Arc<rustls::ClientConfig> {
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(ca.cert_der().clone()).unwrap();
+  let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+  let mut config = match auth {
+    Some((chain, key)) => builder.with_client_auth_cert(chain, key).unwrap(),
+    None => builder.with_no_client_auth(),
+  };
+  config.alpn_protocols = vec![b"http/1.1".to_vec()];
+  Arc::new(config)
+}
+
+fn upstream_config(ca: &CertAuthority, require_cert: bool) -> Arc<rustls::ServerConfig> {
+  let (server_chain, server_key) = arkham_pki::ca::generate_domain_pair(ca, "localhost").unwrap();
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(ca.cert_der().clone()).unwrap();
+  let builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots));
+  let verifier = if require_cert {
+    builder.build().unwrap()
+  } else {
+    builder.allow_unauthenticated().build().unwrap()
+  };
+  let mut config = rustls::ServerConfig::builder()
+    .with_client_cert_verifier(verifier)
+    .with_single_cert(server_chain, server_key)
+    .unwrap();
+  config.alpn_protocols = vec![b"http/1.1".to_vec()];
+  Arc::new(config)
+}
+
+type PeerLog = Arc<tokio::sync::Mutex<Vec<(Option<CertificateDer<'static>>, Vec<u8>)>>>;
+
+struct PeerStub {
+  port: u16,
+  seen: PeerLog,
+  task: tokio::task::JoinHandle<()>,
+}
+
+fn spawn_peer_stub(config: Arc<rustls::ServerConfig>) -> PeerStub {
+  let stub = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  let port = stub.local_addr().unwrap().port();
+  stub.set_nonblocking(true).unwrap();
+  let listener = TcpListener::from_std(stub).unwrap();
+  let seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+  let seen_task = Arc::clone(&seen);
+  let task = tokio::spawn(async move {
+    loop {
+      let Ok((conn, _)) = listener.accept().await else { return };
+      let seen = Arc::clone(&seen_task);
+      let acceptor = TlsAcceptor::from(Arc::clone(&config));
+      tokio::spawn(async move {
+        let Ok(mut tls) = acceptor.accept(conn).await else { return };
+        let peer = tls.get_ref().1.peer_certificates().and_then(|certs| certs.first().cloned());
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+          let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut chunk)).await else {
+            return;
+          };
+          if n == 0 {
+            return;
+          }
+          buf.extend_from_slice(&chunk[..n]);
+          if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+          }
+        }
+        seen.lock().await.push((peer, buf));
+        let _ = tls.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await;
+      });
+    }
+  });
+  PeerStub { port, seen, task }
+}
+
+async fn https_round_trip(
+  proxy_addr: SocketAddr,
+  stub_port: u16,
+  config: Arc<rustls::ClientConfig>,
+  bearer: Option<&str>,
+) -> std::io::Result<Vec<u8>> {
+  let mut guest = TcpStream::connect(proxy_addr).await?;
+  guest
+    .write_all(format!("CONNECT localhost:{stub_port} HTTP/1.1\r\n\r\n").as_bytes())
+    .await?;
+  let mut ok = [0u8; 19];
+  guest.read_exact(&mut ok).await?;
+  let mut tls = TlsConnector::from(config)
+    .connect(ServerName::try_from("localhost".to_string()).unwrap(), guest)
+    .await?;
+  let authorization = match bearer {
+    Some(token) => format!("authorization: Bearer {token}\r\n"),
+    None => String::new(),
+  };
+  tls
+    .write_all(format!("GET / HTTP/1.1\r\nhost: localhost\r\n{authorization}\r\n").as_bytes())
+    .await?;
+  let mut head = Vec::new();
+  let mut chunk = [0u8; 4096];
+  loop {
+    let n = match tokio::time::timeout(Duration::from_secs(5), tls.read(&mut chunk)).await {
+      Ok(read) => read?,
+      Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "no answer")),
+    };
+    if n == 0 {
+      return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "refused"));
+    }
+    head.extend_from_slice(&chunk[..n]);
+    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+      return Ok(head);
+    }
+  }
+}
+
+/// Two certificate users of one server. Each handshake presents that user's
+/// decoy, and upstream sees that user's real certificate.
+#[tokio::test]
+async fn https_guest_cert_selects_each_users_upstream_cert() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let bundle = dir.path().join("arkham-ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let alice = guest_material(&ca, dir.path(), "alice");
+  let bob = guest_material(&ca, dir.path(), "bob");
+  let PeerStub {
+    port: stub_port,
+    seen,
+    task: stub_task,
+  } = spawn_peer_stub(upstream_config(&ca, true));
+  let grants = vec![
+    https_user_grant(
+      &alice.label,
+      "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      stub_port,
+      Some((alice.cert.clone(), alice.key.clone())),
+      &bundle,
+      GuestTlsMode::Mtls,
+    ),
+    https_user_grant(
+      &bob.label,
+      "ghp_cccccccccccccccccccccccccccccccccccccccc",
+      "ghp_dddddddddddddddddddddddddddddddddddddddd",
+      stub_port,
+      Some((bob.cert.clone(), bob.key.clone())),
+      &bundle,
+      GuestTlsMode::Mtls,
+    ),
+  ];
+  let state = test_state_with_plugins(grants, Vec::new(), &ca);
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+  https_round_trip(
+    proxy_addr,
+    stub_port,
+    client_config(&ca, Some((alice.guest_chain.clone(), alice.guest_key.clone_key()))),
+    None,
+  )
+  .await
+  .unwrap();
+  https_round_trip(
+    proxy_addr,
+    stub_port,
+    client_config(&ca, Some((bob.guest_chain.clone(), bob.guest_key.clone_key()))),
+    None,
+  )
+  .await
+  .unwrap();
+  let seen = seen.lock().await;
+  assert_eq!(seen.len(), 2, "each user opened one upstream connection");
+  assert_eq!(seen[0].0.as_ref(), Some(&alice.real_leaf));
+  assert_eq!(seen[1].0.as_ref(), Some(&bob.real_leaf));
+  drop(seen);
+  stub_task.abort();
+  proxy.abort();
+}
+
+/// A token user and a certificate user share one server. The bearer selects
+/// the token user. The guest certificate selects the certificate user, and
+/// that user's connection does not swap the token user's bearer.
+#[tokio::test]
+async fn https_guest_cert_selects_cert_user_beside_token_user() {
+  const TOKEN_FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const TOKEN_VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let bundle = dir.path().join("arkham-ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let cert_user = guest_material(&ca, dir.path(), "cert-user");
+  let PeerStub {
+    port: stub_port,
+    seen,
+    task: stub_task,
+  } = spawn_peer_stub(upstream_config(&ca, false));
+  let grants = vec![
+    https_user_grant("token-user", TOKEN_FAKE, TOKEN_VALUE, stub_port, None, &bundle, GuestTlsMode::Tls),
+    https_user_grant(
+      &cert_user.label,
+      "ghp_cccccccccccccccccccccccccccccccccccccccc",
+      "ghp_dddddddddddddddddddddddddddddddddddddddd",
+      stub_port,
+      Some((cert_user.cert.clone(), cert_user.key.clone())),
+      &bundle,
+      GuestTlsMode::Mtls,
+    ),
+  ];
+  let state = test_state_with_plugins(grants, Vec::new(), &ca);
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+  https_round_trip(
+    proxy_addr,
+    stub_port,
+    client_config(&ca, Some((cert_user.guest_chain.clone(), cert_user.guest_key.clone_key()))),
+    Some(TOKEN_FAKE),
+  )
+  .await
+  .unwrap();
+  https_round_trip(proxy_addr, stub_port, client_config(&ca, None), Some(TOKEN_FAKE))
+    .await
+    .unwrap();
+  let seen = seen.lock().await;
+  assert_eq!(seen.len(), 2);
+  assert_eq!(seen[0].0.as_ref(), Some(&cert_user.real_leaf));
+  assert!(
+    !seen[0].1.windows(TOKEN_VALUE.len()).any(|window| window == TOKEN_VALUE.as_bytes()),
+    "cert user must not swap the token user's bearer"
+  );
+  assert!(seen[0].1.windows(TOKEN_FAKE.len()).any(|window| window == TOKEN_FAKE.as_bytes()));
+  assert!(seen[1].0.is_none(), "token user presents no client certificate");
+  assert!(seen[1].1.windows(TOKEN_VALUE.len()).any(|window| window == TOKEN_VALUE.as_bytes()));
+  drop(seen);
+  stub_task.abort();
+  proxy.abort();
+}
+
+/// An arkham-CA guest certificate that matches no grant is rejected. It does
+/// not authenticate as the first grant.
+#[tokio::test]
+async fn https_unknown_guest_cert_is_rejected() {
+  install_crypto_provider();
+  let ca = CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let bundle = dir.path().join("arkham-ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let alice = guest_material(&ca, dir.path(), "alice");
+  let bob = guest_material(&ca, dir.path(), "bob");
+  let (stranger_chain, stranger_key) = arkham_pki::ca::generate_client_pair(&ca, "stranger").unwrap();
+  let PeerStub {
+    port: stub_port,
+    seen,
+    task: stub_task,
+  } = spawn_peer_stub(upstream_config(&ca, true));
+  let grants = vec![
+    https_user_grant(
+      &alice.label,
+      "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      stub_port,
+      Some((alice.cert.clone(), alice.key.clone())),
+      &bundle,
+      GuestTlsMode::Mtls,
+    ),
+    https_user_grant(
+      &bob.label,
+      "ghp_cccccccccccccccccccccccccccccccccccccccc",
+      "ghp_dddddddddddddddddddddddddddddddddddddddd",
+      stub_port,
+      Some((bob.cert.clone(), bob.key.clone())),
+      &bundle,
+      GuestTlsMode::Mtls,
+    ),
+  ];
+  let state = test_state_with_plugins(grants, Vec::new(), &ca);
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
+  https_round_trip(
+    proxy_addr,
+    stub_port,
+    client_config(&ca, Some((alice.guest_chain.clone(), alice.guest_key.clone_key()))),
+    None,
+  )
+  .await
+  .unwrap();
+  https_round_trip(
+    proxy_addr,
+    stub_port,
+    client_config(&ca, Some((stranger_chain, stranger_key))),
+    None,
+  )
+  .await
+  .expect_err("unknown guest certificate must not round-trip");
+  let seen = seen.lock().await;
+  assert_eq!(seen.len(), 1, "the unknown certificate opened no upstream request");
+  assert_eq!(seen[0].0.as_ref(), Some(&alice.real_leaf));
+  drop(seen);
+  stub_task.abort();
   proxy.abort();
 }

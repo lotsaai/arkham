@@ -8,7 +8,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use rama::extensions::{Extensions, ExtensionsRef};
+use rama::error::BoxError;
+use rama::extensions::{Extension, Extensions, ExtensionsRef};
 use rama::net::address::{Host, HostWithPort};
 use rama::net::client::ConnectorTarget;
 use rama::net::socket::SocketOptions;
@@ -16,9 +17,12 @@ use rama::service::service_fn;
 use rama::tcp::client::TcpStreamConnector;
 use rama::tcp::stream::TokioTcpStream;
 use rama::tls::boring::client::ConnectorConfigClientAuth;
-use rama::tls::boring::core::ssl::SslCredential;
+use rama::tls::boring::core::ssl::{SslCredential, SslRef, SslVerifyMode};
+use rama::tls::boring::core::x509::X509;
 use rama::tls::boring::core::x509::store::X509Store;
-use rama::tls::boring::proxy::client_auth::{TlsMitmClientAuthInput, TlsMitmClientAuthPlan, TlsMitmClientAuthPolicy};
+use rama::tls::boring::proxy::client_auth::{
+  TlsMitmClientAuthInput, TlsMitmClientAuthPlan, TlsMitmClientAuthPolicy, TlsMitmClientIdentity,
+};
 use rama::tls::client::{ClientAuth, ClientAuthData};
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::Error as PemError};
@@ -159,6 +163,176 @@ fn mtls_policy(store: &X509Store, auth: Option<ClientAuth>) -> Result<TlsMitmCli
     let store = store.clone();
     async move { Ok::<_, std::convert::Infallible>(TlsMitmClientAuthPlan::fixed(credential).with_ingress_trust(store)) }
   })))
+}
+
+/// One https grant that covers the destination, when several do.
+#[derive(Clone)]
+pub(crate) struct HttpsCandidate {
+  /// Index into the config grant list.
+  pub(crate) index: usize,
+  /// Grant label. The decoy leaf is `{label}.guest.crt` beside `client_cert`.
+  pub(crate) label: String,
+  /// Real upstream client certificate, when the grant names one.
+  pub(crate) client_cert: Option<PathBuf>,
+  /// Real upstream client key, when the grant names one.
+  pub(crate) client_key: Option<PathBuf>,
+  /// Whether this grant admits a guest certificate.
+  pub(crate) guest_tls: GuestTlsMode,
+}
+
+/// Grants the handshake selected for this connection. Indices into the
+/// config grant list. Absent on the single-grant path.
+#[derive(Debug)]
+pub(crate) struct SelectedHttps {
+  /// Selected grant indices.
+  pub(crate) indices: Vec<usize>,
+}
+
+impl Extension for SelectedHttps {}
+
+/// Client-auth policy for several https grants on one server. A guest
+/// certificate selects the mutual-TLS grant whose decoy leaf matches.
+/// No certificate selects the plain TLS grants. An unknown certificate
+/// fails the handshake.
+pub(crate) fn selecting_client_auth(candidates: Vec<HttpsCandidate>, trust: &X509Store, host: &str, port: u16) -> TlsMitmClientAuthPolicy {
+  let ask = candidates.iter().any(|candidate| candidate.guest_tls == GuestTlsMode::Mtls);
+  let trust = trust.clone();
+  let host = host.to_string();
+  TlsMitmClientAuthPolicy::new(service_fn(move |input: TlsMitmClientAuthInput| {
+    let candidates = candidates.clone();
+    let extensions = input.extensions.clone();
+    let requested = input.request.is_some();
+    let trust = trust.clone();
+    let host = host.clone();
+    async move {
+      let resolver = service_fn(move |identity: TlsMitmClientIdentity| {
+        let candidates = candidates.clone();
+        let extensions = extensions.clone();
+        let host = host.clone();
+        async move {
+          let presented = match identity.leaf() {
+            Some(leaf) => Some(leaf.to_der().map_err(|err| Error::ClientAuthPolicy { source: err.into() })?),
+            None => None,
+          };
+          let (indices, auth) = select_https(&candidates, presented.as_deref(), &host, port)?;
+          extensions.insert(SelectedHttps { indices });
+          let credential = match (requested, auth) {
+            (true, Some(auth)) => Some(upstream_credential(auth)?),
+            _ => None,
+          };
+          Ok::<_, Error>(credential)
+        }
+      });
+      let plan = TlsMitmClientAuthPlan::new(resolver);
+      let plan = if ask {
+        plan.with_ingress(move |ssl: &mut SslRef| {
+          ssl.set_verify_cert_store(trust).map_err(|err| -> BoxError { err.into() })?;
+          ssl.set_verify(SslVerifyMode::PEER);
+          Ok(())
+        })
+      } else {
+        plan
+      };
+      Ok::<_, std::convert::Infallible>(plan)
+    }
+  }))
+}
+
+fn select_https(
+  candidates: &[HttpsCandidate],
+  presented: Option<&[u8]>,
+  host: &str,
+  port: u16,
+) -> Result<(Vec<usize>, Option<ClientAuth>), Error> {
+  if let Some(presented) = presented {
+    let mut matched = Vec::new();
+    for candidate in candidates.iter().filter(|candidate| candidate.guest_tls == GuestTlsMode::Mtls) {
+      let Some(expected) = guest_leaf_der(candidate)? else {
+        continue;
+      };
+      if expected == presented {
+        matched.push(candidate);
+      }
+    }
+    let Some(chosen) = matched.first().copied() else {
+      return Err(Error::UnmappedGuestCert {
+        host: host.to_string(),
+        port,
+      });
+    };
+    if matched.len() != 1 {
+      return Err(Error::AmbiguousGuestCert {
+        host: host.to_string(),
+        port,
+      });
+    }
+    return Ok((vec![chosen.index], upstream_identity(chosen)?));
+  }
+  let plain: Vec<&HttpsCandidate> = candidates
+    .iter()
+    .filter(|candidate| candidate.guest_tls == GuestTlsMode::Tls)
+    .collect();
+  if plain.is_empty() {
+    return Err(Error::UnmappedGuestCert {
+      host: host.to_string(),
+      port,
+    });
+  }
+  let indices = plain.iter().map(|candidate| candidate.index).collect();
+  Ok((indices, shared_upstream(&plain, host, port)?))
+}
+
+fn guest_leaf_der(candidate: &HttpsCandidate) -> Result<Option<Vec<u8>>, Error> {
+  let Some(cert) = &candidate.client_cert else {
+    return Ok(None);
+  };
+  let path = cert.with_file_name(format!("{}.guest.crt", candidate.label));
+  let bytes = match std::fs::read(&path) {
+    Ok(bytes) => bytes,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(source) => return Err(Error::ReadFile { path, source }),
+  };
+  let leaf = X509::from_pem(&bytes).map_err(|err| Error::GuestCertificate {
+    path: path.clone(),
+    source: Box::new(err),
+  })?;
+  leaf.to_der().map(Some).map_err(|err| Error::GuestCertificate {
+    path,
+    source: Box::new(err),
+  })
+}
+
+fn upstream_identity(candidate: &HttpsCandidate) -> Result<Option<ClientAuth>, Error> {
+  match (&candidate.client_cert, &candidate.client_key) {
+    (Some(cert), Some(key)) => client_identity(cert, key).map(Some),
+    _ => Ok(None),
+  }
+}
+
+fn shared_upstream(candidates: &[&HttpsCandidate], host: &str, port: u16) -> Result<Option<ClientAuth>, Error> {
+  let mut paths: Option<(Option<PathBuf>, Option<PathBuf>)> = None;
+  for candidate in candidates {
+    let pair = (candidate.client_cert.clone(), candidate.client_key.clone());
+    match &paths {
+      None => paths = Some(pair),
+      Some(seen) if seen == &pair => {}
+      Some(_) => {
+        return Err(Error::HttpsClientSplit {
+          host: host.to_string(),
+          port,
+        });
+      }
+    }
+  }
+  match paths {
+    Some((Some(cert), Some(key))) => client_identity(&cert, &key).map(Some),
+    _ => Ok(None),
+  }
+}
+
+fn upstream_credential(auth: ClientAuth) -> Result<SslCredential, Error> {
+  let configured = ConnectorConfigClientAuth::try_from(auth).map_err(|err| Error::ClientAuthPolicy { source: err })?;
+  SslCredential::try_from(configured).map_err(|err| Error::ClientAuthPolicy { source: err })
 }
 
 /// Failure loading an upstream CA bundle for one entry's extra egress trust.

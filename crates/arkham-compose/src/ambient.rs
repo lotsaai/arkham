@@ -267,7 +267,7 @@ impl AmbientDeriver<'_> {
           continue;
         }
       };
-      let (adapted, writable) = match name {
+      let adapted = match name {
         "kubeconfig" => match kube::adapt(&path, &content, ca, guests_dir) {
           Ok(Some(found)) => {
             tracing::debug!(
@@ -275,9 +275,9 @@ impl AmbientDeriver<'_> {
               skipped = found.skipped.len(),
               "kube contexts left out of the grant set"
             );
-            (found.grants, true)
+            found.grants
           }
-          Ok(None) => (Vec::new(), true),
+          Ok(None) => Vec::new(),
           Err(err) => {
             tracing::warn!(source = %path.display(), %err, "kubeconfig source skipped");
             continue;
@@ -286,7 +286,7 @@ impl AmbientDeriver<'_> {
         _ => match talos::adapt(&path, &content, ca, guests_dir) {
           Ok(found) => {
             tracing::debug!(source = %path.display(), skipped = found.skipped.len(), "talos contexts left out of the grant set");
-            (found.grants, true)
+            found.grants
           }
           Err(err) => {
             tracing::warn!(source = %path.display(), %err, "talosconfig source skipped");
@@ -299,11 +299,7 @@ impl AmbientDeriver<'_> {
         continue;
       }
       let dest = format!("{}/{twin_dest}", self.home);
-      if writable {
-        self.collector.twin_mode(adapted, twin_name, &dest, false)?;
-      } else {
-        self.collector.twin(adapted, twin_name, &dest)?;
-      }
+      self.collector.twin_mode(adapted, twin_name, &dest, false)?;
     }
     Ok(())
   }

@@ -1,6 +1,7 @@
 //! Helpers shared by the compose crate tests.
 
 use std::ffi::OsString;
+use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -217,6 +218,41 @@ pub(crate) fn derive_home(host: &Path) -> DerivedHome {
     _xdg: xdg,
     _env: env,
     outputs,
+  }
+}
+
+/// Tracing subscriber that keeps warn-level event text.
+pub(crate) struct WarnCapture(pub(crate) std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for WarnCapture {
+  fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+    *metadata.level() <= tracing::Level::WARN
+  }
+
+  fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+    tracing::span::Id::from_u64(1)
+  }
+
+  fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+  fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+  fn event(&self, event: &tracing::Event<'_>) {
+    let mut message = String::new();
+    event.record(&mut WarnVisit(&mut message));
+    self.0.lock().unwrap().push(message);
+  }
+
+  fn enter(&self, _span: &tracing::span::Id) {}
+
+  fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+struct WarnVisit<'a>(&'a mut String);
+
+impl tracing::field::Visit for WarnVisit<'_> {
+  fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+    let _ = write!(self.0, "{}={value:?};", field.name());
   }
 }
 
