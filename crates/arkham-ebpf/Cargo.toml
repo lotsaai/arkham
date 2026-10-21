@@ -11,7 +11,6 @@ publish = false
 aya = { workspace = true }
 dashmap = { workspace = true }
 thiserror = { workspace = true }
-arkham-config = { workspace = true }
 arkham-proxy = { workspace = true }
 libc = { workspace = true }
 tokio = { workspace = true }
@@ -22,6 +21,7 @@ aya-build = { workspace = true }
 
 [dev-dependencies]
 aya-obj = { workspace = true }
+arkham-config = { workspace = true }
 arkham-pki = { workspace = true }
 rustls = { workspace = true }
 secrecy = { workspace = true }

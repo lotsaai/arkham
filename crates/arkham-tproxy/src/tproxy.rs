@@ -32,7 +32,6 @@ use rama::rt::Executor;
 use rama::tcp::server::TcpListener as RamaTcpListener;
 use tokio::net::TcpStream;
 
-use arkham_config::grants::ResolvedConfig;
 use arkham_proxy::{ProxyState, serve_transparent_stream};
 
 /// Capture mark: the nft OUTPUT rule sets it on intercepted TCP, the fib
@@ -200,7 +199,7 @@ async fn tproxy_conn_task(
 ) -> Result<(), Error> {
   let dial = upstream_override.unwrap_or(dst);
   let dial_host = dial.ip().to_string();
-  let snapshot: Arc<ResolvedConfig> = state.snapshot();
+  let snapshot = state.snapshot();
   let snapshot = &*snapshot;
   serve_transparent_stream(stream, &state, snapshot, &dial_host, dial.port(), &dial_host)
     .await
@@ -367,7 +366,7 @@ mod tests {
   use super::*;
   use std::time::Duration;
 
-  use arkham_config::grants::{Credential, EndpointScope, Grant, Scheme};
+  use arkham_config::grants::{Credential, EndpointScope, Grant, ResolvedConfig, Scheme};
 
   /// Main table: the live test's scoped dst route lands here.
   const TABLE_MAIN: u8 = 254;

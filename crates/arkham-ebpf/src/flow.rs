@@ -72,7 +72,7 @@ impl FlowTables {
       Err(err) => return Err(Error::ReadFlow { origin: err }),
     };
     match self.orig.get(&cookie, 0) {
-      Ok(orig) if orig.proto == proto => Ok(orig.socket_addr()),
+      Ok(orig) if orig.proto == proto => Ok(Some(orig.socket_addr())),
       // Either the entry aged out of the LRU, or the local port has been
       // reused by the other protocol: both mean "not this flow".
       Ok(_) | Err(MapError::KeyNotFound) => Ok(None),
