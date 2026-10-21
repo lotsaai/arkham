@@ -4,7 +4,7 @@ Several contexts in one kubeconfig, Talos config, NATS directory, or SSH config 
 
 The choice uses the destination host and port, the client identity, and the decoy bytes. No new config key is added. The proxy terminates the guest session and opens its own upstream session. Real credentials stay on that upstream leg.
 
-`current-context`, the Talos `context` key, and NATS `context.txt` copy the host's current value into the guest. The proxy does not read that pointer when it chooses a credential. Changing the pointer inside the guest changes the guest's default command. `kubectl --context`, `talosctl --context`, and `nats --context` work because every granted context is in the decoy file with its own decoy. `kubectl config use-context`, `talosctl config context`, and `nats context select` rewrite the pointer. The sibling issues mount the generated decoy so those writes succeed, and they leave the host file unmounted for writes.
+`current-context`, the Talos `context` key, and NATS `context.txt` copy the host's current value into the guest. The proxy does not read that pointer when it chooses a credential. Changing the pointer inside the guest changes the guest's default command. `kubectl --context`, `talosctl --context`, and `nats --context` work because every granted context is in the decoy file with its own decoy. `kubectl config use-context` and `talosctl config context` rewrite the pointer. Those mounts are writable, and the host file stays unmounted. NATS mounts stay read-only, so `nats context select` cannot rewrite `context.txt`.
 
 ## One subject, one identity
 
@@ -44,7 +44,7 @@ In `/home/ivan/.talos/config`, contexts `prod` and `staging` that dial `10.5.0.6
 
 ## NATS
 
-One call per `context/<name>.json`, with protocol `Nats` and the name taken once. The source is the json path. Password and token are `secret()`. Nkey and creds use `key_seed()`. `context.txt` is left unread. `NATS_CONTEXT` and `XDG_CONFIG_HOME` are left unread. The directory stays `{host_home}/.config/nats`.
+One call per `context/<name>.json`, with protocol `Nats` and the name taken once. The source is the json path. Password and token decoys are `secret()`, because `NatsPlain::prepare` hashes that identity's env. Nkey and creds decoys are the fresh user key `prepare` mints. `prepare` does not take `key_seed()`. `context.txt` is copied into the guest and is not how a credential is chosen. `NATS_CONTEXT` and `XDG_CONFIG_HOME` are left unread. The directory stays `{host_home}/.config/nats`. The adapter does not call `require_distinct`: each context's decoy differs, and the proxy selects the grant from the CONNECT fields.
 
 The proxy reads the url host and port, then CONNECT fields inside `Policy::swap`, still capped by `MAX_COMMAND` at 16 KiB. #64 collects every grant whose decoy fields match, including a match that is later in label order. No match forwards the line. `relay_guarded` pumps after the grant is chosen. There is no new buffer.
 
@@ -58,11 +58,11 @@ stateDiagram-v2
   Forward --> Pump: Policy::Forward, no real credential
 ```
 
-`Error::NatsSharedEndpoint` stays the dial and TLS clash. `AmbiguousContexts` is the separate case of two decoys that present the same bytes.
+`Error::NatsSharedEndpoint` stays the dial and TLS clash. `AmbiguousContexts` is the separate case of two decoys that present the same bytes. This adapter does not return that error. A seed outside the nkey or creds field is `NatsUriError::MisplacedSeed` for every context file, selected or not. Any other underivable file is skipped with a warning that names it, unless `context.txt` names that file, in which case derivation returns `Error::SourceInvalid`.
 
 A cleartext `nats` upstream uses `Policy::Forward` and writes no real credential. There is nothing to select and nothing to protect, including when two cleartext contexts share a host and port. Both forward. `require_distinct` is not called for them.
 
-In `/home/eng/.config/nats`, contexts `demo` and `Demo` both use tls on host `nats.example` port 4222. The passwords differ because the identities differ. A CONNECT that carries one password selects that context. When both contexts were given the same decoy CONNECT bytes, `require_distinct` names both.
+In `/home/eng/.config/nats`, contexts `demo` and `Demo` both use tls on host `nats.example` port 4222. The passwords differ because the identities differ. A CONNECT that carries one password selects that context. This adapter does not call `require_distinct` for that pair.
 
 ## SSH
 
@@ -86,7 +86,7 @@ In `/home/ivan/.ssh/config`, blocks `git` and `git.example` both resolve to host
 
 The guest file receives `secret()`, the certificate named by the label, or the public half of the seeded key. A destination with no matching grant splices.
 
-Adopting the helper changes the label, the env, and the pem file name. Nothing copies an old pair onto the new name. `load_or_generate_client_pair` mints a new pair on the first adapt after the switch. `write_state` removes a stale file whose name starts with `kube-`, `talos-`, `ssh-`, `git-`, or `nats-` when that name is not in the current set. Older slug files that do not start with those prefixes stay until a sibling removes them. NATS nkeys and SSH keys become stable on the first adapt that uses `key_seed()`.
+Adopting the helper changes the label, the env, and the pem file name. Nothing copies an old pair onto the new name. `load_or_generate_client_pair` mints a new pair on the first adapt after the switch. `write_state` removes a stale file whose name starts with `kube-`, `talos-`, `ssh-`, `git-`, or `nats-` when that name is not in the current set. Older slug files that do not start with those prefixes stay until a sibling removes them. SSH keys become stable on the first adapt that uses `key_seed()`. A NATS nkey or creds decoy is the fresh user key `prepare` mints, so it changes on the next adapt.
 
 ## Outside this change
 

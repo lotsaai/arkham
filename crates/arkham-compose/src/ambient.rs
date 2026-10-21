@@ -218,12 +218,12 @@ impl AmbientDeriver<'_> {
     }
   }
 
-  /// The selected NATS CLI context under `~/.config/nats`.
+  /// Every derivable NATS CLI context under `~/.config/nats`.
   ///
   /// # Errors
   ///
-  /// Returns an error when the twin output cannot be written. A context
-  /// that does not map warns and derives nothing.
+  /// Returns an error when the twin output cannot be written. A selected
+  /// context that does not map warns and derives nothing.
   fn nats(&mut self) -> Result<(), Error> {
     let root = self.host_home.join(".config").join("nats");
     let selected = root.join("context.txt");
@@ -529,10 +529,10 @@ mod moved_suite {
     assert!(!mounted_text(&derived.outputs, "context/demo.json").contains(&seed));
   }
 
-  /// The selected `~/.config/nats` context becomes one grant. The guest
-  /// mounts that context only.
+  /// Every derivable `~/.config/nats` context becomes a grant. The guest
+  /// mounts each of those context files, with the real token only in the grant.
   #[test]
-  fn derive_sources_mounts_the_selected_nats_context() {
+  fn derive_sources_mounts_every_nats_context() {
     use arkham_config::registry::Registry;
     use std::collections::HashMap;
 
@@ -554,10 +554,13 @@ mod moved_suite {
     })
     .unwrap();
     let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
-    for expected in ["/home/eng/.config/nats/context.txt", "/home/eng/.config/nats/context/demo.json"] {
+    for expected in [
+      "/home/eng/.config/nats/context.txt",
+      "/home/eng/.config/nats/context/demo.json",
+      "/home/eng/.config/nats/context/other.json",
+    ] {
       assert!(containers.contains(&expected.to_string()), "{expected} missing from {containers:?}");
     }
-    assert!(!containers.iter().any(|path| path.ends_with("other.json")), "{containers:?}");
     let context = outputs
       .mounts
       .iter()
@@ -566,8 +569,11 @@ mod moved_suite {
     let twin = fs::read_to_string(&context.host).unwrap();
     assert!(twin.contains("app"), "{twin}");
     assert!(!twin.contains("real-token"), "{twin}");
+    let other = outputs.mounts.iter().find(|mount| mount.container.ends_with("other.json")).unwrap();
+    let other_text = fs::read_to_string(&other.host).unwrap();
+    assert!(!other_text.contains("other-real"), "{other_text}");
     assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("real-token")));
-    assert!(!outputs.grants.iter().any(|grant| grant.fragment.contains("other-real")));
+    assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("other-real")));
   }
 
   /// A declared path under `~/.config/nats` stays with that declaration.
