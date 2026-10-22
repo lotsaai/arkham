@@ -340,3 +340,19 @@ impl From<FnoxError> for Error {
     Self::Fnox(Box::new(source))
   }
 }
+
+impl Error {
+  pub(crate) fn is_misplaced_nats_seed(&self) -> bool {
+    matches!(
+      self,
+      Self::Config(boxed)
+        if matches!(
+          boxed.as_ref(),
+          ConfigError::NatsScope {
+            source: arkham_config::grants::NatsUriError::MisplacedSeed,
+            ..
+          }
+        )
+    )
+  }
+}

@@ -173,8 +173,7 @@ impl Drop for AmbientEnv {
   }
 }
 
-pub(crate) fn token_context(host: &Path) -> PathBuf {
-  let nats = host.join(".config").join("nats");
+pub(crate) fn token_context(nats: &Path) -> PathBuf {
   fs::create_dir_all(nats.join("context")).unwrap();
   fs::write(nats.join("context.txt"), "demo\n").unwrap();
   fs::write(
@@ -183,12 +182,11 @@ pub(crate) fn token_context(host: &Path) -> PathBuf {
   )
   .unwrap();
   fs::write(nats.join("context").join("other.json"), r#"{"token":"other-real"}"#).unwrap();
-  nats
+  nats.to_path_buf()
 }
 
 pub(crate) struct DerivedHome {
   pub(crate) _work: tempfile::TempDir,
-  pub(crate) _xdg: tempfile::TempDir,
   pub(crate) _env: AmbientEnv,
   pub(crate) outputs: RewriteOutputs,
 }
@@ -198,8 +196,9 @@ pub(crate) fn derive_home(host: &Path) -> DerivedHome {
   use std::collections::HashMap;
 
   let work = tempdir().unwrap();
-  let xdg = tempdir().unwrap();
-  let env = AmbientEnv::isolate(host, xdg.path());
+  let xdg = host.join(".config");
+  fs::create_dir_all(&xdg).unwrap();
+  let env = AmbientEnv::isolate(host, &xdg);
   let outputs = derive_sources(&DeriveInputs {
     files_dir: &work.path().join("files"),
     root: work.path(),
@@ -214,7 +213,6 @@ pub(crate) fn derive_home(host: &Path) -> DerivedHome {
   .unwrap();
   DerivedHome {
     _work: work,
-    _xdg: xdg,
     _env: env,
     outputs,
   }

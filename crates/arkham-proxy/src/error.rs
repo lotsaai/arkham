@@ -376,14 +376,6 @@ pub enum Error {
   /// `guest_tls_mode` is `mtls` and the guest sent plaintext after INFO.
   #[error("nats mtls guest sent plaintext")]
   NatsGuestPlaintext,
-  /// The server's INFO set `tls_required` and the upstream is cleartext.
-  #[error("nats server requires tls on a cleartext upstream")]
-  NatsTlsRequired {
-    /// INFO `tls_available`.
-    tls_available: bool,
-    /// INFO `tls_verify`.
-    tls_verify: bool,
-  },
   /// A cleartext INFO line did not finish an object, and `tls_required` was not true.
   #[error("nats INFO did not yield tls flags on a cleartext upstream")]
   NatsInfoUnreadable,

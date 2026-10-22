@@ -104,6 +104,17 @@ pub enum NatsPlain {
     /// CONNECT `pass`.
     pass: String,
   },
+  /// CONNECT `user`, `pass`, and `auth_token` together.
+  UserToken {
+    /// CONNECT `user`.
+    user: String,
+    /// CONNECT `pass`.
+    pass: String,
+    /// CONNECT `auth_token`.
+    token: String,
+  },
+  /// CONNECT `jwt` with no seed. The line is not signed.
+  Jwt(String),
   /// CONNECT `auth_token`.
   Token(String),
   /// Username [`Self::NKEY_USER`] and a user seed.
@@ -153,6 +164,8 @@ pub struct NatsContextAuth {
   pub nkey: String,
   /// Context `creds`. A path, not the file body.
   pub creds: String,
+  /// Context `user_jwt`. The JWT text, not a path.
+  pub user_jwt: String,
 }
 
 impl NatsPlain {
@@ -160,14 +173,22 @@ impl NatsPlain {
   pub const NKEY_USER: &'static str = "nkey";
   /// Username spelling of [`Self::Creds`].
   pub const CREDS_USER: &'static str = "creds";
+  /// Username spelling of [`Self::Jwt`].
+  pub const JWT_USER: &'static str = "jwt";
+  /// Query key that carries [`Self::UserToken`]'s token beside `user:pass`.
+  pub const AUTH_TOKEN_QUERY: &'static str = "auth_token";
 
   /// Username and password for a connection string.
   #[must_use]
   pub fn userinfo(&self) -> NatsUserinfo {
     match self {
-      Self::UserPass { user, pass } => NatsUserinfo {
+      Self::UserPass { user, pass } | Self::UserToken { user, pass, .. } => NatsUserinfo {
         user: user.clone(),
         password: Some(pass.clone()),
+      },
+      Self::Jwt(jwt) => NatsUserinfo {
+        user: Self::JWT_USER.to_string(),
+        password: Some(jwt.clone()),
       },
       Self::Token(token) => NatsUserinfo {
         user: token.clone(),
@@ -197,7 +218,11 @@ impl NatsPlain {
       None => host_part,
     };
     let mut rendered = format!("{scheme}://{}@{authority}", self.userinfo().encode());
-    if query.is_empty() {
+    let token = match self {
+      Self::UserToken { token, .. } => Some(token.as_str()),
+      Self::UserPass { .. } | Self::Jwt(_) | Self::Token(_) | Self::Nkey(_) | Self::Creds { .. } => None,
+    };
+    if query.is_empty() && token.is_none() {
       return rendered;
     }
     let Ok(mut url) = Url::parse("nats://placeholder.invalid/") else {
@@ -205,6 +230,9 @@ impl NatsPlain {
     };
     {
       let mut pairs = url.query_pairs_mut();
+      if let Some(token) = token {
+        pairs.append_pair(Self::AUTH_TOKEN_QUERY, token);
+      }
       for (key, value) in query {
         pairs.append_pair(key, value);
       }
@@ -238,6 +266,23 @@ impl NatsPlain {
           signs: false,
         })
       }
+      Self::UserToken { user, pass, .. } => {
+        let decoy_pass = if pass.is_empty() { String::new() } else { fake_for(env, None) };
+        Ok(NatsPrepared {
+          decoy: Self::UserToken {
+            user: user.clone(),
+            pass: decoy_pass,
+            token: fake_for(&format!("{env}\0token"), None),
+          },
+          file: None,
+          signs: false,
+        })
+      }
+      Self::Jwt(_) => Ok(NatsPrepared {
+        decoy: Self::Jwt(format!("e30.e30.{}", fake_for(env, None))),
+        file: None,
+        signs: false,
+      }),
       Self::Token(_) => Ok(NatsPrepared {
         decoy: Self::Token(fake_for(env, None)),
         file: None,
@@ -283,6 +328,16 @@ impl NatsPlain {
         password: pass.clone(),
         ..NatsContextAuth::default()
       },
+      Self::UserToken { user, pass, token } => NatsContextAuth {
+        user: user.clone(),
+        password: pass.clone(),
+        token: token.clone(),
+        ..NatsContextAuth::default()
+      },
+      Self::Jwt(jwt) => NatsContextAuth {
+        user_jwt: jwt.clone(),
+        ..NatsContextAuth::default()
+      },
       Self::Token(token) => NatsContextAuth {
         token: token.clone(),
         ..NatsContextAuth::default()
@@ -322,6 +377,35 @@ impl NatsPlain {
           real: SecretString::from(real_pass),
         },
       }),
+      (
+        Self::UserToken {
+          user: fake_user,
+          pass: fake_pass,
+          token: fake_token,
+        },
+        Self::UserToken {
+          user: real_user,
+          pass: real_pass,
+          token: real_token,
+        },
+      ) => Ok(NatsAuth::UserToken {
+        user: NatsPair {
+          fake: fake_user,
+          real: SecretString::from(real_user),
+        },
+        pass: NatsPair {
+          fake: fake_pass,
+          real: SecretString::from(real_pass),
+        },
+        token: NatsPair {
+          fake: fake_token,
+          real: SecretString::from(real_token),
+        },
+      }),
+      (Self::Jwt(fake), Self::Jwt(real)) => Ok(NatsAuth::Jwt(NatsPair {
+        fake,
+        real: SecretString::from(real),
+      })),
       (Self::Token(fake), Self::Token(real)) => Ok(NatsAuth::Token(NatsPair {
         fake,
         real: SecretString::from(real),
@@ -494,6 +578,17 @@ pub enum NatsAuth {
     /// CONNECT `pass`.
     pass: NatsPair,
   },
+  /// `user:pass` plus `auth_token`. CONNECT swaps all three.
+  UserToken {
+    /// CONNECT `user`.
+    user: NatsPair,
+    /// CONNECT `pass`.
+    pass: NatsPair,
+    /// CONNECT `auth_token`.
+    token: NatsPair,
+  },
+  /// Username `jwt` and a user JWT. CONNECT `jwt` swaps. The line is not signed.
+  Jwt(NatsPair),
   /// Lone userinfo, which every official client sends as CONNECT
   /// `auth_token`.
   Token(NatsPair),
@@ -540,6 +635,28 @@ impl NatsAuth {
           presence: FieldPresence::Required,
         },
       ],
+      Self::UserToken { user, pass, token } => vec![
+        AuthField {
+          name: NatsField::User,
+          pair: user,
+          presence: FieldPresence::Required,
+        },
+        AuthField {
+          name: NatsField::Pass,
+          pair: pass,
+          presence: FieldPresence::Required,
+        },
+        AuthField {
+          name: NatsField::AuthToken,
+          pair: token,
+          presence: FieldPresence::Required,
+        },
+      ],
+      Self::Jwt(jwt) => vec![AuthField {
+        name: NatsField::Jwt,
+        pair: jwt,
+        presence: FieldPresence::Required,
+      }],
       Self::Token(token) => vec![AuthField {
         name: NatsField::AuthToken,
         pair: token,
@@ -570,7 +687,7 @@ impl NatsAuth {
   pub fn forbidden(&self) -> &'static [NatsField] {
     match self {
       Self::Nkey { .. } => &[NatsField::Jwt],
-      Self::UserPass { .. } | Self::Token(_) | Self::UserJwt { .. } => &[],
+      Self::UserPass { .. } | Self::UserToken { .. } | Self::Jwt(_) | Self::Token(_) | Self::UserJwt { .. } => &[],
     }
   }
 
@@ -583,7 +700,7 @@ impl NatsAuth {
       Self::Nkey { seed, decoy_seed, .. } | Self::UserJwt { seed, decoy_seed, .. } => {
         Some((decoy_seed.expose_secret(), seed.raw.expose_secret()))
       }
-      Self::UserPass { .. } | Self::Token(_) => None,
+      Self::UserPass { .. } | Self::UserToken { .. } | Self::Jwt(_) | Self::Token(_) => None,
     }
   }
 
@@ -595,7 +712,7 @@ impl NatsAuth {
         verify: &public_key.fake,
         seed,
       }),
-      Self::UserPass { .. } | Self::Token(_) => None,
+      Self::UserPass { .. } | Self::UserToken { .. } | Self::Jwt(_) | Self::Token(_) => None,
     }
   }
 
@@ -603,10 +720,10 @@ impl NatsAuth {
   #[must_use]
   pub fn credential(&self) -> (&str, &SecretString) {
     match self {
-      Self::UserPass { pass, .. } => (&pass.fake, &pass.real),
+      Self::UserPass { pass, .. } | Self::UserToken { pass, .. } => (&pass.fake, &pass.real),
+      Self::Jwt(jwt) | Self::UserJwt { jwt, .. } => (&jwt.fake, &jwt.real),
       Self::Token(token) => (&token.fake, &token.real),
       Self::Nkey { public_key, .. } => (&public_key.fake, &public_key.real),
-      Self::UserJwt { jwt, .. } => (&jwt.fake, &jwt.real),
     }
   }
 }
@@ -614,7 +731,7 @@ impl NatsAuth {
 /// How the proxy reaches the real server. Only the real string states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatsUpstream {
-  /// `nats://`. The leg never upgrades and CONNECT carries the decoy.
+  /// `nats://`.
   Cleartext,
   /// `tls://`. The leg is TLS before CONNECT, verified against `trust`.
   Tls {
@@ -838,10 +955,11 @@ impl FromStr for NatsUri {
     if url.path() != "" && url.path() != "/" {
       return Err(NatsUriError::Path);
     }
-    let query = url
+    let mut query = url
       .query_pairs()
       .map(|(key, value)| (key.into_owned(), value.into_owned()))
       .collect();
+    let auth = take_auth_token(auth, &mut query);
     Ok(Self {
       scheme,
       endpoint: NatsEndpoint {
@@ -851,6 +969,25 @@ impl FromStr for NatsUri {
       auth,
       query,
     })
+  }
+}
+
+/// `auth_token` on a `user:pass` string is [`NatsPlain::UserToken`]. Any other
+/// credential leaves the key in the query, and the TLS law rejects it.
+fn take_auth_token(auth: NatsPlain, query: &mut Vec<(String, String)>) -> NatsPlain {
+  let Some(index) = query
+    .iter()
+    .position(|(key, value)| key == NatsPlain::AUTH_TOKEN_QUERY && !value.is_empty())
+  else {
+    return auth;
+  };
+  let token = query.remove(index).1;
+  match auth {
+    NatsPlain::UserPass { user, pass } => NatsPlain::UserToken { user, pass, token },
+    other => {
+      query.insert(index, (NatsPlain::AUTH_TOKEN_QUERY.to_string(), token));
+      other
+    }
   }
 }
 
@@ -890,6 +1027,9 @@ fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
       Err(err) => Err(err),
     };
   }
+  if user == NatsPlain::JWT_USER && jwt_shape(&pass) {
+    return Ok(NatsPlain::Jwt(pass));
+  }
   if user == NatsPlain::CREDS_USER {
     return match plain_creds(&pass) {
       Ok(plain) => Ok(plain),
@@ -909,6 +1049,26 @@ fn ordinary_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
     return Err(NatsUriError::MisplacedSeed);
   }
   Ok(NatsPlain::UserPass { user, pass })
+}
+
+fn jwt_shape(text: &str) -> bool {
+  let mut parts = text.split('.');
+  let Some(header) = parts.next() else {
+    return false;
+  };
+  let Some(payload) = parts.next() else {
+    return false;
+  };
+  let Some(sig) = parts.next() else {
+    return false;
+  };
+  parts.next().is_none()
+    && [header, payload, sig].iter().all(|part| {
+      !part.is_empty()
+        && part
+          .bytes()
+          .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    })
 }
 
 fn nkey_material(text: &str) -> bool {

@@ -44,9 +44,9 @@ In `/home/ivan/.talos/config`, contexts `prod` and `staging` that dial `10.5.0.6
 
 ## NATS
 
-One call per `context/<name>.json`, with protocol `Nats` and the name taken once. The source is the json path. Password and token are `secret()`. Nkey and creds use `key_seed()`. `context.txt` is left unread. `NATS_CONTEXT` and `XDG_CONFIG_HOME` are left unread. The directory stays `{host_home}/.config/nats`.
+One call per `context/<name>.json`, with protocol `Nats` and the name taken once. The source is the json path. Password and token are `secret()`. Nkey and creds use `key_seed()`. `context.txt` is copied when the host has one. It does not choose the credential. `NATS_CONTEXT` stays unread. Discovery reads `$XDG_CONFIG_HOME/nats` when that variable is set and non-empty, and otherwise `{host_home}/.config/nats`. The guest directory stays `{home}/.config/nats`.
 
-The proxy reads the url host and port, then CONNECT fields inside `Policy::swap`, still capped by `MAX_COMMAND` at 16 KiB. #64 collects every grant whose decoy fields match, including a match that is later in label order. No match forwards the line. `relay_guarded` pumps after the grant is chosen. There is no new buffer.
+The proxy reads the url host and port, then the CONNECT fields, still capped by `MAX_COMMAND` at 16 KiB. #64 collects every grant whose decoy fields match, including a match that is later in label order. No match forwards the line. `relay_guarded` pumps after the grant is chosen. There is no new buffer.
 
 ```mermaid
 stateDiagram-v2
@@ -55,7 +55,7 @@ stateDiagram-v2
   Reading --> Selected: CONNECT matches one decoy
   Reading --> Forward: CONNECT matches no grant
   Selected --> Pump: relay_guarded
-  Forward --> Pump: Policy::Forward, no real credential
+  Forward --> Pump: a CONNECT that matches no grant is forwarded
 ```
 
 `Error::NatsSharedEndpoint` stays the dial and TLS clash. `AmbiguousContexts` is the separate case of two decoys that present the same bytes.

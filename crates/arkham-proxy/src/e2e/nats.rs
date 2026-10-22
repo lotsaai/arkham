@@ -1,5 +1,6 @@
-//! NATS through the MITM. `tls://` swaps only after its upgrade. A guest
-//! hello without SNI mints for the grant host.
+//! NATS through the MITM. `tls://` swaps only after its upgrade. A `nats://`
+//! leg upgrades the same way when INFO sets `tls_required`. A guest hello
+//! without SNI mints for the grant host.
 
 use std::path::PathBuf;
 
@@ -20,7 +21,7 @@ const CLEAR_INFO: &[u8] = b"INFO {\"server_id\":\"NSTUB\",\"auth_required\":true
 /// How the real string opens the server leg.
 #[derive(Clone, Copy)]
 enum ServerLeg {
-  /// `nats://`: never upgrades.
+  /// `nats://`. Upgrades when INFO sets `tls_required`.
   Cleartext,
   /// `tls://`: upgrades right after INFO.
   AfterInfo,
@@ -165,6 +166,33 @@ async fn nats_cleartext_server_leg_receives_the_real_credential() {
     .expect("cleartext connect");
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   drop(client);
+  proxy.abort();
+}
+
+/// The stub's private CA is not in the platform store, so the handshake does not finish.
+#[tokio::test]
+async fn nats_cleartext_leg_sends_a_client_hello_when_info_requires_tls() {
+  let stub = nats_stub().await;
+  let (proxy_addr, proxy) = run_proxy_with(test_state_with(stub.grants(ServerLeg::Cleartext), &stub.ca)).await;
+  let port = stub.port;
+  let listener = stub.listener;
+  let stub_task = tokio::spawn(async move {
+    let (mut conn, _) = listener.accept().await.unwrap();
+    conn.write_all(INFO).await.unwrap();
+    conn.flush().await.unwrap();
+    let mut hello = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut hello))
+      .await
+      .expect("client hello")
+      .expect("read");
+    assert_eq!(hello, [0x16, 0x03]);
+  });
+  let mut guest = connect_through_proxy(proxy_addr, port).await;
+  let line = read_line(&mut guest).await;
+  assert!(line.starts_with(b"INFO "), "{}", String::from_utf8_lossy(&line));
+  assert!(contains(&line, b"\"tls_required\":true"));
+  assert!(!contains(&line, VALUE.as_bytes()));
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   proxy.abort();
 }
 

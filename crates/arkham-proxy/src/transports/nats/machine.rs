@@ -461,14 +461,9 @@ impl Nats {
         })
       })
       .collect();
-    let policy = if auths.is_empty() {
-      Policy::Forward
-    } else {
-      Policy::Swap { auths }
-    };
     Self::Down(Down {
       framer: Framer::new(Side::Client),
-      policy,
+      auths,
       connect: Vec::new(),
       spilling: false,
       nonce: NonceSlot::Pending,
@@ -526,33 +521,6 @@ impl Wire for Nats {
 struct SwapGrant {
   label: String,
   auth: NatsAuth,
-}
-
-#[derive(Debug)]
-enum Policy {
-  /// No grant covers this endpoint.
-  Forward,
-  Swap {
-    auths: Vec<SwapGrant>,
-  },
-}
-
-impl Policy {
-  fn swap(&self, line: &[u8], nonce: &NonceSlot) -> Option<(Vec<u8>, Hit)> {
-    let Self::Swap { auths } = self else {
-      return None;
-    };
-    auths.iter().find_map(|grant| {
-      let swapped = swap_connect(line, &grant.auth, nonce)?;
-      Some((
-        swapped,
-        Hit {
-          label: grant.label.clone(),
-          location: Location::Header,
-        },
-      ))
-    })
-  }
 }
 
 /// Move the first INFO nonce from the server leg onto the client leg.
@@ -711,9 +679,8 @@ fn rewrite_connect(line: &[u8], edit: impl FnOnce(&mut Map<String, Value>) -> Op
 #[derive(Debug)]
 pub(crate) struct Down {
   framer: Framer,
-  policy: Policy,
-  /// CONNECT bytes held for a swap. Empty unless [`Policy::Swap`] is still
-  /// under [`MAX_COMMAND`].
+  auths: Vec<SwapGrant>,
+  /// CONNECT bytes held until the line ends or passes [`MAX_COMMAND`].
   connect: Vec<u8>,
   /// This CONNECT line passed the cap. The rest of it is forwarded.
   spilling: bool,
@@ -751,8 +718,21 @@ impl Down {
     }
   }
 
+  fn swap(&self, line: &[u8]) -> Option<(Vec<u8>, Hit)> {
+    self.auths.iter().find_map(|grant| {
+      let swapped = swap_connect(line, &grant.auth, &self.nonce)?;
+      Some((
+        swapped,
+        Hit {
+          label: grant.label.clone(),
+          location: Location::Header,
+        },
+      ))
+    })
+  }
+
   fn credential(&mut self, bytes: &[u8], end: bool, out: &mut Vec<u8>, hits: &mut Vec<Hit>) {
-    if self.spilling || matches!(self.policy, Policy::Forward) {
+    if self.spilling {
       out.extend_from_slice(bytes);
       if end {
         self.spilling = false;
@@ -768,7 +748,7 @@ impl Down {
     self.connect.extend_from_slice(bytes);
     if end {
       let line = std::mem::take(&mut self.connect);
-      match self.policy.swap(&line, &self.nonce) {
+      match self.swap(&line) {
         Some((swapped, hit)) => {
           out.extend_from_slice(&swapped);
           hits.push(hit);

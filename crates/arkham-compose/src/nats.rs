@@ -1,25 +1,29 @@
 //! NATS context adapter: `~/.config/nats/context/<name>.json` is one
 //! connection string plus the credential the CLI reads from disk.
-//! `context.txt` is copied into the guest and is not how a credential is
-//! chosen.
+//! `context.txt` is copied when the host has one. It is not how a credential
+//! is chosen.
 //!
 //! The guest tree is one writable directory at `{home}/.config/nats`, so
 //! `nats context select` can rename `context.txt`. A creds or nkey file is
 //! `decoy/<label>.<suffix>` inside that directory. The decoy seed comes from
 //! that context's `key_seed()`. Identical TLS bytes share one blob path. A
-//! real dial clash is a typed error when `context.txt` names one of the
-//! contexts, and a typed skip otherwise.
+//! selected context that does not map is a skip. A dial clash is a typed
+//! error when `context.txt` names one of the contexts, and a typed skip
+//! otherwise.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::LazyLock;
 
 use arkham_config::config::IfMissing;
 use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, Presented, identities, require_distinct};
 use arkham_config::grants::{NATS_DEFAULT_PORT, NatsPlain, NatsScope, NatsSeed, NatsUriError, check_user_jwt};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use regex::Regex;
 use secrecy::SecretString;
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -28,20 +32,17 @@ use crate::adapt::{BLOB_PREFIX_NATS, GRANTS_STATE_DIR, GrantFragment, RewriteAda
 use crate::error::Error;
 use crate::rewrites::RewriteCollector;
 
-/// JSON keys that name a credential. The decoy states the replacement.
-const DROPPED_KEYS: &[&str] = &[
-  "user",
-  "password",
-  "token",
-  "creds",
-  "nkey",
-  "cert",
-  "key",
-  "ca",
-  "nsc",
-  "socks_proxy",
-  "user_jwt",
-  "user_seed",
+/// Context fields the CLI keeps that are not credentials. The decoy copies
+/// these and the replacement auth fields, and leaves every other key out.
+const KEPT_KEYS: &[&str] = &[
+  "description",
+  "url",
+  "jetstream_domain",
+  "jetstream_api_prefix",
+  "jetstream_event_prefix",
+  "inbox_prefix",
+  "color_scheme",
+  "tls_first",
 ];
 
 /// One discovered context directory, ready for the ambient pass.
@@ -53,7 +54,7 @@ pub(crate) struct AdaptedNats {
   pub(crate) files: Vec<(String, Vec<u8>)>,
   /// `{home}/.config/nats`. The directory mounts here, writable.
   pub(crate) container: String,
-  /// Contexts that did not map. The selected context is an error instead.
+  /// Contexts that did not map. A dial clash on the selected context is an error instead.
   pub(crate) skipped: Vec<NatsSkip>,
 }
 
@@ -73,13 +74,12 @@ impl AdaptedNats {
 /// Guest-tree directory in the state folder. Main wrote that twin as a file named `nats-context`.
 const NATS_HOME_DIR: &str = "nats-home";
 
-/// Map every context under `root`, or nothing when `context.txt` is absent.
-///
 /// # Errors
 ///
-/// Returns an error when the selected context cannot be derived, a seed sits
-/// outside the nkey or creds field, two contexts on one server cannot be told
-/// apart, or a grant fragment cannot be serialized.
+/// Returns an error when a seed sits outside the nkey or creds field, two
+/// contexts on one server cannot be told apart, the selected context clashes
+/// on the upstream dial, or a grant fragment cannot be serialized. A missing
+/// `context.txt` still maps the directory.
 pub(crate) fn adapt(root: &Path, home: &str, host_home: &Path) -> Result<Option<AdaptedNats>, Error> {
   NatsContextTree::new(root, home, host_home).adapt()
 }
@@ -98,18 +98,15 @@ pub struct NatsSkip {
 /// The reason a [`NatsSkip`] names.
 #[derive(Debug, thiserror::Error)]
 pub enum NatsSkipCause {
-  /// `windows_cert_store`, `socks_proxy`, or `nsc`.
+  /// `windows_cert_store` or `socks_proxy`.
   #[error("uses {0}")]
   Unsupported(NatsUnsupported),
-  /// The server URL is not one `nats` or `tls` URL.
-  #[error("server url is not one nats or tls url")]
+  /// The server URL is not a `nats` or `tls` list.
+  #[error("server url is not a nats or tls list")]
   ServerUrl,
   /// The credential does not map onto one auth method.
   #[error("credential does not map onto one auth method")]
   Credential,
-  /// TLS material on a cleartext upstream.
-  #[error("tls material on a cleartext upstream")]
-  TlsOnCleartext,
   /// `cert` without `key`, or a TLS file that cannot be read.
   #[error("tls file cannot be read")]
   TlsFile,
@@ -146,11 +143,40 @@ pub enum NatsUnsupported {
   /// `socks_proxy`.
   #[error("socks_proxy")]
   SocksProxy,
-  /// `nsc`.
-  #[error("nsc")]
-  Nsc,
 }
 
+impl NatsSkip {
+  fn new(name: &str, cause: NatsSkipCause) -> Self {
+    Self {
+      name: name.to_string(),
+      cause,
+    }
+  }
+
+  fn from_scope(name: &str, err: NatsUriError) -> Result<Self, Error> {
+    if matches!(err, NatsUriError::MisplacedSeed) {
+      return Err(Error::Config(Box::new(arkham_config::Error::NatsScope {
+        label: name.to_string(),
+        source: err,
+      })));
+    }
+    Ok(Self::new(name, NatsSkipCause::Rejected))
+  }
+}
+
+impl NatsUnsupported {
+  fn of(doc: &Map<String, Value>) -> Option<Self> {
+    if occupied(doc, "windows_cert_store") {
+      return Some(Self::WindowsCertStore);
+    }
+    if occupied(doc, "socks_proxy") {
+      return Some(Self::SocksProxy);
+    }
+    None
+  }
+}
+
+#[derive(Clone)]
 struct GuestCred {
   tree_path: String,
   bytes: String,
@@ -196,9 +222,11 @@ struct TlsQuery {
 
 struct Ready {
   identity: ContextIdentity,
+  /// Blobs and the rule label use the first.
+  server_index: usize,
   dial: Dial,
   doc: Map<String, Value>,
-  url: Url,
+  public_url: String,
   fake: NatsPlain,
   guest: Option<GuestCred>,
   fake_url: String,
@@ -233,15 +261,21 @@ impl Ready {
   }
 
   fn decoy_doc(&self) -> Map<String, Value> {
-    let mut out = self.doc.clone();
-    out.retain(|key, _| !DROPPED_KEYS.contains(&key.as_str()) && !key.starts_with("windows_"));
-    out.insert("url".to_string(), Value::String(public_url(&self.url)));
+    let mut out = kept_doc(&self.doc, &self.public_url);
     let written = self.guest.as_ref().map(GuestCred::written);
     let auth = self.fake.context_auth(written.as_deref());
     match &self.fake {
       NatsPlain::UserPass { .. } => {
         out.insert("user".to_string(), Value::String(auth.user));
         out.insert("password".to_string(), Value::String(auth.password));
+      }
+      NatsPlain::UserToken { .. } => {
+        out.insert("user".to_string(), Value::String(auth.user));
+        out.insert("password".to_string(), Value::String(auth.password));
+        out.insert("token".to_string(), Value::String(auth.token));
+      }
+      NatsPlain::Jwt(_) => {
+        out.insert("user_jwt".to_string(), Value::String(auth.user_jwt));
       }
       NatsPlain::Token(_) => {
         out.insert("token".to_string(), Value::String(auth.token));
@@ -270,25 +304,25 @@ impl<'a> NatsContextTree<'a> {
     Self { root, home, host_home }
   }
 
-  /// Map every context under `root`, or nothing when `context.txt` is absent.
-  ///
   /// # Errors
   ///
-  /// Returns an error when the selected context cannot be derived, a seed
-  /// sits outside the nkey or creds field, two contexts on one server cannot
-  /// be told apart, or a grant fragment cannot be serialized.
+  /// Returns an error when a seed sits outside the nkey or creds field, two
+  /// contexts on one server cannot be told apart, the selected context
+  /// clashes on the upstream dial, or a grant fragment cannot be serialized.
+  /// A context that does not map is a skip, including the selected one.
   pub(crate) fn adapt(self) -> Result<Option<AdaptedNats>, Error> {
-    let Some(selected) = self.selected_name()? else {
-      return Ok(None);
-    };
+    let (selected_text, mut skipped) = self.selection()?;
     let mut name_skips = Vec::new();
     let files = self.context_files(&mut name_skips)?;
-    let mut skipped = Vec::new();
-    for skip in name_skips {
-      self.note(&selected, skip, &mut skipped)?;
+    skipped.append(&mut name_skips);
+    if files.is_empty() && selected_text.is_none() {
+      return Ok(None);
     }
-    if !files.iter().any(|(name, _)| name == &selected) {
-      return Err(self.selected_error(skip(&selected, NatsSkipCause::Absent)));
+    let selected = selected_text.as_deref().filter(|name| context_name(name));
+    if let Some(name) = selected
+      && !files.iter().any(|(found, _)| found == name)
+    {
+      skipped.push(NatsSkip::new(name, NatsSkipCause::Absent));
     }
     let refs = files
       .iter()
@@ -300,27 +334,32 @@ impl<'a> NatsContextTree<'a> {
       .collect::<Vec<_>>();
     let ids = identities(&refs)?;
     let mut ready = Vec::new();
+    let mut opens = Vec::new();
     for ((name, path), id) in files.iter().zip(ids.iter()) {
       match self.one_context(path, name, id)? {
-        Ok(item) => ready.push(item),
-        Err(skip) => self.note(&selected, skip, &mut skipped)?,
+        Ok(Built::Grants(items)) => ready.extend(items),
+        Ok(Built::Open(decoy)) => opens.push((name.clone(), decoy)),
+        Err(skip) => {
+          tracing::warn!(%skip, "nats context skipped");
+          skipped.push(skip);
+        }
       }
     }
-    let (ready, dial_skips) = self.reconcile(&selected, ready)?;
+    let (ready, dial_skips) = self.reconcile(selected, ready)?;
     for skip in dial_skips {
-      self.note(&selected, skip, &mut skipped)?;
+      tracing::warn!(%skip, "nats context skipped");
+      skipped.push(skip);
     }
-    let presented = ready
-      .iter()
-      .map(|item| Presented {
-        identity: &item.identity,
-        host: item.dial.host.as_str(),
-        port: item.dial.port,
-        decoy: item.fake_url.as_bytes(),
-      })
-      .collect::<Vec<_>>();
-    require_distinct(&presented)?;
-    let mut tree = vec![("context.txt".to_string(), format!("{selected}\n").into_bytes())];
+    let (ready, shared) = Self::collapse_same(ready);
+    require_distinct(&Self::distinct_rows(&ready))?;
+    let mut tree = Vec::new();
+    if let Some(name) = &selected_text {
+      tree.push(("context.txt".to_string(), format!("{name}\n").into_bytes()));
+    }
+    for (name, decoy) in opens {
+      tree.push((format!("context/{name}.json"), decoy.into_bytes()));
+    }
+    tree.extend(shared);
     let mut grants = Vec::new();
     for item in ready {
       Self::push_tree(&mut tree, &item);
@@ -334,39 +373,21 @@ impl<'a> NatsContextTree<'a> {
     }))
   }
 
-  fn note(&self, selected: &str, skip: NatsSkip, skipped: &mut Vec<NatsSkip>) -> Result<(), Error> {
-    if skip.name == selected {
-      return Err(self.selected_error(skip));
-    }
-    tracing::warn!(%skip, "nats context skipped");
-    skipped.push(skip);
-    Ok(())
-  }
-
-  fn selected_error(&self, skip: NatsSkip) -> Error {
-    Error::NatsSelected {
-      file: self.root.join("context").join(format!("{}.json", skip.name)),
-      skip,
-    }
-  }
-
-  fn selected_name(&self) -> Result<Option<String>, Error> {
+  fn selection(&self) -> Result<(Option<String>, Vec<NatsSkip>), Error> {
     let path = self.root.join("context.txt");
     if !path.is_file() {
-      return Ok(None);
+      return Ok((None, Vec::new()));
     }
     let text = fs::read_to_string(&path).map_err(|source| Error::ReadFile {
       path: path.clone(),
       source,
     })?;
-    let name = text.trim();
-    if !context_name(name) {
-      return Err(Error::NatsSelected {
-        file: path,
-        skip: skip(name, NatsSkipCause::Name),
-      });
+    let name = text.trim().to_string();
+    if context_name(&name) {
+      return Ok((Some(name), Vec::new()));
     }
-    Ok(Some(name.to_string()))
+    let skip = NatsSkip::new(&name, NatsSkipCause::Name);
+    Ok((Some(name), vec![skip]))
   }
 
   fn context_files(&self, skipped: &mut Vec<NatsSkip>) -> Result<Vec<(String, PathBuf)>, Error> {
@@ -386,7 +407,7 @@ impl<'a> NatsContextTree<'a> {
         continue;
       };
       if !context_name(&name) {
-        skipped.push(skip(&name, NatsSkipCause::Name));
+        skipped.push(NatsSkip::new(&name, NatsSkipCause::Name));
         continue;
       }
       files.push((name, path));
@@ -395,71 +416,90 @@ impl<'a> NatsContextTree<'a> {
     Ok(files)
   }
 
-  fn one_context(&self, path: &Path, name: &str, id: &ContextIdentity) -> Result<Result<Ready, NatsSkip>, Error> {
+  fn one_context(&self, path: &Path, name: &str, id: &ContextIdentity) -> Result<Result<Built, NatsSkip>, Error> {
     let Ok(body) = fs::read_to_string(path) else {
-      return Ok(Err(skip(name, NatsSkipCause::Document)));
+      return Ok(Err(NatsSkip::new(name, NatsSkipCause::Document)));
     };
     let Ok(value) = serde_json::from_str::<Value>(&body) else {
-      return Ok(Err(skip(name, NatsSkipCause::Document)));
+      return Ok(Err(NatsSkip::new(name, NatsSkipCause::Document)));
     };
-    let Some(doc) = value.as_object().cloned() else {
-      return Ok(Err(skip(name, NatsSkipCause::Document)));
+    let Some(mut doc) = value.as_object().cloned() else {
+      return Ok(Err(NatsSkip::new(name, NatsSkipCause::Document)));
     };
-    if let Some(feature) = unsupported(&doc) {
-      return Ok(Err(skip(name, NatsSkipCause::Unsupported(feature))));
+    if let Some(feature) = NatsUnsupported::of(&doc) {
+      return Ok(Err(NatsSkip::new(name, NatsSkipCause::Unsupported(feature))));
     }
-    let Some(url) = dial_url(text(&doc, "url")) else {
-      return Ok(Err(skip(name, NatsSkipCause::ServerUrl)));
+    if let Err(cause) = Self::apply_nsc(&mut doc) {
+      return Ok(Err(NatsSkip::new(name, cause)));
+    }
+    let Some(servers) = ServerUrl::parse_list(text(&doc, "url")) else {
+      return Ok(Err(NatsSkip::new(name, NatsSkipCause::ServerUrl)));
     };
-    let Some(real) = self.found_cred(&doc) else {
-      return Ok(Err(skip(name, NatsSkipCause::Credential)));
+    let real = match self.credential(&doc, &servers) {
+      Ok(real) => real,
+      Err(cause) => return Ok(Err(NatsSkip::new(name, cause))),
     };
-    let dial = match self.dial(&url, &doc) {
-      Ok(dial) => dial,
-      Err(cause) => return Ok(Err(skip(name, cause))),
+    let Some(real) = real else {
+      let public_url = ServerUrl::public_list(&servers);
+      let Ok(decoy) = serde_json::to_string_pretty(&kept_doc(&doc, &public_url)) else {
+        return Ok(Err(NatsSkip::new(name, NatsSkipCause::Rejected)));
+      };
+      return Ok(Ok(Built::Open(decoy)));
     };
     let (fake, guest) = Self::wire_auth(&real, &id.env(), &id.label, id.key_seed())?;
-    let Some(fake_url) = auth_url(&url, url.scheme(), &fake, &[]) else {
-      return Ok(Err(skip(name, NatsSkipCause::Rejected)));
-    };
-    let mut item = Ready {
-      identity: id.clone(),
-      dial,
-      doc,
-      url,
-      fake,
-      guest,
-      fake_url,
-      real_url: String::new(),
-      blobs: Vec::new(),
-      decoy: String::new(),
-    };
-    let query = item.tls_query();
-    let pairs = query
-      .pairs
-      .iter()
-      .map(|(key, value)| (key.as_str(), value.as_str()))
-      .collect::<Vec<_>>();
-    let scheme = if item.dial.real_tls { "tls" } else { "nats" };
-    let Some(real_url) = auth_url(&item.url, scheme, &real, &pairs) else {
-      return Ok(Err(skip(name, NatsSkipCause::Rejected)));
-    };
-    if let Err(err) = NatsScope::from_strings(&item.fake_url, &real_url) {
-      return match scope_failure(name, err) {
-        Ok(skip) => Ok(Err(skip)),
-        Err(err) => Err(err),
+    let public_url = ServerUrl::public_list(&servers);
+    let mut items = Vec::with_capacity(servers.len());
+    for (index, server) in servers.iter().enumerate() {
+      let dial = match self.dial(server, &doc) {
+        Ok(dial) => dial,
+        Err(cause) => return Ok(Err(NatsSkip::new(name, cause))),
       };
+      let Some(fake_url) = server.auth_string(server.url.scheme(), &fake, &[]) else {
+        return Ok(Err(NatsSkip::new(name, NatsSkipCause::Rejected)));
+      };
+      let mut item = Ready {
+        identity: id.clone(),
+        server_index: index,
+        dial,
+        doc: doc.clone(),
+        public_url: public_url.clone(),
+        fake: fake.clone(),
+        guest: guest.clone(),
+        fake_url,
+        real_url: String::new(),
+        blobs: Vec::new(),
+        decoy: String::new(),
+      };
+      let query = item.tls_query();
+      let pairs = query
+        .pairs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+      let scheme = if item.dial.real_tls { "tls" } else { "nats" };
+      let Some(real_url) = server.auth_string(scheme, &real, &pairs) else {
+        return Ok(Err(NatsSkip::new(name, NatsSkipCause::Rejected)));
+      };
+      if let Err(err) = NatsScope::from_strings(&item.fake_url, &real_url) {
+        return match NatsSkip::from_scope(name, err) {
+          Ok(skip) => Ok(Err(skip)),
+          Err(err) => Err(err),
+        };
+      }
+      if index == 0 {
+        item.blobs = query.blobs;
+      }
+      item.real_url = real_url;
+      let Ok(decoy) = serde_json::to_string_pretty(&item.decoy_doc()) else {
+        return Ok(Err(NatsSkip::new(name, NatsSkipCause::Rejected)));
+      };
+      item.decoy = decoy;
+      items.push(item);
     }
-    item.blobs = query.blobs;
-    item.real_url = real_url;
-    item.decoy = match serde_json::to_string_pretty(&item.decoy_doc()) {
-      Ok(text) => text,
-      Err(_) => return Ok(Err(skip(name, NatsSkipCause::Rejected))),
-    };
-    Ok(Ok(item))
+    Ok(Ok(Built::Grants(items)))
   }
 
-  fn reconcile(&self, selected: &str, mut ready: Vec<Ready>) -> Result<(Vec<Ready>, Vec<NatsSkip>), Error> {
+  fn reconcile(&self, selected: Option<&str>, mut ready: Vec<Ready>) -> Result<(Vec<Ready>, Vec<NatsSkip>), Error> {
     let mut groups: BTreeMap<(String, u16), Vec<usize>> = BTreeMap::new();
     for (index, item) in ready.iter().enumerate() {
       groups.entry((item.dial.host.clone(), item.dial.port)).or_default().push(index);
@@ -469,35 +509,26 @@ impl<'a> NatsContextTree<'a> {
     for indexes in groups.into_values() {
       let at = indexes
         .iter()
-        .position(|&index| ready[index].identity.name == selected)
+        .position(|&index| selected.is_some_and(|name| ready[index].identity.name == name))
         .unwrap_or(0);
       let canonical = indexes[at];
       let canonical_name = ready[canonical].identity.name.clone();
       let canonical_dial = ready[canonical].dial.clone();
-      let selected_here = canonical_name == selected;
+      let selected_here = selected.is_some_and(|name| canonical_name == name);
       for index in indexes {
         if ready[index].dial.same_material(&canonical_dial) {
           continue;
         }
         let other = ready[index].identity.name.clone();
+        let cause = NatsSkipCause::Dial {
+          other: if selected_here { other.clone() } else { canonical_name.clone() },
+          host: canonical_dial.host.clone(),
+          port: canonical_dial.port,
+        };
         if selected_here {
-          return Err(self.selected_error(NatsSkip {
-            name: selected.to_string(),
-            cause: NatsSkipCause::Dial {
-              other,
-              host: canonical_dial.host.clone(),
-              port: canonical_dial.port,
-            },
-          }));
+          return Err(self.selected_error(NatsSkip::new(selected.unwrap_or(&canonical_name), cause)));
         }
-        skipped.push(NatsSkip {
-          name: other,
-          cause: NatsSkipCause::Dial {
-            other: canonical_name.clone(),
-            host: canonical_dial.host.clone(),
-            port: canonical_dial.port,
-          },
-        });
+        skipped.push(NatsSkip::new(&other, cause));
         drop.push(index);
       }
     }
@@ -508,62 +539,109 @@ impl<'a> NatsContextTree<'a> {
     Ok((ready, skipped))
   }
 
+  fn selected_error(&self, skip: NatsSkip) -> Error {
+    Error::NatsSelected {
+      file: self.root.join("context").join(format!("{}.json", skip.name)),
+      skip,
+    }
+  }
+
+  fn collapse_same(ready: Vec<Ready>) -> (Vec<Ready>, Vec<(String, Vec<u8>)>) {
+    let mut seen: BTreeSet<(String, u16, String, String)> = BTreeSet::new();
+    let mut kept = Vec::new();
+    let mut shared = Vec::new();
+    for item in ready {
+      let key = (item.dial.host.clone(), item.dial.port, item.fake_url.clone(), item.real_url.clone());
+      if !seen.insert(key) {
+        shared.push((format!("context/{}.json", item.identity.name), item.decoy.into_bytes()));
+        if let Some(guest) = item.guest {
+          shared.push((guest.tree_path, guest.bytes.into_bytes()));
+        }
+        continue;
+      }
+      kept.push(item);
+    }
+    (kept, shared)
+  }
+
+  fn distinct_rows(ready: &[Ready]) -> Vec<Presented<'_>> {
+    let mut groups: BTreeMap<(String, u16, &str), Vec<usize>> = BTreeMap::new();
+    for (index, item) in ready.iter().enumerate() {
+      groups
+        .entry((item.dial.host.clone(), item.dial.port, item.fake_url.as_str()))
+        .or_default()
+        .push(index);
+    }
+    let mut out = Vec::new();
+    for indexes in groups.into_values() {
+      let first = &ready[indexes[0]];
+      let same_real = indexes.iter().all(|&index| ready[index].real_url == first.real_url);
+      let keep = if same_real { &indexes[..1] } else { indexes.as_slice() };
+      for &index in keep {
+        let item = &ready[index];
+        out.push(Presented {
+          identity: &item.identity,
+          host: item.dial.host.as_str(),
+          port: item.dial.port,
+          decoy: item.fake_url.as_bytes(),
+        });
+      }
+    }
+    out
+  }
+
   fn push_tree(tree: &mut Vec<(String, Vec<u8>)>, item: &Ready) {
-    tree.push((format!("context/{}.json", item.identity.name), item.decoy.as_bytes().to_vec()));
+    let path = format!("context/{}.json", item.identity.name);
+    if tree.iter().any(|(found, _)| found == &path) {
+      return;
+    }
+    tree.push((path, item.decoy.as_bytes().to_vec()));
     if let Some(guest) = &item.guest {
       tree.push((guest.tree_path.clone(), guest.bytes.as_bytes().to_vec()));
     }
   }
 
   fn grant_of(item: Ready) -> Result<RewriteAdapted, Error> {
-    let real_url = item.real_url;
+    let label = if item.server_index == 0 {
+      item.identity.label.clone()
+    } else {
+      format!("{}-{}", item.identity.label, item.server_index)
+    };
     let fragment = GrantFragment {
       env: item.identity.env(),
       registry: false,
       allow: Vec::new(),
       value: Some(item.fake_url),
-      real: Some(crate::adapt::Redacted(real_url)),
+      real: Some(crate::adapt::Redacted(item.real_url)),
       generated: true,
       if_missing: Some(IfMissing::Ignore),
       tls: BTreeMap::new(),
       ssh: BTreeMap::new(),
     };
     Ok(RewriteAdapted {
-      fragment: render_fragment(&item.identity.source, &item.identity.label, &fragment)?,
+      fragment: render_fragment(&item.identity.source, &label, &fragment)?,
       decoy: String::new(),
       materialized: item.blobs,
       decoy_files: Vec::new(),
     })
   }
 
-  fn dial(&self, url: &Url, doc: &Map<String, Value>) -> Result<Dial, NatsSkipCause> {
+  fn dial(&self, server: &ServerUrl, doc: &Map<String, Value>) -> Result<Dial, NatsSkipCause> {
     let tls_first = doc.get("tls_first").and_then(Value::as_bool).unwrap_or(false);
-    let real_tls = url.scheme() == "tls" || tls_first;
     let cert = text(doc, "cert");
     let key = text(doc, "key");
     let ca = text(doc, "ca");
-    if !real_tls && (!cert.is_empty() || !key.is_empty() || !ca.is_empty()) {
-      return Err(NatsSkipCause::TlsOnCleartext);
-    }
-    if cert.is_empty() != key.is_empty() {
-      return Err(NatsSkipCause::TlsFile);
-    }
-    let read = |raw: &str| -> Option<Option<Vec<u8>>> {
-      if raw.is_empty() {
-        return Some(None);
-      }
-      let path = self.resolve_path(raw)?;
-      fs::read(path).ok().map(Some)
-    };
-    let (Some(cert), Some(key), Some(ca)) = (read(cert), read(key), read(ca)) else {
-      return Err(NatsSkipCause::TlsFile);
-    };
-    let Some(host) = url.host_str() else {
+    let paired = !cert.is_empty() && !key.is_empty();
+    let real_tls = server.url.scheme() == "tls" || tls_first || paired || !ca.is_empty();
+    let cert = if paired { self.tls_file(cert)? } else { None };
+    let key = if paired { self.tls_file(key)? } else { None };
+    let ca = if ca.is_empty() { None } else { self.tls_file(ca)? };
+    let Some(host) = server.url.host_str() else {
       return Err(NatsSkipCause::ServerUrl);
     };
     Ok(Dial {
       host: host.to_ascii_lowercase(),
-      port: url.port().unwrap_or(NATS_DEFAULT_PORT),
+      port: server.url.port().unwrap_or(NATS_DEFAULT_PORT),
       real_tls,
       handshake_first: tls_first,
       cert,
@@ -572,103 +650,201 @@ impl<'a> NatsContextTree<'a> {
     })
   }
 
-  fn found_cred(&self, doc: &Map<String, Value>) -> Option<NatsPlain> {
+  fn tls_file(&self, raw: &str) -> Result<Option<Vec<u8>>, NatsSkipCause> {
+    if raw.is_empty() {
+      return Ok(None);
+    }
+    let expanded = self.expand_host(raw);
+    if let Some(scheme) = parse_scheme(&expanded)
+      && !scheme.eq_ignore_ascii_case("file")
+    {
+      return Err(NatsSkipCause::TlsFile);
+    }
+    let path = self.path_from_ref(&expanded);
+    fs::read(&path).map(Some).map_err(|_err| NatsSkipCause::TlsFile)
+  }
+
+  fn credential(&self, doc: &Map<String, Value>, servers: &[ServerUrl]) -> Result<Option<NatsPlain>, NatsSkipCause> {
     let user = text(doc, "user");
-    let password = text(doc, "password");
-    let token = text(doc, "token");
+    let token_raw = text(doc, "token");
     let creds = text(doc, "creds");
     let nkey = text(doc, "nkey");
     let user_jwt = text(doc, "user_jwt");
     let user_seed = text(doc, "user_seed");
-    let other_kind = !user.is_empty() || !password.is_empty() || !creds.is_empty() || !nkey.is_empty() || !user_jwt.is_empty();
-    if !token.is_empty() && other_kind {
-      return None;
-    }
-    if !user.is_empty() {
-      return Some(NatsPlain::UserPass {
+    let primary = if !user.is_empty() {
+      let password = self.resolve_literal(text(doc, "password"))?;
+      Some(NatsPlain::UserPass {
         user: user.to_string(),
-        pass: password.to_string(),
-      });
-    }
-    if !password.is_empty() {
-      return None;
-    }
-    if !creds.is_empty() {
-      let (seed, jwt) = self.load_creds(creds)?;
-      return Some(NatsPlain::Creds { seed, jwt });
-    }
-    if !nkey.is_empty() {
-      let path = self.resolve_path(nkey)?;
-      return Some(NatsPlain::Nkey(nkey_file(&path)?));
-    }
-    if !user_jwt.is_empty() && !user_seed.is_empty() {
-      let seed = self.load_user_seed(user_seed)?;
-      let jwt = self.load_jwt(user_jwt)?;
-      let parsed = NatsSeed::from_seed(SecretString::from(seed.clone())).ok()?;
-      check_user_jwt(&jwt, &parsed.public).ok()?;
-      return Some(NatsPlain::Creds { seed, jwt });
-    }
-    if !user_jwt.is_empty() {
-      return None;
-    }
-    if !token.is_empty() {
-      return Some(NatsPlain::Token(token.to_string()));
-    }
-    None
-  }
-
-  fn load_creds(&self, raw: &str) -> Option<(String, String)> {
-    let path = self.resolve_path(raw)?;
-    let text = fs::read_to_string(path).ok()?;
-    let mut found = USER_CONFIG_RE.captures_iter(&text);
-    let jwt = found.next()?.get(1)?.as_str().to_string();
-    let seed = found.next()?.get(1)?.as_str().to_string();
-    let parsed = NatsSeed::from_seed(SecretString::from(seed.clone())).ok()?;
-    check_user_jwt(&jwt, &parsed.public).ok()?;
-    Some((seed, jwt))
-  }
-
-  fn load_user_seed(&self, raw: &str) -> Option<String> {
-    if NatsSeed::from_seed(SecretString::from(raw.to_string())).is_ok() {
-      return Some(raw.to_string());
-    }
-    let path = self.resolve_path(raw)?;
-    nkey_file(&path)
-  }
-
-  fn load_jwt(&self, raw: &str) -> Option<String> {
-    let text = if let Some(path) = self.resolve_path(raw) {
-      fs::read_to_string(path).ok()?
+        pass: password,
+      })
+    } else if !creds.is_empty() {
+      Some(self.creds_plain(creds)?)
+    } else if !nkey.is_empty() {
+      Some(NatsPlain::Nkey(self.nkey_seed(nkey)?))
+    } else if !user_jwt.is_empty() && !user_seed.is_empty() {
+      let seed = self.seed_literal(user_seed)?;
+      let jwt = self.jwt_literal(user_jwt)?;
+      let parsed = NatsSeed::from_seed(SecretString::from(seed.clone())).map_err(|_err| NatsSkipCause::Credential)?;
+      check_user_jwt(&jwt, &parsed.public).map_err(|_err| NatsSkipCause::Credential)?;
+      Some(NatsPlain::Creds { seed, jwt })
+    } else if !user_jwt.is_empty() {
+      Some(NatsPlain::Jwt(self.jwt_literal(user_jwt)?))
     } else {
-      raw.to_string()
-    };
-    if let Some(jwt) = USER_CONFIG_RE.captures_iter(&text).next().and_then(|cap| cap.get(1)) {
-      return Some(jwt.as_str().to_string());
-    }
-    let line = text.trim();
-    if line.is_empty() || line.contains('\n') {
       None
+    };
+    let with_token = if token_raw.is_empty() {
+      primary
     } else {
-      Some(line.to_string())
+      let token = self.resolve_literal(token_raw)?;
+      match primary {
+        None => Some(NatsPlain::Token(token)),
+        Some(NatsPlain::UserPass { user, pass }) => Some(NatsPlain::UserToken { user, pass, token }),
+        Some(NatsPlain::Creds { .. } | NatsPlain::Nkey(_) | NatsPlain::Jwt(_) | NatsPlain::Token(_) | NatsPlain::UserToken { .. }) => {
+          return Err(NatsSkipCause::Credential);
+        }
+      }
+    };
+    if let Some(from_url) = servers.iter().find_map(ServerUrl::userinfo) {
+      match &with_token {
+        Some(NatsPlain::Creds { .. } | NatsPlain::Nkey(_) | NatsPlain::Jwt(_)) => return Ok(with_token),
+        None | Some(NatsPlain::UserPass { .. } | NatsPlain::UserToken { .. } | NatsPlain::Token(_)) => return Ok(Some(from_url)),
+      }
+    }
+    Ok(with_token)
+  }
+
+  fn apply_nsc(doc: &mut Map<String, Value>) -> Result<(), NatsSkipCause> {
+    let nsc = text(doc, "nsc");
+    if nsc.is_empty() {
+      return Ok(());
+    }
+    let profile = Self::nsc_profile(nsc)?;
+    if text(doc, "creds").is_empty() && !profile.user_creds.is_empty() {
+      doc.insert("creds".to_string(), Value::String(profile.user_creds));
+    }
+    if text(doc, "url").is_empty() && !profile.service.is_empty() {
+      doc.insert("url".to_string(), Value::String(profile.service));
+    }
+    Ok(())
+  }
+
+  fn creds_plain(&self, raw: &str) -> Result<NatsPlain, NatsSkipCause> {
+    let bytes = self.material(&self.expand_host(raw))?;
+    let text = String::from_utf8(bytes).map_err(|_err| NatsSkipCause::Credential)?;
+    let mut found = USER_CONFIG_RE.captures_iter(&text);
+    let jwt = found
+      .next()
+      .and_then(|cap| cap.get(1))
+      .map(|item| item.as_str().to_string())
+      .ok_or(NatsSkipCause::Credential)?;
+    let seed = found
+      .next()
+      .and_then(|cap| cap.get(1))
+      .map(|item| item.as_str().to_string())
+      .ok_or(NatsSkipCause::Credential)?;
+    let parsed = NatsSeed::from_seed(SecretString::from(seed.clone())).map_err(|_err| NatsSkipCause::Credential)?;
+    check_user_jwt(&jwt, &parsed.public).map_err(|_err| NatsSkipCause::Credential)?;
+    Ok(NatsPlain::Creds { seed, jwt })
+  }
+
+  fn nkey_seed(&self, raw: &str) -> Result<String, NatsSkipCause> {
+    let expanded = self.expand_host(raw);
+    let bytes = self.material(&expanded)?;
+    let text = String::from_utf8(bytes).map_err(|_err| NatsSkipCause::Credential)?;
+    seed_in(&text).ok_or(NatsSkipCause::Credential)
+  }
+
+  fn seed_literal(&self, raw: &str) -> Result<String, NatsSkipCause> {
+    let resolved = self.resolve_literal(raw)?;
+    if NatsSeed::from_seed(SecretString::from(resolved.clone())).is_ok() {
+      return Ok(resolved);
+    }
+    let text = fs::read_to_string(self.path_from_ref(&self.expand_host(&resolved))).map_err(|_err| NatsSkipCause::Credential)?;
+    seed_in(&text).ok_or(NatsSkipCause::Credential)
+  }
+
+  fn jwt_literal(&self, raw: &str) -> Result<String, NatsSkipCause> {
+    let resolved = self.resolve_literal(raw)?;
+    if let Some(jwt) = jwt_text(&resolved) {
+      return Ok(jwt);
+    }
+    let text = fs::read_to_string(self.path_from_ref(&self.expand_host(&resolved))).map_err(|_err| NatsSkipCause::Credential)?;
+    jwt_text(&text).ok_or(NatsSkipCause::Credential)
+  }
+
+  fn resolve_literal(&self, raw: &str) -> Result<String, NatsSkipCause> {
+    if raw.is_empty() {
+      return Ok(String::new());
+    }
+    let Some(scheme) = parse_scheme(raw) else {
+      return Ok(raw.to_string());
+    };
+    if !known_resolver(scheme) {
+      return Ok(raw.to_string());
+    }
+    let bytes = self.material(raw)?;
+    let mut text = String::from_utf8(bytes).map_err(|_err| NatsSkipCause::Credential)?;
+    while text.ends_with(['\r', '\n']) {
+      text.pop();
+    }
+    Ok(text)
+  }
+
+  /// Path fields are already expanded.
+  fn material(&self, raw: &str) -> Result<Vec<u8>, NatsSkipCause> {
+    let scheme = parse_scheme(raw).map(str::to_ascii_lowercase);
+    match scheme.as_deref() {
+      None | Some("file") => fs::read(self.path_from_ref(raw)).map_err(|_err| NatsSkipCause::Credential),
+      Some("env") => Self::resolve_env(raw),
+      Some("op") => command_stdout("op", &["read", &normalize_scheme(raw, "op")]),
+      Some("nsc") => {
+        let profile = Self::nsc_profile(raw)?;
+        fs::read(&profile.user_creds).map_err(|_err| NatsSkipCause::Credential)
+      }
+      Some("data") => decode_data(raw),
+      Some(_) => Err(NatsSkipCause::Credential),
     }
   }
 
-  fn resolve_path(&self, raw: &str) -> Option<PathBuf> {
-    if raw.is_empty() || (raw.contains("://") && !raw.starts_with("file://")) {
-      return None;
+  fn resolve_env(raw: &str) -> Result<Vec<u8>, NatsSkipCause> {
+    let name = trim_prefix(raw, "env://");
+    if name.is_empty() {
+      return Err(NatsSkipCause::Credential);
     }
-    let path = if let Some(rest) = raw.strip_prefix("file://") {
-      let abs = rest.strip_prefix('/')?;
-      PathBuf::from(format!("/{abs}"))
-    } else if let Some(rest) = raw.strip_prefix("~/") {
-      self.host_home.join(rest)
-    } else if raw == "~" {
-      self.host_home.to_path_buf()
+    match std::env::var(name) {
+      Ok(value) if !value.is_empty() => Ok(value.into_bytes()),
+      Ok(_) | Err(_) => Err(NatsSkipCause::Credential),
+    }
+  }
+
+  fn nsc_profile(raw: &str) -> Result<NscProfile, NatsSkipCause> {
+    let refer = normalize_scheme(raw, "nsc");
+    let stdout = command_stdout("nsc", &["generate", "profile", &refer])?;
+    serde_json::from_slice::<NscProfile>(&stdout)
+      .ok()
+      .filter(|profile| !profile.user_creds.is_empty())
+      .map(|mut profile| {
+        profile.service = profile.operator.service.join(",");
+        profile
+      })
+      .ok_or(NatsSkipCause::Credential)
+  }
+
+  /// `os.ExpandEnv`, then the first leading `~` becomes the host home.
+  fn expand_host(&self, raw: &str) -> String {
+    let expanded = shellexpand::env_with_context_no_errors(raw, |key| Some(std::env::var(key).unwrap_or_default())).into_owned();
+    if let Some(rest) = expanded.strip_prefix('~') {
+      format!("{}{rest}", self.host_home.display())
     } else {
-      let path = PathBuf::from(raw);
-      if path.is_absolute() { path } else { self.root.join(path) }
-    };
-    path.is_file().then_some(path)
+      expanded
+    }
+  }
+
+  fn path_from_ref(&self, raw: &str) -> PathBuf {
+    let stripped = trim_prefix(raw, "file://");
+    let expanded = self.expand_host(stripped);
+    let path = PathBuf::from(&expanded);
+    if path.is_absolute() { path } else { self.root.join(path) }
   }
 
   fn wire_auth(real: &NatsPlain, env: &str, label: &str, key_seed: &[u8; 32]) -> Result<(NatsPlain, Option<GuestCred>), Error> {
@@ -681,41 +857,171 @@ impl<'a> NatsContextTree<'a> {
   }
 }
 
-fn skip(name: &str, cause: NatsSkipCause) -> NatsSkip {
-  NatsSkip {
-    name: name.to_string(),
-    cause,
+enum Built {
+  Grants(Vec<Ready>),
+  Open(String),
+}
+
+struct ServerUrl {
+  url: Url,
+}
+
+impl ServerUrl {
+  fn parse_list(raw: &str) -> Option<Vec<Self>> {
+    let raw = if raw.is_empty() { "nats://localhost:4222" } else { raw };
+    let mut out = Vec::new();
+    for part in raw.split(',') {
+      let part = part.trim().trim_end_matches('/');
+      if part.is_empty() {
+        continue;
+      }
+      let url = Url::parse(part).ok()?;
+      if url.scheme() != "nats" && url.scheme() != "tls" {
+        return None;
+      }
+      url.host_str()?;
+      out.push(Self { url });
+    }
+    (!out.is_empty()).then_some(out)
+  }
+
+  fn userinfo(&self) -> Option<NatsPlain> {
+    let user = self.url.username();
+    if user.is_empty() {
+      return None;
+    }
+    match self.url.password() {
+      None => Some(NatsPlain::Token(user.to_string())),
+      Some(pass) => Some(NatsPlain::UserPass {
+        user: user.to_string(),
+        pass: pass.to_string(),
+      }),
+    }
+  }
+
+  fn auth_string(&self, scheme: &str, auth: &NatsPlain, query: &[(&str, &str)]) -> Option<String> {
+    let host = match self.url.host()? {
+      url::Host::Domain(host) => host.to_string(),
+      url::Host::Ipv4(addr) => addr.to_string(),
+      url::Host::Ipv6(addr) => addr.to_string(),
+    };
+    Some(auth.connection_string(scheme, &host, self.url.port(), query))
+  }
+
+  fn public(&self) -> String {
+    let host = match self.url.host() {
+      Some(url::Host::Ipv6(addr)) => format!("[{addr}]"),
+      Some(host) => host.to_string(),
+      None => "localhost".to_string(),
+    };
+    match self.url.port() {
+      Some(port) => format!("{}://{host}:{port}", self.url.scheme()),
+      None => format!("{}://{host}", self.url.scheme()),
+    }
+  }
+
+  fn public_list(servers: &[Self]) -> String {
+    servers.iter().map(Self::public).collect::<Vec<_>>().join(",")
   }
 }
 
-fn scope_failure(name: &str, err: NatsUriError) -> Result<NatsSkip, Error> {
-  if matches!(err, NatsUriError::MisplacedSeed) {
-    return Err(Error::Config(Box::new(arkham_config::Error::NatsScope {
-      label: name.to_string(),
-      source: err,
-    })));
-  }
-  Ok(skip(name, NatsSkipCause::Rejected))
+/// `nsc generate profile` fields this adapter reads.
+#[derive(Deserialize)]
+struct NscProfile {
+  user_creds: String,
+  #[serde(default)]
+  operator: NscOperator,
+  #[serde(skip)]
+  service: String,
 }
 
-fn unsupported(doc: &Map<String, Value>) -> Option<NatsUnsupported> {
-  if occupied(doc, "windows_cert_store") {
-    return Some(NatsUnsupported::WindowsCertStore);
-  }
-  if occupied(doc, "socks_proxy") {
-    return Some(NatsUnsupported::SocksProxy);
-  }
-  if occupied(doc, "nsc") {
-    return Some(NatsUnsupported::Nsc);
-  }
-  None
+#[derive(Deserialize, Default)]
+struct NscOperator {
+  #[serde(default)]
+  service: Vec<String>,
 }
 
-fn nkey_file(path: &Path) -> Option<String> {
-  let text = fs::read_to_string(path).ok()?;
-  let seed = text.trim();
-  NatsSeed::from_seed(SecretString::from(seed.to_string())).ok()?;
-  Some(seed.to_string())
+fn kept_doc(doc: &Map<String, Value>, public_url: &str) -> Map<String, Value> {
+  let mut out = Map::new();
+  for key in KEPT_KEYS {
+    if *key == "url" {
+      continue;
+    }
+    if let Some(value) = doc.get(*key) {
+      out.insert((*key).to_string(), value.clone());
+    }
+  }
+  out.insert("url".to_string(), Value::String(public_url.to_string()));
+  out
+}
+
+fn known_resolver(scheme: &str) -> bool {
+  matches!(scheme.to_ascii_lowercase().as_str(), "file" | "env" | "op" | "nsc" | "data")
+}
+
+fn normalize_scheme(raw: &str, scheme: &str) -> String {
+  format!("{scheme}://{}", trim_prefix(raw, &format!("{scheme}://")))
+}
+
+fn trim_prefix<'a>(raw: &'a str, prefix: &str) -> &'a str {
+  if raw.len() >= prefix.len() && raw[..prefix.len()].eq_ignore_ascii_case(prefix) {
+    &raw[prefix.len()..]
+  } else {
+    raw
+  }
+}
+
+fn parse_scheme(raw: &str) -> Option<&str> {
+  let bytes = raw.as_bytes();
+  if bytes.first().is_none_or(|byte| !byte.is_ascii_alphabetic()) {
+    return None;
+  }
+  let mut end = 1;
+  while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'+' | b'-' | b'.')) {
+    end += 1;
+  }
+  if end < 2 || bytes.get(end) != Some(&b':') {
+    return None;
+  }
+  Some(&raw[..end])
+}
+
+fn decode_data(raw: &str) -> Result<Vec<u8>, NatsSkipCause> {
+  let rest = trim_prefix(raw, "data:");
+  let (header, payload) = rest.split_once(',').ok_or(NatsSkipCause::Credential)?;
+  if !header.split(';').any(|part| part.trim() == "base64") {
+    return Err(NatsSkipCause::Credential);
+  }
+  STANDARD.decode(payload).map_err(|_err| NatsSkipCause::Credential)
+}
+
+fn command_stdout(program: &str, args: &[&str]) -> Result<Vec<u8>, NatsSkipCause> {
+  let output = Command::new(program)
+    .args(args)
+    .output()
+    .map_err(|_err| NatsSkipCause::Credential)?;
+  if !output.status.success() {
+    return Err(NatsSkipCause::Credential);
+  }
+  Ok(output.stdout)
+}
+
+fn seed_in(text: &str) -> Option<String> {
+  let trimmed = text.trim();
+  NatsSeed::from_seed(SecretString::from(trimmed.to_string())).ok()?;
+  Some(trimmed.to_string())
+}
+
+fn jwt_text(text: &str) -> Option<String> {
+  if let Some(jwt) = USER_CONFIG_RE.captures_iter(text).next().and_then(|cap| cap.get(1)) {
+    return Some(jwt.as_str().to_string());
+  }
+  let line = text.trim();
+  if line.is_empty() || line.contains('\n') {
+    None
+  } else {
+    Some(line.to_string())
+  }
 }
 
 fn context_name(name: &str) -> bool {
@@ -734,40 +1040,6 @@ fn occupied(doc: &Map<String, Value>, key: &str) -> bool {
   }
 }
 
-fn dial_url(raw: &str) -> Option<Url> {
-  let raw = if raw.is_empty() { "nats://localhost:4222" } else { raw };
-  if raw.split(',').filter(|part| !part.is_empty()).count() != 1 {
-    return None;
-  }
-  let url = Url::parse(raw).ok()?;
-  if url.scheme() != "nats" && url.scheme() != "tls" {
-    return None;
-  }
-  url.host_str()?;
-  Some(url)
-}
-
-fn auth_url(base: &Url, scheme: &str, auth: &NatsPlain, query: &[(&str, &str)]) -> Option<String> {
-  let host = match base.host()? {
-    url::Host::Domain(host) => host.to_string(),
-    url::Host::Ipv4(addr) => addr.to_string(),
-    url::Host::Ipv6(addr) => addr.to_string(),
-  };
-  Some(auth.connection_string(scheme, &host, base.port(), query))
-}
-
-fn public_url(url: &Url) -> String {
-  let host = match url.host() {
-    Some(url::Host::Ipv6(addr)) => format!("[{addr}]"),
-    Some(host) => host.to_string(),
-    None => "localhost".to_string(),
-  };
-  match url.port() {
-    Some(port) => format!("{}://{host}:{port}", url.scheme()),
-    None => format!("{}://{host}", url.scheme()),
-  }
-}
-
 /// The credentials-file regex from async-nats `auth_utils`. The first capture
 /// is the user JWT and the second is the nkey seed.
 static USER_CONFIG_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -779,7 +1051,7 @@ mod tests {
   use std::os::unix::fs::MetadataExt as _;
 
   use arkham_config::config::RuleCfg;
-  use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+  use base64::engine::general_purpose::URL_SAFE_NO_PAD;
   use pretty_assertions::assert_eq;
   use secrecy::ExposeSecret as _;
   use serde::Deserialize;
@@ -884,12 +1156,15 @@ mod tests {
 
   #[test]
   fn ipv6_auth_url_is_bracketed_once() {
-    let base = url::Url::parse("tls://[::1]:4222").expect("ipv6 url");
+    let server = ServerUrl::parse_list("tls://[::1]:4222")
+      .expect("ipv6 url")
+      .pop()
+      .expect("one server");
     let auth = NatsPlain::UserPass {
       user: "agent".to_string(),
       pass: "p".to_string(),
     };
-    assert_eq!(auth_url(&base, "tls", &auth, &[]).expect("auth url"), "tls://agent:p@[::1]:4222");
+    assert_eq!(server.auth_string("tls", &auth, &[]).expect("auth url"), "tls://agent:p@[::1]:4222");
   }
 
   #[test]
@@ -928,14 +1203,10 @@ mod tests {
     assert_ne!(decoy["password"], "real-nats-pass");
     assert!(!text.contains("real-nats-pass"));
     assert!(!text.contains("other-real-pass"));
-    assert!(
-      found.skipped.iter().any(|skip| matches!(
-        skip,
-        NatsSkip { name, cause: NatsSkipCause::Credential } if name == "other"
-      )),
-      "{:?}",
-      found.skipped
-    );
+    let other = context_json(&found, "other");
+    assert!(!other.contains("other-real-pass"), "{other}");
+    assert!(other.contains("localhost"), "{other}");
+    assert!(found.skipped.is_empty(), "{:?}", found.skipped);
     assert!(found.grants.iter().all(|grant| !grant.fragment.contains("/context/other.json")));
     assert_eq!(found.container, "/home/eng/.config/nats");
     assert_eq!(file(&found, "context.txt"), b"demo\n");
@@ -997,7 +1268,12 @@ mod tests {
     assert!(!guest.contains(&seed));
     NatsSeed::from_seed(SecretString::from(guest.trim().to_string())).expect("decoy seed");
     fs::write(&nkey, format!("# operator key\n{seed}\n")).unwrap();
-    adapt(&root, "/home/eng", home.path()).expect_err("context does not map");
+    let found = adapt(&root, "/home/eng", home.path()).expect("directory stays").expect("tree");
+    assert!(found.grants.is_empty(), "{:?}", found.skipped);
+    assert!(found.skipped.iter().any(|skip| matches!(
+      skip,
+      NatsSkip { name, cause: NatsSkipCause::Credential } if name == "keyed"
+    )));
 
     write_context(&root, "tok", r#"{"url":"","token":"real-token","tls_first":true}"#);
     let found = adapted(&root, home.path());
@@ -1006,15 +1282,26 @@ mod tests {
     assert!(real.expose_secret().contains("real-token"));
     assert!(real.expose_secret().contains("localhost"));
     assert!(!context_json(&found, "tok").contains("real-token"));
+    assert!(found.skipped.iter().any(|skip| skip.name == "keyed"));
 
     write_context(&root, "bad", r#"{"url":"nats://a:4222,nats://b:4222","token":"real-token"}"#);
-    adapt(&root, "/home/eng", home.path()).expect_err("context does not map");
+    let found = adapted(&root, home.path());
+    assert_eq!(rules_of(&found).len(), 3, "tok plus both servers in bad");
+    let bad = context_json(&found, "bad");
+    assert!(bad.contains("nats://a:4222,nats://b:4222"), "{bad}");
+    assert!(!bad.contains("real-token"), "{bad}");
+
     write_context(
       &root,
       "nsc",
       r#"{"url":"nats://nats.internal:4222","nsc":"nsc://operator/account/user"}"#,
     );
-    adapt(&root, "/home/eng", home.path()).expect_err("context does not map");
+    let found = adapt(&root, "/home/eng", home.path()).expect("directory stays").expect("tree");
+    assert!(found.skipped.iter().any(|skip| matches!(
+      skip,
+      NatsSkip { name, cause: NatsSkipCause::Credential } if name == "nsc"
+    )));
+    assert!(found.grants.iter().any(|grant| grant.fragment.contains("/context/tok.json")));
   }
 
   /// A creds path, wherever it points, mounts under `decoy/` and the real seed stays in the TLS grant.
@@ -1098,7 +1385,7 @@ mod tests {
   }
 
   #[test]
-  fn unknown_context_field_stays_on_the_decoy_and_secret_keys_do_not() {
+  fn decoy_keeps_listed_fields_and_drops_the_rest() {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     write_context(
@@ -1110,8 +1397,8 @@ mod tests {
     let text = String::from_utf8(file(&found, "context/demo.json").to_vec()).unwrap();
     let decoy: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(decoy["description"], "kept");
-    assert_eq!(decoy["name"], "demo");
-    assert_eq!(decoy["operator_note"], "kept-too");
+    assert!(decoy.get("name").is_none(), "{decoy}");
+    assert!(decoy.get("operator_note").is_none(), "{decoy}");
     assert!(decoy.get("windows_cert_match").is_none());
     assert!(decoy.get("user_jwt").is_none());
     assert!(!text.contains("real-token"));
@@ -1277,9 +1564,13 @@ mod tests {
       "demo",
       &format!(r#"{{"url":"tls://nats.internal:4222","creds":"{}"}}"#, creds.display()),
     );
-    adapt(&root, "/home/eng", home.path()).expect_err("context does not map");
+    let found = adapt(&root, "/home/eng", home.path()).expect("directory stays").expect("tree");
+    assert!(found.grants.is_empty());
+    assert!(found.skipped.iter().any(|skip| matches!(skip.cause, NatsSkipCause::Credential)));
     fs::write(&creds, format!("{jwt}\n{seed}\n")).unwrap();
-    adapt(&root, "/home/eng", home.path()).expect_err("context does not map");
+    let found = adapt(&root, "/home/eng", home.path()).expect("directory stays").expect("tree");
+    assert!(found.grants.is_empty());
+    assert!(found.skipped.iter().any(|skip| matches!(skip.cause, NatsSkipCause::Credential)));
   }
 
   #[test]
@@ -1288,7 +1579,10 @@ mod tests {
     let root = home.path().join(".config").join("nats");
     let seed = user_seed();
     write_context(&root, "demo", &format!(r#"{{"url":"nats://nats.internal:4222","nkey":"{seed}"}}"#));
-    adapt(&root, "/home/eng", home.path()).expect_err("context does not map");
+    let found = adapt(&root, "/home/eng", home.path()).expect("directory stays").expect("tree");
+    assert!(found.grants.is_empty());
+    assert!(found.skipped.iter().any(|skip| matches!(skip.cause, NatsSkipCause::Credential)));
+    assert_eq!(file(&found, "context.txt"), b"demo\n");
   }
 
   /// Password, nkey, and creds contexts on one server each become a grant.
@@ -1765,9 +2059,9 @@ mod tests {
     assert!(decoy.contains("password"), "{decoy}");
   }
 
-  /// The same user and an empty password mint one decoy. Two contexts on one server cannot share it.
+  /// The same user and an empty password are the same credential. Both contexts load on one grant.
   #[test]
-  fn two_cleartext_contexts_with_the_same_decoy_are_ambiguous() {
+  fn two_cleartext_contexts_with_the_same_decoy_both_load() {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     write_context(&root, "demo", r#"{"url":"nats://nats.internal:4222","user":"agent","password":""}"#);
@@ -1776,14 +2070,20 @@ mod tests {
       r#"{"url":"nats://nats.internal:4222","user":"agent","password":""}"#,
     )
     .unwrap();
-    let err = adapt(&root, "/home/eng", home.path()).expect_err("same decoy");
-    let Error::Config(source) = err else {
-      panic!("expected the context collision, got {err}");
-    };
-    assert!(matches!(source.as_ref(), arkham_config::Error::AmbiguousContexts(_)), "{source}");
+    let found = adapted(&root, home.path());
+    assert_eq!(found.grants.len(), 1, "{:?}", found.skipped);
+    assert!(context_json(&found, "demo").contains("\"user\": \"agent\""));
+    assert!(context_json(&found, "other").contains("\"user\": \"agent\""));
+    let guest = found
+      .files
+      .iter()
+      .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+      .collect::<String>();
+    assert!(!guest.contains("real"), "{guest}");
   }
 
-  /// An unselected context that fails to map is a skip. The selected grant still loads.
+  /// A comma-separated list is one grant per server. An unselected context that
+  /// does not map is a skip, and the selected grant still loads.
   #[test]
   fn unselected_reject_keeps_the_selected_grant() {
     let home = tempdir().unwrap();
@@ -1806,12 +2106,19 @@ mod tests {
     )
     .unwrap();
     let found = adapted(&root, home.path());
-    assert_eq!(found.grants.len(), 1, "{:?}", found.skipped);
-    assert!(found.grants[0].fragment.contains("/context/demo.json"));
-    assert!(found.skipped.iter().any(|skip| matches!(
-      skip,
-      NatsSkip { name, cause: NatsSkipCause::ServerUrl } if name == "bad"
-    )));
+    assert_eq!(found.grants.len(), 3, "{:?}", found.skipped);
+    assert!(found.grants.iter().any(|grant| grant.fragment.contains("/context/demo.json")));
+    assert_eq!(
+      found
+        .grants
+        .iter()
+        .filter(|grant| grant.fragment.contains("/context/bad.json"))
+        .count(),
+      2
+    );
+    let bad = context_json(&found, "bad");
+    assert!(bad.contains("nats://a:4222,nats://b:4222"), "{bad}");
+    assert!(!bad.contains("other-token"), "{bad}");
     assert!(found.skipped.iter().any(|skip| matches!(
       skip,
       NatsSkip { name, cause: NatsSkipCause::Rejected } if name == "seeded"
@@ -1843,6 +2150,332 @@ mod tests {
       "{:?}",
       found.skipped
     );
+  }
+
+  #[test]
+  fn context_without_a_credential_is_copied_and_grants_nothing() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(&root, "local", r#"{"url":"nats://localhost:4222","description":"dev"}"#);
+    fs::write(
+      root.join("context").join("remote.json"),
+      r#"{"url":"nats://nats.internal:4222","token":"real-token"}"#,
+    )
+    .unwrap();
+    let found = adapted(&root, home.path());
+    assert_eq!(found.grants.len(), 1, "{:?}", found.skipped);
+    assert!(found.grants[0].fragment.contains("/context/remote.json"));
+    let local = context_json(&found, "local");
+    assert!(local.contains("nats://localhost:4222"), "{local}");
+    assert!(local.contains("dev"), "{local}");
+    assert!(!local.contains("password"), "{local}");
+    assert!(!local.contains("token"), "{local}");
+  }
+
+  #[test]
+  fn credential_in_the_server_url_is_the_grant() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(
+      &root,
+      "demo",
+      r#"{"url":"nats://agent:real-nats-pass@nats.internal:4222"}"#, // betterleaks:allow
+    );
+    let found = adapted(&root, home.path());
+    let real = rule_of(&found).real.expect("grant").expose_secret().to_string();
+    assert!(real.contains("real-nats-pass"), "{real}");
+    assert!(real.starts_with("nats://agent:"), "{real}");
+    let decoy = context_json(&found, "demo");
+    assert!(decoy.contains("\"user\": \"agent\""), "{decoy}");
+    assert!(!decoy.contains("real-nats-pass"), "{decoy}");
+    assert!(decoy.contains("nats://nats.internal:4222"), "{decoy}");
+    assert!(!decoy.contains('@'), "{decoy}");
+  }
+
+  #[test]
+  fn user_and_token_are_one_grant() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(
+      &root,
+      "demo",
+      r#"{"url":"tls://nats.internal:4222","user":"agent","password":"real-nats-pass","token":"real-token"}"#, // betterleaks:allow
+    );
+    let found = adapted(&root, home.path());
+    let rule = rule_of(&found);
+    let scope = NatsScope::from_strings(rule.value.unwrap().expose_secret(), rule.real.unwrap().expose_secret()).expect("user token");
+    let pairs: Vec<_> = scope
+      .auth
+      .fields()
+      .iter()
+      .map(|field| (<&str>::from(field.name), field.pair.real.expose_secret().to_string()))
+      .collect();
+    assert_eq!(pairs.len(), 3, "{pairs:?}");
+    assert!(pairs.iter().any(|pair| pair.0 == "user" && pair.1 == "agent"));
+    assert!(pairs.iter().any(|pair| pair.0 == "pass" && pair.1 == "real-nats-pass"));
+    assert!(pairs.iter().any(|pair| pair.0 == "auth_token" && pair.1 == "real-token"));
+    let decoy = context_json(&found, "demo");
+    assert!(!decoy.contains("real-nats-pass"), "{decoy}");
+    assert!(!decoy.contains("real-token"), "{decoy}");
+    assert!(decoy.contains("\"token\""), "{decoy}");
+  }
+
+  #[test]
+  fn jwt_without_a_seed_grants_and_does_not_sign() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let seed = user_seed();
+    let public = NatsSeed::from_seed(SecretString::from(seed)).unwrap().public;
+    let jwt = user_jwt(&public);
+    write_context(
+      &root,
+      "demo",
+      &format!(r#"{{"url":"nats://nats.internal:4222","user_jwt":"{jwt}"}}"#),
+    );
+    let found = adapted(&root, home.path());
+    let rule = rule_of(&found);
+    let real = rule.real.unwrap().expose_secret().to_string();
+    let fake = rule.value.unwrap().expose_secret().to_string();
+    let scope = NatsScope::from_strings(&fake, &real).expect("bearer jwt");
+    assert!(scope.auth.signer().is_none());
+    assert_eq!(scope.auth.fields().len(), 1);
+    assert!(real.contains(&jwt), "{real}");
+    let decoy = context_json(&found, "demo");
+    assert!(!decoy.contains(&jwt), "{decoy}");
+    assert!(decoy.contains("user_jwt"), "{decoy}");
+    assert!(!decoy.contains("user_seed"), "{decoy}");
+  }
+
+  #[test]
+  fn env_and_data_literals_resolve_on_the_host() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let saved = std::env::var_os("ARKHAM_NATS_TEST_PASS");
+    crate::test_support::set_env("ARKHAM_NATS_TEST_PASS", "env-nats-pass"); // betterleaks:allow
+    write_context(
+      &root,
+      "demo",
+      r#"{"url":"nats://nats.internal:4222","user":"agent","password":"env://ARKHAM_NATS_TEST_PASS"}"#, // betterleaks:allow
+    );
+    let found = adapted(&root, home.path());
+    let real = rule_of(&found).real.expect("env grant").expose_secret().to_string();
+    assert!(real.contains("env-nats-pass"), "{real}");
+    assert!(!real.contains("env://"), "{real}");
+    assert!(!context_json(&found, "demo").contains("env-nats-pass"));
+    assert!(!context_json(&found, "demo").contains("ARKHAM_NATS_TEST_PASS"));
+    match saved {
+      Some(value) => crate::test_support::set_env("ARKHAM_NATS_TEST_PASS", value),
+      None => crate::test_support::unset_env("ARKHAM_NATS_TEST_PASS"),
+    }
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(b"data-nats-pass"); // betterleaks:allow
+    write_context(
+      &root,
+      "demo",
+      &format!(r#"{{"url":"nats://nats.internal:4222","user":"agent","password":"data:;base64,{encoded}"}}"#), // betterleaks:allow
+    );
+    let found = adapted(&root, home.path());
+    let real = rule_of(&found).real.expect("data grant").expose_secret().to_string();
+    assert!(real.contains("data-nats-pass"), "{real}");
+    assert!(!context_json(&found, "demo").contains("data-nats-pass"));
+    assert!(!context_json(&found, "demo").contains("data:"));
+  }
+
+  struct RestorePath(Option<std::ffi::OsString>);
+
+  impl Drop for RestorePath {
+    fn drop(&mut self) {
+      match self.0.take() {
+        Some(value) => crate::test_support::set_env("PATH", value),
+        None => crate::test_support::unset_env("PATH"),
+      }
+    }
+  }
+
+  #[test]
+  fn op_and_nsc_commands_resolve_on_the_host() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let bin = home.path().join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let seed = user_seed();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public;
+    let creds = home.path().join("user.creds");
+    fs::write(&creds, decorate_creds(&user_jwt(&public), &seed)).unwrap();
+    let op = bin.join("op");
+    fs::write(
+      &op,
+      "#!/bin/sh\nif [ \"$1\" = read ] && [ \"$2\" = op://vault/item/password ]; then printf '%s\\n' 'op-nats-pass'; exit 0; fi\nexit 1\n", // betterleaks:allow
+    )
+    .unwrap();
+    let nsc = bin.join("nsc");
+    fs::write(
+      &nsc,
+      format!(
+        "#!/bin/sh\nif [ \"$1\" = generate ] && [ \"$2\" = profile ] && [ \"$3\" = nsc://op/acct/user ]; then printf '%s' '{{\"user_creds\":\"{}\",\"operator\":{{\"service\":[\"nats://nsc.example:4222\"]}}}}'; exit 0; fi\nexit 1\n",
+        creds.display()
+      ),
+    )
+    .unwrap();
+    for path in [&op, &nsc] {
+      let mut mode = fs::metadata(path).unwrap().permissions();
+      mode.set_mode(0o755);
+      fs::set_permissions(path, mode).unwrap();
+    }
+    let saved = std::env::var_os("PATH");
+    let mut path = bin.into_os_string();
+    path.push(":");
+    if let Some(rest) = &saved {
+      path.push(rest);
+    }
+    crate::test_support::set_env("PATH", &path);
+    let _path = RestorePath(saved);
+    fs::create_dir_all(root.join("context")).unwrap();
+    fs::write(root.join("context.txt"), "opened\n").unwrap();
+    fs::write(
+      root.join("context").join("opened.json"),
+      r#"{"url":"nats://op.example:4222","user":"agent","password":"op://vault/item/password"}"#, // betterleaks:allow
+    )
+    .unwrap();
+    fs::write(root.join("context").join("profile.json"), r#"{"nsc":"nsc://op/acct/user"}"#).unwrap();
+    let found = adapt(&root, "/home/eng", home.path()).expect("adapt").expect("contexts");
+    let rendered = found.grants.iter().map(|grant| grant.fragment.clone()).collect::<String>();
+    assert!(rendered.contains("op-nats-pass"), "{rendered}"); // betterleaks:allow
+    assert!(rendered.contains(&seed), "{rendered}");
+    assert!(!rendered.contains("op://"), "{rendered}");
+    for (_, bytes) in &found.files {
+      let text = String::from_utf8_lossy(bytes);
+      assert!(!text.contains("op-nats-pass"), "{text}"); // betterleaks:allow
+      assert!(!text.contains(&seed), "{text}");
+    }
+  }
+
+  #[test]
+  fn creds_path_expands_home_on_the_host() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let seed = user_seed();
+    let public = NatsSeed::from_seed(SecretString::from(seed.clone())).unwrap().public;
+    let jwt = user_jwt(&public);
+    let creds = home.path().join("user.creds");
+    fs::write(&creds, decorate_creds(&jwt, &seed)).unwrap();
+    let saved = std::env::var_os("HOME");
+    crate::test_support::set_env("HOME", home.path());
+    write_context(&root, "demo", r#"{"url":"tls://nats.internal:4222","creds":"$HOME/user.creds"}"#);
+    let found = adapted(&root, home.path());
+    let real = rule_of(&found).real.expect("expanded creds").expose_secret().to_string();
+    assert!(real.contains(&seed), "{real}");
+    assert!(!context_json(&found, "demo").contains(&seed));
+    assert!(!context_json(&found, "demo").contains("$HOME"));
+    match saved {
+      Some(value) => crate::test_support::set_env("HOME", value),
+      None => crate::test_support::unset_env("HOME"),
+    }
+  }
+
+  #[test]
+  fn cleartext_url_with_a_ca_grants_tls() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let ca = root.join("ca.pem");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&ca, b"ca-bytes").unwrap();
+    write_context(
+      &root,
+      "demo",
+      &format!(
+        r#"{{"url":"nats://nats.internal:4222","user":"agent","password":"real-nats-pass","ca":"{}"}}"#, // betterleaks:allow
+        ca.display()
+      ),
+    );
+    let found = adapted(&root, home.path());
+    let real = rule_of(&found).real.expect("tls grant").expose_secret().to_string();
+    assert!(real.starts_with("tls://"), "{real}");
+    assert!(real.contains("sslrootcert="), "{real}");
+    assert!(real.contains("real-nats-pass"), "{real}");
+    assert!(!context_json(&found, "demo").contains("real-nats-pass"));
+    assert!(found.skipped.is_empty(), "{:?}", found.skipped);
+  }
+
+  /// `windows_cert_store` matches the host failure on Linux. `socks_proxy` stays
+  /// a skip until the dial is decided. Neither drop takes the other contexts.
+  #[test]
+  fn windows_cert_store_and_socks_proxy_skip_that_context_only() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(&root, "demo", r#"{"url":"nats://nats.internal:4222","token":"real-token"}"#);
+    fs::write(
+      root.join("context").join("win.json"),
+      r#"{"url":"tls://nats.internal:4222","token":"win-token","windows_cert_store":"windows"}"#,
+    )
+    .unwrap();
+    fs::write(
+      root.join("context").join("sock.json"),
+      r#"{"url":"nats://other.internal:4222","token":"sock-token","socks_proxy":"socks5://127.0.0.1:1080"}"#,
+    )
+    .unwrap();
+    let found = adapted(&root, home.path());
+    assert_eq!(found.grants.len(), 1, "{:?}", found.skipped);
+    assert!(found.grants[0].fragment.contains("/context/demo.json"));
+    assert!(found.skipped.iter().any(|skip| matches!(
+      skip,
+      NatsSkip {
+        name,
+        cause: NatsSkipCause::Unsupported(NatsUnsupported::WindowsCertStore)
+      } if name == "win"
+    )));
+    assert!(found.skipped.iter().any(|skip| matches!(
+      skip,
+      NatsSkip {
+        name,
+        cause: NatsSkipCause::Unsupported(NatsUnsupported::SocksProxy)
+      } if name == "sock"
+    )));
+    let guest = found
+      .files
+      .iter()
+      .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+      .collect::<String>();
+    assert!(!guest.contains("win-token"), "{guest}");
+    assert!(!guest.contains("sock-token"), "{guest}");
+  }
+
+  #[test]
+  fn missing_selection_keeps_the_other_contexts() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    fs::create_dir_all(root.join("context")).unwrap();
+    fs::write(
+      root.join("context").join("demo.json"),
+      r#"{"url":"nats://nats.internal:4222","token":"real-token"}"#,
+    )
+    .unwrap();
+    fs::write(
+      root.join("context").join("other.json"),
+      r#"{"url":"nats://other.internal:4222","token":"other-token"}"#,
+    )
+    .unwrap();
+    let found = adapt(&root, "/home/eng", home.path()).expect("adapt").expect("contexts");
+    assert_eq!(found.grants.len(), 2, "{:?}", found.skipped);
+    assert!(found.files.iter().all(|(path, _)| path != "context.txt"));
+    assert!(
+      !found
+        .files
+        .iter()
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes))
+        .any(|text| text.contains("real-token") || text.contains("other-token"))
+    );
+
+    fs::write(root.join("context.txt"), "gone\n").unwrap();
+    let found = adapt(&root, "/home/eng", home.path()).expect("adapt").expect("contexts");
+    assert_eq!(found.grants.len(), 2, "{:?}", found.skipped);
+    assert_eq!(file(&found, "context.txt"), b"gone\n");
+    assert!(found.skipped.iter().any(|skip| matches!(
+      skip,
+      NatsSkip { name, cause: NatsSkipCause::Absent } if name == "gone"
+    )));
   }
 
   fn assert_misplaced_seed(err: Error) {

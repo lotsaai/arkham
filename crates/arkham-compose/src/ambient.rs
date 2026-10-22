@@ -218,16 +218,18 @@ impl AmbientDeriver<'_> {
     }
   }
 
-  /// Every derivable NATS CLI context under `~/.config/nats`.
+  /// Every NATS CLI context under `$XDG_CONFIG_HOME/nats`, or `~/.config/nats`
+  /// when that variable is unset or empty.
   ///
   /// # Errors
   ///
-  /// Returns an error when the twin output cannot be written. A selected
-  /// context that does not map warns and derives nothing.
+  /// Returns an error when the twin output cannot be written, or a seed sits
+  /// outside the nkey or creds field. A dial clash on the selected context
+  /// warns and leaves the directory out. Any other context that does not map
+  /// is left out.
   fn nats(&mut self) -> Result<(), Error> {
-    let root = self.host_home.join(".config").join("nats");
-    let selected = root.join("context.txt");
-    if self.declared.iter().any(|path| path == &root || path.starts_with(&root)) || !selected.is_file() {
+    let root = self.nats_root();
+    if self.declared.iter().any(|path| path == &root || path.starts_with(&root)) {
       return Ok(());
     }
     match nats::adapt(&root, self.home, self.host_home) {
@@ -236,10 +238,18 @@ impl AmbientDeriver<'_> {
         found.install(&mut self.collector)
       }
       Ok(None) => Ok(()),
+      Err(err) if err.is_misplaced_nats_seed() => Err(err),
       Err(err) => {
         tracing::warn!(source = %root.display(), %err, "nats source skipped");
         Ok(())
       }
+    }
+  }
+
+  fn nats_root(&self) -> PathBuf {
+    match env::var("XDG_CONFIG_HOME") {
+      Ok(value) if !value.trim().is_empty() => PathBuf::from(value).join("nats"),
+      _ => self.host_home.join(".config").join("nats"),
     }
   }
 
@@ -538,9 +548,9 @@ mod moved_suite {
     use std::collections::HashMap;
 
     let host = tempdir().unwrap();
-    token_context(host.path());
     let work = tempdir().unwrap();
     let empty_xdg = tempdir().unwrap();
+    token_context(&empty_xdg.path().join("nats"));
     let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
     let outputs = derive_sources(&DeriveInputs {
       files_dir: &work.path().join("files"),
@@ -581,9 +591,9 @@ mod moved_suite {
     use std::collections::HashMap;
 
     let host = tempdir().unwrap();
-    let nats = token_context(host.path());
     let work = tempdir().unwrap();
     let empty_xdg = tempdir().unwrap();
+    let nats = token_context(&empty_xdg.path().join("nats"));
     let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
     let declared = [FileRewrite {
       source: nats.join("context.txt"),
@@ -683,6 +693,148 @@ mod moved_suite {
       !containers.contains(&"/home/eng/.kube/config".to_string()),
       "the broken kubeconfig derives nothing: {containers:?}"
     );
+  }
+
+  #[test]
+  fn nats_under_home_is_ignored_when_xdg_points_elsewhere() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    token_context(&host.path().join(".config").join("nats"));
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    assert!(!outputs.mounts.iter().any(|mount| mount.container.ends_with(".config/nats")));
+    assert!(outputs.grants.iter().all(|grant| !grant.fragment.contains("real-token")));
+  }
+
+  #[test]
+  fn nats_without_context_txt_still_derives() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    let host = tempdir().unwrap();
+    let xdg = tempdir().unwrap();
+    let nats = xdg.path().join("nats");
+    fs::create_dir_all(nats.join("context")).unwrap();
+    fs::write(
+      nats.join("context").join("demo.json"),
+      r#"{"url":"nats://nats.internal:4222","token":"real-token"}"#,
+    )
+    .unwrap();
+    let work = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), xdg.path());
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.config/nats"))
+      .expect("nats directory");
+    assert!(!mount.host.join("context.txt").exists());
+    let twin = fs::read_to_string(mount.host.join("context").join("demo.json")).unwrap();
+    assert!(!twin.contains("real-token"), "{twin}");
+    assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("real-token")));
+  }
+
+  #[test]
+  fn misplaced_nats_seed_fails_ambient_derivation() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    let xdg = tempdir().unwrap();
+    let nats = xdg.path().join("nats");
+    fs::create_dir_all(nats.join("context")).unwrap();
+    let seed = nkeys::KeyPair::new_user().seed().unwrap();
+    fs::write(nats.join("context.txt"), "demo\n").unwrap();
+    fs::write(
+      nats.join("context").join("demo.json"),
+      format!(r#"{{"url":"nats://nats.internal:4222","user":"agent","password":"{seed}"}}"#),
+    )
+    .unwrap();
+    let work = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), xdg.path());
+    let err = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .expect_err("seed");
+    assert!(err.is_misplaced_nats_seed(), "{err}");
+  }
+
+  #[test]
+  fn selected_nats_dial_clash_warns_and_derives_nothing() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    let xdg = tempdir().unwrap();
+    let nats = xdg.path().join("nats");
+    let tls = nats.join("tls");
+    fs::create_dir_all(tls.join("a")).unwrap();
+    fs::create_dir_all(tls.join("b")).unwrap();
+    fs::write(tls.join("a").join("client.crt"), b"cert-a").unwrap();
+    fs::write(tls.join("a").join("client.key"), b"key-a").unwrap();
+    fs::write(tls.join("b").join("client.crt"), b"cert-b").unwrap();
+    fs::write(tls.join("b").join("client.key"), b"key-b").unwrap();
+    fs::create_dir_all(nats.join("context")).unwrap();
+    fs::write(nats.join("context.txt"), "alpha\n").unwrap();
+    for (name, side) in [("alpha", "a"), ("beta", "b")] {
+      let body = format!(
+        r#"{{"url":"tls://nats.internal:4222","token":"tok-{name}","cert":"{}","key":"{}"}}"#,
+        tls.join(side).join("client.crt").display(),
+        tls.join(side).join("client.key").display(),
+      );
+      fs::write(nats.join("context").join(format!("{name}.json")), body).unwrap();
+    }
+    let work = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), xdg.path());
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .expect("dial clash warns");
+    assert!(!outputs.mounts.iter().any(|mount| mount.container.ends_with(".config/nats")));
+    assert!(outputs.grants.iter().all(|grant| !grant.fragment.contains("tok-alpha")));
   }
 
   /// An empty `TALOSCONFIG` is unset: the default path under the host home.

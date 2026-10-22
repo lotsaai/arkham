@@ -353,27 +353,21 @@ async fn prop_nats_info_cut_leaves_the_rest_unread() {
       let mut clear_up = nats_leg(NatsLeg::Up);
       let mut clear_down = nats_leg(NatsLeg::Down);
       let mut clear_guest = Vec::new();
-      let err = server_info(&mut clear_reader, &mut clear_up, &mut clear_down, &mut clear_guest, true)
+      let opened = server_info(&mut clear_reader, &mut clear_up, &mut clear_down, &mut clear_guest, true)
         .await
-        .expect_err("cleartext INFO with tls_required must close");
-      prop_assert!(
-        matches!(
-          err,
-          crate::Error::NatsTlsRequired {
-            tls_available: false,
-            tls_verify: false
-          }
-        ),
-        "cleartext close was {err}"
-      );
-      prop_assert!(
-        !clear_guest.contains(&b'\n'),
-        "the read that held LF was written on a cleartext close"
-      );
+        .expect("cleartext INFO with tls_required upgrades");
+      let Some(opening) = opened else {
+        return Err(TestCaseError::fail("the INFO reader closed"));
+      };
+      prop_assert!(opening.upgrade, "cleartext INFO with tls_required upgrades");
+      prop_assert_eq!(&clear_guest, &expected, "cut INFO reached the guest differently");
       prop_assert!(
         !contains_bytes(&clear_guest, NATS_REAL.as_bytes()),
         "INFO carried the real password to the guest"
       );
+      let mut clear_rest = opening.rest;
+      clear_rest.extend_from_slice(clear_reader.data.get(clear_reader.at..).unwrap_or_default());
+      prop_assert_eq!(&clear_rest, &tail, "bytes past INFO were consumed or lost");
       let mut reader = CutPend::new(stream, &cuts);
       let mut up = nats_leg(NatsLeg::Up);
       let mut down = nats_leg(NatsLeg::Down);
@@ -381,9 +375,11 @@ async fn prop_nats_info_cut_leaves_the_rest_unread() {
       let opened = server_info(&mut reader, &mut up, &mut down, &mut guest, false)
         .await
         .expect("info read");
-      let Some(mut rest) = opened else {
+      let Some(opening) = opened else {
         return Err(TestCaseError::fail("the INFO reader closed"));
       };
+      prop_assert!(!opening.upgrade, "a tls leg does not upgrade again from INFO");
+      let mut rest = opening.rest;
       prop_assert_eq!(&guest, &expected, "cut INFO reached the guest differently");
       prop_assert!(
         !contains_bytes(&guest, NATS_REAL.as_bytes()),
