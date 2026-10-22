@@ -39,8 +39,7 @@ const NATS_PORT: u16 = 4222;
 /// One direction the NATS properties drive. Guest-bound output is [`NatsLeg::Up`].
 #[derive(Clone, Copy, Debug)]
 enum NatsLeg {
-  DownSwap,
-  DownClear,
+  Down,
   Up,
 }
 
@@ -50,8 +49,7 @@ fn nats_leg(leg: NatsLeg) -> Nats {
     &format!("tls://agent:{NATS_REAL}@nats.upstream:{NATS_PORT}"),
   );
   match leg {
-    NatsLeg::DownSwap => Nats::downstream(&grants, NATS_HOST, NATS_PORT, true),
-    NatsLeg::DownClear => Nats::downstream(&grants, NATS_HOST, NATS_PORT, false),
+    NatsLeg::Down => Nats::downstream(&grants, NATS_HOST, NATS_PORT),
     NatsLeg::Up => Nats::upstream(&grants, NATS_HOST, NATS_PORT),
   }
 }
@@ -257,8 +255,7 @@ where
 }
 
 /// Any cut of an accepted NATS stream, including one byte at a time,
-/// matches one shot. A cleartext server leg changes nothing; a TLS one
-/// swaps each decoy CONNECT; guest-bound bytes never hold the real password.
+/// matches one shot. Guest-bound bytes never hold the real password.
 #[tokio::test]
 async fn prop_nats_split_output_is_identical() {
   drive(
@@ -272,9 +269,7 @@ async fn prop_nats_split_output_is_identical() {
       let client = client.concat();
       let server = server.concat();
       let client_cuts = nats_cuts(&cuts, &client);
-      let clear = nats_splits_match(NatsLeg::DownClear, &client, &client_cuts).await?;
-      prop_assert_eq!(&clear.out, &client, "a cleartext server leg changed guest bytes");
-      let swapped = nats_splits_match(NatsLeg::DownSwap, &client, &client_cuts).await?;
+      let swapped = nats_splits_match(NatsLeg::Down, &client, &client_cuts).await?;
       let decoys = count_bytes(&client, format!("\"pass\":\"{NATS_FAKE}\"").as_bytes());
       prop_assert_eq!(count_bytes(&swapped.out, format!("\"pass\":\"{NATS_REAL}\"").as_bytes()), decoys);
       prop_assert_eq!(swapped.hits, decoys);
@@ -356,7 +351,7 @@ async fn prop_nats_info_cut_leaves_the_rest_unread() {
       let expected = run_nats(NatsLeg::Up, &info, &[]).await.out;
       let mut clear_reader = CutPend::new(stream.clone(), &cuts);
       let mut clear_up = nats_leg(NatsLeg::Up);
-      let mut clear_down = nats_leg(NatsLeg::DownSwap);
+      let mut clear_down = nats_leg(NatsLeg::Down);
       let mut clear_guest = Vec::new();
       let err = server_info(&mut clear_reader, &mut clear_up, &mut clear_down, &mut clear_guest, true)
         .await
@@ -381,7 +376,7 @@ async fn prop_nats_info_cut_leaves_the_rest_unread() {
       );
       let mut reader = CutPend::new(stream, &cuts);
       let mut up = nats_leg(NatsLeg::Up);
-      let mut down = nats_leg(NatsLeg::DownSwap);
+      let mut down = nats_leg(NatsLeg::Down);
       let mut guest = Vec::new();
       let opened = server_info(&mut reader, &mut up, &mut down, &mut guest, false)
         .await
@@ -422,11 +417,9 @@ async fn prop_nats_truncated_prefix_at_eof() {
     |(client, server, keep, cuts)| async move {
       let end = 1 + keep % (client.len() - 1);
       let prefix = &client[..end];
-      for leg in [NatsLeg::DownSwap, NatsLeg::DownClear] {
-        for run in nats_runs(leg, prefix, &nats_cuts(&cuts, prefix)).await {
-          prop_assert_eq!(run.out.as_slice(), prefix, "a partial guest command changed at EOF");
-          prop_assert!(!run.closed, "a partial guest command closed the leg");
-        }
+      for run in nats_runs(NatsLeg::Down, prefix, &nats_cuts(&cuts, prefix)).await {
+        prop_assert_eq!(run.out.as_slice(), prefix, "a partial guest command changed at EOF");
+        prop_assert!(!run.closed, "a partial guest command closed the leg");
       }
       let end = 1 + keep % (server.len() - 1);
       let prefix = &server[..end];
@@ -443,11 +436,9 @@ async fn prop_nats_truncated_prefix_at_eof() {
   .await;
 }
 
-/// A CONNECT past the cap is forwarded byte-identical. One shot and the
-/// random cuts each end with the empty EOF flush. A TLS leg does not swap
-/// it, and the command after it keeps the session open. One byte at a time
-/// stays in the unit tests: this line is longer than the cap, and walking
-/// every byte for 256 cases would pass the slow-test deadline.
+/// One byte at a time stays in the unit tests: this line is longer than
+/// the cap, and walking every byte for 256 cases would pass the slow-test
+/// deadline.
 #[tokio::test]
 async fn prop_nats_oversize_connect_is_forwarded() {
   drive(
@@ -461,15 +452,13 @@ async fn prop_nats_oversize_connect_is_forwarded() {
       let mut data = line.into_bytes();
       data.extend_from_slice(b"PING\r\n");
       let scaled = nats_cuts(&cuts, &data);
-      for leg in [NatsLeg::DownSwap, NatsLeg::DownClear] {
-        let once = run_nats(leg, &data, &[]).await;
-        let split = run_nats(leg, &data, &scaled).await;
-        prop_assert!(!once.closed && !split.closed, "an oversize CONNECT closed the {leg:?} leg");
-        prop_assert_eq!(&once.out, &data);
-        prop_assert_eq!(&split.out, &data);
-        prop_assert_eq!(once.hits, 0);
-        prop_assert_eq!(split.hits, 0);
-      }
+      let once = run_nats(NatsLeg::Down, &data, &[]).await;
+      let split = run_nats(NatsLeg::Down, &data, &scaled).await;
+      prop_assert!(!once.closed && !split.closed, "an oversize CONNECT closed the leg");
+      prop_assert_eq!(&once.out, &data);
+      prop_assert_eq!(&split.out, &data);
+      prop_assert_eq!(once.hits, 0);
+      prop_assert_eq!(split.hits, 0);
       Ok(())
     },
   )
@@ -485,13 +474,13 @@ async fn prop_nats_arbitrary_no_panic() {
     (
       proptest::collection::vec(any::<u8>(), 0..1024),
       0usize..1024,
-      prop_oneof![Just(NatsLeg::DownSwap), Just(NatsLeg::DownClear), Just(NatsLeg::Up)],
+      prop_oneof![Just(NatsLeg::Down), Just(NatsLeg::Up)],
     ),
     |(data, cut, leg)| async move {
       let _ = run_nats(leg, &data, &[cut.min(data.len())]).await;
       let mut reader = CutPend::new(data, &[cut]);
       let mut up = nats_leg(NatsLeg::Up);
-      let mut down = nats_leg(NatsLeg::DownSwap);
+      let mut down = nats_leg(NatsLeg::Down);
       let mut guest = Vec::new();
       let _ = server_info(&mut reader, &mut up, &mut down, &mut guest, false).await;
       Ok(())
@@ -562,7 +551,7 @@ fn info_line(nonce: &str) -> Vec<u8> {
 
 async fn arm_nonce(grants: &[Grant], nonce: &str) -> Result<Nats, TestCaseError> {
   let mut up = Nats::upstream(grants, NATS_HOST, NATS_PORT);
-  let mut down = Nats::downstream(grants, NATS_HOST, NATS_PORT, true);
+  let mut down = Nats::downstream(grants, NATS_HOST, NATS_PORT);
   let info = info_line(nonce);
   let (out, _, closed) = feed_parts(&mut up, &info, &[]).await;
   prop_assert!(!closed && out == info, "opening INFO");
@@ -572,7 +561,7 @@ async fn arm_nonce(grants: &[Grant], nonce: &str) -> Result<Nats, TestCaseError>
 
 async fn arm_absent(grants: &[Grant]) -> Nats {
   let mut up = Nats::upstream(grants, NATS_HOST, NATS_PORT);
-  let mut down = Nats::downstream(grants, NATS_HOST, NATS_PORT, true);
+  let mut down = Nats::downstream(grants, NATS_HOST, NATS_PORT);
   let info = b"INFO {\"server_id\":\"N1\"}\r\n";
   let (out, _, closed) = feed_parts(&mut up, info, &[]).await;
   assert!(!closed && out == info, "opening INFO without a nonce");
@@ -772,14 +761,14 @@ async fn prop_nats_tampered_signed_connect_is_forwarded() {
         prop_assert!(line.len() > NATS_MAX_COMMAND);
       }
       let mut down = match tamper {
-        SignedTamper::Pending => Nats::downstream(&grants, NATS_HOST, NATS_PORT, true),
+        SignedTamper::Pending => Nats::downstream(&grants, NATS_HOST, NATS_PORT),
         SignedTamper::Absent => arm_absent(&grants).await,
         _ => arm_nonce(&grants, &nonce).await?,
       };
       let (out, hits, closed) = feed_parts(&mut down, &line, &nats_cuts(&cuts, &line)).await;
       let (once, once_hits, once_closed) = feed_parts(
         &mut match tamper {
-          SignedTamper::Pending => Nats::downstream(&grants, NATS_HOST, NATS_PORT, true),
+          SignedTamper::Pending => Nats::downstream(&grants, NATS_HOST, NATS_PORT),
           SignedTamper::Absent => arm_absent(&grants).await,
           _ => arm_nonce(&grants, &nonce).await?,
         },

@@ -1,6 +1,5 @@
-//! NATS through the MITM: a `nats://` server leg keeps the decoy, a `tls://`
-//! server leg carries the real password, nkey, or user JWT only after its
-//! upgrade, and a guest hello without SNI mints for the grant host.
+//! NATS through the MITM. `tls://` swaps only after its upgrade. A guest
+//! hello without SNI mints for the grant host.
 
 use std::path::PathBuf;
 
@@ -145,7 +144,7 @@ fn guest_url(addr: SocketAddr) -> String {
 }
 
 #[tokio::test]
-async fn nats_cleartext_server_leg_receives_the_decoy() {
+async fn nats_cleartext_server_leg_receives_the_real_credential() {
   let stub = nats_stub().await;
   let (proxy_addr, proxy) = run_proxy_with(test_state_with(stub.grants(ServerLeg::Cleartext), &stub.ca)).await;
   let port = stub.port;
@@ -156,7 +155,7 @@ async fn nats_cleartext_server_leg_receives_the_decoy() {
     opening.extend_from_slice(b"PING\r\n");
     conn.write_all(&opening).await.unwrap();
     conn.flush().await.unwrap();
-    expect_connect(&mut conn, FAKE, VALUE).await;
+    expect_connect(&mut conn, VALUE, FAKE).await;
   });
   let upstream = connect_through_proxy(proxy_addr, port).await;
   let splice = splice_guest(upstream).await;

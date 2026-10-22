@@ -60,7 +60,7 @@ stateDiagram-v2
 
 `Error::NatsSharedEndpoint` stays the dial and TLS clash. `AmbiguousContexts` is the separate case of two decoys that present the same bytes.
 
-A cleartext `nats` upstream uses `Policy::Forward` and writes no real credential. There is nothing to select and nothing to protect, including when two cleartext contexts share a host and port. Both forward. `require_distinct` is not called for them.
+A `nats://` context is a grant. CONNECT is swapped. `require_distinct` applies to it.
 
 In `/home/eng/.config/nats`, contexts `demo` and `Demo` both use tls on host `nats.example` port 4222. The passwords differ because the identities differ. A CONNECT that carries one password selects that context. When both contexts were given the same decoy CONNECT bytes, `require_distinct` names both.
 

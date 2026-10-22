@@ -150,6 +150,16 @@ cluster {
 }
 EOF
 
+cat >"$nats/plain.conf" <<EOF
+port: 4224
+http_port: 8222
+authorization {
+  users: [
+    { user: agent, password: arkham_real_nats_pass }
+  ]
+}
+EOF
+
 cat >"$nats/jwt.conf" <<EOF
 port: 4223
 http_port: 8222

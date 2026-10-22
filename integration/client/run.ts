@@ -1412,7 +1412,7 @@ if (process.env.NATS_DISCOVERED === "1") {
   });
 
   await once("nats", "nats cli pub/sub per discovered context, then context select and a bare command", async () => {
-    for (const name of ["pass", "discovered", "creds"]) {
+    for (const name of ["pass", "discovered", "creds", "clear"]) {
       if (!await natsCliRoundTrip(["--context", name], name)) return false;
     }
     const selected = await runNats(["context", "select", "pass"]);

@@ -101,8 +101,9 @@ nats_client_log_hides_real_material() {
 
 # Host ~/.config/nats discovery. The caller has already run certs to
 # completion. Copy that CA, then `arkham init` in an empty workspace. That
-# reads three contexts (no project [rules.nats_*], no fnox key): password
-# and nkey on nats:4222, creds on nats-jwt:4223. The guest tree is the decoy
+# reads four contexts (no project [rules.nats_*], no fnox key): password
+# and nkey on nats:4222, creds on nats-jwt:4223, and a cleartext password
+# on nats-plain:4224. The guest tree is the decoy
 # mount. The grant file, which states the real credentials, is appended to
 # the global config. The caller must not start certs again: gen-secrets.sh
 # truncates that file.
@@ -214,6 +215,14 @@ EOF
   "ca": "${home}/.config/nats/ca.crt"
 }
 EOF
+  cat >"$home/.config/nats/context/clear.json" <<EOF
+{
+  "description": "integration cleartext",
+  "url": "nats://nats-plain:4224",
+  "user": "agent",
+  "password": "${real_password}"
+}
+EOF
 
   echo "=== nats discovery: arkham init ==="
   env -u ARKHAM_CONFIG -u KUBECONFIG -u TALOSCONFIG \
@@ -256,8 +265,12 @@ EOF
     echo "discovered grant does not state the real creds seed"
     return 1
   fi
-  if [ "$(grep -c -E '^\[rules\.' "$grant_toml" || true)" -lt 3 ]; then
-    echo "discovered grant does not cover password, nkey, and creds"
+  if [ "$(grep -c -E '^\[rules\.' "$grant_toml" || true)" -lt 4 ]; then
+    echo "discovered grant does not cover password, nkey, creds, and cleartext"
+    return 1
+  fi
+  if ! grep -F -q -- "nats://agent:${real_password}@nats-plain:4224" "$grant_toml"; then
+    echo "discovered cleartext grant does not state the real password"
     return 1
   fi
   while IFS= read -r label; do
@@ -339,7 +352,7 @@ EOF
     echo "client does not bind the generated nats directory writable"
     return 1
   fi
-  if [ ! -f "$dest/guest/context.txt" ] || [ ! -f "$dest/guest/context/pass.json" ] || [ ! -f "$dest/guest/context/creds.json" ]; then
+  if [ ! -f "$dest/guest/context.txt" ] || [ ! -f "$dest/guest/context/pass.json" ] || [ ! -f "$dest/guest/context/creds.json" ] || [ ! -f "$dest/guest/context/clear.json" ]; then
     echo "discovery did not mount every nats context into the guest"
     return 1
   fi

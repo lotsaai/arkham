@@ -532,8 +532,6 @@ mod moved_suite {
     assert!(!mounted_text(&derived.outputs, "context/demo.json").contains(&seed));
   }
 
-  /// Every derivable `~/.config/nats` context is one writable directory. A
-  /// cleartext context keeps the real token out of the grant.
   #[test]
   fn derive_sources_mounts_every_nats_context() {
     use arkham_config::registry::Registry;
@@ -572,8 +570,8 @@ mod moved_suite {
     let other_text = fs::read_to_string(nats.host.join("context").join("other.json")).unwrap();
     assert!(!other_text.contains("other-real"), "{other_text}");
     let rendered = outputs.grants.iter().map(|grant| grant.fragment.clone()).collect::<String>();
-    assert!(!rendered.contains("real-token"), "{rendered}");
-    assert!(!rendered.contains("other-real"), "{rendered}");
+    assert!(rendered.contains("real-token"), "{rendered}");
+    assert!(rendered.contains("other-real"), "{rendered}");
   }
 
   /// A declared path under `~/.config/nats` stays with that declaration.

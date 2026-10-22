@@ -3,10 +3,10 @@
 //!
 //! `nats://` and `tls://` are the two spellings official NATS clients
 //! accept, and both are [`Scheme::Nats`]. A `nats://` real string is a
-//! cleartext upstream, so CONNECT forwards the decoy. A `tls://` real
-//! string is a TLS upstream: the server sends one cleartext INFO line and
-//! the client upgrades before CONNECT, or with `handshake_first=true` both
-//! legs do TLS before any protocol byte.
+//! cleartext upstream, and CONNECT is swapped. A `tls://` real string is a
+//! TLS upstream: the server sends one cleartext INFO line and the client
+//! upgrades before CONNECT, or with `handshake_first=true` both legs do TLS
+//! before any protocol byte. CONNECT is swapped on that leg too.
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -1139,14 +1139,6 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
       return Err(Error::NatsTrust { label: label.to_string() });
     }
     scope.guest_tls = tls.guest_tls_mode;
-  }
-  if scope.upstream_tls == NatsUpstream::Cleartext {
-    tracing::warn!(
-      label,
-      host = %scope.upstream.host,
-      port = scope.upstream.port,
-      "nats:// upstream is cleartext; CONNECT forwards the decoy"
-    );
   }
   let (fake, value) = scope.auth.credential();
   let (fake, value) = (fake.to_string(), value.clone());

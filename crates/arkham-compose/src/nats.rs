@@ -1,8 +1,7 @@
 //! NATS context adapter: `~/.config/nats/context/<name>.json` is one
-//! connection string plus the credential the CLI reads from disk. A TLS
-//! context becomes one grant. A cleartext context mounts a decoy and writes
-//! no real credential. `context.txt` is copied into the guest and is not how
-//! a credential is chosen.
+//! connection string plus the credential the CLI reads from disk.
+//! `context.txt` is copied into the guest and is not how a credential is
+//! chosen.
 //!
 //! The guest tree is one writable directory at `{home}/.config/nats`, so
 //! `nats context select` can rename `context.txt`. A creds or nkey file is
@@ -48,9 +47,9 @@ const DROPPED_KEYS: &[&str] = &[
 /// One discovered context directory, ready for the ambient pass.
 #[derive(Debug)]
 pub(crate) struct AdaptedNats {
-  /// TLS contexts that became grants, in file order.
+  /// Contexts that became grants, in file order.
   pub(crate) grants: Vec<RewriteAdapted>,
-  /// Paths relative to [`Self::container`], including cleartext contexts.
+  /// Paths relative to [`Self::container`].
   pub(crate) files: Vec<(String, Vec<u8>)>,
   /// `{home}/.config/nats`. The directory mounts here, writable.
   pub(crate) container: String,
@@ -203,8 +202,7 @@ struct Ready {
   fake: NatsPlain,
   guest: Option<GuestCred>,
   fake_url: String,
-  /// Set for a TLS upstream. Cleartext validates this string and drops it.
-  real_url: Option<String>,
+  real_url: String,
   blobs: Vec<(String, Vec<u8>)>,
   decoy: String,
 }
@@ -314,7 +312,6 @@ impl<'a> NatsContextTree<'a> {
     }
     let presented = ready
       .iter()
-      .filter(|item| item.real_url.is_some())
       .map(|item| Presented {
         identity: &item.identity,
         host: item.dial.host.as_str(),
@@ -327,9 +324,7 @@ impl<'a> NatsContextTree<'a> {
     let mut grants = Vec::new();
     for item in ready {
       Self::push_tree(&mut tree, &item);
-      if let Some(grant) = Self::grant_of(item)? {
-        grants.push(grant);
-      }
+      grants.push(Self::grant_of(item)?);
     }
     Ok(Some(AdaptedNats {
       grants,
@@ -435,7 +430,7 @@ impl<'a> NatsContextTree<'a> {
       fake,
       guest,
       fake_url,
-      real_url: None,
+      real_url: String::new(),
       blobs: Vec::new(),
       decoy: String::new(),
     };
@@ -456,9 +451,7 @@ impl<'a> NatsContextTree<'a> {
       };
     }
     item.blobs = query.blobs;
-    if item.dial.real_tls {
-      item.real_url = Some(real_url);
-    }
+    item.real_url = real_url;
     item.decoy = match serde_json::to_string_pretty(&item.decoy_doc()) {
       Ok(text) => text,
       Err(_) => return Ok(Err(skip(name, NatsSkipCause::Rejected))),
@@ -469,9 +462,7 @@ impl<'a> NatsContextTree<'a> {
   fn reconcile(&self, selected: &str, mut ready: Vec<Ready>) -> Result<(Vec<Ready>, Vec<NatsSkip>), Error> {
     let mut groups: BTreeMap<(String, u16), Vec<usize>> = BTreeMap::new();
     for (index, item) in ready.iter().enumerate() {
-      if item.real_url.is_some() {
-        groups.entry((item.dial.host.clone(), item.dial.port)).or_default().push(index);
-      }
+      groups.entry((item.dial.host.clone(), item.dial.port)).or_default().push(index);
     }
     let mut skipped = Vec::new();
     let mut drop = Vec::new();
@@ -524,10 +515,8 @@ impl<'a> NatsContextTree<'a> {
     }
   }
 
-  fn grant_of(item: Ready) -> Result<Option<RewriteAdapted>, Error> {
-    let Some(real_url) = item.real_url else {
-      return Ok(None);
-    };
+  fn grant_of(item: Ready) -> Result<RewriteAdapted, Error> {
+    let real_url = item.real_url;
     let fragment = GrantFragment {
       env: item.identity.env(),
       registry: false,
@@ -539,12 +528,12 @@ impl<'a> NatsContextTree<'a> {
       tls: BTreeMap::new(),
       ssh: BTreeMap::new(),
     };
-    Ok(Some(RewriteAdapted {
+    Ok(RewriteAdapted {
       fragment: render_fragment(&item.identity.source, &item.identity.label, &fragment)?,
       decoy: String::new(),
       materialized: item.blobs,
       decoy_files: Vec::new(),
-    }))
+    })
   }
 
   fn dial(&self, url: &Url, doc: &Map<String, Value>) -> Result<Dial, NatsSkipCause> {
@@ -1127,7 +1116,10 @@ mod tests {
     assert!(decoy.get("user_jwt").is_none());
     assert!(!text.contains("real-token"));
     assert_ne!(decoy["password"], "real-token");
-    assert!(found.grants.is_empty(), "a cleartext context writes no grant");
+    assert_eq!(found.grants.len(), 1, "{:?}", found.skipped);
+    let real = rule_of(&found).real.expect("grant").expose_secret().to_string();
+    assert!(real.starts_with("nats://"), "{real}");
+    assert!(real.contains("real-token"), "{real}");
   }
 
   #[test]
@@ -1498,71 +1490,6 @@ mod tests {
     load_grants(&found).expect("one dial loads");
   }
 
-  #[test]
-  fn selected_cleartext_does_not_clash_with_tls_on_the_same_server() {
-    let home = tempdir().unwrap();
-    let root = home.path().join(".config").join("nats");
-    write_context(
-      &root,
-      "demo",
-      r#"{"url":"nats://nats.internal:4222","user":"agent","password":"real-nats-pass"}"#, // betterleaks:allow
-    );
-    fs::write(
-      root.join("context").join("secure.json"),
-      r#"{"url":"tls://nats.internal:4222","token":"secure-token"}"#,
-    )
-    .unwrap();
-    let found = adapted(&root, home.path());
-    assert!(
-      found.grants.iter().any(|grant| grant.fragment.contains("/context/secure.json")),
-      "{:?}",
-      found.skipped
-    );
-    assert!(found.grants.iter().all(|grant| !grant.fragment.contains("/context/demo.json")));
-    assert!(
-      found.skipped.iter().all(|skip| !matches!(skip.cause, NatsSkipCause::Dial { .. })),
-      "{:?}",
-      found.skipped
-    );
-    let decoy = String::from_utf8(file(&found, "context/demo.json").to_vec()).unwrap();
-    assert!(!decoy.contains("real-nats-pass"), "{decoy}");
-    let real = rule_named(&found, "secure").real.expect("tls grant").expose_secret().to_string();
-    assert!(real.contains("secure-token"), "{real}");
-    assert!(!real.contains("real-nats-pass"), "{real}");
-  }
-
-  #[test]
-  fn unselected_cleartext_that_sorts_first_does_not_skip_the_tls_grant() {
-    let home = tempdir().unwrap();
-    let root = home.path().join(".config").join("nats");
-    write_context(&root, "other", r#"{"url":"tls://other.internal:4222","token":"kept-token"}"#);
-    fs::write(
-      root.join("context").join("aplain.json"),
-      r#"{"url":"nats://nats.internal:4222","user":"agent","password":"plain-pass"}"#, // betterleaks:allow
-    )
-    .unwrap();
-    fs::write(
-      root.join("context").join("bsecure.json"),
-      r#"{"url":"tls://nats.internal:4222","token":"secure-token"}"#,
-    )
-    .unwrap();
-    let found = adapted(&root, home.path());
-    assert!(found.grants.iter().any(|grant| grant.fragment.contains("/context/other.json")));
-    assert!(
-      found.grants.iter().any(|grant| grant.fragment.contains("/context/bsecure.json")),
-      "{:?}",
-      found.skipped
-    );
-    assert!(found.grants.iter().all(|grant| !grant.fragment.contains("/context/aplain.json")));
-    assert!(
-      found.skipped.iter().all(|skip| !matches!(skip.cause, NatsSkipCause::Dial { .. })),
-      "{:?}",
-      found.skipped
-    );
-    let plain = String::from_utf8(file(&found, "context/aplain.json").to_vec()).unwrap();
-    assert!(!plain.contains("plain-pass"), "{plain}");
-  }
-
   /// Different client certs on the selected server fail before grant load and name both contexts.
   #[test]
   fn selected_tls_clash_names_both_contexts() {
@@ -1808,9 +1735,8 @@ mod tests {
     assert!(real.contains("real-nats-pass"), "{real}");
   }
 
-  /// A cleartext upstream stores no real credential and still mounts the decoy.
   #[test]
-  fn cleartext_context_omits_the_real_credential() {
+  fn two_cleartext_contexts_on_one_server_grant_and_hide_the_real_credential() {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     write_context(
@@ -1824,13 +1750,37 @@ mod tests {
     )
     .unwrap();
     let found = adapted(&root, home.path());
+    assert_eq!(found.grants.len(), 2, "{:?}", found.skipped);
     let rendered = found.grants.iter().map(|grant| grant.fragment.clone()).collect::<String>();
-    assert!(!rendered.contains("real-nats-pass"), "{rendered}");
-    assert!(!rendered.contains("other-real-token"), "{rendered}");
+    assert!(rendered.contains("real-nats-pass"), "{rendered}");
+    assert!(rendered.contains("other-real-token"), "{rendered}");
+    let guest = found
+      .files
+      .iter()
+      .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+      .collect::<String>();
+    assert!(!guest.contains("real-nats-pass"), "{guest}");
+    assert!(!guest.contains("other-real-token"), "{guest}");
     let decoy = String::from_utf8(file(&found, "context/demo.json").to_vec()).unwrap();
-    assert!(!decoy.contains("real-nats-pass"), "{decoy}");
     assert!(decoy.contains("password"), "{decoy}");
-    assert!(found.grants.is_empty());
+  }
+
+  /// The same user and an empty password mint one decoy. Two contexts on one server cannot share it.
+  #[test]
+  fn two_cleartext_contexts_with_the_same_decoy_are_ambiguous() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(&root, "demo", r#"{"url":"nats://nats.internal:4222","user":"agent","password":""}"#);
+    fs::write(
+      root.join("context").join("other.json"),
+      r#"{"url":"nats://nats.internal:4222","user":"agent","password":""}"#,
+    )
+    .unwrap();
+    let err = adapt(&root, "/home/eng", home.path()).expect_err("same decoy");
+    let Error::Config(source) = err else {
+      panic!("expected the context collision, got {err}");
+    };
+    assert!(matches!(source.as_ref(), arkham_config::Error::AmbiguousContexts(_)), "{source}");
   }
 
   /// An unselected context that fails to map is a skip. The selected grant still loads.

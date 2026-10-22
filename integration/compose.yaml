@@ -377,6 +377,22 @@ services:
       certs:
         condition: service_completed_successfully
 
+  # No tls block, so INFO does not set tls_required. The port is its own
+  # shortlist, beside the TLS servers on 4222 and 4223.
+  nats-plain:
+    image: nats:2.15.1-alpine
+    command: ["nats-server", "-c", "/etc/nats/plain.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - ./out/nats/plain.conf:/etc/nats/plain.conf:ro
+    networks:
+      server:
+        ipv4_address: 10.202.0.92
+
   # Official RabbitMQ 4.3.6 (Alpine), pinned by its manifest-list digest.
   # The broker's one user is `svc` with the real password; `default_user`
   # replaces the image's `guest`. 5672 is cleartext and 5671 is TLS with
@@ -606,6 +622,8 @@ services:
       nats:
         condition: service_healthy
       nats-jwt:
+        condition: service_healthy
+      nats-plain:
         condition: service_healthy
       amqp:
         condition: service_healthy
