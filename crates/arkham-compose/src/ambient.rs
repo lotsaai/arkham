@@ -231,7 +231,10 @@ impl AmbientDeriver<'_> {
       return Ok(());
     }
     match nats::adapt(&root, self.home, self.host_home) {
-      Ok(Some(found)) => found.install(&mut self.collector),
+      Ok(Some(found)) => {
+        tracing::debug!(source = %root.display(), skipped = found.skipped.len(), "nats contexts left out of the grant set");
+        found.install(&mut self.collector)
+      }
       Ok(None) => Ok(()),
       Err(err) => {
         tracing::warn!(source = %root.display(), %err, "nats source skipped");
@@ -476,7 +479,7 @@ mod moved_suite {
     )
     .unwrap();
     let derived = derive_home(host.path());
-    let guest = mounted_text(&derived.outputs, "/.config/nats/user.nk");
+    let guest = mounted_text(&derived.outputs, ".nk");
     assert!(!guest.contains(&seed), "{guest}");
     NatsSeed::from_seed(SecretString::from(guest.trim().to_string())).expect("decoy seed");
     assert!(derived.outputs.grants.iter().any(|grant| grant.fragment.contains(&seed)));
@@ -516,7 +519,7 @@ mod moved_suite {
     )
     .unwrap();
     let derived = derive_home(host.path());
-    let guest = mounted_text(&derived.outputs, "/.config/nats/creds/user.creds");
+    let guest = mounted_text(&derived.outputs, ".creds");
     assert!(!guest.contains(&seed), "{guest}");
     assert!(!guest.contains(&jwt), "{guest}");
     let fragment = derived
@@ -561,11 +564,28 @@ mod moved_suite {
     ] {
       assert!(containers.contains(&expected.to_string()), "{expected} missing from {containers:?}");
     }
+    let txt = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.config/nats/context.txt"))
+      .unwrap();
+    assert!(!txt.ro, "context.txt is writable so nats context select can rewrite it");
+    assert!(
+      outputs
+        .mounts
+        .iter()
+        .filter(|mount| mount.container.ends_with(".json"))
+        .all(|mount| mount.ro),
+      "context json stays read-only"
+    );
     let context = outputs
       .mounts
       .iter()
       .find(|mount| mount.container == Path::new("/home/eng/.config/nats/context/demo.json"))
       .unwrap();
+    let host_name = context.host.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    assert!(host_name.starts_with("nats-"), "{host_name}");
+    assert!(!host_name.starts_with("nats-context-"), "{host_name}");
     let twin = fs::read_to_string(&context.host).unwrap();
     assert!(twin.contains("app"), "{twin}");
     assert!(!twin.contains("real-token"), "{twin}");

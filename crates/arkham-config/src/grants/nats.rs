@@ -218,10 +218,14 @@ impl NatsPlain {
 
   /// Mint the decoy and the guest file for this credential.
   ///
+  /// Password and token decoys are [`fake_for`] of `env`. Nkey and creds
+  /// decoys are the user key of `key_seed`, so the same subject mints the
+  /// same guest file on the next adapt.
+  ///
   /// # Errors
   ///
   /// [`NatsUriError::Decoy`] when the decoy user seed cannot be minted.
-  pub fn prepare(&self, env: &str) -> Result<NatsPrepared, NatsUriError> {
+  pub fn prepare(&self, env: &str, key_seed: &[u8; 32]) -> Result<NatsPrepared, NatsUriError> {
     match self {
       Self::UserPass { user, pass } => {
         let decoy_pass = if pass.is_empty() { String::new() } else { fake_for(env, None) };
@@ -239,19 +243,19 @@ impl NatsPlain {
         file: None,
         signs: false,
       }),
-      Self::Nkey(_) => {
-        let seed = nkeys::KeyPair::new_user().seed().map_err(|_source| NatsUriError::Decoy)?;
-        Ok(NatsPrepared {
-          decoy: Self::Nkey(seed.clone()),
-          file: Some(NatsGuestFile {
-            body: format!("{seed}\n"),
-            suffix: "nk",
-          }),
-          signs: true,
-        })
-      }
-      Self::Creds { .. } => {
-        let seed = nkeys::KeyPair::new_user().seed().map_err(|_source| NatsUriError::Decoy)?;
+      Self::Nkey(_) | Self::Creds { .. } => {
+        let pair = nkeys::KeyPair::new_from_raw(nkeys::KeyPairType::User, *key_seed).map_err(|_source| NatsUriError::Decoy)?;
+        let seed = pair.seed().map_err(|_source| NatsUriError::Decoy)?;
+        if matches!(self, Self::Nkey(_)) {
+          return Ok(NatsPrepared {
+            decoy: Self::Nkey(seed.clone()),
+            file: Some(NatsGuestFile {
+              body: format!("{seed}\n"),
+              suffix: "nk",
+            }),
+            signs: true,
+          });
+        }
         let public = NatsSeed::from_seed(SecretString::from(seed.clone()))?.public.clone();
         let jwt = decoy_user_jwt(&public);
         Ok(NatsPrepared {
@@ -1169,6 +1173,25 @@ mod tests {
     NatsUriError,
   };
   use crate::grants::RootCert;
+
+  #[test]
+  fn nkey_and_creds_decoys_follow_the_key_seed() {
+    let seed = [7u8; 32];
+    let other = [9u8; 32];
+    let nkey = NatsPlain::Nkey(String::new());
+    let creds = NatsPlain::Creds {
+      seed: String::new(),
+      jwt: String::new(),
+    };
+    let first = nkey.prepare("NATS_NKEY", &seed).expect("nkey decoy");
+    let second = nkey.prepare("NATS_NKEY", &seed).expect("nkey decoy");
+    assert_eq!(first, second);
+    assert_ne!(nkey.prepare("NATS_NKEY", &other).expect("other nkey"), first);
+    let creds_a = creds.prepare("NATS_CREDS", &seed).expect("creds decoy");
+    let creds_b = creds.prepare("NATS_CREDS", &seed).expect("creds decoy");
+    assert_eq!(creds_a, creds_b);
+    assert_ne!(creds.prepare("NATS_CREDS", &other).expect("other creds"), creds_a);
+  }
 
   #[test]
   fn userinfo_round_trips_a_literal_percent() {

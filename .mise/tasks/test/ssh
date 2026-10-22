@@ -95,16 +95,37 @@ nats_client_log_hides_real_material() {
 
 # Host ~/.config/nats discovery. The caller has already run certs to
 # completion. Copy that CA, then `arkham init` in an empty workspace. That
-# reads the context (no project [rules.nats_*], no fnox key) and writes the
-# generated grant. The guest tree is the decoy mount. The grant file, which
-# states the real seed, is appended to the global config. The caller must
-# not start certs again: gen-secrets.sh truncates that file.
+# reads three contexts (no project [rules.nats_*], no fnox key): password
+# and nkey on nats:4222, creds on nats-jwt:4223. The guest tree is the decoy
+# mount. The grant file, which states the real credentials, is appended to
+# the global config. The caller must not start certs again: gen-secrets.sh
+# truncates that file.
 prepare_nats_discovery() {
-  local real_seed home isolate workspace certs_cid status code
+  local real_seed real_jwt_url jwt_userinfo jwt_payload jwt_seed jwt real_password home
+  local isolate workspace certs_cid status code
   local state_root grant_toml compose_file env_name label dest rel host rest container
   real_seed=$(nats_env_value NATS_NKEY_REAL_SEED)
-  if [ -z "$real_seed" ]; then
-    echo "missing NATS_NKEY_REAL_SEED in integration/out/nats/nats.env"
+  real_jwt_url=$(nats_env_value ARKHAM_NATS_JWT_REAL)
+  if [ -z "$real_seed" ] || [ -z "$real_jwt_url" ]; then
+    echo "missing NATS_NKEY_REAL_SEED or ARKHAM_NATS_JWT_REAL in integration/out/nats/nats.env"
+    return 1
+  fi
+  jwt_userinfo=${real_jwt_url#*://}
+  jwt_userinfo=${jwt_userinfo%%@*}
+  jwt_payload=${jwt_userinfo#creds:}
+  jwt_seed=${jwt_payload%%:*}
+  jwt=${jwt_payload#*:}
+  if [[ ! $jwt_seed =~ ^SU[A-Z2-7]+$ || ! $jwt =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+    echo "ARKHAM_NATS_JWT_REAL is not a creds userinfo"
+    return 1
+  fi
+  real_password=$(grep -E '^ARKHAM_NATS_REAL=' integration/.env.example || true)
+  real_password=${real_password#ARKHAM_NATS_REAL=}
+  real_password=${real_password#*://}
+  real_password=${real_password%%@*}
+  real_password=${real_password#*:}
+  if [ -z "${real_password}" ]; then
+    echo "integration/.env.example has no nats user secret"
     return 1
   fi
   if grep -q 'generated = true' integration/arkham.toml integration/out/arkham.toml; then
@@ -145,12 +166,39 @@ prepare_nats_discovery() {
   docker cp "$certs_cid":/certs/ca.crt "$home/.config/nats/ca.crt"
   printf '%s\n' "$real_seed" >"$home/.config/nats/user.nk"
   chmod 600 "$home/.config/nats/user.nk"
+  cat >"$home/.config/nats/user.creds" <<EOF
+-----BEGIN NATS USER JWT-----
+${jwt}
+------END NATS USER JWT------
+
+-----BEGIN USER NKEY SEED-----
+${jwt_seed}
+------END USER NKEY SEED------
+EOF
+  chmod 600 "$home/.config/nats/user.creds"
   printf 'discovered\n' >"$home/.config/nats/context.txt"
   cat >"$home/.config/nats/context/discovered.json" <<EOF
 {
   "description": "integration discovery",
   "url": "tls://nats:4222",
   "nkey": "${home}/.config/nats/user.nk",
+  "ca": "${home}/.config/nats/ca.crt"
+}
+EOF
+  cat >"$home/.config/nats/context/pass.json" <<EOF
+{
+  "description": "integration password",
+  "url": "tls://nats:4222",
+  "user": "agent",
+  "password": "${real_password}",
+  "ca": "${home}/.config/nats/ca.crt"
+}
+EOF
+  cat >"$home/.config/nats/context/creds.json" <<EOF
+{
+  "description": "integration creds",
+  "url": "tls://nats-jwt:4223",
+  "creds": "${home}/.config/nats/user.creds",
   "ca": "${home}/.config/nats/ca.crt"
 }
 EOF
@@ -192,23 +240,37 @@ EOF
     echo "discovered grant does not state the real nkey"
     return 1
   fi
-  env_name=$(grep -m 1 -E '^env = ' "$grant_toml" || true)
-  env_name=${env_name#env = }
-  env_name=${env_name#\"}
-  env_name=${env_name#\'}
-  env_name=${env_name%\"}
-  env_name=${env_name%\'}
-  label=$(grep -m 1 -E '^\[rules\.' "$grant_toml" || true)
-  label=${label#\[rules.}
-  label=${label%\]}
-  if [ -z "$env_name" ] || [ -z "$label" ]; then
-    echo "discovered grant has no env name"
+  if ! grep -F -q -- "$jwt_seed" "$grant_toml"; then
+    echo "discovered grant does not state the real creds seed"
     return 1
   fi
-  if grep -F -q -- "[rules.${label}]" integration/out/arkham.toml integration/arkham.toml; then
-    echo "discovered rule is hand-written in the project config"
+  if [ "$(grep -c -E '^\[rules\.' "$grant_toml" || true)" -lt 3 ]; then
+    echo "discovered grant does not cover password, nkey, and creds"
     return 1
   fi
+  while IFS= read -r label; do
+    label=${label#\[rules.}
+    label=${label%\]}
+    if [ -z "$label" ]; then
+      echo "discovered grant has an empty rule label"
+      return 1
+    fi
+    if grep -F -q -- "[rules.${label}]" integration/out/arkham.toml integration/arkham.toml; then
+      echo "discovered rule ${label} is hand-written in the project config"
+      return 1
+    fi
+  done < <(grep -E '^\[rules\.' "$grant_toml")
+  while IFS= read -r env_name; do
+    env_name=${env_name#env = }
+    env_name=${env_name#\"}
+    env_name=${env_name#\'}
+    env_name=${env_name%\"}
+    env_name=${env_name%\'}
+    if [ -z "$env_name" ]; then
+      echo "discovered grant has an empty env name"
+      return 1
+    fi
+  done < <(grep -E '^env = ' "$grant_toml")
 
   dest=integration/out/nats-discovery
   # The grants directory is already bind-mounted into arkham. Remove its
@@ -233,12 +295,12 @@ EOF
     mkdir -p "$dest/guest/$(dirname "$rel")"
     cp "$host" "$dest/guest/$rel"
   done <"$compose_file"
-  if [ ! -f "$dest/guest/context.txt" ]; then
-    echo "discovery did not mount a nats context into the guest"
+  if [ ! -f "$dest/guest/context.txt" ] || [ ! -f "$dest/guest/context/pass.json" ] || [ ! -f "$dest/guest/context/creds.json" ]; then
+    echo "discovery did not mount every nats context into the guest"
     return 1
   fi
-  if grep -R -F -q -- "$real_seed" "$dest/guest"; then
-    echo "discovered guest tree contains the real nkey"
+  if grep -R -F -q -- "$real_seed" "$dest/guest" || grep -R -F -q -- "$jwt_seed" "$dest/guest" || grep -R -F -q -- "$jwt" "$dest/guest" || grep -R -F -q -- "$real_password" "$dest/guest"; then
+    echo "discovered guest tree contains a real nats credential"
     return 1
   fi
 
@@ -252,10 +314,17 @@ EOF
     echo "global config is missing the discovered grant"
     return 1
   fi
-  if grep -F -q -- "[secrets.${env_name}]" "$dest/fnox.toml"; then
-    echo "discovered grant env is a fnox secret"
-    return 1
-  fi
+  while IFS= read -r env_name; do
+    env_name=${env_name#env = }
+    env_name=${env_name#\"}
+    env_name=${env_name#\'}
+    env_name=${env_name%\"}
+    env_name=${env_name%\'}
+    if grep -F -q -- "[secrets.${env_name}]" "$dest/fnox.toml"; then
+      echo "discovered grant env ${env_name} is a fnox secret"
+      return 1
+    fi
+  done < <(grep -E '^env = ' "$grant_toml")
 }
 
 for backend in $backends; do

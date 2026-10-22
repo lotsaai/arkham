@@ -192,6 +192,15 @@ pub enum Error {
   /// because it can echo the seed.
   #[error("nats decoy seed could not be minted")]
   NatsDecoy,
+  /// The context named by `context.txt` did not become a grant.
+  #[error("selected nats context `{}`: {skip}", file.display())]
+  NatsSelected {
+    /// The context file.
+    file: PathBuf,
+    /// Why that context was left out.
+    #[source]
+    skip: crate::nats::NatsSkip,
+  },
   /// An ambient derivation source does not map onto grants or a decoy twin.
   #[error("derived source `{}`: {detail}", file.display())]
   SourceInvalid {

@@ -167,17 +167,19 @@ impl RewriteCollector {
   /// Returns an error when a side file cannot be written.
   fn decoy_files(&mut self, first: &RewriteAdapted) -> Result<(), Error> {
     for file in &first.decoy_files {
-      self.mount_decoy_file(file)?;
+      self.mount_decoy_file(file, true)?;
     }
     Ok(())
   }
 
-  /// Write one decoy side file and mount it read-only at its container path.
+  /// Write one decoy side file and mount it at its container path.
+  ///
+  /// `ro` is false for `context.txt`, which `nats context select` rewrites.
   ///
   /// # Errors
   ///
   /// Returns an error when the file cannot be written.
-  pub(crate) fn mount_decoy_file(&mut self, file: &DecoyFile) -> Result<(), Error> {
+  pub(crate) fn mount_decoy_file(&mut self, file: &DecoyFile, ro: bool) -> Result<(), Error> {
     let file_path = self.files_dir.join(&file.name);
     fs::write(&file_path, &file.bytes).map_err(|source| Error::WriteFile {
       path: file_path.clone(),
@@ -186,7 +188,7 @@ impl RewriteCollector {
     self.mounts.push(Mount {
       host: file_path,
       container: PathBuf::from(&file.container),
-      ro: true,
+      ro,
     });
     Ok(())
   }

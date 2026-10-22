@@ -1301,6 +1301,103 @@ function natsRejected(err: unknown): boolean {
   return text.includes("Authorization Violation") && !text.includes(NATS_REAL);
 }
 
+type NatsCliResult = { code: number; stdout: string; stderr: string };
+
+function runNats(args: string[], timeoutMs = 15000): Promise<NatsCliResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("nats", args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`nats ${args.join(" ")} timed out`));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code: code ?? 1, stdout, stderr });
+    });
+  });
+}
+
+// `nats sub` prints "Subscribing on" before the server has the subscription.
+// Publish until one copy lands, then stop.
+async function natsCliRoundTrip(prefix: string[], label: string): Promise<boolean> {
+  const subject = `arkham.cli.${label}.${randomBytes(4).toString("hex")}`;
+  const body = `payload keeps ${label}`;
+  const sub = spawn("nats", [...prefix, "sub", subject, "--count=1"], { stdio: ["ignore", "pipe", "pipe"] });
+  let subOut = "";
+  let subErr = "";
+  sub.stdout.on("data", (chunk: Buffer) => {
+    subOut += chunk.toString();
+  });
+  sub.stderr.on("data", (chunk: Buffer) => {
+    subErr += chunk.toString();
+  });
+  const ready = await new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), 12000);
+    const check = () => {
+      if (`${subOut}${subErr}`.includes("Subscribing on")) {
+        clearTimeout(timer);
+        resolve(true);
+      }
+    };
+    sub.stdout.on("data", check);
+    sub.stderr.on("data", check);
+    sub.on("close", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+    sub.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+  if (!ready) {
+    sub.kill("SIGKILL");
+    stage(`nats cli ${label} subscriber did not start: ${subErr}`);
+    return false;
+  }
+  let published = false;
+  for (let attempt = 0; attempt < 8 && sub.exitCode === null; attempt++) {
+    const pub = await runNats([...prefix, "pub", subject, body]);
+    if (pub.code !== 0) {
+      sub.kill("SIGKILL");
+      stage(`nats cli ${label} publish failed: ${pub.stderr}`);
+      return false;
+    }
+    published = true;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  const got = await new Promise<string>((resolve) => {
+    const timer = setTimeout(() => {
+      sub.kill("SIGKILL");
+      resolve(subOut + subErr);
+    }, 8000);
+    if (sub.exitCode !== null) {
+      clearTimeout(timer);
+      resolve(subOut + subErr);
+      return;
+    }
+    sub.on("close", () => {
+      clearTimeout(timer);
+      resolve(subOut + subErr);
+    });
+  });
+  if (got.includes(NATS_REAL)) return false;
+  stage(`nats cli ${label} received: ${got.trim()}`);
+  return published && got.includes(body);
+}
+
 if (process.env.NATS_DISCOVERED === "1") {
   await once("nats", "nats host ~/.config/nats discovery swaps the mounted decoy nkey; publish and receive", async () => {
     const ctx = await selectedNatsContext();
@@ -1312,6 +1409,20 @@ if (process.env.NATS_DISCOVERED === "1") {
       if (new TextDecoder().decode(fromFile).includes(fnoxFake)) return false;
     }
     return natsRoundTrip(ctx.url, nkeyAuthenticator(fromFile), "discovered");
+  });
+
+  await once("nats", "nats cli pub/sub per discovered context, then context select and a bare command", async () => {
+    for (const name of ["pass", "discovered", "creds"]) {
+      if (!await natsCliRoundTrip(["--context", name], name)) return false;
+    }
+    const selected = await runNats(["context", "select", "pass"]);
+    if (selected.code !== 0) {
+      stage(`nats context select failed: ${selected.stderr}`);
+      return false;
+    }
+    const name = (await readFile(join(natsConfigDir(), "context.txt"), "utf8")).trim();
+    if (name !== "pass") return false;
+    return natsCliRoundTrip([], "selected");
   });
 }
 

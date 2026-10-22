@@ -28,6 +28,7 @@ pub use confine::{AgentArgs, DownArgs, InitArgs, LogsArgs, UpArgs};
 pub use decoys::rules_command;
 pub use error::Error;
 pub use expose::ExposeArgs;
+pub use nats::{NatsSkip, NatsUnsupported};
 
 #[cfg(test)]
 mod test_support;

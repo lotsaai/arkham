@@ -51,7 +51,8 @@ Topology:
 | 20 | Same client with a user seed that is not the decoy | `[rules.nats_nkey]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
 | 21 | `credsAuthenticator` to `nats-jwt:4223`. The client writes the decoy creds file under `~/.config/nats`, selects it from `context.txt`, and reads the `creds` path | `[rules.nats_jwt]`: `nats://creds:<user-seed>:<user-jwt>@nats-jwt:4223`; the account JWT is preloaded on the operator server | publish and subscribe succeed only when the proxy replaces the decoy JWT and signs with the real seed |
 | 22 | Same client with a user JWT that is not the decoy | `[rules.nats_jwt]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
-| 23 | The client reads the decoy nkey context that host discovery mounted, then subscribes and publishes. `test:ssh` is the only path that runs it | no hand-written `[rules.nats_*]` and no fnox key. `arkham init` reads a host `~/.config/nats` context whose nkey file is the real seed and whose `ca` is the demo CA. The generated fragment (`generated = true`, `if_missing = ignore`) is appended to the global config. The arkham service mounts the CA blob. The client receives only the decoy files | nats-server accepts the session, so the proxy swapped the mounted decoy for the real seed. The real seed is absent from the guest tree |
+| 23 | The client reads the decoy nkey context that host discovery mounted, then subscribes and publishes. `test:ssh` is the only path that runs it | no hand-written `[rules.nats_*]` and no fnox key. `arkham init` reads a host `~/.config/nats` with three contexts: password and nkey on `tls://nats:4222`, and creds on `tls://nats-jwt:4223`. The nkey file is the real seed. Each context's `ca` is the demo CA. The generated fragments (`generated = true`, `if_missing = ignore`) are appended to the global config. The arkham service mounts the CA blobs. The client receives only the decoy files | nats-server accepts the session, so the proxy swapped the mounted decoy for the real seed. The real seed is absent from the guest tree |
+| 35 | The `nats` CLI 0.5.0 uses that same decoy tree. `nats --context` publishes and subscribes for the password context, the nkey context, and the creds context. `nats context select pass` then a `pub` and `sub` with no `--context`. `test:ssh` is the only path that runs it, on tproxy and on tun | the grants from scenario 23. Password and nkey share `nats:4222`. Creds uses `nats-jwt:4223` | each session is accepted, so the proxy swapped that context's decoy. `context.txt` becomes `pass`. The client log and the guest tree contain neither the real password, the real nkey seed, nor the real user JWT |
 | 24 | `amqplib` (AMQP 0-9-1) to `amqp:5672` with the decoy user and password: open, declare a queue, publish with a confirm, read the message back | `[rules.amqp_plain]`: fake `amqp://` URL; the real URL is `amqps://` and carries `sslrootcert` | RabbitMQ accepts the swapped user and password on its TLS port 5671 and the message comes back |
 | 25 | `rhea` (AMQP 1.0) to `amqp:5672` with the decoy: SASL `PLAIN`, then `open` | `[rules.amqp_plain]` | the broker sends `open`, which it never does after a refused login |
 | 26 | Both clients to `amqp:5671` over TLS with the decoy | `[rules.amqp_tls]`: fake `amqps://` URL; real URL carries `sslrootcert` | same swaps on a guest leg that is TLS from the first byte |
@@ -139,10 +140,15 @@ and 20 are gated on `NATS_NKEY_URL`. Scenarios 21 and 22 are gated on
 container's own `~/.config/nats` and read it back. That is not discovery:
 the proxy grant is still the fnox URL, and `compose::nats::adapt` does not
 run. Scenario 23 is the discovery proof. `test:ssh` writes a host
-`~/.config/nats` context, runs `arkham init` in an empty workspace with no
-`[rules.nats_*]` and no fnox entry for that grant, and mounts the decoy
-files into the client. The client reads those files before scenarios 19 and
-21 overwrite the same directory. `credsAuthenticator` sends `jwt`, `nkey`, and `sig`. A matching `nkey` is
+`~/.config/nats` with a password context and an nkey context on `nats:4222`
+and a creds context on `nats-jwt:4223`, runs `arkham init` in an empty
+workspace with no `[rules.nats_*]` and no fnox entry for those grants, and
+copies the decoy files into the client. The client reads those files before
+scenarios 19 and 21 overwrite the same directory. Scenario 35 is the same
+tree through the `nats` CLI: one `pub`/`sub` per context, then
+`nats context select` and a command with no `--context`. The CLI trusts the
+demo CA from the system store, because the decoy context does not carry the
+upstream `ca` path. `credsAuthenticator` sends `jwt`, `nkey`, and `sig`. A matching `nkey` is
 rewritten to the real public key. The client container does not receive the
 real nkey seed or the real user JWT. `test:ssh` greps the client log for
 those values in `integration/out/nats/nats.env`.

@@ -516,7 +516,20 @@ services:
       - -c
       - |
         set -euo pipefail
-        apt-get update -qq && apt-get install -qq -y openssh-client python3 iproute2
+        apt-get update -qq && apt-get install -qq -y openssh-client python3 iproute2 ca-certificates curl unzip
+        cp /certs/ca.crt /usr/local/share/ca-certificates/arkham-demo.crt
+        update-ca-certificates
+        arch=$$(uname -m)
+        case "$$arch" in
+          x86_64) nats_arch=amd64; nats_sum=d9fc93e9e9ab0310deff7e719a8a0da6f9d66f26d473f039aaee70155507aecc ;;
+          aarch64|arm64) nats_arch=arm64; nats_sum=39496b0e332ba8d1b7dcbac2019c7d1e7a7f0d0ccefef9da547e9d6eeed408c8 ;;
+          *) echo "unsupported arch $$arch"; exit 1 ;;
+        esac
+        curl -fsSL -o /tmp/natscli.zip "https://github.com/nats-io/natscli/releases/download/v0.5.0/nats-0.5.0-linux-$${nats_arch}.zip"
+        echo "$${nats_sum}  /tmp/natscli.zip" | sha256sum -c -
+        unzip -p /tmp/natscli.zip "nats-0.5.0-linux-$${nats_arch}/nats" > /usr/local/bin/nats
+        chmod 755 /usr/local/bin/nats
+        rm -f /tmp/natscli.zip
         mkdir -p /opt/client
         cp /srv/package.json /srv/run.ts /opt/client/
         (cd /opt/client && bun install)
