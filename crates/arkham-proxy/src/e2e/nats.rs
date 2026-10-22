@@ -169,30 +169,38 @@ async fn nats_cleartext_server_leg_receives_the_real_credential() {
   proxy.abort();
 }
 
-/// The stub's private CA is not in the platform store, so the handshake does not finish.
+/// INFO `tls_required` on a `nats://` leg upgrades the server inside TLS.
+/// CONNECT arrives on that TLS stream with the real password.
 #[tokio::test]
-async fn nats_cleartext_leg_sends_a_client_hello_when_info_requires_tls() {
+async fn nats_cleartext_leg_swaps_connect_inside_tls_when_info_requires_tls() {
   let stub = nats_stub().await;
-  let (proxy_addr, proxy) = run_proxy_with(test_state_with(stub.grants(ServerLeg::Cleartext), &stub.ca)).await;
+  let client_config = guest_tls_config(&stub.ca);
+  let state = test_state_with(stub.grants(ServerLeg::Cleartext), &stub.ca);
+  let mut store = rustls::RootCertStore::empty();
+  store.add(stub.ca.cert_der().clone()).unwrap();
+  state.seed_nats_system_roots(Arc::new(store));
+  let (proxy_addr, proxy) = run_proxy_with(state).await;
   let port = stub.port;
-  let listener = stub.listener;
+  let NatsStub { listener, acceptor, .. } = stub;
   let stub_task = tokio::spawn(async move {
     let (mut conn, _) = listener.accept().await.unwrap();
     conn.write_all(INFO).await.unwrap();
     conn.flush().await.unwrap();
-    let mut hello = [0u8; 2];
-    tokio::time::timeout(Duration::from_secs(5), conn.read_exact(&mut hello))
-      .await
-      .expect("client hello")
-      .expect("read");
-    assert_eq!(hello, [0x16, 0x03]);
+    let mut tls = acceptor.accept(conn).await.expect("server handshake");
+    expect_connect(&mut tls, VALUE, FAKE).await;
+    tls.write_all(b"+OK\r\n").await.unwrap();
+    tls.flush().await.unwrap();
   });
-  let mut guest = connect_through_proxy(proxy_addr, port).await;
-  let line = read_line(&mut guest).await;
-  assert!(line.starts_with(b"INFO "), "{}", String::from_utf8_lossy(&line));
-  assert!(contains(&line, b"\"tls_required\":true"));
-  assert!(!contains(&line, VALUE.as_bytes()));
+  let upstream = connect_through_proxy(proxy_addr, port).await;
+  let splice = splice_guest(upstream).await;
+  let client = async_nats::ConnectOptions::with_user_and_password("agent".to_string(), FAKE.to_string())
+    .require_tls(true)
+    .tls_client_config(client_config)
+    .connect(guest_url(splice))
+    .await
+    .expect("cleartext info upgrades");
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  drop(client);
   proxy.abort();
 }
 

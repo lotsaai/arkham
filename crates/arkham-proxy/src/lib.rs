@@ -225,6 +225,12 @@ impl ProxyState {
   pub fn fwmark(&self) -> Option<u32> {
     self.fwmark
   }
+
+  /// Stand in for the platform trust store on a `nats://` upgrade.
+  #[cfg(test)]
+  pub(crate) fn seed_nats_system_roots(&self, store: Arc<rustls::RootCertStore>) {
+    self.nats.seed_roots(arkham_config::grants::RootCert::System, store);
+  }
 }
 
 /// Box an error for a rama service error, preserving its debug chain.

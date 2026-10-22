@@ -69,6 +69,12 @@ impl NatsTransport {
       roots: DashMap::new(),
     })
   }
+
+  /// Preload one trust store so a test can stand in for the platform roots.
+  #[cfg(test)]
+  pub(crate) fn seed_roots(&self, root: RootCert, store: Arc<RootCertStore>) {
+    self.roots.insert(root, store);
+  }
 }
 
 impl TlsHalves for NatsTransport {

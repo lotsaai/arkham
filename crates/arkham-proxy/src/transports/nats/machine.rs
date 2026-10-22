@@ -37,7 +37,7 @@
 //! `lexical-core` 1.0 `parse` and `parse_partial` also need one contiguous
 //! slice and report nothing `atoi` does not already return.
 //!
-//! INFO's `tls_required`, `tls_available`, and `tls_verify` come from actson
+//! INFO's `tls_required` comes from actson
 //! 2.1.0. The verb is still the framer's first piece. Object bytes go into
 //! `PushJsonFeeder`, and names and bools are taken at depth 1. That crate
 //! keeps the current token in `current_buffer` until the event, and the
@@ -759,15 +759,11 @@ impl Down {
   }
 }
 
-/// TLS flags from one completed INFO object. Absent fields stay false.
+/// TLS flag from one completed INFO object. Absent `tls_required` stays false.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct InfoTls {
   /// INFO `tls_required`.
   pub(crate) tls_required: bool,
-  /// INFO `tls_available`.
-  pub(crate) tls_available: bool,
-  /// INFO `tls_verify`.
-  pub(crate) tls_verify: bool,
 }
 
 /// What a finished INFO line says about TLS on a cleartext upstream.
@@ -779,18 +775,10 @@ pub(crate) enum InfoVerdict {
   Unreadable,
 }
 
-/// Which INFO bool a key names.
-#[derive(Clone, Copy)]
-enum TlsKey {
-  Required,
-  Available,
-  Verify,
-}
-
 /// A depth-1 INFO key the parser keeps.
 #[derive(Clone, Copy)]
 enum InfoKey {
-  Tls(TlsKey),
+  TlsRequired,
   Nonce,
 }
 
@@ -947,14 +935,8 @@ impl InfoParse {
   }
 
   fn note_bool(&mut self, value: bool) {
-    if self.depth == 1
-      && let Some(InfoKey::Tls(key)) = self.key
-    {
-      match key {
-        TlsKey::Required => self.tls.tls_required = value,
-        TlsKey::Available => self.tls.tls_available = value,
-        TlsKey::Verify => self.tls.tls_verify = value,
-      }
+    if self.depth == 1 && matches!(self.key, Some(InfoKey::TlsRequired)) {
+      self.tls.tls_required = value;
     }
     self.key = None;
   }
@@ -985,9 +967,7 @@ impl InfoParse {
 
 fn info_key(raw: &[u8]) -> Option<InfoKey> {
   match raw {
-    b"tls_required" => Some(InfoKey::Tls(TlsKey::Required)),
-    b"tls_available" => Some(InfoKey::Tls(TlsKey::Available)),
-    b"tls_verify" => Some(InfoKey::Tls(TlsKey::Verify)),
+    b"tls_required" => Some(InfoKey::TlsRequired),
     b"nonce" => Some(InfoKey::Nonce),
     _ => None,
   }

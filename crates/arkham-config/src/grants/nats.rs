@@ -278,19 +278,21 @@ impl NatsPlain {
           signs: false,
         })
       }
-      Self::Jwt(_) => Ok(NatsPrepared {
-        decoy: Self::Jwt(format!("e30.e30.{}", fake_for(env, None))),
-        file: None,
-        signs: false,
-      }),
+      Self::Jwt(_) => {
+        let (_, public) = decoy_user(key_seed)?;
+        Ok(NatsPrepared {
+          decoy: Self::Jwt(decoy_user_jwt(&public)),
+          file: None,
+          signs: false,
+        })
+      }
       Self::Token(_) => Ok(NatsPrepared {
         decoy: Self::Token(fake_for(env, None)),
         file: None,
         signs: false,
       }),
       Self::Nkey(_) | Self::Creds { .. } => {
-        let pair = nkeys::KeyPair::new_from_raw(nkeys::KeyPairType::User, *key_seed).map_err(|_source| NatsUriError::Decoy)?;
-        let seed = pair.seed().map_err(|_source| NatsUriError::Decoy)?;
+        let (seed, public) = decoy_user(key_seed)?;
         if matches!(self, Self::Nkey(_)) {
           return Ok(NatsPrepared {
             decoy: Self::Nkey(seed.clone()),
@@ -301,7 +303,6 @@ impl NatsPlain {
             signs: true,
           });
         }
-        let public = NatsSeed::from_seed(SecretString::from(seed.clone()))?.public.clone();
         let jwt = decoy_user_jwt(&public);
         Ok(NatsPrepared {
           decoy: Self::Creds {
@@ -452,6 +453,13 @@ impl NatsPlain {
       _ => Err(NatsUriError::AuthKindMismatch),
     }
   }
+}
+
+fn decoy_user(key_seed: &[u8; 32]) -> Result<(String, String), NatsUriError> {
+  let pair = nkeys::KeyPair::new_from_raw(nkeys::KeyPairType::User, *key_seed).map_err(|_source| NatsUriError::Decoy)?;
+  let seed = pair.seed().map_err(|_source| NatsUriError::Decoy)?;
+  let public = NatsSeed::from_seed(SecretString::from(seed.clone()))?.public;
+  Ok((seed, public))
 }
 
 fn decoy_user_jwt(public: &str) -> String {
@@ -1027,7 +1035,7 @@ fn classify_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
       Err(err) => Err(err),
     };
   }
-  if user == NatsPlain::JWT_USER && jwt_shape(&pass) {
+  if user == NatsPlain::JWT_USER && jwt::Token::<UserJwtHeader, UserJwtClaims, _>::parse_unverified(&pass).is_ok() {
     return Ok(NatsPlain::Jwt(pass));
   }
   if user == NatsPlain::CREDS_USER {
@@ -1049,26 +1057,6 @@ fn ordinary_userinfo(user: String, pass: String) -> Result<NatsPlain, NatsUriErr
     return Err(NatsUriError::MisplacedSeed);
   }
   Ok(NatsPlain::UserPass { user, pass })
-}
-
-fn jwt_shape(text: &str) -> bool {
-  let mut parts = text.split('.');
-  let Some(header) = parts.next() else {
-    return false;
-  };
-  let Some(payload) = parts.next() else {
-    return false;
-  };
-  let Some(sig) = parts.next() else {
-    return false;
-  };
-  parts.next().is_none()
-    && [header, payload, sig].iter().all(|part| {
-      !part.is_empty()
-        && part
-          .bytes()
-          .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    })
 }
 
 fn nkey_material(text: &str) -> bool {
@@ -1844,6 +1832,37 @@ mod tests {
     let input = format!("{head}.{body}");
     let sig = account.sign(input.as_bytes()).expect("account signs");
     format!("{input}.{}", b64_nopad(&sig))
+  }
+
+  #[test]
+  fn bearer_jwt_decoy_is_a_nats_user_jwt() {
+    let key_seed = [7u8; 32];
+    let prepared = NatsPlain::Jwt(String::new()).prepare("NATS_URL", &key_seed).expect("decoy");
+    let NatsPlain::Jwt(decoy) = &prepared.decoy else {
+      panic!("bearer decoy");
+    };
+    assert!(prepared.file.is_none());
+    assert!(!prepared.signs);
+    let token = jwt::Token::<super::UserJwtHeader, super::UserJwtClaims, _>::parse_unverified(decoy).expect("user jwt");
+    assert_eq!(token.header().alg, "ed25519-nkey");
+    assert_eq!(token.header().typ, "JWT");
+    let pair = nkeys::KeyPair::new_from_raw(nkeys::KeyPairType::User, key_seed).expect("pair");
+    let public = pair.public_key();
+    assert_eq!(token.claims().sub, public);
+    let real_jwt = user_jwt(&public, br#"{"alg":"ed25519-nkey","typ":"JWT"}"#);
+    let scope = NatsScope::from_strings(
+      &format!("nats://jwt:{decoy}@nats.internal:4222"),
+      &format!("nats://jwt:{real_jwt}@nats.upstream:4222"),
+    )
+    .expect("bearer pair");
+    assert!(scope.auth.signer().is_none());
+    let junk = "e30.e30.abcd";
+    let err = NatsScope::from_strings(
+      &format!("nats://jwt:{junk}@nats.internal:4222"),
+      &format!("nats://jwt:{real_jwt}@nats.upstream:4222"),
+    )
+    .expect_err("empty objects are not a user jwt");
+    assert!(err.to_string().contains("different auth kinds"), "{err}");
   }
 
   #[test]
