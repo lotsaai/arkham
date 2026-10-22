@@ -919,6 +919,63 @@ mod moved_suite {
     );
   }
 
+  #[test]
+  fn unreadable_kubeconfig_entry_keeps_the_earlier_grant() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let first = host.path().join("first.yaml");
+    let second = host.path().join("second.yaml");
+    fs::write(
+      &first,
+      "apiVersion: v1\nkind: Config\ncurrent-context: prod\ncontexts:\n- name: prod\n  context: {cluster: prod, user: alice}\nclusters:\n- name: prod\n  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: alice\n  user: {token: alice-token}\n",
+    )
+    .unwrap();
+    fs::write(
+      &second,
+      "apiVersion: v1\nkind: Config\ncurrent-context: staging\ncontexts:\n- name: staging\n  context: {cluster: staging, user: bob}\nclusters:\n- name: staging\n  cluster: {server: https://10.2.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: bob\n  user: {token: bob-token}\n",
+    )
+    .unwrap();
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o000)).unwrap();
+    let denied = fs::read(&second).expect_err("mode 000 is still readable");
+    assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+    set_env("KUBECONFIG", format!("{}:{}", first.display(), second.display()));
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outputs = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || {
+      derive_sources(&DeriveInputs {
+        files_dir: &work.path().join("files"),
+        root: work.path(),
+        registry: &Registry::load(None).unwrap(),
+        decoys: &[],
+        expander: &build_expander(HashMap::new()),
+        home: "/home/eng",
+        host_home: Some(host.path()),
+        guests_dir: &work.path().join("guests"),
+        rewrites: &[],
+      })
+      .unwrap()
+    });
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .expect("the readable entry still mounts");
+    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    assert!(body.contains("name: prod") && body.contains("user: alice"), "{body}");
+    assert!(!body.contains("alice-token") && !body.contains("bob-token"), "{body}");
+    let fragment: String = outputs.grants.iter().map(|grant| grant.fragment.as_str()).collect();
+    assert!(fragment.contains("https://10.0.0.1:6443"), "{fragment}");
+    assert!(!fragment.contains("https://10.2.0.1:6443"), "{fragment}");
+    let logged = lines.lock().unwrap().join("\n");
+    assert!(logged.contains("kubeconfig source skipped"), "{logged}");
+    assert!(logged.contains(&second.display().to_string()), "{logged}");
+  }
+
   /// An ambiguous current context is warned with the typed error and skipped.
   #[test]
   fn ambiguous_current_kubeconfig_warns_and_skips() {
