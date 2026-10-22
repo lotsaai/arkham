@@ -330,7 +330,7 @@ impl AmbientDeriver<'_> {
       }
     };
     let dest = format!("{}/.kube", self.home);
-    self.collector.twin_in_dir(adapted, "kube-config", "config", &dest)
+    self.collector.twin_in_dir(adapted, "kube-home", "config", &dest)
   }
 
   /// The guest CA for the kubeconfig and talosconfig adapters, loaded on

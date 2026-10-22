@@ -218,7 +218,8 @@ impl RewriteCollector {
   }
 
   /// Mount a writable directory with the decoy at `file_name`, so the guest
-  /// can create a lock file beside it.
+  /// can create a lock file beside it. The directory itself stays, because a
+  /// container may already have it mounted.
   ///
   /// # Errors
   ///
@@ -234,6 +235,9 @@ impl RewriteCollector {
       return Ok(());
     };
     let host_dir = self.files_dir.join(dir_name);
+    if host_dir.is_dir() {
+      Self::clear_children(&host_dir)?;
+    }
     fs::create_dir_all(&host_dir).map_err(|source| Error::CreateDir {
       path: host_dir.clone(),
       source,
@@ -247,6 +251,31 @@ impl RewriteCollector {
     });
     self.decoy_files(first)?;
     self.grants.extend(adapted);
+    Ok(())
+  }
+
+  fn clear_children(dir: &Path) -> Result<(), Error> {
+    let entries = fs::read_dir(dir).map_err(|source| Error::ReadFile {
+      path: dir.to_path_buf(),
+      source,
+    })?;
+    for entry in entries {
+      let entry = entry.map_err(|source| Error::ReadFile {
+        path: dir.to_path_buf(),
+        source,
+      })?;
+      let path = entry.path();
+      let kind = entry.file_type().map_err(|source| Error::ReadFile {
+        path: path.clone(),
+        source,
+      })?;
+      let removed = if kind.is_dir() {
+        fs::remove_dir_all(&path)
+      } else {
+        fs::remove_file(&path)
+      };
+      removed.map_err(|source| Error::RemoveFile { path, source })?;
+    }
     Ok(())
   }
 

@@ -131,16 +131,17 @@ struct Opened {
 }
 
 struct Derived {
-  context: String,
+  opened: Opened,
   user_id: ContextIdentity,
   cluster_id: ContextIdentity,
-  server: String,
-  host: String,
-  scope: EndpointScope,
-  token: Option<String>,
-  cert: Option<Vec<u8>>,
-  key: Option<Vec<u8>>,
-  ca: Option<Vec<u8>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("context `{context}` ({path}) has no identity for `{name}`")]
+struct MissingIdentity {
+  context: String,
+  name: String,
+  path: PathBuf,
 }
 
 impl KubeContextEntry {
@@ -214,27 +215,32 @@ impl KubeContextEntry {
 }
 
 impl Opened {
-  fn identified(self, users: &[ContextIdentity], clusters: &[ContextIdentity]) -> Option<Derived> {
+  fn identified(self, users: &[ContextIdentity], clusters: &[ContextIdentity]) -> Result<Derived, MissingIdentity> {
     let user_id = users
       .iter()
-      .find(|id| id.name == self.user && id.source == self.user_source)?
-      .clone();
+      .find(|id| id.name == self.user && id.source == self.user_source)
+      .cloned();
     let cluster_id = clusters
       .iter()
-      .find(|id| id.name == self.cluster && id.source == self.cluster_source)?
-      .clone();
-    Some(Derived {
-      context: self.context,
-      user_id,
-      cluster_id,
-      server: self.server,
-      host: self.host,
-      scope: self.scope,
-      token: self.token,
-      cert: self.cert,
-      key: self.key,
-      ca: self.ca,
-    })
+      .find(|id| id.name == self.cluster && id.source == self.cluster_source)
+      .cloned();
+    match (user_id, cluster_id) {
+      (Some(user_id), Some(cluster_id)) => Ok(Derived {
+        opened: self,
+        user_id,
+        cluster_id,
+      }),
+      (None, _) => Err(MissingIdentity {
+        context: self.context,
+        name: self.user,
+        path: self.user_source,
+      }),
+      (_, None) => Err(MissingIdentity {
+        context: self.context,
+        name: self.cluster,
+        path: self.cluster_source,
+      }),
+    }
   }
 }
 
@@ -247,7 +253,7 @@ impl Derived {
 struct DerivedContexts(Vec<Derived>);
 
 impl DerivedContexts {
-  fn identify(opened: Vec<Opened>) -> Result<Self, Error> {
+  fn identify(opened: Vec<Opened>, current: &str) -> Result<Self, Error> {
     let users = identities(
       &opened
         .iter()
@@ -268,9 +274,19 @@ impl DerivedContexts {
         })
         .collect::<Vec<_>>(),
     )?;
-    Ok(Self(
-      opened.into_iter().filter_map(|item| item.identified(&users, &clusters)).collect(),
-    ))
+    Self::collect(opened, &users, &clusters, current)
+  }
+
+  fn collect(opened: Vec<Opened>, users: &[ContextIdentity], clusters: &[ContextIdentity], current: &str) -> Result<Self, Error> {
+    let mut kept = Vec::new();
+    for item in opened {
+      match item.identified(users, clusters) {
+        Ok(derived) => kept.push(derived),
+        Err(missing) if missing.context == current => return Err(missing.path.invalid(missing.to_string())),
+        Err(missing) => tracing::warn!(%missing, "kube context skipped"),
+      }
+    }
+    Ok(Self(kept))
   }
 
   fn resolve_shared_certs(mut self, current: &str) -> Result<Self, Error> {
@@ -286,7 +302,7 @@ impl DerivedContexts {
       }
       let listed = names.join(", ");
       tracing::warn!(contexts = %listed, host = %ambiguous.host, port = ambiguous.port, "kube contexts skipped");
-      self.0.retain(|derived| !names.iter().any(|name| name == &derived.context));
+      self.0.retain(|derived| !names.iter().any(|name| name == &derived.opened.context));
     }
   }
 
@@ -294,11 +310,11 @@ impl DerivedContexts {
     self
       .0
       .iter()
-      .filter(|derived| derived.cert.is_some())
+      .filter(|derived| derived.opened.cert.is_some())
       .map(|derived| Presented {
         identity: &derived.user_id,
-        host: &derived.host,
-        port: derived.scope.port,
+        host: &derived.opened.host,
+        port: derived.opened.scope.port,
         decoy: b"",
       })
       .collect()
@@ -309,12 +325,12 @@ impl DerivedContexts {
       .0
       .iter()
       .filter(|derived| {
-        derived.cert.is_some()
-          && derived.scope.port == ambiguous.port
-          && derived.host.eq_ignore_ascii_case(&ambiguous.host)
+        derived.opened.cert.is_some()
+          && derived.opened.scope.port == ambiguous.port
+          && derived.opened.host.eq_ignore_ascii_case(&ambiguous.host)
           && ambiguous.parties.iter().any(|party| derived.matches_party(party))
       })
-      .map(|derived| derived.context.clone())
+      .map(|derived| derived.opened.context.clone())
       .collect();
     names.sort();
     names.dedup();
@@ -349,16 +365,21 @@ struct UserGrants(Vec<UserGrant>);
 
 impl UserGrants {
   fn include(&mut self, derived: Derived) {
+    let Derived {
+      opened,
+      user_id,
+      cluster_id,
+    } = derived;
     let server = Server {
-      url: derived.server,
-      scope: derived.scope,
-      cluster_id: derived.cluster_id,
-      ca: derived.ca,
+      url: opened.server,
+      scope: opened.scope,
+      cluster_id,
+      ca: opened.ca,
     };
     if let Some(grant) = self
       .0
       .iter_mut()
-      .find(|grant| grant.user_id.name == derived.user_id.name && grant.user_id.source == derived.user_id.source)
+      .find(|grant| grant.user_id.name == user_id.name && grant.user_id.source == user_id.source)
     {
       if grant.servers.iter().all(|existing| existing.url != server.url) {
         grant.servers.push(server);
@@ -366,10 +387,10 @@ impl UserGrants {
       return;
     }
     self.0.push(UserGrant {
-      user_id: derived.user_id,
-      token: derived.token,
-      cert: derived.cert,
-      key: derived.key,
+      user_id,
+      token: opened.token,
+      cert: opened.cert,
+      key: opened.key,
       servers: vec![server],
     });
   }
@@ -492,7 +513,7 @@ pub(crate) fn adapt_sources(sources: &[(&Path, &[u8])], ca: &CertAuthority, gues
       Err(err) => tracing::warn!(context = %entry.name, %err, "kube context skipped"),
     }
   }
-  let rendered = DerivedContexts::identify(opened)?
+  let rendered = DerivedContexts::identify(opened, &merged.doc.current_context)?
     .resolve_shared_certs(&merged.doc.current_context)?
     .into_grants()
     .render(ca, guests_dir)?;
@@ -766,6 +787,54 @@ users:
 ";
 
   const SOURCE: &str = "/home/ivan/.kube/k3s.yaml";
+
+  fn opened_context(context: &str, user: &str) -> Opened {
+    let scope: EndpointScope = "https://10.0.0.1:6443".parse().expect("scope");
+    let HostPat::Exact(host) = &scope.host else {
+      panic!("exact host");
+    };
+    Opened {
+      context: context.to_string(),
+      user: user.to_string(),
+      user_source: PathBuf::from(SOURCE),
+      cluster: "prod".to_string(),
+      cluster_source: PathBuf::from(SOURCE),
+      server: "https://10.0.0.1:6443".to_string(),
+      host: host.clone(),
+      scope,
+      token: Some("tok".to_string()),
+      cert: None,
+      key: None,
+      ca: None,
+    }
+  }
+
+  #[test]
+  fn missing_identity_fails_the_current_context() {
+    let Err(err) = DerivedContexts::collect(vec![opened_context("prod", "alice")], &[], &[], "prod") else {
+      panic!("current context");
+    };
+    let err = err.to_string();
+    assert!(err.contains("context `prod`"), "{err}");
+    assert!(err.contains("has no identity for `alice`"), "{err}");
+    assert!(err.contains(SOURCE), "{err}");
+  }
+
+  #[test]
+  fn missing_identity_on_another_context_warns_and_skips() {
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || {
+      match DerivedContexts::collect(vec![opened_context("staging", "bob")], &[], &[], "prod") {
+        Ok(kept) => kept,
+        Err(err) => panic!("{err}"),
+      }
+    });
+    assert!(kept.0.is_empty());
+    let logged = lines.lock().expect("lines").join("\n");
+    assert!(logged.contains("staging"), "{logged}");
+    assert!(logged.contains("has no identity for `bob`"), "{logged}");
+    assert!(logged.contains("kube context skipped"), "{logged}");
+  }
 
   fn test_ca() -> CertAuthority {
     CertAuthority::generate().unwrap()
