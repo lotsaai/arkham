@@ -41,9 +41,15 @@ export HOST_UID HOST_GID
 # Discovery writes the real nkey and the generated grant here. Drop the
 # contents after the guest-tree check and the client-log check, including
 # when a round exits early. The directory itself may be a bind mount.
+nats_isolate=""
 cleanup_nats_discovery() {
   if [ -d integration/out/nats-discovery ]; then
     find integration/out/nats-discovery -mindepth 1 -delete
+  fi
+  # The generated decoy directory lives here and is what the client mounts.
+  if [ -n "${nats_isolate}" ]; then
+    rm -rf "$nats_isolate"
+    nats_isolate=""
   fi
 }
 trap cleanup_nats_discovery EXIT
@@ -158,8 +164,14 @@ prepare_nats_discovery() {
     return 1
   fi
 
-  isolate=$(mktemp -d /tmp/arkham-nats-discovery.XXXXXX)
-  trap 'rm -rf "$isolate"' RETURN
+  # This directory holds the generated decoy tree. The client bind-mounts
+  # that tree, so it has to stay until the container is gone. Deleting it
+  # on return makes Docker mount an empty path and context.txt is missing.
+  if [ -n "${nats_isolate}" ]; then
+    rm -rf "$nats_isolate"
+  fi
+  nats_isolate=$(mktemp -d /tmp/arkham-nats-discovery.XXXXXX)
+  isolate=$nats_isolate
   home=$isolate/home
   workspace=$isolate/workspace
   mkdir -p "$home/.config/nats/context" "$workspace" "$isolate/xdg-config" "$isolate/xdg-state" "$isolate/xdg-data"
@@ -381,6 +393,22 @@ for backend in $backends; do
   done <<< "$service_list"
   ARKHAM_BACKEND="$backend" $compose up -d --build "${services[@]}"
   prepare_nats_discovery
+  # prepare returns before the client starts. The mount source has to still
+  # be the directory arkham init wrote, not a copy and not a deleted temp dir.
+  nats_host=""
+  while IFS= read -r line; do
+    case "$line" in
+      *":/tmp/.config/nats:rw")
+        rest=${line#*- }
+        nats_host=${rest%%:*}
+        break
+        ;;
+    esac
+  done <integration/out/nats-discovery/client.yml
+  if [ ! -d "$nats_host" ] || [ ! -f "$nats_host/context.txt" ]; then
+    echo "nats directory mount source is missing: ${nats_host}"
+    exit 1
+  fi
   # Reload arkham so it reads the appended grant. --no-deps leaves the
   # exited certs container alone.
   ARKHAM_BACKEND="$backend" $compose up -d --no-deps --force-recreate arkham
