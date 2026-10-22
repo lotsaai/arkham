@@ -564,7 +564,7 @@ mod moved_suite {
     assert!(!nats.ro, "the directory is writable so nats context select can rename context.txt");
     assert!(nats.host.is_dir());
     let host_name = nats.host.file_name().and_then(|name| name.to_str()).unwrap_or("");
-    assert!(host_name.starts_with("nats-"), "{host_name}");
+    assert_eq!(host_name, "nats-home", "{host_name}");
     assert_eq!(fs::read_to_string(nats.host.join("context.txt")).unwrap(), "demo\n");
     let twin = fs::read_to_string(nats.host.join("context").join("demo.json")).unwrap();
     assert!(twin.contains("app"), "{twin}");

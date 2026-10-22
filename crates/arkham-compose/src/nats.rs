@@ -65,11 +65,14 @@ impl AdaptedNats {
   ///
   /// Returns an error when the directory cannot be written.
   pub(crate) fn install(self, collector: &mut RewriteCollector) -> Result<(), Error> {
-    collector.mount_directory(&format!("{BLOB_PREFIX_NATS}context"), &self.container, &self.files)?;
+    collector.mount_directory(NATS_HOME_DIR, &self.container, &self.files)?;
     collector.grants.extend(self.grants);
     Ok(())
   }
 }
+
+/// Guest-tree directory in the state folder. Main wrote that twin as a file named `nats-context`.
+const NATS_HOME_DIR: &str = "nats-home";
 
 /// Map every context under `root`, or nothing when `context.txt` is absent.
 ///
@@ -1736,7 +1739,7 @@ mod tests {
     let root = home.path().join(".config").join("nats");
     write_context(&root, "demo", r#"{"url":"tls://nats.internal:4222","token":"real-token"}"#);
     let files = tempdir().unwrap();
-    let dir = files.path().join(format!("{BLOB_PREFIX_NATS}context"));
+    let dir = files.path().join(NATS_HOME_DIR);
     fs::create_dir_all(dir.join("context")).unwrap();
     fs::write(dir.join("previous-context.txt"), "gone\n").unwrap();
     fs::write(dir.join("context").join("gone.json"), "{}\n").unwrap();
@@ -1751,6 +1754,26 @@ mod tests {
     assert!(!host.join("scratch.tmp").exists());
     assert_eq!(fs::read_to_string(host.join("context.txt")).unwrap(), "demo\n");
     assert!(host.join("context").join("demo.json").is_file());
+    assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("/context/demo.json")));
+  }
+
+  #[test]
+  fn old_nats_context_file_does_not_block_init() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(&root, "demo", r#"{"url":"tls://nats.internal:4222","token":"real-token"}"#);
+    let files = tempdir().unwrap();
+    let old = files.path().join("nats-context");
+    fs::write(&old, "old-twin").unwrap();
+    let found = adapted(&root, home.path());
+    let mut collector = RewriteCollector::new(files.path()).unwrap();
+    found.install(&mut collector).unwrap();
+    let outputs = collector.outputs();
+    let host = &outputs.mounts[0].host;
+    assert!(host.is_dir());
+    assert_eq!(host.file_name().and_then(|name| name.to_str()), Some(NATS_HOME_DIR));
+    assert_eq!(fs::read_to_string(host.join("context.txt")).unwrap(), "demo\n");
+    assert_eq!(fs::read_to_string(&old).unwrap(), "old-twin");
     assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("/context/demo.json")));
   }
 
