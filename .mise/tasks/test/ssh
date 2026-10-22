@@ -175,7 +175,11 @@ prepare_nats_discovery() {
   isolate=$nats_isolate
   home=$isolate/home
   workspace=$isolate/workspace
-  mkdir -p "$home/.config/nats/context" "$workspace" "$isolate/xdg-config" "$isolate/xdg-state" "$isolate/xdg-data"
+  # natscli reads `$XDG_CONFIG_HOME/nats` when that variable is set. This
+  # run sets it so arkham's own files stay out of the fixture home, so the
+  # context tree lives there. Credential files stay on the absolute paths
+  # the context JSON names.
+  mkdir -p "$home/.config/nats" "$isolate/xdg-config/nats/context" "$workspace" "$isolate/xdg-state" "$isolate/xdg-data"
   docker cp "$certs_cid":/certs/ca.crt "$home/.config/nats/ca.crt"
   printf '%s\n' "$real_seed" >"$home/.config/nats/user.nk"
   chmod 600 "$home/.config/nats/user.nk"
@@ -189,8 +193,8 @@ ${jwt_seed}
 ------END USER NKEY SEED------
 EOF
   chmod 600 "$home/.config/nats/user.creds"
-  printf 'discovered\n' >"$home/.config/nats/context.txt"
-  cat >"$home/.config/nats/context/discovered.json" <<EOF
+  printf 'discovered\n' >"$isolate/xdg-config/nats/context.txt"
+  cat >"$isolate/xdg-config/nats/context/discovered.json" <<EOF
 {
   "description": "integration discovery",
   "url": "tls://nats:4222",
@@ -198,7 +202,7 @@ EOF
   "ca": "${home}/.config/nats/ca.crt"
 }
 EOF
-  cat >"$home/.config/nats/context/pass.json" <<EOF
+  cat >"$isolate/xdg-config/nats/context/pass.json" <<EOF
 {
   "description": "integration password",
   "url": "tls://nats:4222",
@@ -207,7 +211,7 @@ EOF
   "ca": "${home}/.config/nats/ca.crt"
 }
 EOF
-  cat >"$home/.config/nats/context/creds.json" <<EOF
+  cat >"$isolate/xdg-config/nats/context/creds.json" <<EOF
 {
   "description": "integration creds",
   "url": "tls://nats-jwt:4223",
@@ -215,7 +219,7 @@ EOF
   "ca": "${home}/.config/nats/ca.crt"
 }
 EOF
-  cat >"$home/.config/nats/context/clear.json" <<EOF
+  cat >"$isolate/xdg-config/nats/context/clear.json" <<EOF
 {
   "description": "integration cleartext",
   "url": "nats://nats-plain:4224",
