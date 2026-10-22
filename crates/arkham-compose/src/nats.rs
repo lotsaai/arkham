@@ -787,6 +787,8 @@ static USER_CONFIG_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 #[cfg(test)]
 mod tests {
+  use std::os::unix::fs::MetadataExt as _;
+
   use arkham_config::config::RuleCfg;
   use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
   use pretty_assertions::assert_eq;
@@ -1734,27 +1736,33 @@ mod tests {
   }
 
   #[test]
-  fn init_replaces_the_nats_directory() {
+  fn init_clears_stale_children_and_keeps_the_directory_inode() {
     let home = tempdir().unwrap();
     let root = home.path().join(".config").join("nats");
     write_context(&root, "demo", r#"{"url":"tls://nats.internal:4222","token":"real-token"}"#);
     let files = tempdir().unwrap();
-    let dir = files.path().join(NATS_HOME_DIR);
-    fs::create_dir_all(dir.join("context")).unwrap();
-    fs::write(dir.join("previous-context.txt"), "gone\n").unwrap();
-    fs::write(dir.join("context").join("gone.json"), "{}\n").unwrap();
-    fs::write(dir.join("scratch.tmp"), "temp").unwrap();
+    let found = adapted(&root, home.path());
+    let mut collector = RewriteCollector::new(files.path()).unwrap();
+    found.install(&mut collector).unwrap();
+    let host = collector.outputs().mounts.into_iter().next().expect("nats mount").host;
+    let held = fs::File::open(&host).expect("open nats home");
+    let inode = held.metadata().expect("nats home").ino();
+    fs::write(host.join("previous-context.txt"), "gone\n").unwrap();
+    fs::write(host.join("context").join("gone.json"), "{}\n").unwrap();
+    fs::write(host.join("scratch.tmp"), "temp").unwrap();
     let found = adapted(&root, home.path());
     let mut collector = RewriteCollector::new(files.path()).unwrap();
     found.install(&mut collector).unwrap();
     let outputs = collector.outputs();
     let host = &outputs.mounts[0].host;
+    assert_eq!(fs::metadata(host).expect("nats home").ino(), inode);
     assert!(!host.join("previous-context.txt").exists());
     assert!(!host.join("context").join("gone.json").exists());
     assert!(!host.join("scratch.tmp").exists());
     assert_eq!(fs::read_to_string(host.join("context.txt")).unwrap(), "demo\n");
     assert!(host.join("context").join("demo.json").is_file());
     assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("/context/demo.json")));
+    assert_eq!(held.metadata().expect("held nats home").ino(), inode);
   }
 
   #[test]
