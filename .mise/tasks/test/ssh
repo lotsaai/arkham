@@ -278,23 +278,55 @@ EOF
   mkdir -p "$dest/grants" "$dest/guest"
   find "$dest/grants" "$dest/guest" -mindepth 1 -delete
   cp -a "$(dirname "$grant_toml")/." "$dest/grants/"
+  # The client bind-mounts the same host paths arkham init emitted. A copy
+  # into an ordinary directory would hide a rename onto a file mount.
+  {
+    echo "services:"
+    echo "  client:"
+    echo "    volumes:"
+  } >"$dest/client.yml"
+  mounted=0
   while IFS= read -r line; do
     case "$line" in
-      *"/home/eng/.config/nats/"*) ;;
+      *"/home/eng/.config/nats"* ) ;;
       *) continue ;;
     esac
     rest=${line#*- }
     host=${rest%%:*}
-    container=${rest#*:}
-    container=${container%%:*}
-    rel=${container#/home/eng/.config/nats/}
-    if [ "$rel" = "$container" ] || [ -z "$rel" ]; then
-      echo "unexpected nats mount: ${line}"
+    tail=${rest#*:}
+    container=${tail%:*}
+    mode=${tail##*:}
+    case "$container" in
+      /home/eng/.config/nats|/home/eng/.config/nats/*) ;;
+      *) continue ;;
+    esac
+    if [ ! -e "$host" ]; then
+      echo "nats mount is missing on the host: ${line}"
       return 1
     fi
-    mkdir -p "$dest/guest/$(dirname "$rel")"
-    cp "$host" "$dest/guest/$rel"
+    if [ "$container" = "/home/eng/.config/nats" ]; then
+      if [ ! -d "$host" ]; then
+        echo "nats config mount is not a directory: ${line}"
+        return 1
+      fi
+      cp -a "$host"/. "$dest/guest/"
+    else
+      rel=${container#/home/eng/.config/nats/}
+      mkdir -p "$dest/guest/$(dirname "$rel")"
+      cp "$host" "$dest/guest/$rel"
+    fi
+    client_container=${container/#\/home\/eng/\/tmp}
+    printf '      - %s:%s:%s\n' "$host" "$client_container" "$mode" >>"$dest/client.yml"
+    mounted=1
   done <"$compose_file"
+  if [ "$mounted" -eq 0 ]; then
+    echo "discovery did not emit a nats mount"
+    return 1
+  fi
+  if ! grep -q ':/tmp/.config/nats:rw$' "$dest/client.yml"; then
+    echo "client does not bind the generated nats directory writable"
+    return 1
+  fi
   if [ ! -f "$dest/guest/context.txt" ] || [ ! -f "$dest/guest/context/pass.json" ] || [ ! -f "$dest/guest/context/creds.json" ]; then
     echo "discovery did not mount every nats context into the guest"
     return 1
@@ -352,7 +384,7 @@ for backend in $backends; do
   # Reload arkham so it reads the appended grant. --no-deps leaves the
   # exited certs container alone.
   ARKHAM_BACKEND="$backend" $compose up -d --no-deps --force-recreate arkham
-  ARKHAM_BACKEND="$backend" NATS_DISCOVERED=1 $compose up -d --no-deps client
+  ARKHAM_BACKEND="$backend" NATS_DISCOVERED=1 $compose -f integration/out/nats-discovery/client.yml up -d --no-deps client
 
   # A failed one-shot leaves the client in `created`. Don't spend the
   # rest of the poll on a container that will never start.

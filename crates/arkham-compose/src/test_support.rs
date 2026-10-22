@@ -221,10 +221,33 @@ pub(crate) fn derive_home(host: &Path) -> DerivedHome {
 }
 
 pub(crate) fn mounted_text(outputs: &RewriteOutputs, suffix: &str) -> String {
-  let mount = outputs
-    .mounts
-    .iter()
-    .find(|mount| mount.container.to_string_lossy().ends_with(suffix))
-    .unwrap_or_else(|| panic!("{suffix} missing"));
-  fs::read_to_string(&mount.host).unwrap()
+  for mount in &outputs.mounts {
+    if mount.host.is_file() && mount.container.to_string_lossy().ends_with(suffix) {
+      return fs::read_to_string(&mount.host).unwrap();
+    }
+    if !mount.host.is_dir() {
+      continue;
+    }
+    let direct = mount.host.join(suffix.trim_start_matches('/'));
+    if direct.is_file() {
+      return fs::read_to_string(direct).unwrap();
+    }
+    let mut pending = vec![mount.host.clone()];
+    while let Some(dir) = pending.pop() {
+      let Ok(entries) = fs::read_dir(&dir) else {
+        continue;
+      };
+      for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+          pending.push(path);
+          continue;
+        }
+        if path.to_string_lossy().ends_with(suffix) {
+          return fs::read_to_string(path).unwrap();
+        }
+      }
+    }
+  }
+  panic!("{suffix} missing")
 }

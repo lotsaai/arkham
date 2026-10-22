@@ -143,7 +143,7 @@ run. Scenario 23 is the discovery proof. `test:ssh` writes a host
 `~/.config/nats` with a password context and an nkey context on `nats:4222`
 and a creds context on `nats-jwt:4223`, runs `arkham init` in an empty
 workspace with no `[rules.nats_*]` and no fnox entry for those grants, and
-copies the decoy files into the client. The client reads those files before
+bind-mounts that directory into the client. The client reads those files before
 scenarios 19 and 21 overwrite the same directory. Scenario 35 is the same
 tree through the `nats` CLI: one `pub`/`sub` per context, then
 `nats context select` and a command with no `--context`. The CLI trusts the

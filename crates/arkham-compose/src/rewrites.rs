@@ -167,19 +167,17 @@ impl RewriteCollector {
   /// Returns an error when a side file cannot be written.
   fn decoy_files(&mut self, first: &RewriteAdapted) -> Result<(), Error> {
     for file in &first.decoy_files {
-      self.mount_decoy_file(file, true)?;
+      self.mount_decoy_file(file)?;
     }
     Ok(())
   }
 
-  /// Write one decoy side file and mount it at its container path.
-  ///
-  /// `ro` is false for `context.txt`, which `nats context select` rewrites.
+  /// Write one decoy side file and mount it read-only at its container path.
   ///
   /// # Errors
   ///
   /// Returns an error when the file cannot be written.
-  pub(crate) fn mount_decoy_file(&mut self, file: &DecoyFile, ro: bool) -> Result<(), Error> {
+  fn mount_decoy_file(&mut self, file: &DecoyFile) -> Result<(), Error> {
     let file_path = self.files_dir.join(&file.name);
     fs::write(&file_path, &file.bytes).map_err(|source| Error::WriteFile {
       path: file_path.clone(),
@@ -188,8 +186,49 @@ impl RewriteCollector {
     self.mounts.push(Mount {
       host: file_path,
       container: PathBuf::from(&file.container),
-      ro,
+      ro: true,
     });
+    Ok(())
+  }
+
+  /// Write `files` under one directory and mount that directory writable.
+  ///
+  /// `nats context select` renames a temp file onto `context.txt` inside this
+  /// directory. A rename onto a single-file bind mount fails with `EBUSY`.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a directory or file cannot be written.
+  pub(crate) fn mount_directory(
+    &mut self,
+    name: &str,
+    container: &str,
+    files: &[(String, Vec<u8>)],
+    grants: Vec<RewriteAdapted>,
+  ) -> Result<(), Error> {
+    let dir = self.files_dir.join(name);
+    fs::create_dir_all(&dir).map_err(|source| Error::CreateDir { path: dir.clone(), source })?;
+    for (rel, bytes) in files {
+      let path = dir.join(rel);
+      if let Some(parent) = path.parent()
+        && parent != dir
+      {
+        fs::create_dir_all(parent).map_err(|source| Error::CreateDir {
+          path: parent.to_path_buf(),
+          source,
+        })?;
+      }
+      fs::write(&path, bytes).map_err(|source| Error::WriteFile {
+        path: path.clone(),
+        source,
+      })?;
+    }
+    self.mounts.push(Mount {
+      host: dir,
+      container: PathBuf::from(container),
+      ro: false,
+    });
+    self.grants.extend(grants);
     Ok(())
   }
 

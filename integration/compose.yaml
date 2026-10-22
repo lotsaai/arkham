@@ -534,14 +534,6 @@ services:
         cp /srv/package.json /srv/run.ts /opt/client/
         (cd /opt/client && bun install)
         chmod -R a+rX /opt/client
-        if [ -f /opt/nats-discovered/context.txt ]; then
-          mkdir -p /tmp/.config/nats
-          cp -a /opt/nats-discovered/. /tmp/.config/nats/
-          if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
-            gid="$${HOST_GID:-$$HOST_UID}"
-            chown -R "$$HOST_UID:$$gid" /tmp/.config/nats
-          fi
-        fi
         if [ -n "$${HOST_UID:-}" ] && [ "$$HOST_UID" != 0 ]; then
           gid="$${HOST_GID:-$$HOST_UID}"
           mkdir -p /out
@@ -593,7 +585,6 @@ services:
       - ./client:/srv:ro
       - certs:/certs:ro
       - ./out/results:/out
-      - ./out/nats-discovery/guest:/opt/nats-discovered:ro
     network_mode: service:arkham
     depends_on:
       smtp-direct:

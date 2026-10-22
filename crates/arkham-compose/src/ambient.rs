@@ -475,7 +475,7 @@ mod moved_suite {
     fs::write(nats.join("context.txt"), "demo\n").unwrap();
     fs::write(
       nats.join("context").join("demo.json"),
-      format!(r#"{{"url":"nats://nats.internal:4222","nkey":"{}"}}"#, nkey.display()),
+      format!(r#"{{"url":"tls://nats.internal:4222","nkey":"{}"}}"#, nkey.display()),
     )
     .unwrap();
     let derived = derive_home(host.path());
@@ -515,7 +515,7 @@ mod moved_suite {
     fs::write(nats.join("context.txt"), "demo\n").unwrap();
     fs::write(
       nats.join("context").join("demo.json"),
-      r#"{"url":"nats://nats.internal:4222","creds":"creds/user.creds"}"#,
+      r#"{"url":"tls://nats.internal:4222","creds":"creds/user.creds"}"#,
     )
     .unwrap();
     let derived = derive_home(host.path());
@@ -532,8 +532,8 @@ mod moved_suite {
     assert!(!mounted_text(&derived.outputs, "context/demo.json").contains(&seed));
   }
 
-  /// Every derivable `~/.config/nats` context becomes a grant. The guest
-  /// mounts each of those context files, with the real token only in the grant.
+  /// Every derivable `~/.config/nats` context is one writable directory. A
+  /// cleartext context keeps the real token out of the grant.
   #[test]
   fn derive_sources_mounts_every_nats_context() {
     use arkham_config::registry::Registry;
@@ -556,44 +556,24 @@ mod moved_suite {
       rewrites: &[],
     })
     .unwrap();
-    let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
-    for expected in [
-      "/home/eng/.config/nats/context.txt",
-      "/home/eng/.config/nats/context/demo.json",
-      "/home/eng/.config/nats/context/other.json",
-    ] {
-      assert!(containers.contains(&expected.to_string()), "{expected} missing from {containers:?}");
-    }
-    let txt = outputs
+    let nats = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.config/nats/context.txt"))
-      .unwrap();
-    assert!(!txt.ro, "context.txt is writable so nats context select can rewrite it");
-    assert!(
-      outputs
-        .mounts
-        .iter()
-        .filter(|mount| mount.container.ends_with(".json"))
-        .all(|mount| mount.ro),
-      "context json stays read-only"
-    );
-    let context = outputs
-      .mounts
-      .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.config/nats/context/demo.json"))
-      .unwrap();
-    let host_name = context.host.file_name().and_then(|name| name.to_str()).unwrap_or("");
+      .find(|mount| mount.container == Path::new("/home/eng/.config/nats"))
+      .expect("one nats directory");
+    assert!(!nats.ro, "the directory is writable so nats context select can rename context.txt");
+    assert!(nats.host.is_dir());
+    let host_name = nats.host.file_name().and_then(|name| name.to_str()).unwrap_or("");
     assert!(host_name.starts_with("nats-"), "{host_name}");
-    assert!(!host_name.starts_with("nats-context-"), "{host_name}");
-    let twin = fs::read_to_string(&context.host).unwrap();
+    assert_eq!(fs::read_to_string(nats.host.join("context.txt")).unwrap(), "demo\n");
+    let twin = fs::read_to_string(nats.host.join("context").join("demo.json")).unwrap();
     assert!(twin.contains("app"), "{twin}");
     assert!(!twin.contains("real-token"), "{twin}");
-    let other = outputs.mounts.iter().find(|mount| mount.container.ends_with("other.json")).unwrap();
-    let other_text = fs::read_to_string(&other.host).unwrap();
+    let other_text = fs::read_to_string(nats.host.join("context").join("other.json")).unwrap();
     assert!(!other_text.contains("other-real"), "{other_text}");
-    assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("real-token")));
-    assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("other-real")));
+    let rendered = outputs.grants.iter().map(|grant| grant.fragment.clone()).collect::<String>();
+    assert!(!rendered.contains("real-token"), "{rendered}");
+    assert!(!rendered.contains("other-real"), "{rendered}");
   }
 
   /// A declared path under `~/.config/nats` stays with that declaration.
