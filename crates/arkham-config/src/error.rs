@@ -472,14 +472,6 @@ pub enum Error {
     /// Rule label.
     label: String,
   },
-  /// `guest_tls_mode = mtls` on a cleartext `redis://` fake string.
-  #[error(
-    "rule `{label}`: mtls requires a rediss:// fake, because AUTH is rewritten before a cleartext guest can present a client certificate"
-  )]
-  RedisCleartextMtls {
-    /// Rule label.
-    label: String,
-  },
   /// An SMTP connection string does not parse.
   #[error("rule `{label}`: {source}")]
   SmtpScope {

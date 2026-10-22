@@ -244,48 +244,30 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
-  /// A guest Postgres TLS handshake fails.
-  #[error("guest postgres TLS: {source}")]
-  GuestPostgresTls {
+  /// A guest TLS handshake fails.
+  #[error("guest TLS: {source}")]
+  GuestTls {
     /// Underlying handshake failure.
     #[source]
     source: IoError,
   },
-  /// A server Postgres TLS handshake fails.
-  #[error("server postgres TLS: {source}")]
-  ServerPostgresTls {
+  /// An upstream TLS handshake fails.
+  #[error("server TLS: {source}")]
+  ServerTls {
     /// Underlying handshake failure.
     #[source]
     source: IoError,
   },
-  /// A Postgres upstream name cannot become a TLS server name.
-  #[error("postgres server name: {source}")]
-  PostgresServerName {
+  /// An upstream name cannot become a TLS server name.
+  #[error("TLS server name: {source}")]
+  TlsServerName {
     /// Underlying name failure.
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
-  /// A guest Redis TLS handshake fails.
-  #[error("guest redis TLS: {source}")]
-  GuestRedisTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A server Redis TLS handshake fails.
-  #[error("server redis TLS: {source}")]
-  ServerRedisTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A Redis upstream name cannot become a TLS server name.
-  #[error("redis server name: {source}")]
-  RedisServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
+  /// A TLS handshake exceeded the configured budget.
+  #[error("TLS handshake timed out")]
+  HandshakeTimeout,
   /// A guest SMTP TLS handshake fails.
   #[error("guest smtp TLS: {source}")]
   GuestSmtpTls {
@@ -428,9 +410,6 @@ pub enum Error {
     #[source]
     source: rasn::error::EncodeError,
   },
-  /// `guest_tls_mode` is `mtls` and the postgres guest opened in cleartext.
-  #[error("postgres mtls guest sent plaintext")]
-  PostgresGuestPlaintext,
   /// Postgres authentication did not finish inside the handshake budget.
   #[error("postgres authentication timed out")]
   PostgresAuthTimeout,

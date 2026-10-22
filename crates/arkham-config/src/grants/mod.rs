@@ -515,7 +515,7 @@ impl Grant {
     let Grant::Postgres { scope, .. } = self else {
       return None;
     };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
   /// The redis scope whose downstream (guest-side) port and host cover a
@@ -526,7 +526,7 @@ impl Grant {
     let Grant::Redis { scope, .. } = self else {
       return None;
     };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
   /// The SMTP scope whose downstream (guest-side) port and host cover a
@@ -537,7 +537,7 @@ impl Grant {
     let Grant::Smtp { scope, .. } = self else {
       return None;
     };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
   /// The LDAP scope whose downstream (guest-side) port and host cover a
@@ -548,7 +548,7 @@ impl Grant {
     let Grant::Ldap { scope, .. } = self else {
       return None;
     };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
   /// The NATS scope whose downstream (guest-side) port and host cover a
@@ -559,7 +559,7 @@ impl Grant {
     let Grant::Nats { scope, .. } = self else {
       return None;
     };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
   /// The AMQP scope whose downstream (guest-side) port and host cover a
@@ -570,7 +570,7 @@ impl Grant {
     let Grant::Amqp { scope, .. } = self else {
       return None;
     };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
   /// The ssh scope whose port and host cover a destination, `host` optional
@@ -584,6 +584,11 @@ impl Grant {
       .iter()
       .find(|entry| entry.port == port && host.is_none_or(|host| entry.host.matches(host)))
   }
+}
+
+/// One downstream cover check for every connection-string scope.
+fn downstream_covers(entry_host: &str, entry_port: u16, host: Option<&str>, port: u16) -> bool {
+  entry_port == port && host.is_none_or(|name| entry_host.eq_ignore_ascii_case(name))
 }
 
 fn endpoint_match(entry: &EndpointScope, scheme: Scheme, host: &str, port: u16) -> bool {
@@ -1079,23 +1084,46 @@ mod tests {
   }
 
   #[test]
-  fn redis_mtls_on_a_cleartext_fake_is_rejected() {
-    assert_mtls_rejected(
-      "redis://app:arkham_fake_redis_pass@db.internal:6379/0",         // betterleaks:allow
-      "rediss://app:arkham_real_redis_pass_01@db.internal:6379/0",     // betterleaks:allow
-      &["arkham_fake_redis_pass", "arkham_real_redis_pass_01", "app"], // betterleaks:allow
-      |err| matches!(err, crate::Error::RedisCleartextMtls { .. }),
+  fn redis_mtls_on_a_cleartext_fake_still_loads() {
+    let mut cfg = cfg_with_db(
+      "redis://app:arkham_fake_redis_pass@db.internal:6379/0",     // betterleaks:allow
+      "rediss://app:arkham_real_redis_pass_01@db.internal:6379/0", // betterleaks:allow
     );
+    mtls_on(&mut cfg);
+    let resolved = resolve(&cfg).expect("mtls on a cleartext fake still loads");
+    let Some(Grant::Redis { scope, .. }) = resolved.grants.first() else {
+      panic!("a redis rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(!scope.is_downstream_tls);
   }
 
   #[test]
-  fn redis_mtls_on_a_cleartext_upstream_is_rejected() {
-    assert_mtls_rejected(
-      "redis://app:arkham_fake_redis_pass@db.internal:6379/0",         // betterleaks:allow
-      "redis://app:arkham_real_redis_pass_01@db.internal:6379/0",      // betterleaks:allow
-      &["arkham_fake_redis_pass", "arkham_real_redis_pass_01", "app"], // betterleaks:allow
-      |err| matches!(err, crate::Error::RedisCleartextMtls { .. }),
+  fn redis_mtls_on_a_cleartext_upstream_still_loads() {
+    let mut cfg = cfg_with_db(
+      "redis://app:arkham_fake_redis_pass@db.internal:6379/0",    // betterleaks:allow
+      "redis://app:arkham_real_redis_pass_01@db.internal:6379/0", // betterleaks:allow
     );
+    mtls_on(&mut cfg);
+    let resolved = resolve(&cfg).expect("mtls on a cleartext upstream still loads");
+    let Some(Grant::Redis { scope, .. }) = resolved.grants.first() else {
+      panic!("a redis rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(!scope.is_upstream_tls);
+    assert!(!scope.is_downstream_tls);
+  }
+
+  #[test]
+  fn redis_cleartext_string_keeps_trust_and_identity() {
+    let scope = redis_scope(
+      "redis://app:fake@db.internal:6379/0", // betterleaks:allow
+      "redis://app:real@db.internal:6379/0?sslrootcert=/ca.pem&sslcert=/c.pem&sslkey=/c.key", // betterleaks:allow
+    );
+    assert!(!scope.is_upstream_tls);
+    assert_eq!(scope.root_cert, Some(RootCert::Path(PathBuf::from("/ca.pem"))));
+    assert_eq!(scope.client_cert, Some(PathBuf::from("/c.pem")));
+    assert_eq!(scope.client_key, Some(PathBuf::from("/c.key")));
   }
 
   #[test]

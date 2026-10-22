@@ -1,5 +1,19 @@
 # AGENTS.md - arkham
 
+arkham protects against the agent, not against the network: the agent sees fake values only, and cleartext vs TLS never changes behaviour.
+
+## Rules for protocol work
+
+- Read the codebase and `.agents/skills/add-protocol/SKILL.md` before writing anything.
+- Reuse the existing TCP, TLS, HTTPS, and OAuth layers. Never rebuild transport.
+- One crate per protocol. No protocol code in shared files.
+- Per-protocol work is protocol level only. That is the wire credential swap, plus rewriting that tool's config file with decoys.
+- Use maintained libraries.
+- Invent no rules, skips, refusals, or special cases. Report a blocker instead of choosing an alternative.
+- User docs (`docs/user/**`, `README`) contain no implementation notes and no walls of text.
+
+Shared crates hold the base layers and a minimal protocol registration. A protocol crate holds grant parsing, the wire machine, the compose adapter, errors, and tests.
+
 Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates, swaps format-valid decoy fakes for real secrets only on URI-grant match, and redacts real values back to fakes on responses; everything else splices byte-identical.
 
 ## Crate Roles & Boundaries

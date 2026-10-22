@@ -1,21 +1,34 @@
-//! Cached guest leaves and upstream trust anchors shared by the TLS transports.
+//! Shared TLS legs: guest accept, upstream connect, and the handshake budget.
 //!
-//! Redis, Postgres, and LDAP each keep their own cache. The mint and the
-//! PEM read are the same work, so they live here. A protocol that offers an
-//! ALPN identifier passes it in; one that does not passes `None`.
+//! A protocol passes its ALPN identifier and its [`Verify`] mode. The leaf
+//! cache keys on the server name, the client-certificate demand, and that
+//! identifier. Protocols that still keep a private cache call [`cached_leaf`]
+//! with their own map.
 
+use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use dashmap::DashMap;
-use rustls::pki_types::CertificateDer;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject as _;
-use rustls::{RootCertStore, ServerConfig};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, ServerConfig, SignatureScheme};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_rustls::client::TlsStream as ClientTlsStream;
+use tokio_rustls::server::TlsStream as ServerTlsStream;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use arkham_config::grants::RootCert;
+use arkham_config::grants::{GuestTlsMode, RootCert};
 use arkham_pki::ca::CertAuthority;
 use arkham_pki::ca::generate_domain_pair;
+use rama::tls::client::ClientAuth;
 
 use crate::Error;
+use crate::connection::client_identity;
 
 /// Leaf for one name, cached. Minted before insert so two guests naming the
 /// same host keygen at most twice. `alpn` is offered when the protocol's
@@ -30,7 +43,8 @@ pub(crate) fn cached_leaf(
   sni: &str,
   alpn: Option<&[u8]>,
 ) -> Result<Arc<ServerConfig>, Error> {
-  if let Some(config) = leaves.get(sni) {
+  let cache_key = leaf_cache_key(sni, alpn, false);
+  if let Some(config) = leaves.get(&cache_key) {
     return Ok(config.clone());
   }
   let mut config = (*ca.generate_domain_cert(sni)?.server_config).clone();
@@ -38,7 +52,7 @@ pub(crate) fn cached_leaf(
     config.alpn_protocols = vec![alpn.to_vec()];
   }
   let config = Arc::new(config);
-  leaves.insert(sni.to_string(), Arc::clone(&config));
+  leaves.insert(cache_key, Arc::clone(&config));
   Ok(config)
 }
 
@@ -55,7 +69,7 @@ pub(crate) fn cached_leaf_mtls(
   sni: &str,
   alpn: Option<&[u8]>,
 ) -> Result<Arc<ServerConfig>, Error> {
-  let cache_key = format!("{sni}|mtls");
+  let cache_key = leaf_cache_key(sni, alpn, true);
   if let Some(config) = leaves.get(&cache_key) {
     return Ok(config.clone());
   }
@@ -134,4 +148,359 @@ pub(crate) fn cached_roots(roots: &DashMap<RootCert, Arc<RootCertStore>>, root: 
   let store = Arc::new(store);
   roots.insert(root.clone(), Arc::clone(&store));
   Ok(store)
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// Cache key for one leaf. The name, the client-certificate demand, and the
+/// ALPN identifier are all part of the leaf a peer will see.
+fn leaf_cache_key(sni: &str, alpn: Option<&[u8]>, mtls: bool) -> String {
+  let mut key = String::with_capacity(sni.len().saturating_add(24));
+  key.push_str(sni);
+  key.push('|');
+  key.push(if mtls { 'm' } else { 't' });
+  key.push('|');
+  let Some(alpn) = alpn else {
+    return key;
+  };
+  for byte in alpn {
+    let hi = usize::from(byte >> 4);
+    let lo = usize::from(byte & 0x0f);
+    let Some(hi) = HEX.get(hi) else {
+      continue;
+    };
+    let Some(lo) = HEX.get(lo) else {
+      continue;
+    };
+    key.push(char::from(*hi));
+    key.push(char::from(*lo));
+  }
+  key
+}
+
+/// How an upstream certificate is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Verify {
+  /// Chain and host name. A missing root uses the platform store.
+  Full,
+  /// libpq. A missing root accepts the certificate. A present root checks
+  /// the chain, and the host name only when `name` is set.
+  Libpq {
+    /// Check the certificate's host name.
+    name: bool,
+  },
+}
+
+/// What one upstream handshake needs. The caller already decided that this
+/// leg speaks TLS.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpstreamTls<'a> {
+  /// Name the certificate must match when verification checks it.
+  pub(crate) server_name: &'a str,
+  /// Trust anchor from the connection string, when it names one.
+  pub(crate) root: Option<&'a RootCert>,
+  /// Which checks to run.
+  pub(crate) verify: Verify,
+  /// PEM client certificate, when the upstream asks for one.
+  pub(crate) client_cert: Option<&'a Path>,
+  /// PEM client key paired with `client_cert`.
+  pub(crate) client_key: Option<&'a Path>,
+  /// ALPN identifier to offer, when the protocol has one.
+  pub(crate) alpn: Option<&'a [u8]>,
+}
+
+/// One side of a connection before the handshake, or the plaintext stream.
+pub(crate) enum Pending<P, F> {
+  /// No handshake. The stream is already the byte stream.
+  Plain(P),
+  /// Handshake future. `settle` applies the budget.
+  Tls(F),
+}
+
+/// One side after [`settle`].
+pub(crate) enum Leg<P, T> {
+  /// The original stream.
+  Plain(P),
+  /// The stream after the handshake.
+  Tls(T),
+}
+
+/// Shared guest and upstream TLS legs. Protocols differ by ALPN and by
+/// [`Verify`]. The handshake itself is this one path.
+pub(crate) struct TlsLegs {
+  ca: CertAuthority,
+  leaves: DashMap<String, Arc<ServerConfig>>,
+  roots: DashMap<RootCert, Arc<RootCertStore>>,
+  provider: Arc<CryptoProvider>,
+}
+
+impl TlsLegs {
+  /// Build the caches over the CA that signs guest-facing leaves.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the CA cannot be read back from its own PEM.
+  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
+    Ok(Self {
+      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
+      leaves: DashMap::new(),
+      roots: DashMap::new(),
+      provider: CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider())),
+    })
+  }
+
+  /// Accept the guest's TLS, minting the leaf for `name` on first use.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the leaf cannot be minted or the handshake fails.
+  pub(crate) async fn accept_guest<G>(
+    &self,
+    name: &str,
+    guest: G,
+    mode: GuestTlsMode,
+    alpn: Option<&[u8]>,
+  ) -> Result<ServerTlsStream<G>, Error>
+  where
+    G: AsyncRead + AsyncWrite + Unpin,
+  {
+    let config = match mode {
+      GuestTlsMode::Tls => cached_leaf(&self.ca, &self.leaves, name, alpn)?,
+      GuestTlsMode::Mtls => cached_leaf_mtls(&self.ca, &self.leaves, name, alpn)?,
+    };
+    TlsAcceptor::from(config)
+      .accept(guest)
+      .await
+      .map_err(|err| Error::GuestTls { source: err })
+  }
+
+  /// Handshake the upstream under `request`.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the trust anchor or client identity cannot be
+  /// read, when the server name is unusable, or when the handshake fails.
+  pub(crate) async fn connect_upstream<S>(&self, request: &UpstreamTls<'_>, server: S) -> Result<ClientTlsStream<S>, Error>
+  where
+    S: AsyncRead + AsyncWrite + Unpin,
+  {
+    let server_name = ServerName::try_from(request.server_name.to_string()).map_err(|err| Error::TlsServerName { source: err.into() })?;
+    let mut config = match request.verify {
+      Verify::Full => {
+        let root = request.root.cloned().unwrap_or(RootCert::System);
+        let roots = cached_roots(&self.roots, &root)?;
+        with_identity(
+          ClientConfig::builder().with_root_certificates(roots),
+          request.client_cert,
+          request.client_key,
+        )?
+      }
+      Verify::Libpq { name } => {
+        let roots = match request.root {
+          Some(root) => Some(cached_roots(&self.roots, root)?),
+          None => None,
+        };
+        let verifier = EgressCertVerifier {
+          roots,
+          check_name: name,
+          provider: Arc::clone(&self.provider),
+        };
+        let builder = ClientConfig::builder()
+          .dangerous()
+          .with_custom_certificate_verifier(Arc::new(verifier));
+        with_identity(builder, request.client_cert, request.client_key)?
+      }
+    };
+    if let Some(alpn) = request.alpn {
+      config.alpn_protocols = vec![alpn.to_vec()];
+    }
+    TlsConnector::from(Arc::new(config))
+      .connect(server_name, server)
+      .await
+      .map_err(|err| Error::ServerTls { source: err })
+  }
+}
+
+/// Present the named client identity, or none when the entry names neither file.
+///
+/// # Errors
+///
+/// Returns an error when the identity cannot be read or is empty.
+fn with_identity(builder: impl IdentityBuilder, cert: Option<&Path>, key: Option<&Path>) -> Result<ClientConfig, Error> {
+  match (cert, key) {
+    (Some(cert), Some(key)) => {
+      let ClientAuth::Single(data) = client_identity(cert, key)? else {
+        return Err(Error::EmptyClientIdentity { path: cert.to_path_buf() });
+      };
+      builder
+        .with_cert(data.cert_chain.clone(), data.private_key.clone_key())
+        .map_err(|err| Error::ClientIdentity {
+          path: cert.to_path_buf(),
+          source: err,
+        })
+    }
+    _ => Ok(builder.with_none()),
+  }
+}
+
+/// The two rustls client builders expose the same two methods under different types.
+trait IdentityBuilder {
+  /// Install a client certificate.
+  fn with_cert(
+    self,
+    chain: Vec<CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+  ) -> Result<ClientConfig, RustlsError>;
+
+  /// Present no client certificate.
+  fn with_none(self) -> ClientConfig;
+}
+
+impl IdentityBuilder for rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert> {
+  fn with_cert(
+    self,
+    chain: Vec<CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+  ) -> Result<ClientConfig, RustlsError> {
+    self.with_client_auth_cert(chain, key)
+  }
+
+  fn with_none(self) -> ClientConfig {
+    self.with_no_client_auth()
+  }
+}
+
+/// Run the handshake on each TLS side, under one budget, and leave plaintext sides alone.
+///
+/// # Errors
+///
+/// Returns an error when a handshake fails or exceeds `budget`.
+pub(crate) async fn settle<GP, GF, GT, SP, SF, ST>(
+  guest: Pending<GP, GF>,
+  upstream: Pending<SP, SF>,
+  budget: Duration,
+) -> Result<(Leg<GP, GT>, Leg<SP, ST>), Error>
+where
+  GF: Future<Output = Result<GT, Error>>,
+  SF: Future<Output = Result<ST, Error>>,
+{
+  let guest = settle_one(guest, budget).await?;
+  let upstream = settle_one(upstream, budget).await?;
+  Ok((guest, upstream))
+}
+
+async fn settle_one<P, F, T>(side: Pending<P, F>, budget: Duration) -> Result<Leg<P, T>, Error>
+where
+  F: Future<Output = Result<T, Error>>,
+{
+  match side {
+    Pending::Plain(plain) => Ok(Leg::Plain(plain)),
+    Pending::Tls(handshake) => match tokio::time::timeout(budget, handshake).await {
+      Ok(result) => result.map(Leg::Tls),
+      Err(_elapsed) => Err(Error::HandshakeTimeout),
+    },
+  }
+}
+
+impl<P, T> AsyncRead for Leg<P, T>
+where
+  P: AsyncRead + Unpin,
+  T: AsyncRead + Unpin,
+{
+  fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      Self::Plain(inner) => Pin::new(inner).poll_read(cx, buf),
+      Self::Tls(inner) => Pin::new(inner).poll_read(cx, buf),
+    }
+  }
+}
+
+impl<P, T> AsyncWrite for Leg<P, T>
+where
+  P: AsyncWrite + Unpin,
+  T: AsyncWrite + Unpin,
+{
+  fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    match self.get_mut() {
+      Self::Plain(inner) => Pin::new(inner).poll_write(cx, buf),
+      Self::Tls(inner) => Pin::new(inner).poll_write(cx, buf),
+    }
+  }
+
+  fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      Self::Plain(inner) => Pin::new(inner).poll_flush(cx),
+      Self::Tls(inner) => Pin::new(inner).poll_flush(cx),
+    }
+  }
+
+  fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    match self.get_mut() {
+      Self::Plain(inner) => Pin::new(inner).poll_shutdown(cx),
+      Self::Tls(inner) => Pin::new(inner).poll_shutdown(cx),
+    }
+  }
+}
+
+/// Egress verification for a libpq-shaped upstream.
+///
+/// libpq verifies nothing when no trust anchor is named, which is what makes
+/// `require` usable against a private server. It verifies the chain once one
+/// is named, and it checks the host name only for `verify-full`.
+#[derive(Debug)]
+struct EgressCertVerifier {
+  roots: Option<Arc<RootCertStore>>,
+  check_name: bool,
+  provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for EgressCertVerifier {
+  fn verify_server_cert(
+    &self,
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    server_name: &ServerName<'_>,
+    _ocsp_response: &[u8],
+    now: UnixTime,
+  ) -> Result<ServerCertVerified, RustlsError> {
+    let Some(roots) = self.roots.as_ref() else {
+      return Ok(ServerCertVerified::assertion());
+    };
+    let cert = rustls::server::ParsedCertificate::try_from(end_entity)?;
+    rustls::client::verify_server_cert_signed_by_trust_anchor(
+      &cert,
+      roots,
+      intermediates,
+      now,
+      self.provider.signature_verification_algorithms.all,
+    )?;
+    if self.check_name {
+      rustls::client::verify_server_name(&cert, server_name)?;
+    }
+    Ok(ServerCertVerified::assertion())
+  }
+
+  fn verify_tls12_signature(
+    &self,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+  ) -> Result<HandshakeSignatureValid, RustlsError> {
+    rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+  }
+
+  fn verify_tls13_signature(
+    &self,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+  ) -> Result<HandshakeSignatureValid, RustlsError> {
+    rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+  }
+
+  fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+    self.provider.signature_verification_algorithms.supported_schemes()
+  }
 }

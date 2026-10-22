@@ -1,131 +1,32 @@
-//! Redis vertical: transport halves, serve arm, and the RESP framing
-//! machine — everything redis owns.
+//! Redis vertical: serve arm and the RESP framing machine.
 
 pub(crate) mod machine;
 
-use dashmap::DashMap;
-use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::server::TlsStream as ServerTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use arkham_config::grants::{GuestTlsMode, RedisScope, RootCert};
-use arkham_pki::ca::CertAuthority;
+use arkham_config::grants::RedisScope;
 
 use super::PairCtx;
-use super::{ServeStream, TlsHalves, Transport};
+use super::{ServeStream, Transport};
 use crate::Error;
-use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening};
+use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Direction, Redis};
-use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
-use rama::tls::client::ClientAuth;
+use crate::transports::tls::{Pending, UpstreamTls, Verify, settle};
 
-/// First byte of a TLS record carrying a handshake: the only shape a
-/// `rediss` guest leg opens with, and a shape a cleartext `redis` scope
-/// never serves.
-const TLS_RECORD_HANDSHAKE: u8 = 0x16;
-
-/// Redis transport: each connection string states its own leg, and the
-/// upstream `rediss` leg verifies the chain and the host name — the https
-/// precedent, not libpq's.
-#[derive(Debug)]
-pub(crate) struct RedisTransport {
-  ca: CertAuthority,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
-}
-
-impl RedisTransport {
-  /// Build both halves over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
-    })
-  }
-}
-
-impl TlsHalves for RedisTransport {
-  type Scope = RedisScope;
-
-  /// Accept the guest's TLS, minting the leaf for `name` on first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the handshake fails.
-  async fn accept_guest<G>(&self, name: &str, guest: G, guest_tls: GuestTlsMode) -> Result<ServerTlsStream<G>, Error>
-  where
-    G: AsyncRead + AsyncWrite + Unpin,
-  {
-    // Redis has no ALPN identifier; a real server offers none either.
-    let config = match guest_tls {
-      GuestTlsMode::Tls => cached_leaf(&self.ca, &self.leaves, name, None)?,
-      // `mtls` asks the guest for a client certificate and admits only ones
-      // this arkham's own CA signs — the same anchor that mints the leaves.
-      GuestTlsMode::Mtls => cached_leaf_mtls(&self.ca, &self.leaves, name, None)?,
-    };
-    TlsAcceptor::from(config)
-      .accept(guest)
-      .await
-      .map_err(|err| Error::GuestRedisTls { source: err })
-  }
-
-  /// Handshake the server: chain and host name are always verified, against
-  /// the entry's `sslrootcert` or the platform store.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the trust anchor cannot be read, when the server
-  /// name is unusable, or when the handshake fails.
-  async fn connect_server<S>(&self, scope: &RedisScope, server_name: &str, server: S) -> Result<ClientTlsStream<S>, Error>
-  where
-    S: AsyncRead + AsyncWrite + Unpin,
-  {
-    let root = scope.root_cert.clone().unwrap_or(RootCert::System);
-    let roots = cached_roots(&self.roots, &root)?;
-    let builder = ClientConfig::builder().with_root_certificates(roots);
-    let config = match (&scope.client_cert, &scope.client_key) {
-      // The entry names the proxy's client identity, so the upstream leg
-      // presents it; nothing else invents one.
-      (Some(cert), Some(key)) => {
-        let ClientAuth::Single(data) = client_identity(cert, key)? else {
-          return Err(Error::EmptyClientIdentity { path: cert.clone() });
-        };
-        builder
-          .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|err| Error::ClientIdentity {
-            path: cert.clone(),
-            source: err,
-          })?
-      }
-      _ => builder.with_no_client_auth(),
-    };
-    let name = ServerName::try_from(server_name.to_string()).map_err(|err| Error::RedisServerName { source: err.into() })?;
-    TlsConnector::from(Arc::new(config))
-      .connect(name, server)
-      .await
-      .map_err(|err| Error::ServerRedisTls { source: err })
-  }
-}
+/// Redis transport. Each connection string states its own leg, and the
+/// upstream `rediss` leg verifies the chain and the host name.
+#[derive(Debug, Default)]
+pub(crate) struct RedisTransport;
 
 impl Transport for RedisTransport {
   type Scope = RedisScope;
 
-  /// The `redis://` / `rediss://` arm. Each connection string states its
-  /// own leg's transport, so both legs are settled here and the wire
-  /// machine then works on plaintext whichever way either arrived.
+  /// The `redis://` / `rediss://` arm. Both legs settle through the shared
+  /// TLS helper, then the wire machine works on plaintext.
   async fn serve<G>(&self, ServeStream { mut guest, params, scope }: ServeStream<'_, G, RedisScope>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -153,11 +54,6 @@ impl Transport for RedisTransport {
       };
       server_name = Some(sni_name);
       guest_tls = Some((hello_buf, identity));
-    } else if initial.first() == Some(&TLS_RECORD_HANDSHAKE) {
-      // The scope says cleartext; a TLS hello is a different protocol on a
-      // port this scope owns, and the arm never guesses another one.
-      tracing::debug!("TLS opening on a cleartext redis scope; closing");
-      return Ok(());
     }
 
     // The real string states the far end: the dial follows its host and
@@ -177,28 +73,39 @@ impl Transport for RedisTransport {
       plugins: &state.plugins,
       mint: Some(state.mint_handle()),
     };
-    let upstream_name = scope.upstream.host.as_str();
-    let redis = &state.redis;
-    match (guest_tls, scope.is_upstream_tls) {
-      (None, false) => relay(Prefixed::new(guest_head, guest), upstream, &ctx).await,
-      (Some((hello_buf, identity)), false) => {
-        let plain = redis
-          .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
-          .await?;
-        relay(plain, upstream, &ctx).await
+    let legs = &state.legs;
+    let guest_pending = match guest_tls {
+      Some((hello_buf, identity)) => {
+        let mode = scope.guest_tls;
+        Pending::Tls(async move { legs.accept_guest(&identity, Prefixed::new(hello_buf, guest), mode, None).await })
       }
-      (None, true) => {
-        let plain = redis.connect_server(scope, upstream_name, upstream).await?;
-        relay(Prefixed::new(guest_head, guest), plain, &ctx).await
-      }
-      (Some((hello_buf, identity)), true) => {
-        let guest_plain = redis
-          .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
-          .await?;
-        let server_plain = redis.connect_server(scope, upstream_name, upstream).await?;
-        relay(guest_plain, server_plain, &ctx).await
-      }
-    }
+      None => Pending::Plain(Prefixed::new(guest_head, guest)),
+    };
+    let server_name = scope.upstream.host.as_str();
+    let root = scope.root_cert.as_ref();
+    let client_cert = scope.client_cert.as_deref();
+    let client_key = scope.client_key.as_deref();
+    let upstream_pending = if scope.is_upstream_tls {
+      Pending::Tls(async move {
+        legs
+          .connect_upstream(
+            &UpstreamTls {
+              server_name,
+              root,
+              verify: Verify::Full,
+              client_cert,
+              client_key,
+              alpn: None,
+            },
+            upstream,
+          )
+          .await
+      })
+    } else {
+      Pending::Plain(upstream)
+    };
+    let (guest_leg, upstream_leg) = settle(guest_pending, upstream_pending, budget).await?;
+    relay(guest_leg, upstream_leg, &ctx).await
   }
 }
 
@@ -220,4 +127,94 @@ pub(crate) fn redis_pair(ctx: &PairCtx<'_>) -> (Redis, Redis) {
     Redis::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream),
     Redis::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream),
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use std::time::Duration;
+
+  use arkham_config::config::ProxyCfg;
+  use arkham_config::grants::{Credential, Grant, RedisScope, ResolvedConfig};
+  use arkham_pki::ca::{CertAuthority, install_crypto_provider};
+  use secrecy::SecretString;
+  use tokio::net::TcpListener;
+
+  use super::RedisTransport;
+  use crate::ProxyState;
+  use crate::identity::CandidateParams;
+  use crate::transports::{ServeStream, Transport as _};
+
+  const FAKE: &str = "arkham_fake_redis_pass"; // betterleaks:allow
+  const VALUE: &str = "arkham_real_redis_pass_01"; // betterleaks:allow
+
+  #[tokio::test]
+  async fn cleartext_redis_dials_when_the_guest_starts_with_a_tls_record() {
+    install_crypto_provider();
+    let ca = CertAuthority::generate().unwrap();
+    let spy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = spy.local_addr().unwrap().port();
+    let scope = RedisScope::from_strings(
+      &format!("redis://app:{FAKE}@localhost:{port}/0"),
+      &format!("redis://app:{VALUE}@localhost:{port}/0"),
+    )
+    .unwrap();
+    let state = ProxyState::new(
+      ResolvedConfig {
+        proxy: ProxyCfg {
+          listen: "127.0.0.1:0".parse().unwrap(),
+          ca_file: None,
+          ssh_host_key: None,
+          ssh_known_hosts: None,
+          root_certs: Vec::new(),
+          handshake_timeout_secs: 1,
+        },
+        grants: vec![Grant::Redis {
+          credential: Credential {
+            label: "r".into(),
+            fake: FAKE.into(),
+            value: SecretString::from(VALUE),
+          },
+          scope: Box::new(scope.clone()),
+        }],
+        plugins: Vec::new(),
+      },
+      &ca,
+    )
+    .unwrap();
+    let snapshot = state.snapshot();
+    let (guest, _peer) = tokio::io::duplex(64);
+    let initial = [0x16u8, 0x03, 0x01];
+    let transport = RedisTransport;
+    let accept = spy.accept();
+    tokio::pin!(accept);
+    let serve = transport.serve(ServeStream {
+      guest,
+      params: CandidateParams {
+        state: &state,
+        snapshot: snapshot.as_ref(),
+        dial_host: "127.0.0.1",
+        port,
+        host: Some("localhost"),
+        raw_host: "localhost",
+        initial: &initial,
+      },
+      scope: &scope,
+    });
+    tokio::pin!(serve);
+    let dialed = tokio::time::timeout(Duration::from_secs(2), async {
+      tokio::select! {
+        biased;
+        accepted = &mut accept => accepted.is_ok(),
+        result = &mut serve => {
+          let _ = result;
+          false
+        }
+      }
+    })
+    .await;
+    assert!(
+      matches!(dialed, Ok(true)),
+      "cleartext redis dials when the first guest byte is a TLS record"
+    );
+  }
 }

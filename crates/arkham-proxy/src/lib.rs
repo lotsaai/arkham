@@ -53,6 +53,7 @@ use transports::redis::RedisTransport;
 use transports::smtp::SmtpTransport;
 use transports::ssh::SshTransport;
 use transports::tcp::TcpTransport;
+use transports::tls::TlsLegs;
 /// One HTTPS MITM relay shape: cached in-memory leaf issuer.
 type HttpsRelay = TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCertIssuer>>;
 
@@ -78,6 +79,8 @@ pub struct ProxyState {
   ssh: Arc<SshTransport>,
   postgres: Arc<PostgresTransport>,
   redis: Arc<RedisTransport>,
+  /// Guest and upstream TLS for protocols on the shared helper.
+  pub(crate) legs: TlsLegs,
   smtp: Arc<SmtpTransport>,
   ldap: Arc<LdapTransport>,
   nats: Arc<NatsTransport>,
@@ -171,8 +174,9 @@ impl ProxyState {
       .add_cert(&crt)
       .map_err(|source| Error::MtlsTrustAnchor { source: source.into() })?;
     let mtls_trust = trust.build();
-    let postgres = Arc::new(PostgresTransport::new(ca)?);
-    let redis = Arc::new(RedisTransport::new(ca)?);
+    let legs = TlsLegs::new(ca)?;
+    let postgres = Arc::new(PostgresTransport);
+    let redis = Arc::new(RedisTransport);
     let smtp = Arc::new(SmtpTransport::new(ca)?);
     let ldap = Arc::new(LdapTransport::new(ca)?);
     let nats = Arc::new(NatsTransport::new(ca)?);
@@ -188,6 +192,7 @@ impl ProxyState {
       ssh: Arc::new(SshTransport::default()),
       postgres,
       redis,
+      legs,
       smtp,
       ldap,
       nats,
