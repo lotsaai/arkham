@@ -7,9 +7,9 @@
 //! The guest tree is one writable directory at `{home}/.config/nats`, so
 //! `nats context select` can rename `context.txt`. A creds or nkey file is
 //! `decoy/<label>.<suffix>` inside that directory. The decoy seed comes from
-//! that context's `key_seed()`. Identical TLS material on one server shares
-//! one blob path. A real dial clash is a typed error when `context.txt` names
-//! one of the contexts, and a typed skip otherwise.
+//! that context's `key_seed()`. Identical TLS bytes share one blob path. A
+//! real dial clash is a typed error when `context.txt` names one of the
+//! contexts, and a typed skip otherwise.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,9 +22,10 @@ use arkham_config::grants::{NATS_DEFAULT_PORT, NatsPlain, NatsScope, NatsSeed, N
 use regex::Regex;
 use secrecy::SecretString;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use url::Url;
 
-use crate::adapt::{BLOB_PREFIX_NATS, DecoyFile, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment};
+use crate::adapt::{BLOB_PREFIX_NATS, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment};
 use crate::error::Error;
 use crate::rewrites::RewriteCollector;
 
@@ -64,7 +65,9 @@ impl AdaptedNats {
   ///
   /// Returns an error when the directory cannot be written.
   pub(crate) fn install(self, collector: &mut RewriteCollector) -> Result<(), Error> {
-    collector.mount_directory(&format!("{BLOB_PREFIX_NATS}context"), &self.container, &self.files, self.grants)
+    collector.mount_directory(&format!("{BLOB_PREFIX_NATS}context"), &self.container, &self.files)?;
+    collector.grants.extend(self.grants);
+    Ok(())
   }
 }
 
@@ -147,13 +150,14 @@ pub enum NatsUnsupported {
 }
 
 struct GuestCred {
-  written: String,
-  container: String,
+  tree_path: String,
   bytes: String,
 }
 
-struct FoundCred {
-  real: NatsPlain,
+impl GuestCred {
+  fn written(&self) -> String {
+    format!("~/.config/nats/{}", self.tree_path)
+  }
 }
 
 /// Upstream dial compared within one host and port.
@@ -176,6 +180,11 @@ impl Dial {
       && self.key == other.key
       && self.ca == other.ca
   }
+
+  fn blob_name(bytes: &[u8], kind: &str) -> String {
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    format!("{BLOB_PREFIX_NATS}{}.{kind}", hex::encode(&digest[..16]))
+  }
 }
 
 struct TlsQuery {
@@ -195,7 +204,6 @@ struct Ready {
   real_url: Option<String>,
   blobs: Vec<(String, Vec<u8>)>,
   decoy: String,
-  blob: String,
 }
 
 impl Ready {
@@ -216,7 +224,7 @@ impl Ready {
       let Some(bytes) = bytes else {
         continue;
       };
-      let name = format!("{}.{kind}", self.blob);
+      let name = Dial::blob_name(bytes, kind);
       pairs.push((field.to_string(), format!("{GRANTS_STATE_DIR}/rules.d/{name}")));
       blobs.push((name, bytes.to_vec()));
     }
@@ -227,8 +235,8 @@ impl Ready {
     let mut out = self.doc.clone();
     out.retain(|key, _| !DROPPED_KEYS.contains(&key.as_str()) && !key.starts_with("windows_"));
     out.insert("url".to_string(), Value::String(public_url(&self.url)));
-    let guest = self.guest.as_ref().map(|guest| guest.written.as_str());
-    let auth = self.fake.context_auth(guest);
+    let written = self.guest.as_ref().map(GuestCred::written);
+    let auth = self.fake.context_auth(written.as_deref());
     match &self.fake {
       NatsPlain::UserPass { .. } => {
         out.insert("user".to_string(), Value::String(auth.user));
@@ -245,24 +253,6 @@ impl Ready {
       }
     }
     out
-  }
-
-  /// Point this context's TLS blobs at the shared label.
-  fn share_blob(&mut self, label: &str) {
-    if self.blob == label {
-      return;
-    }
-    if let Some(url) = &mut self.real_url {
-      let from = format!("%2Frules.d%2F{}.", self.blob);
-      let to = format!("%2Frules.d%2F{label}.");
-      *url = url.replace(&from, &to);
-    }
-    for (name, _) in &mut self.blobs {
-      if let Some(rest) = name.strip_prefix(&self.blob) {
-        *name = format!("{label}{rest}");
-      }
-    }
-    self.blob = label.to_string();
   }
 }
 
@@ -423,14 +413,14 @@ impl<'a> NatsContextTree<'a> {
     let Some(url) = dial_url(text(&doc, "url")) else {
       return Ok(Err(skip(name, NatsSkipCause::ServerUrl)));
     };
-    let Some(found) = self.found_cred(&doc) else {
+    let Some(real) = self.found_cred(&doc) else {
       return Ok(Err(skip(name, NatsSkipCause::Credential)));
     };
     let dial = match self.dial(&url, &doc) {
       Ok(dial) => dial,
       Err(cause) => return Ok(Err(skip(name, cause))),
     };
-    let (fake, guest) = self.wire_auth(&found, &id.env(), &id.label, id.key_seed())?;
+    let (fake, guest) = Self::wire_auth(&real, &id.env(), &id.label, id.key_seed())?;
     let Some(fake_url) = auth_url(&url, url.scheme(), &fake, &[]) else {
       return Ok(Err(skip(name, NatsSkipCause::Rejected)));
     };
@@ -445,7 +435,6 @@ impl<'a> NatsContextTree<'a> {
       real_url: None,
       blobs: Vec::new(),
       decoy: String::new(),
-      blob: id.label.clone(),
     };
     let query = item.tls_query();
     let pairs = query
@@ -454,7 +443,7 @@ impl<'a> NatsContextTree<'a> {
       .map(|(key, value)| (key.as_str(), value.as_str()))
       .collect::<Vec<_>>();
     let scheme = if item.dial.real_tls { "tls" } else { "nats" };
-    let Some(real_url) = auth_url(&item.url, scheme, &found.real, &pairs) else {
+    let Some(real_url) = auth_url(&item.url, scheme, &real, &pairs) else {
       return Ok(Err(skip(name, NatsSkipCause::Rejected)));
     };
     if let Err(err) = NatsScope::from_strings(&item.fake_url, &real_url) {
@@ -474,43 +463,29 @@ impl<'a> NatsContextTree<'a> {
     Ok(Ok(item))
   }
 
-  /// Keep one dial per host and port. The selected context's dial wins when
-  /// it is in the group; a difference is then an error. Otherwise the first
-  /// context's dial wins and the others are skipped.
   fn reconcile(&self, selected: &str, mut ready: Vec<Ready>) -> Result<(Vec<Ready>, Vec<NatsSkip>), Error> {
     let mut groups: BTreeMap<(String, u16), Vec<usize>> = BTreeMap::new();
     for (index, item) in ready.iter().enumerate() {
-      groups.entry((item.dial.host.clone(), item.dial.port)).or_default().push(index);
+      if item.real_url.is_some() {
+        groups.entry((item.dial.host.clone(), item.dial.port)).or_default().push(index);
+      }
     }
     let mut skipped = Vec::new();
     let mut drop = Vec::new();
-    for indexes in groups.values() {
-      let Some(&first) = indexes.first() else {
-        continue;
-      };
-      let canonical = indexes
+    for indexes in groups.into_values() {
+      let at = indexes
         .iter()
-        .copied()
-        .find(|&index| ready.get(index).is_some_and(|item| item.identity.name == selected))
-        .unwrap_or(first);
-      let Some(canonical_item) = ready.get(canonical) else {
-        continue;
-      };
-      let canonical_label = canonical_item.identity.label.clone();
-      let canonical_name = canonical_item.identity.name.clone();
-      let canonical_dial = canonical_item.dial.clone();
+        .position(|&index| ready[index].identity.name == selected)
+        .unwrap_or(0);
+      let canonical = indexes[at];
+      let canonical_name = ready[canonical].identity.name.clone();
+      let canonical_dial = ready[canonical].dial.clone();
       let selected_here = canonical_name == selected;
-      for &index in indexes {
-        let Some(item) = ready.get(index) else {
-          continue;
-        };
-        if item.dial.same_material(&canonical_dial) {
-          if let Some(item) = ready.get_mut(index) {
-            item.share_blob(&canonical_label);
-          }
+      for index in indexes {
+        if ready[index].dial.same_material(&canonical_dial) {
           continue;
         }
-        let other = item.identity.name.clone();
+        let other = ready[index].identity.name.clone();
         if selected_here {
           return Err(self.selected_error(NatsSkip {
             name: selected.to_string(),
@@ -533,41 +508,23 @@ impl<'a> NatsContextTree<'a> {
       }
     }
     drop.sort_unstable();
-    drop.dedup();
     for index in drop.into_iter().rev() {
-      if index < ready.len() {
-        ready.remove(index);
-      }
+      ready.remove(index);
     }
     Ok((ready, skipped))
   }
 
   fn push_tree(tree: &mut Vec<(String, Vec<u8>)>, item: &Ready) {
     tree.push((format!("context/{}.json", item.identity.name), item.decoy.as_bytes().to_vec()));
-    let Some(guest) = &item.guest else {
-      return;
-    };
-    let Some(file_name) = guest.container.rsplit('/').next() else {
-      return;
-    };
-    if file_name.is_empty() {
-      return;
+    if let Some(guest) = &item.guest {
+      tree.push((guest.tree_path.clone(), guest.bytes.as_bytes().to_vec()));
     }
-    tree.push((format!("decoy/{file_name}"), guest.bytes.as_bytes().to_vec()));
   }
 
   fn grant_of(item: Ready) -> Result<Option<RewriteAdapted>, Error> {
     let Some(real_url) = item.real_url else {
       return Ok(None);
     };
-    let mut decoy_files = Vec::new();
-    if let Some(guest) = &item.guest {
-      decoy_files.push(DecoyFile {
-        name: format!("{}.credential", item.identity.label),
-        bytes: guest.bytes.as_bytes().to_vec(),
-        container: guest.container.clone(),
-      });
-    }
     let fragment = GrantFragment {
       env: item.identity.env(),
       registry: false,
@@ -581,9 +538,9 @@ impl<'a> NatsContextTree<'a> {
     };
     Ok(Some(RewriteAdapted {
       fragment: render_fragment(&item.identity.source, &item.identity.label, &fragment)?,
-      decoy: item.decoy,
+      decoy: String::new(),
       materialized: item.blobs,
-      decoy_files,
+      decoy_files: Vec::new(),
     }))
   }
 
@@ -623,7 +580,7 @@ impl<'a> NatsContextTree<'a> {
     })
   }
 
-  fn found_cred(&self, doc: &Map<String, Value>) -> Option<FoundCred> {
+  fn found_cred(&self, doc: &Map<String, Value>) -> Option<NatsPlain> {
     let user = text(doc, "user");
     let password = text(doc, "password");
     let token = text(doc, "token");
@@ -636,11 +593,9 @@ impl<'a> NatsContextTree<'a> {
       return None;
     }
     if !user.is_empty() {
-      return Some(FoundCred {
-        real: NatsPlain::UserPass {
-          user: user.to_string(),
-          pass: password.to_string(),
-        },
+      return Some(NatsPlain::UserPass {
+        user: user.to_string(),
+        pass: password.to_string(),
       });
     }
     if !password.is_empty() {
@@ -648,32 +603,24 @@ impl<'a> NatsContextTree<'a> {
     }
     if !creds.is_empty() {
       let (seed, jwt) = self.load_creds(creds)?;
-      return Some(FoundCred {
-        real: NatsPlain::Creds { seed, jwt },
-      });
+      return Some(NatsPlain::Creds { seed, jwt });
     }
     if !nkey.is_empty() {
       let path = self.resolve_path(nkey)?;
-      return Some(FoundCred {
-        real: NatsPlain::Nkey(nkey_file(&path)?),
-      });
+      return Some(NatsPlain::Nkey(nkey_file(&path)?));
     }
     if !user_jwt.is_empty() && !user_seed.is_empty() {
       let seed = self.load_user_seed(user_seed)?;
       let jwt = self.load_jwt(user_jwt)?;
       let parsed = NatsSeed::from_seed(SecretString::from(seed.clone())).ok()?;
       check_user_jwt(&jwt, &parsed.public).ok()?;
-      return Some(FoundCred {
-        real: NatsPlain::Creds { seed, jwt },
-      });
+      return Some(NatsPlain::Creds { seed, jwt });
     }
     if !user_jwt.is_empty() {
       return None;
     }
     if !token.is_empty() {
-      return Some(FoundCred {
-        real: NatsPlain::Token(token.to_string()),
-      });
+      return Some(NatsPlain::Token(token.to_string()));
     }
     None
   }
@@ -732,11 +679,10 @@ impl<'a> NatsContextTree<'a> {
     path.is_file().then_some(path)
   }
 
-  fn wire_auth(&self, found: &FoundCred, env: &str, label: &str, key_seed: &[u8; 32]) -> Result<(NatsPlain, Option<GuestCred>), Error> {
-    let prepared = found.real.prepare(env, key_seed).map_err(|_source| Error::NatsDecoy)?;
+  fn wire_auth(real: &NatsPlain, env: &str, label: &str, key_seed: &[u8; 32]) -> Result<(NatsPlain, Option<GuestCred>), Error> {
+    let prepared = real.prepare(env, key_seed).map_err(|_source| Error::NatsDecoy)?;
     let guest = prepared.file.map(|file| GuestCred {
-      written: format!("~/.config/nats/decoy/{label}.{}", file.suffix),
-      container: format!("{}/.config/nats/decoy/{label}.{}", self.home, file.suffix),
+      tree_path: format!("decoy/{label}.{}", file.suffix),
       bytes: file.body,
     });
     Ok((prepared.decoy, guest))
@@ -895,6 +841,20 @@ mod tests {
       .as_slice()
   }
 
+  fn context_json(found: &AdaptedNats, name: &str) -> String {
+    String::from_utf8(file(found, &format!("context/{name}.json")).to_vec()).unwrap()
+  }
+
+  fn decoy_bytes<'a>(found: &'a AdaptedNats, ext: &str) -> &'a [u8] {
+    found
+      .files
+      .iter()
+      .find(|(path, _)| path.starts_with("decoy/") && extension_is(path, ext))
+      .unwrap_or_else(|| panic!("decoy {ext} missing"))
+      .1
+      .as_slice()
+  }
+
   fn grant<'a>(found: &'a AdaptedNats, name: &str) -> &'a RewriteAdapted {
     let marker = format!("/context/{name}.json");
     found
@@ -966,13 +926,14 @@ mod tests {
     assert!(!fake.contains("real-nats-pass"), "{fake}");
     assert!(real.contains("handshake_first=true"), "{real}");
     assert!(!fake.contains("handshake_first"), "{fake}");
-    let decoy: Value = serde_json::from_str(&grant(&found, "demo").decoy).unwrap();
+    let text = context_json(&found, "demo");
+    let decoy: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(decoy["user"], "agent");
     assert_eq!(decoy["tls_first"], true);
     assert_eq!(decoy["jetstream_domain"], "app");
     assert_ne!(decoy["password"], "real-nats-pass");
-    assert!(!grant(&found, "demo").decoy.contains("real-nats-pass"));
-    assert!(!grant(&found, "demo").decoy.contains("other-real-pass"));
+    assert!(!text.contains("real-nats-pass"));
+    assert!(!text.contains("other-real-pass"));
     assert!(
       found.skipped.iter().any(|skip| matches!(
         skip,
@@ -1009,19 +970,15 @@ mod tests {
     NatsScope::from_strings(&fake, &real).expect("creds grant");
     assert!(real.contains(&seed), "the grant holds the real seed");
     assert!(real.contains(&jwt), "the grant holds the real jwt");
-    let guest = grant(&found, "demo")
-      .decoy_files
-      .iter()
-      .find(|file| file.container.contains("/.config/nats/decoy/") && extension_is(&file.container, "creds"))
-      .expect("per-context creds");
-    let guest_text = String::from_utf8(guest.bytes.clone()).unwrap();
+    let guest_text = String::from_utf8(decoy_bytes(&found, "creds").to_vec()).unwrap();
     assert!(guest_text.contains(JWT_BEGIN));
     assert!(guest_text.contains(SEED_BEGIN));
     assert!(!guest_text.contains(&seed));
     assert!(!guest_text.contains(&jwt));
-    assert!(!grant(&found, "demo").decoy.contains(&seed));
-    assert!(!grant(&found, "demo").decoy.contains(&jwt));
-    let decoy: Value = serde_json::from_str(&grant(&found, "demo").decoy).unwrap();
+    let text = context_json(&found, "demo");
+    assert!(!text.contains(&seed));
+    assert!(!text.contains(&jwt));
+    let decoy: Value = serde_json::from_str(&text).unwrap();
     assert!(decoy["creds"].as_str().unwrap().contains("/.config/nats/decoy/"));
   }
 
@@ -1042,13 +999,7 @@ mod tests {
     let rule = rule_of(&found);
     let real = rule.real.unwrap().expose_secret().to_string();
     assert!(real.contains(&seed));
-    let guest = &grant(&found, "keyed")
-      .decoy_files
-      .iter()
-      .find(|file| file.container.contains("/.config/nats/decoy/") && extension_is(&file.container, "nk"))
-      .unwrap()
-      .bytes;
-    let guest = String::from_utf8(guest.clone()).unwrap();
+    let guest = String::from_utf8(decoy_bytes(&found, "nk").to_vec()).unwrap();
     assert!(!guest.contains(&seed));
     NatsSeed::from_seed(SecretString::from(guest.trim().to_string())).expect("decoy seed");
     fs::write(&nkey, format!("# operator key\n{seed}\n")).unwrap();
@@ -1060,7 +1011,7 @@ mod tests {
     let real = rule.real.unwrap();
     assert!(real.expose_secret().contains("real-token"));
     assert!(real.expose_secret().contains("localhost"));
-    assert!(!grant(&found, "tok").decoy.contains("real-token"));
+    assert!(!context_json(&found, "tok").contains("real-token"));
 
     write_context(&root, "bad", r#"{"url":"nats://a:4222,nats://b:4222","token":"real-token"}"#);
     adapt(&root, "/home/eng", home.path()).expect_err("context does not map");
@@ -1127,22 +1078,23 @@ mod tests {
       &format!(r#"{{"url":"tls://nats.internal:4222","creds":"{creds_ref}"}}"#),
     );
     let found = adapted(root, home);
-    let containers: Vec<String> = grant(&found, "demo")
-      .decoy_files
+    let mut containers: Vec<String> = found
+      .files
       .iter()
-      .map(|file| file.container.clone())
+      .filter(|(path, _)| path.starts_with("decoy/"))
+      .map(|(path, _)| path.clone())
       .collect();
     assert!(containers.iter().all(|path| !path.contains("..")), "{containers:?}");
-    assert!(
-      containers.iter().any(|path| path.starts_with("/home/eng/.config/nats/decoy/")),
-      "{containers:?}"
-    );
-    let guest = grant(&found, "demo")
-      .decoy_files
-      .iter()
-      .find(|file| file.container.contains("decoy"))
-      .expect("decoy creds");
-    let guest_text = String::from_utf8(guest.bytes.clone()).unwrap();
+    assert!(containers.iter().any(|path| path.starts_with("decoy/")), "{containers:?}");
+    let creds = context_json(&found, "demo");
+    let creds_path = serde_json::from_str::<Value>(&creds).unwrap()["creds"]
+      .as_str()
+      .unwrap()
+      .to_string();
+    assert!(creds_path.starts_with("~/.config/nats/decoy/"), "{creds_path}");
+    assert!(!creds_path.contains(".."), "{creds_path}");
+    containers.push(creds_path);
+    let guest_text = String::from_utf8(decoy_bytes(&found, "creds").to_vec()).unwrap();
     assert!(!guest_text.contains(seed));
     assert!(!guest_text.contains(jwt));
     let real = rule_of(&found).real.unwrap().expose_secret().to_string();
@@ -1236,7 +1188,7 @@ mod tests {
       .find(|field| <&str>::from(field.name) == "pass")
       .expect("pass");
     assert_eq!(pass.pair.real.expose_secret(), password);
-    assert!(!grant(&found, "demo").decoy.contains(password));
+    assert!(!context_json(&found, "demo").contains(password));
 
     write_context(
       &root,
@@ -1302,22 +1254,13 @@ mod tests {
     let real = rule_of(&found).real.unwrap().expose_secret().to_string();
     assert!(real.contains(&seed));
     assert!(real.contains(&jwt));
-    let guest = grant(&found, "demo")
-      .decoy_files
-      .iter()
-      .find(|file| {
-        file.container.contains("decoy")
-          || Path::new(&file.container)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("creds"))
-      })
-      .expect("guest creds");
-    let guest_text = String::from_utf8(guest.bytes.clone()).unwrap();
+    let guest_text = String::from_utf8(decoy_bytes(&found, "creds").to_vec()).unwrap();
     assert!(guest_text.contains(JWT_BEGIN));
     assert!(!guest_text.contains(&seed));
     assert!(!guest_text.contains(&jwt));
-    assert!(!grant(&found, "demo").decoy.contains(&seed));
-    assert!(!grant(&found, "demo").decoy.contains(&jwt));
+    let text = context_json(&found, "demo");
+    assert!(!text.contains(&seed));
+    assert!(!text.contains(&jwt));
     let scope = NatsScope::from_strings(rule_of(&found).value.unwrap().expose_secret(), &real).expect("inline user jwt");
     assert!(scope.auth.signer().is_some());
   }
@@ -1424,13 +1367,12 @@ mod tests {
     assert_eq!(selected.1, "pass\n");
     assert_eq!(file(&found, "context.txt"), b"pass\n");
     assert_eq!(found.grants.len(), 3);
-    assert!(found.grants.iter().all(|grant| !grant.decoy.is_empty()));
-    assert!(found.grants.iter().all(|grant| {
-      grant
-        .decoy_files
+    assert!(
+      found
+        .grants
         .iter()
-        .all(|file| !file.container.ends_with("context.txt") && !file.container.contains("/context/"))
-    }));
+        .all(|grant| grant.decoy.is_empty() && grant.decoy_files.is_empty())
+    );
     for (_, text) in &guest {
       assert!(!text.contains("real-nats-pass"), "{text}");
       assert!(!text.contains(&nkey_seed), "{text}");
@@ -1526,10 +1468,10 @@ mod tests {
     let found = adapted(&root, home.path());
     assert_eq!(found.grants.len(), 4);
     let cred_paths: Vec<&str> = found
-      .grants
+      .files
       .iter()
-      .flat_map(|grant| grant.decoy_files.iter().map(|file| file.container.as_str()))
-      .filter(|path| extension_is(path, "creds"))
+      .map(|(path, _)| path.as_str())
+      .filter(|path| path.starts_with("decoy/") && extension_is(path, "creds"))
       .collect();
     assert_eq!(cred_paths.len(), 2, "{cred_paths:?}");
     assert_ne!(cred_paths[0], cred_paths[1]);
@@ -1549,6 +1491,71 @@ mod tests {
       .collect();
     assert!(sslcerts.iter().all(|path| !path.is_empty() && path == &sslcerts[0]), "{sslcerts:?}");
     load_grants(&found).expect("one dial loads");
+  }
+
+  #[test]
+  fn selected_cleartext_does_not_clash_with_tls_on_the_same_server() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(
+      &root,
+      "demo",
+      r#"{"url":"nats://nats.internal:4222","user":"agent","password":"real-nats-pass"}"#, // betterleaks:allow
+    );
+    fs::write(
+      root.join("context").join("secure.json"),
+      r#"{"url":"tls://nats.internal:4222","token":"secure-token"}"#,
+    )
+    .unwrap();
+    let found = adapted(&root, home.path());
+    assert!(
+      found.grants.iter().any(|grant| grant.fragment.contains("/context/secure.json")),
+      "{:?}",
+      found.skipped
+    );
+    assert!(found.grants.iter().all(|grant| !grant.fragment.contains("/context/demo.json")));
+    assert!(
+      found.skipped.iter().all(|skip| !matches!(skip.cause, NatsSkipCause::Dial { .. })),
+      "{:?}",
+      found.skipped
+    );
+    let decoy = String::from_utf8(file(&found, "context/demo.json").to_vec()).unwrap();
+    assert!(!decoy.contains("real-nats-pass"), "{decoy}");
+    let real = rule_named(&found, "secure").real.expect("tls grant").expose_secret().to_string();
+    assert!(real.contains("secure-token"), "{real}");
+    assert!(!real.contains("real-nats-pass"), "{real}");
+  }
+
+  #[test]
+  fn unselected_cleartext_that_sorts_first_does_not_skip_the_tls_grant() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(&root, "other", r#"{"url":"tls://other.internal:4222","token":"kept-token"}"#);
+    fs::write(
+      root.join("context").join("aplain.json"),
+      r#"{"url":"nats://nats.internal:4222","user":"agent","password":"plain-pass"}"#, // betterleaks:allow
+    )
+    .unwrap();
+    fs::write(
+      root.join("context").join("bsecure.json"),
+      r#"{"url":"tls://nats.internal:4222","token":"secure-token"}"#,
+    )
+    .unwrap();
+    let found = adapted(&root, home.path());
+    assert!(found.grants.iter().any(|grant| grant.fragment.contains("/context/other.json")));
+    assert!(
+      found.grants.iter().any(|grant| grant.fragment.contains("/context/bsecure.json")),
+      "{:?}",
+      found.skipped
+    );
+    assert!(found.grants.iter().all(|grant| !grant.fragment.contains("/context/aplain.json")));
+    assert!(
+      found.skipped.iter().all(|skip| !matches!(skip.cause, NatsSkipCause::Dial { .. })),
+      "{:?}",
+      found.skipped
+    );
+    let plain = String::from_utf8(file(&found, "context/aplain.json").to_vec()).unwrap();
+    assert!(!plain.contains("plain-pass"), "{plain}");
   }
 
   /// Different client certs on the selected server fail before grant load and name both contexts.
@@ -1653,10 +1660,7 @@ mod tests {
     );
     let first = adapted(&root, home.path());
     let second = adapted(&root, home.path());
-    assert_eq!(
-      grant(&first, "keyed").decoy_files[0].bytes,
-      grant(&second, "keyed").decoy_files[0].bytes
-    );
+    assert_eq!(decoy_bytes(&first, "nk"), decoy_bytes(&second, "nk"));
   }
 
   fn load_grants(found: &AdaptedNats) -> Result<arkham_config::grants::ResolvedConfig, Box<arkham_config::Error>> {
@@ -1724,6 +1728,30 @@ mod tests {
     assert_eq!(nats[0].container, Path::new("/home/eng/.config/nats"));
     assert!(nats[0].host.is_dir());
     assert_eq!(fs::read_to_string(nats[0].host.join("context.txt")).unwrap(), "demo\n");
+  }
+
+  #[test]
+  fn init_replaces_the_nats_directory() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    write_context(&root, "demo", r#"{"url":"tls://nats.internal:4222","token":"real-token"}"#);
+    let files = tempdir().unwrap();
+    let dir = files.path().join(format!("{BLOB_PREFIX_NATS}context"));
+    fs::create_dir_all(dir.join("context")).unwrap();
+    fs::write(dir.join("previous-context.txt"), "gone\n").unwrap();
+    fs::write(dir.join("context").join("gone.json"), "{}\n").unwrap();
+    fs::write(dir.join("scratch.tmp"), "temp").unwrap();
+    let found = adapted(&root, home.path());
+    let mut collector = RewriteCollector::new(files.path()).unwrap();
+    found.install(&mut collector).unwrap();
+    let outputs = collector.outputs();
+    let host = &outputs.mounts[0].host;
+    assert!(!host.join("previous-context.txt").exists());
+    assert!(!host.join("context").join("gone.json").exists());
+    assert!(!host.join("scratch.tmp").exists());
+    assert_eq!(fs::read_to_string(host.join("context.txt")).unwrap(), "demo\n");
+    assert!(host.join("context").join("demo.json").is_file());
+    assert!(outputs.grants.iter().any(|grant| grant.fragment.contains("/context/demo.json")));
   }
 
   /// A `nats://` URL with `tls_first` is an upstream TLS grant, and the rest of the directory still loads.

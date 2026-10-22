@@ -199,14 +199,11 @@ impl RewriteCollector {
   /// # Errors
   ///
   /// Returns an error when a directory or file cannot be written.
-  pub(crate) fn mount_directory(
-    &mut self,
-    name: &str,
-    container: &str,
-    files: &[(String, Vec<u8>)],
-    grants: Vec<RewriteAdapted>,
-  ) -> Result<(), Error> {
+  pub(crate) fn mount_directory(&mut self, name: &str, container: &str, files: &[(String, Vec<u8>)]) -> Result<(), Error> {
     let dir = self.files_dir.join(name);
+    if dir.exists() {
+      fs::remove_dir_all(&dir).map_err(|source| Error::RemoveFile { path: dir.clone(), source })?;
+    }
     fs::create_dir_all(&dir).map_err(|source| Error::CreateDir { path: dir.clone(), source })?;
     for (rel, bytes) in files {
       let path = dir.join(rel);
@@ -228,7 +225,6 @@ impl RewriteCollector {
       container: PathBuf::from(container),
       ro: false,
     });
-    self.grants.extend(grants);
     Ok(())
   }
 
