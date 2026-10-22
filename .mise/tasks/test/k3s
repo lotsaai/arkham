@@ -487,16 +487,24 @@ run_guest() {
   guest_compose=$compose
   XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" up "$ws"
 
+  if [ "$backend" = tun ] && [ ! -e /dev/net/tun ]; then
+    run_privileged modprobe tun || {
+      echo "tun device is missing" >&2
+      exit 1
+    }
+  fi
+
   guest() {
     docker compose -f "$compose" exec -T -i \
       -e HOME="$HOME" \
       -e KUBECONFIG="$HOME/.kube/config" \
-      -e PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+      -e PATH="/tmp/arkham-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
       agent "$@"
   }
 
   echo "--- ${backend}: kubectl in the guest"
   guest sh -s <<'GUEST'
+set -eu
 if command -v kubectl >/dev/null 2>&1; then
   exit 0
 fi
@@ -510,10 +518,10 @@ if ! command -v curl >/dev/null 2>&1; then
   echo "curl is required to fetch kubectl" >&2
   exit 1
 fi
-mkdir -p "$HOME/.local/bin"
+mkdir -p /tmp/arkham-bin
 ver=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
-curl -fsSL -o "$HOME/.local/bin/kubectl" "https://dl.k8s.io/release/${ver}/bin/linux/${karch}/kubectl"
-chmod +x "$HOME/.local/bin/kubectl"
+curl -fsSL -o /tmp/arkham-bin/kubectl "https://dl.k8s.io/release/${ver}/bin/linux/${karch}/kubectl"
+chmod +x /tmp/arkham-bin/kubectl
 GUEST
 
   local try=0
@@ -562,7 +570,7 @@ GUEST
     exit 1
   fi
   for ctx in alpha alpha-view beta admin; do
-    if ! grep -q "name: ${ctx}" "$guest_host"; then
+    if ! grep -E -q "(^|[[:space:]])name: \"?${ctx}\"?$" "$guest_host"; then
       echo "guest kubeconfig is missing context ${ctx}" >&2
       exit 1
     fi
