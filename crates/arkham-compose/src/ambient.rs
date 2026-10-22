@@ -241,49 +241,49 @@ impl AmbientDeriver<'_> {
     }
   }
 
-  /// The kubeconfig and talosconfig at their default paths. `KUBECONFIG` is a
-  /// `:`-separated list. `TALOSCONFIG` is one path.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when a twin output cannot be written.
   fn kube_and_talos(&mut self) -> Result<(), Error> {
     self.kube()?;
-    let path = env_source("TALOSCONFIG", ".talos/config", self.host_home);
-    if self.declared.contains(&path) || !path.is_file() {
-      return Ok(());
+    for (name, env_name, default, twin_name, twin_dest) in
+      [("talosconfig", "TALOSCONFIG", ".talos/config", "talos-config", ".talos/config")]
+    {
+      let path = env_source(env_name, default, self.host_home);
+      if self.declared.contains(&path) || !path.is_file() {
+        continue;
+      }
+      let Ok(content) = fs::read(&path) else {
+        tracing::warn!(source = %path.display(), "{name} source skipped: it cannot be read");
+        continue;
+      };
+      let guests_dir = self.guests_dir;
+      let ca = match self.ca() {
+        Ok(ca) => ca,
+        Err(err) => {
+          tracing::warn!(source = %path.display(), %err, "{name} source skipped: the guest CA is unavailable");
+          continue;
+        }
+      };
+      let adapted = match talos::adapt(&path, &content, ca, guests_dir) {
+        Ok(found) => {
+          tracing::debug!(
+            source = %path.display(),
+            skipped = found.skipped.len(),
+            "talos contexts left out of the grant set"
+          );
+          found.grants
+        }
+        Err(err) => {
+          tracing::warn!(source = %path.display(), %err, "talosconfig source skipped");
+          continue;
+        }
+      };
+      if adapted.is_empty() {
+        tracing::warn!(source = %path.display(), "{name} source skipped: it does not map onto a grant");
+        continue;
+      }
+      let dest = format!("{}/{twin_dest}", self.home);
+      self.collector.twin_mode(adapted, twin_name, &dest, false)?;
     }
-    let content = match fs::read(&path) {
-      Ok(content) => content,
-      Err(err) => {
-        tracing::warn!(source = %path.display(), %err, "talosconfig source skipped: it cannot be read");
-        return Ok(());
-      }
-    };
-    let guests_dir = self.guests_dir;
-    let ca = match self.ca() {
-      Ok(ca) => ca,
-      Err(err) => {
-        tracing::warn!(source = %path.display(), %err, "talosconfig source skipped: the guest CA is unavailable");
-        return Ok(());
-      }
-    };
-    let adapted = match talos::adapt(&path, &content, ca, guests_dir) {
-      Ok(found) => {
-        tracing::debug!(source = %path.display(), skipped = found.skipped.len(), "talos contexts left out of the grant set");
-        found.grants
-      }
-      Err(err) => {
-        tracing::warn!(source = %path.display(), %err, "talosconfig source skipped");
-        return Ok(());
-      }
-    };
-    if adapted.is_empty() {
-      tracing::warn!(source = %path.display(), "talosconfig source skipped: it does not map onto a grant");
-      return Ok(());
-    }
-    let dest = format!("{}/.talos/config", self.home);
-    self.collector.twin_mode(adapted, "talos-config", &dest, false)
+    Ok(())
   }
 
   /// `KUBECONFIG` files merged in order, mounted writable at `{home}/.kube/config`.
@@ -358,17 +358,13 @@ impl AmbientDeriver<'_> {
   }
 }
 
-/// Paths named by `KUBECONFIG`, split on `:`. An empty value, an empty list,
-/// or an unset variable is `~/.kube/config`.
 fn kube_paths(host_home: &Path) -> Vec<PathBuf> {
   let default = host_home.join(".kube").join("config");
-  match env::var("KUBECONFIG") {
-    Ok(value) if !value.trim().is_empty() => {
-      let paths: Vec<PathBuf> = value.split(':').filter(|part| !part.is_empty()).map(PathBuf::from).collect();
-      if paths.is_empty() { vec![default] } else { paths }
-    }
-    _ => vec![default],
-  }
+  let Some(value) = env::var_os("KUBECONFIG").filter(|value| !value.is_empty()) else {
+    return vec![default];
+  };
+  let paths: Vec<PathBuf> = env::split_paths(&value).filter(|path| !path.as_os_str().is_empty()).collect();
+  if paths.is_empty() { vec![default] } else { paths }
 }
 
 /// The source path one `TALOSCONFIG`-style override names, or the default
@@ -872,38 +868,19 @@ mod moved_suite {
     assert!(logged.contains("alice") && logged.contains("bob"), "{logged}");
   }
 
-  struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-  impl tracing::Subscriber for WarnCapture {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-      *metadata.level() <= tracing::Level::WARN
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-      tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-      let mut message = String::new();
-      event.record(&mut WarnVisit(&mut message));
-      self.0.lock().unwrap().push(message);
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-  }
-
-  struct WarnVisit<'a>(&'a mut String);
-
-  impl tracing::field::Visit for WarnVisit<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-      use std::fmt::Write as _;
-      let _ = write!(self.0, "{}={value:?};", field.name());
+  #[test]
+  fn kubeconfig_search_path_skips_empty_segments() {
+    let host = tempdir().unwrap();
+    let saved = std::env::var_os("KUBECONFIG");
+    let first = host.path().join("a.yaml");
+    let second = host.path().join("b.yaml");
+    set_env("KUBECONFIG", format!("{}::{}:", first.display(), second.display()));
+    assert_eq!(kube_paths(host.path()), vec![first, second]);
+    set_env("KUBECONFIG", "");
+    assert_eq!(kube_paths(host.path()), vec![host.path().join(".kube").join("config")]);
+    match saved {
+      Some(value) => set_env("KUBECONFIG", value),
+      None => unset_env("KUBECONFIG"),
     }
   }
 

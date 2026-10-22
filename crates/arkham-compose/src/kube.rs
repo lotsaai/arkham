@@ -1,28 +1,11 @@
-//! Kubeconfig adapter for `file_rewrite`: a kubectl config file is a
-//! differently structured form of the same information a rule holds, so the
-//! adapter derives the grant from the file instead of asking the operator to
-//! state it twice. Every derivable context maps onto one grant per user. The
-//! file is the secret source, so a kube entry stating `envs` is an error
-//! rather than a second source.
-//!
-//! Detection is structural: a YAML mapping with `kind: Config` takes the
-//! adapter path, everything else keeps the raw byte-swap. The grant label,
-//! env, decoy, and guest pair come from [`AmbientProtocol::KubernetesUser`].
-//! Each cluster CA blob is named by [`AmbientProtocol::KubernetesCluster`].
-//! The decoy twin keeps every context and swaps trust and identity: arkham's
-//! CA, a minted guest pair per user, and that user's decoy token. Two
-//! client-certificate users of one API server host and port are
-//! [`arkham_config::Error::AmbiguousContexts`]. The file fails when
-//! `current-context` is in that group. Otherwise those contexts are skipped.
-//! Any other context that cannot be derived is skipped. The `current-context`
-//! failing still fails the file.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::{HostTlsCfg, RewriteFormat, fake_for};
-use arkham_config::context::{AmbientProtocol, AmbiguousContexts, ContextIdentity, ContextRef, Presented, identities, require_distinct};
+use arkham_config::context::{
+  AmbientProtocol, AmbiguousContexts, AmbiguousParty, ContextIdentity, ContextRef, Presented, identities, require_distinct,
+};
 use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -32,159 +15,127 @@ use serde_yaml::{Mapping, Value, from_str};
 use crate::adapt::{GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, decode, render_decoy, render_fragment};
 use crate::error::Error;
 
-/// A kubeconfig document; unknown fields ignored.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct KubeDoc {
-  /// Document kind: `Config` for kubeconfigs.
   #[serde(default)]
   kind: String,
-  /// Active context name.
   #[serde(rename = "current-context", default)]
   current_context: String,
-  /// Named context refs.
   #[serde(default)]
   contexts: Vec<KubeContextEntry>,
-  /// Named clusters.
   #[serde(default)]
   clusters: Vec<KubeClusterEntry>,
-  /// Named users.
   #[serde(default)]
   users: Vec<KubeUserEntry>,
 }
 
-/// One `contexts` entry: a name over a cluster/user pair.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct KubeContextEntry {
-  /// Entry name, matched against `current-context`.
   #[serde(default)]
   name: String,
-  /// The referenced cluster and user.
   #[serde(default)]
   context: KubeContextRef,
-  /// File that defined this context.
   #[serde(skip)]
   source: PathBuf,
 }
 
-/// The cluster/user a context points at.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct KubeContextRef {
-  /// Referenced cluster name.
   #[serde(default)]
   cluster: String,
-  /// Referenced user name.
   #[serde(default)]
   user: String,
 }
 
-/// One `clusters` entry.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct KubeClusterEntry {
-  /// Entry name, matched against the context's `cluster`.
   #[serde(default)]
   name: String,
-  /// The server and its trust anchor.
   #[serde(default)]
   cluster: KubeCluster,
-  /// File that defined this cluster.
   #[serde(skip)]
   source: PathBuf,
 }
 
-/// A cluster's server and CA, inline or by file.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct KubeCluster {
-  /// API server URL.
   #[serde(default)]
   server: String,
-  /// Inline base64 CA bundle.
   #[serde(rename = "certificate-authority-data", default)]
   ca_data: Option<String>,
-  /// CA bundle file path: inline it first, the container cannot see it.
   #[serde(rename = "certificate-authority", default)]
   ca_file: Option<String>,
 }
 
-/// One `users` entry.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct KubeUserEntry {
-  /// Entry name, matched against the context's `user`.
   #[serde(default)]
   name: String,
-  /// The credential.
   #[serde(default)]
   user: KubeUser,
-  /// File that defined this user.
   #[serde(skip)]
   source: PathBuf,
 }
 
-/// A user's credential: bearer token and/or client pair, inline or by file.
 #[derive(Debug, Clone, Deserialize, Default)]
 struct KubeUser {
-  /// Bearer token.
   #[serde(default)]
   token: Option<String>,
-  /// Cloud auth-provider token.
   #[serde(rename = "auth-provider", default)]
-  auth_provider: Option<KubeAuthProvider>,
-  /// Exec credential plugin: unsupported, detected so it errors clearly.
+  auth_provider: Option<Mapping>,
   #[serde(default)]
   exec: Option<Mapping>,
-  /// Inline base64 client certificate.
   #[serde(rename = "client-certificate-data", default)]
   cert_data: Option<String>,
-  /// Client certificate file path: inline it first.
   #[serde(rename = "client-certificate", default)]
   cert_file: Option<String>,
-  /// Inline base64 client key.
   #[serde(rename = "client-key-data", default)]
   key_data: Option<String>,
-  /// Client key file path: inline it first.
   #[serde(rename = "client-key", default)]
   key_file: Option<String>,
 }
 
-/// A cloud auth provider block.
-#[derive(Debug, Clone, Deserialize, Default)]
-struct KubeAuthProvider {
-  /// Provider config holding the token.
-  #[serde(default)]
-  config: KubeProviderConfig,
+trait KubeFile {
+  fn invalid(&self, detail: String) -> Error;
 }
 
-/// Auth provider config.
-#[derive(Debug, Clone, Deserialize, Default)]
-struct KubeProviderConfig {
-  /// Bearer token.
-  #[serde(rename = "access-token", default)]
-  access_token: Option<String>,
+impl KubeFile for Path {
+  fn invalid(&self, detail: String) -> Error {
+    Error::RewriteInvalid {
+      file: self.to_path_buf(),
+      format: RewriteFormat::Kubeconfig,
+      detail,
+    }
+  }
 }
 
 impl KubeUser {
   fn bearer(&self) -> Option<&str> {
-    self
-      .token
-      .as_deref()
-      .or_else(|| {
-        self
-          .auth_provider
-          .as_ref()
-          .and_then(|provider| provider.config.access_token.as_deref())
-      })
-      .filter(|token| !token.is_empty())
+    self.token.as_deref().filter(|token| !token.is_empty())
   }
 }
 
-/// One context resolved to a server and a credential.
-struct Derived {
+struct Opened {
   context: String,
   user: String,
   user_source: PathBuf,
   cluster: String,
   cluster_source: PathBuf,
-  /// API server URL, as written.
   server: String,
+  host: String,
+  scope: EndpointScope,
+  token: Option<String>,
+  cert: Option<Vec<u8>>,
+  key: Option<Vec<u8>>,
+  ca: Option<Vec<u8>>,
+}
+
+struct Derived {
+  context: String,
+  user_id: ContextIdentity,
+  cluster_id: ContextIdentity,
+  server: String,
+  host: String,
   scope: EndpointScope,
   token: Option<String>,
   cert: Option<Vec<u8>>,
@@ -193,176 +144,164 @@ struct Derived {
 }
 
 impl KubeContextEntry {
-  fn derive(&self, doc: &KubeDoc) -> Result<Derived, Error> {
-    let invalid = |detail: String| invalid_at(&self.source, detail);
+  fn derive(&self, doc: &KubeDoc) -> Result<Opened, Error> {
+    let bad = |detail: String| self.source.invalid(detail);
     if self.context.cluster.is_empty() || self.context.user.is_empty() {
-      return Err(invalid(format!("context `{}` names no `cluster` or no `user`", self.name)));
+      return Err(bad(format!("context `{}` names no `cluster` or no `user`", self.name)));
     }
     let cluster = doc
       .clusters
       .iter()
       .find(|entry| entry.name == self.context.cluster)
-      .ok_or_else(|| invalid(format!("unknown cluster `{}`", self.context.cluster)))?;
-    if cluster.cluster.server.is_empty() {
-      return Err(invalid(format!("cluster `{}` states no `server`", cluster.name)));
+      .ok_or_else(|| bad(format!("unknown cluster `{}`", self.context.cluster)))?;
+    let server = &cluster.cluster.server;
+    if server.is_empty() {
+      return Err(bad(format!("cluster `{}` states no `server`", cluster.name)));
     }
-    let scope: EndpointScope = cluster
-      .cluster
-      .server
+    let scope: EndpointScope = server
       .parse()
-      .map_err(|detail| invalid(format!("server `{}` is not an allow entry: {detail}", cluster.cluster.server)))?;
+      .map_err(|detail| bad(format!("server `{server}` is not an allow entry: {detail}")))?;
     if scope.scheme != Scheme::Https {
-      return Err(invalid(format!(
-        "server `{}` is plain HTTP: the API server is TLS-only",
-        cluster.cluster.server
-      )));
+      return Err(bad(format!("server `{server}` is plain HTTP: the API server is TLS-only")));
     }
-    if !matches!(scope.host, HostPat::Exact(_)) {
-      return Err(invalid(format!("server `{}` is not an exact host", cluster.cluster.server)));
-    }
+    let HostPat::Exact(host) = &scope.host else {
+      return Err(bad(format!("server `{server}` is not an exact host")));
+    };
     let user = doc
       .users
       .iter()
       .find(|entry| entry.name == self.context.user)
-      .ok_or_else(|| invalid(format!("unknown user `{}`", self.context.user)))?;
+      .ok_or_else(|| bad(format!("unknown user `{}`", self.context.user)))?;
     if user.user.cert_file.is_some() || user.user.key_file.is_some() || cluster.cluster.ca_file.is_some() {
-      return Err(invalid(
+      return Err(bad(
         "uses file references; inline them first: `kubectl config view --flatten`".to_string(),
       ));
     }
     let token = user.user.bearer();
     if user.user.exec.is_some() && token.is_none() && user.user.cert_data.is_none() && user.user.key_data.is_none() {
-      return Err(invalid("exec credential plugins are not supported".to_string()));
+      return Err(bad("exec credential plugins are not supported".to_string()));
     }
-    let cert = decode(
-      &self.source,
-      RewriteFormat::Kubeconfig,
-      user.user.cert_data.as_deref(),
-      "client-certificate-data",
-    )?;
-    let key = decode(
-      &self.source,
-      RewriteFormat::Kubeconfig,
-      user.user.key_data.as_deref(),
-      "client-key-data",
-    )?;
+    let blob = |value, name| decode(&self.source, RewriteFormat::Kubeconfig, value, name);
+    let cert = blob(user.user.cert_data.as_deref(), "client-certificate-data")?;
+    let key = blob(user.user.key_data.as_deref(), "client-key-data")?;
     if cert.is_some() != key.is_some() {
-      return Err(invalid(format!("user `{}` carries half of the client pair", user.name)));
+      return Err(bad(format!("user `{}` carries half of the client pair", user.name)));
     }
     if token.is_none() && cert.is_none() {
-      return Err(invalid(format!(
-        "user `{}` carries neither `token` nor a client pair: nothing to substitute",
-        user.name
-      )));
+      let name = &user.name;
+      let detail = if user.user.token.is_none() && user.user.auth_provider.is_some() {
+        format!("user `{name}` uses an auth-provider; that flow is not substituted")
+      } else {
+        format!("user `{name}` carries neither `token` nor a client pair: nothing to substitute")
+      };
+      return Err(bad(detail));
     }
-    let ca = decode(
-      &self.source,
-      RewriteFormat::Kubeconfig,
-      cluster.cluster.ca_data.as_deref(),
-      "certificate-authority-data",
-    )?;
-    Ok(Derived {
+    Ok(Opened {
       context: self.name.clone(),
       user: user.name.clone(),
       user_source: user.source.clone(),
       cluster: cluster.name.clone(),
       cluster_source: cluster.source.clone(),
-      server: cluster.cluster.server.clone(),
+      server: server.clone(),
+      host: host.clone(),
       scope,
       token: token.map(str::to_string),
       cert,
       key,
-      ca,
+      ca: blob(cluster.cluster.ca_data.as_deref(), "certificate-authority-data")?,
     })
   }
 }
 
-fn invalid_at(file: &Path, detail: String) -> Error {
-  Error::RewriteInvalid {
-    file: file.to_path_buf(),
-    format: RewriteFormat::Kubeconfig,
-    detail,
+impl Opened {
+  fn identified(self, users: &[ContextIdentity], clusters: &[ContextIdentity]) -> Option<Derived> {
+    let user_id = users
+      .iter()
+      .find(|id| id.name == self.user && id.source == self.user_source)?
+      .clone();
+    let cluster_id = clusters
+      .iter()
+      .find(|id| id.name == self.cluster && id.source == self.cluster_source)?
+      .clone();
+    Some(Derived {
+      context: self.context,
+      user_id,
+      cluster_id,
+      server: self.server,
+      host: self.host,
+      scope: self.scope,
+      token: self.token,
+      cert: self.cert,
+      key: self.key,
+      ca: self.ca,
+    })
   }
 }
 
-/// Contexts that survived derivation.
+impl Derived {
+  fn matches_party(&self, party: &AmbiguousParty) -> bool {
+    party.protocol == self.user_id.protocol && party.name == self.user_id.name && party.source == self.user_id.source
+  }
+}
+
 struct DerivedContexts(Vec<Derived>);
 
 impl DerivedContexts {
-  fn user_refs(&self) -> Vec<ContextRef<'_>> {
-    self
-      .0
-      .iter()
-      .map(|derived| ContextRef {
-        source: derived.user_source.as_path(),
-        protocol: AmbientProtocol::KubernetesUser,
-        name: derived.user.as_str(),
-      })
-      .collect()
+  fn identify(opened: Vec<Opened>) -> Result<Self, Error> {
+    let users = identities(
+      &opened
+        .iter()
+        .map(|item| ContextRef {
+          source: item.user_source.as_path(),
+          protocol: AmbientProtocol::KubernetesUser,
+          name: item.user.as_str(),
+        })
+        .collect::<Vec<_>>(),
+    )?;
+    let clusters = identities(
+      &opened
+        .iter()
+        .map(|item| ContextRef {
+          source: item.cluster_source.as_path(),
+          protocol: AmbientProtocol::KubernetesCluster,
+          name: item.cluster.as_str(),
+        })
+        .collect::<Vec<_>>(),
+    )?;
+    Ok(Self(
+      opened.into_iter().filter_map(|item| item.identified(&users, &clusters)).collect(),
+    ))
   }
 
-  fn cluster_refs(&self) -> Vec<ContextRef<'_>> {
-    self
-      .0
-      .iter()
-      .map(|derived| ContextRef {
-        source: derived.cluster_source.as_path(),
-        protocol: AmbientProtocol::KubernetesCluster,
-        name: derived.cluster.as_str(),
-      })
-      .collect()
-  }
-
-  /// Certificate users that share a host and port cannot be told apart: the
-  /// upstream handshake offers one client certificate before it reads a
-  /// bearer. Token users are not part of that check. A group that includes
-  /// `current` fails the file. Any other group is skipped.
-  fn resolve_shared_certs(mut self, current: &str) -> Result<(Self, Vec<ContextIdentity>), Error> {
-    let user_ids = identities(&self.user_refs())?;
+  fn resolve_shared_certs(mut self, current: &str) -> Result<Self, Error> {
     loop {
-      let presented = self.presented(&user_ids)?;
-      match require_distinct(&presented) {
-        Ok(()) => return Ok((self, user_ids)),
-        Err(arkham_config::Error::AmbiguousContexts(ambiguous)) => {
-          let names = self.contexts_of(ambiguous.as_ref());
-          if names.is_empty() || names.iter().any(|name| name == current) {
-            return Err(arkham_config::Error::AmbiguousContexts(ambiguous).into());
-          }
-          let listed = names.join(", ");
-          tracing::warn!(contexts = %listed, host = %ambiguous.host, port = ambiguous.port, "kube contexts skipped");
-          self.0.retain(|derived| !names.iter().any(|name| name == &derived.context));
-        }
+      let ambiguous = match require_distinct(&self.presented()) {
+        Ok(()) => return Ok(self),
+        Err(arkham_config::Error::AmbiguousContexts(ambiguous)) => ambiguous,
         Err(err) => return Err(err.into()),
+      };
+      let names = self.contexts_of(ambiguous.as_ref());
+      if names.is_empty() || names.iter().any(|name| name == current) {
+        return Err(arkham_config::Error::AmbiguousContexts(ambiguous).into());
       }
+      let listed = names.join(", ");
+      tracing::warn!(contexts = %listed, host = %ambiguous.host, port = ambiguous.port, "kube contexts skipped");
+      self.0.retain(|derived| !names.iter().any(|name| name == &derived.context));
     }
   }
 
-  fn presented<'a>(&'a self, user_ids: &'a [ContextIdentity]) -> Result<Vec<Presented<'a>>, Error> {
-    let mut presented = Vec::new();
-    for derived in &self.0 {
-      if derived.cert.is_none() {
-        continue;
-      }
-      let host = match &derived.scope.host {
-        HostPat::Exact(host) => host.as_str(),
-        HostPat::Wildcard(_) | HostPat::Any => {
-          return Err(invalid_at(
-            &derived.user_source,
-            format!("server `{}` is not an exact host", derived.server),
-          ));
-        }
-      };
-      let Some(identity) = identity_for(user_ids, &derived.user_source, &derived.user) else {
-        return Err(invalid_at(&derived.user_source, format!("user `{}` has no identity", derived.user)));
-      };
-      presented.push(Presented {
-        identity,
-        host,
+  fn presented(&self) -> Vec<Presented<'_>> {
+    self
+      .0
+      .iter()
+      .filter(|derived| derived.cert.is_some())
+      .map(|derived| Presented {
+        identity: &derived.user_id,
+        host: &derived.host,
         port: derived.scope.port,
         decoy: b"",
-      });
-    }
-    Ok(presented)
+      })
+      .collect()
   }
 
   fn contexts_of(&self, ambiguous: &AmbiguousContexts) -> Vec<String> {
@@ -372,11 +311,8 @@ impl DerivedContexts {
       .filter(|derived| {
         derived.cert.is_some()
           && derived.scope.port == ambiguous.port
-          && ambiguous
-            .parties
-            .iter()
-            .any(|party| party.name == derived.user && party.source == derived.user_source)
-          && matches!(&derived.scope.host, HostPat::Exact(host) if host.eq_ignore_ascii_case(&ambiguous.host))
+          && derived.host.eq_ignore_ascii_case(&ambiguous.host)
+          && ambiguous.parties.iter().any(|party| derived.matches_party(party))
       })
       .map(|derived| derived.context.clone())
       .collect();
@@ -394,30 +330,21 @@ impl DerivedContexts {
   }
 }
 
-fn identity_for<'a>(ids: &'a [ContextIdentity], source: &Path, name: &str) -> Option<&'a ContextIdentity> {
-  ids.iter().find(|id| id.name == name && id.source == source)
-}
-
-/// One API server a user reaches.
 struct Server {
   url: String,
   scope: EndpointScope,
-  cluster: String,
-  cluster_source: PathBuf,
+  cluster_id: ContextIdentity,
   ca: Option<Vec<u8>>,
 }
 
-/// One grant: every server a single user reaches.
 struct UserGrant {
-  user: String,
-  user_source: PathBuf,
+  user_id: ContextIdentity,
   token: Option<String>,
   cert: Option<Vec<u8>>,
   key: Option<Vec<u8>>,
   servers: Vec<Server>,
 }
 
-/// Grants keyed by user identity.
 struct UserGrants(Vec<UserGrant>);
 
 impl UserGrants {
@@ -425,14 +352,13 @@ impl UserGrants {
     let server = Server {
       url: derived.server,
       scope: derived.scope,
-      cluster: derived.cluster,
-      cluster_source: derived.cluster_source,
+      cluster_id: derived.cluster_id,
       ca: derived.ca,
     };
     if let Some(grant) = self
       .0
       .iter_mut()
-      .find(|grant| grant.user == derived.user && grant.user_source == derived.user_source)
+      .find(|grant| grant.user_id.name == derived.user_id.name && grant.user_id.source == derived.user_id.source)
     {
       if grant.servers.iter().all(|existing| existing.url != server.url) {
         grant.servers.push(server);
@@ -440,8 +366,7 @@ impl UserGrants {
       return;
     }
     self.0.push(UserGrant {
-      user: derived.user,
-      user_source: derived.user_source,
+      user_id: derived.user_id,
       token: derived.token,
       cert: derived.cert,
       key: derived.key,
@@ -449,79 +374,40 @@ impl UserGrants {
     });
   }
 
-  fn render(
-    self,
-    users: &[ContextIdentity],
-    clusters: &[ContextIdentity],
-    ca: &CertAuthority,
-    guests_dir: &Path,
-  ) -> Result<RenderedBatch, Error> {
-    let mut fragment = String::new();
-    let mut materialized = Vec::new();
-    let mut guests = BTreeMap::new();
+  fn render(self, ca: &CertAuthority, guests_dir: &Path) -> Result<RenderedBatch, Error> {
+    let mut batch = RenderedBatch::default();
     for grant in self.0 {
-      let rendered = grant.render(users, clusters, ca, guests_dir)?;
-      fragment.push_str(&rendered.fragment);
-      materialized.extend(rendered.materialized);
-      guests.insert(rendered.user, rendered.guest);
+      grant.append_to(&mut batch, ca, guests_dir)?;
     }
-    Ok(RenderedBatch {
-      fragment,
-      materialized,
-      guests,
-    })
+    Ok(batch)
   }
 }
 
 impl UserGrant {
-  fn render(
-    self,
-    users: &[ContextIdentity],
-    clusters: &[ContextIdentity],
-    ca: &CertAuthority,
-    guests_dir: &Path,
-  ) -> Result<Rendered, Error> {
-    let Some(user_id) = identity_for(users, &self.user_source, &self.user) else {
-      return Err(invalid_at(&self.user_source, format!("user `{}` has no identity", self.user)));
-    };
-    if self.servers.is_empty() {
-      return Err(invalid_at(&self.user_source, format!("user `{}` has no server", self.user)));
-    }
-    // Identity-only grants (cert auth, no bearer) still need a value to
-    // resolve; the certificate never reaches the wire as application data, so
-    // it can never match the swap.
+  fn append_to(self, batch: &mut RenderedBatch, ca: &CertAuthority, guests_dir: &Path) -> Result<(), Error> {
     let value = self
       .token
       .clone()
       .unwrap_or_else(|| String::from_utf8_lossy(self.cert.as_deref().unwrap_or_default()).into_owned());
-    // A client pair means mutual TLS both ways: the guest presents the minted
-    // pair, the proxy the real one upstream. Token-only users carry no client
-    // certificate, so asking for one fails their handshake with `certificate
-    // required` before any bearer swap can happen.
     let mode = if self.cert.is_some() {
       GuestTlsMode::Mtls
     } else {
       GuestTlsMode::Tls
     };
-    let (guest_cert_path, guest_key_path) = load_or_generate_client_pair(ca, guests_dir, &user_id.label)?;
-    let guest_cert = fs::read(&guest_cert_path).map_err(|source| Error::ReadFile {
-      path: guest_cert_path.clone(),
-      source,
-    })?;
-    let guest_key = fs::read(&guest_key_path).map_err(|source| Error::ReadFile {
-      path: guest_key_path.clone(),
-      source,
-    })?;
-    let mut materialized = Vec::new();
+    let (guest_cert_path, guest_key_path) = load_or_generate_client_pair(ca, guests_dir, &self.user_id.label)?;
+    let read = |path: PathBuf| fs::read(&path).map_err(|source| Error::ReadFile { path, source });
+    let guest_cert = read(guest_cert_path)?;
+    let guest_key = read(guest_key_path)?;
     let (client_cert, client_key) = match (self.cert, self.key) {
       (Some(cert), Some(key)) => {
-        let cert_name = format!("{}.client.crt", user_id.label);
-        let key_name = format!("{}.client.key", user_id.label);
-        let cert_path = PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}"));
-        let key_path = PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{key_name}"));
-        materialized.push((cert_name, cert));
-        materialized.push((key_name, key));
-        (Some(cert_path), Some(key_path))
+        let cert_name = format!("{}.client.crt", self.user_id.label);
+        let key_name = format!("{}.client.key", self.user_id.label);
+        batch.materialized.push((cert_name.clone(), cert));
+        batch.materialized.push((key_name.clone(), key));
+        (
+          Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}"))),
+          Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{key_name}"))),
+        )
       }
       _ => (None, None),
     };
@@ -530,12 +416,6 @@ impl UserGrant {
     let mut tls = BTreeMap::new();
     let mut written_ca = BTreeSet::new();
     for server in self.servers {
-      let Some(cluster_id) = identity_for(clusters, &server.cluster_source, &server.cluster) else {
-        return Err(invalid_at(
-          &server.cluster_source,
-          format!("cluster `{}` has no identity", server.cluster),
-        ));
-      };
       let mut entry = HostTlsCfg {
         client_cert: client_cert.clone(),
         client_key: client_key.clone(),
@@ -545,21 +425,21 @@ impl UserGrant {
         guest_key: None,
       };
       if let Some(bytes) = server.ca {
-        let ca_name = format!("{}.ca.crt", cluster_id.label);
+        let ca_name = format!("{}.ca.crt", server.cluster_id.label);
         entry.root_cert = Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{ca_name}")));
         if written_ca.insert(ca_name.clone()) {
-          materialized.push((ca_name, bytes));
+          batch.materialized.push((ca_name, bytes));
         }
       }
       allow.push(server.url.clone());
       scopes.push(server.scope);
       tls.insert(server.url, entry);
     }
-    let fragment = render_fragment(
-      &self.user_source,
-      &user_id.label,
+    batch.fragment.push_str(&render_fragment(
+      &self.user_id.source,
+      &self.user_id.label,
       &GrantFragment {
-        env: user_id.env(),
+        env: self.user_id.env(),
         registry: false,
         allow,
         value: Some(value),
@@ -569,73 +449,37 @@ impl UserGrant {
         tls,
         ssh: BTreeMap::new(),
       },
-    )?;
-    Ok(Rendered {
-      user: self.user,
-      fragment,
-      materialized,
-      guest: GuestUser {
-        token: self.token.map(|_| user_id.secret()),
+    )?);
+    let token = self.token.is_some().then(|| self.user_id.secret());
+    batch.guests.insert(
+      self.user_id.name,
+      GuestUser {
+        token,
         cert: STANDARD.encode(guest_cert),
         key: STANDARD.encode(guest_key),
       },
-    })
+    );
+    Ok(())
   }
 }
 
-/// Grant text plus the per-user guest identities.
+#[derive(Default)]
 struct RenderedBatch {
   fragment: String,
   materialized: Vec<(String, Vec<u8>)>,
   guests: BTreeMap<String, GuestUser>,
 }
 
-/// Grant text plus the identity the guest file writes for one user.
-struct Rendered {
-  user: String,
-  /// `[rules.{label}]` fragment.
-  fragment: String,
-  /// Blobs beside the fragment.
-  materialized: Vec<(String, Vec<u8>)>,
-  /// Decoy identity embedded in the guest kubeconfig.
-  guest: GuestUser,
-}
-
-/// Decoy bearer and guest pair for one user in the guest kubeconfig.
 struct GuestUser {
-  /// Decoy bearer. Absent when the user has no token.
   token: Option<String>,
-  /// Base64 guest certificate.
   cert: String,
-  /// Base64 guest key.
   key: String,
 }
 
-/// Map one kubeconfig onto grants. A file that is not a kubeconfig returns
-/// `None`. A `KUBECONFIG` list uses [`adapt_sources`].
-///
-/// # Errors
-///
-/// Returns an error when the document does not parse, the current context
-/// cannot be derived, the current context shares a client certificate with
-/// another user on one API server, or a credential field is malformed.
 pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Path) -> Result<Option<RewriteAdapted>, Error> {
   adapt_sources(&[(source, content)], ca, guests_dir)
 }
 
-/// Map kubeconfig files, merged in order, onto one fragment per derivable user.
-///
-/// A context, cluster, or user name that is already defined stays. A new name
-/// is added. `current-context` is the first non-empty value. The winning
-/// entry keeps the path of the file that defined it, so identities from two
-/// files stay distinct. A single file that is not a kubeconfig returns `None`.
-///
-/// # Errors
-///
-/// Returns an error when a document does not parse, a later file in a list is
-/// not a kubeconfig, the current context cannot be derived, the current
-/// context shares a client certificate with another user on one API server, or
-/// a credential field is malformed.
 pub(crate) fn adapt_sources(sources: &[(&Path, &[u8])], ca: &CertAuthority, guests_dir: &Path) -> Result<Option<RewriteAdapted>, Error> {
   let Some(merged) = MergedKube::load(sources)? else {
     return Ok(None);
@@ -643,24 +487,23 @@ pub(crate) fn adapt_sources(sources: &[(&Path, &[u8])], ca: &CertAuthority, gues
   let mut opened = Vec::new();
   for entry in &merged.doc.contexts {
     match entry.derive(&merged.doc) {
-      Ok(derived) => opened.push(derived),
+      Ok(item) => opened.push(item),
       Err(err) if entry.name == merged.doc.current_context => return Err(err),
       Err(err) => tracing::warn!(context = %entry.name, %err, "kube context skipped"),
     }
   }
-  let (opened, user_ids) = DerivedContexts(opened).resolve_shared_certs(&merged.doc.current_context)?;
-  let cluster_ids = identities(&opened.cluster_refs())?;
-  let rendered = opened.into_grants().render(&user_ids, &cluster_ids, ca, guests_dir)?;
+  let rendered = DerivedContexts::identify(opened)?
+    .resolve_shared_certs(&merged.doc.current_context)?
+    .into_grants()
+    .render(ca, guests_dir)?;
   Ok(Some(RewriteAdapted {
     fragment: rendered.fragment,
-    decoy: decoy_doc(&merged.guest, ca, &rendered.guests)?,
+    decoy: merged.guest_doc(ca, &rendered.guests)?,
     materialized: rendered.materialized,
     decoy_files: Vec::new(),
   }))
 }
 
-/// Merged kubeconfig: the typed document grants are derived from, and the raw
-/// document the guest file is rewritten from.
 struct MergedKube {
   doc: KubeDoc,
   guest: Value,
@@ -686,24 +529,92 @@ impl MergedKube {
         if sources.len() == 1 {
           return Ok(None);
         }
-        return Err(invalid_at(path, "not a kubeconfig".to_string()));
+        return Err(path.invalid("not a kubeconfig".to_string()));
       }
       merge.absorb(path, &doc, &raw);
     }
     merge.finish(first).map(Some)
   }
+
+  fn guest_doc(&self, ca: &CertAuthority, guests: &BTreeMap<String, GuestUser>) -> Result<String, Error> {
+    let mut root = self.guest.clone();
+    let guest_ca = Value::from(STANDARD.encode(ca.cert_pem()));
+    let field = |name: &str| Value::from(name);
+    for cluster in root.entries_mut("clusters") {
+      let Some(inner) = cluster.get_mut(field("cluster")).and_then(Value::as_mapping_mut) else {
+        continue;
+      };
+      let ca_data = field("certificate-authority-data");
+      if inner.contains_key(&ca_data) {
+        inner.insert(ca_data, guest_ca.clone());
+      }
+      inner.remove(field("certificate-authority"));
+    }
+    for user in root.entries_mut("users") {
+      let name = user.get(field("name")).and_then(Value::as_str).unwrap_or_default().to_string();
+      let Some(inner) = user.get_mut(field("user")).and_then(Value::as_mapping_mut) else {
+        continue;
+      };
+      let guest = guests.get(&name);
+      let placeholder = || fake_for(&format!("KUBE_{}", name.to_uppercase().replace(['-', '.'], "_")), None);
+      let token_key = field("token");
+      if inner.contains_key(&token_key) {
+        let token = guest.and_then(|guest| guest.token.clone()).unwrap_or_else(&placeholder);
+        inner.insert(token_key, Value::from(token));
+      }
+      let cert_data = field("client-certificate-data");
+      let key_data = field("client-key-data");
+      if inner.contains_key(&cert_data) || inner.contains_key(&key_data) {
+        let filler = placeholder();
+        let (cert, key) = guest.map_or_else(|| (filler.clone(), filler), |guest| (guest.cert.clone(), guest.key.clone()));
+        inner.insert(cert_data, Value::from(cert));
+        inner.insert(key_data, Value::from(key));
+      }
+      inner.remove(field("client-certificate"));
+      inner.remove(field("client-key"));
+      if let Some(config) = inner
+        .get_mut(field("auth-provider"))
+        .and_then(Value::as_mapping_mut)
+        .and_then(|provider| provider.get_mut(field("config")))
+      {
+        config.scrub_secret_strings(&placeholder());
+      }
+      let password = field("password");
+      if inner.contains_key(&password) {
+        inner.insert(password, Value::from(placeholder()));
+      }
+      inner.remove(field("exec"));
+    }
+    render_decoy(&root)
+  }
 }
 
-/// First-wins merge of kubeconfig files.
+trait Named {
+  fn name(&self) -> &str;
+  fn set_source(&mut self, path: &Path);
+}
+
+macro_rules! named {
+  ($($ty:ty),+ $(,)?) => {$(
+    impl Named for $ty {
+      fn name(&self) -> &str {
+        &self.name
+      }
+      fn set_source(&mut self, path: &Path) {
+        self.source = path.to_path_buf();
+      }
+    }
+  )+};
+}
+
+named!(KubeContextEntry, KubeClusterEntry, KubeUserEntry);
+
 #[derive(Default)]
 struct Merge {
   current: String,
   contexts: Vec<KubeContextEntry>,
   clusters: Vec<KubeClusterEntry>,
   users: Vec<KubeUserEntry>,
-  seen_contexts: BTreeSet<String>,
-  seen_clusters: BTreeSet<String>,
-  seen_users: BTreeSet<String>,
   guest_contexts: Vec<Value>,
   guest_clusters: Vec<Value>,
   guest_users: Vec<Value>,
@@ -718,52 +629,52 @@ impl Merge {
     if self.current.is_empty() {
       self.current.clone_from(&doc.current_context);
     }
-    for (entry, raw_entry) in doc.contexts.iter().zip(sequence(raw, "contexts")) {
-      if !self.seen_contexts.insert(entry.name.clone()) {
+    Self::absorb_list(
+      &mut self.contexts,
+      &mut self.guest_contexts,
+      &doc.contexts,
+      raw.sequence("contexts"),
+      path,
+    );
+    Self::absorb_list(
+      &mut self.clusters,
+      &mut self.guest_clusters,
+      &doc.clusters,
+      raw.sequence("clusters"),
+      path,
+    );
+    Self::absorb_list(&mut self.users, &mut self.guest_users, &doc.users, raw.sequence("users"), path);
+  }
+
+  fn absorb_list<T: Named + Clone>(typed: &mut Vec<T>, raw_out: &mut Vec<Value>, entries: &[T], raw_entries: &[Value], path: &Path) {
+    for (entry, raw_entry) in entries.iter().zip(raw_entries) {
+      if typed.iter().any(|existing| existing.name() == entry.name()) {
         continue;
       }
-      let mut entry = entry.clone();
-      entry.source = path.to_path_buf();
-      self.contexts.push(entry);
-      self.guest_contexts.push(raw_entry.clone());
-    }
-    for (entry, raw_entry) in doc.clusters.iter().zip(sequence(raw, "clusters")) {
-      if !self.seen_clusters.insert(entry.name.clone()) {
-        continue;
-      }
-      let mut entry = entry.clone();
-      entry.source = path.to_path_buf();
-      self.clusters.push(entry);
-      self.guest_clusters.push(raw_entry.clone());
-    }
-    for (entry, raw_entry) in doc.users.iter().zip(sequence(raw, "users")) {
-      if !self.seen_users.insert(entry.name.clone()) {
-        continue;
-      }
-      let mut entry = entry.clone();
-      entry.source = path.to_path_buf();
-      self.users.push(entry);
-      self.guest_users.push(raw_entry.clone());
+      let mut owned = entry.clone();
+      owned.set_source(path);
+      typed.push(owned);
+      raw_out.push(raw_entry.clone());
     }
   }
 
   fn finish(self, first: &Path) -> Result<MergedKube, Error> {
     if self.current.is_empty() {
-      return Err(invalid_at(first, "missing `current-context`".to_string()));
+      return Err(first.invalid("missing `current-context`".to_string()));
     }
     if !self.contexts.iter().any(|entry| entry.name == self.current) {
-      return Err(invalid_at(first, format!("unknown context `{}`", self.current)));
+      return Err(first.invalid(format!("unknown context `{}`", self.current)));
     }
     let Some(mut guest) = self.root else {
-      return Err(invalid_at(first, "kubeconfig is not a mapping".to_string()));
+      return Err(first.invalid("kubeconfig is not a mapping".to_string()));
     };
     let Some(map) = guest.as_mapping_mut() else {
-      return Err(invalid_at(first, "kubeconfig is not a mapping".to_string()));
+      return Err(first.invalid("kubeconfig is not a mapping".to_string()));
     };
-    map.insert(Value::String("current-context".to_string()), Value::String(self.current.clone()));
-    map.insert(Value::String("contexts".to_string()), Value::Sequence(self.guest_contexts));
-    map.insert(Value::String("clusters".to_string()), Value::Sequence(self.guest_clusters));
-    map.insert(Value::String("users".to_string()), Value::Sequence(self.guest_users));
+    map.insert(Value::from("current-context"), Value::from(self.current.clone()));
+    map.insert(Value::from("contexts"), Value::Sequence(self.guest_contexts));
+    map.insert(Value::from("clusters"), Value::Sequence(self.guest_clusters));
+    map.insert(Value::from("users"), Value::Sequence(self.guest_users));
     Ok(MergedKube {
       doc: KubeDoc {
         kind: "Config".to_string(),
@@ -777,113 +688,47 @@ impl Merge {
   }
 }
 
-fn sequence<'a>(raw: &'a Value, key: &str) -> &'a [Value] {
-  raw
-    .as_mapping()
-    .and_then(|map| map.get(Value::String(key.to_string())))
-    .and_then(Value::as_sequence)
-    .map_or(&[], Vec::as_slice)
+trait KubeValue {
+  fn sequence(&self, key: &str) -> &[Value];
+  fn entries_mut(&mut self, key: &str) -> Vec<&mut Mapping>;
+  fn scrub_secret_strings(&mut self, filler: &str);
 }
 
-/// The agent's decoy kubeconfig: the parsed document verbatim, with trust
-/// and identity swapped in every entry. Arkham's CA replaces every inline
-/// cluster CA. Each granted user's own guest pair and decoy token replace
-/// that user's credentials, because only decoys may cross into the agent. A
-/// user with no grant gets placeholders, never another user's pair. Every
-/// string in `auth-provider.config` becomes a placeholder. `exec` blocks and
-/// file-reference credentials are dropped from every user. Every other field,
-/// spec'd or not, round-trips unchanged.
-fn decoy_doc(root: &Value, ca: &CertAuthority, guests: &BTreeMap<String, GuestUser>) -> Result<String, Error> {
-  let mut root = root.clone();
-  let guest_ca = Value::String(STANDARD.encode(ca.cert_pem()));
-  for cluster in entries_mut(&mut root, "clusters") {
-    let Some(inner) = cluster
-      .get_mut(Value::String("cluster".to_string()))
-      .and_then(Value::as_mapping_mut)
-    else {
-      continue;
-    };
-    let ca_data = Value::String("certificate-authority-data".to_string());
-    if inner.contains_key(&ca_data) {
-      inner.insert(ca_data, guest_ca.clone());
-    }
-    inner.remove(Value::String("certificate-authority".to_string()));
+impl KubeValue for Value {
+  fn sequence(&self, key: &str) -> &[Value] {
+    self
+      .as_mapping()
+      .and_then(|map| map.get(Value::from(key)))
+      .and_then(Value::as_sequence)
+      .map_or(&[], Vec::as_slice)
   }
-  for user in entries_mut(&mut root, "users") {
-    let name = user
-      .get(Value::String("name".to_string()))
-      .and_then(Value::as_str)
-      .unwrap_or_default()
-      .to_string();
-    let Some(inner) = user.get_mut(Value::String("user".to_string())).and_then(Value::as_mapping_mut) else {
-      continue;
-    };
-    let guest = guests.get(&name);
-    let placeholder = || fake_for(&format!("KUBE_{}", name.to_uppercase().replace(['-', '.'], "_")), None);
-    let token_key = Value::String("token".to_string());
-    if inner.contains_key(&token_key) {
-      let decoy = guest.and_then(|guest| guest.token.clone()).unwrap_or_else(&placeholder);
-      inner.insert(token_key, Value::String(decoy));
-    }
-    let cert_data = Value::String("client-certificate-data".to_string());
-    let key_data = Value::String("client-key-data".to_string());
-    if inner.contains_key(&cert_data) || inner.contains_key(&key_data) {
-      let (cert, key) = guest.map_or_else(
-        || {
-          let filler = placeholder();
-          (filler.clone(), filler)
-        },
-        |guest| (guest.cert.clone(), guest.key.clone()),
-      );
-      inner.insert(cert_data, Value::String(cert));
-      inner.insert(key_data, Value::String(key));
-    }
-    inner.remove(Value::String("client-certificate".to_string()));
-    inner.remove(Value::String("client-key".to_string()));
-    if let Some(config) = inner
-      .get_mut(Value::String("auth-provider".to_string()))
-      .and_then(Value::as_mapping_mut)
-      .and_then(|provider| provider.get_mut(Value::String("config".to_string())))
-    {
-      let filler = placeholder();
-      scrub_secret_strings(config, &filler);
-    }
-    if inner.contains_key(Value::String("password".to_string())) {
-      inner.insert(Value::String("password".to_string()), Value::String(placeholder()));
-    }
-    inner.remove(Value::String("exec".to_string()));
-  }
-  render_decoy(&root)
-}
 
-fn scrub_secret_strings(value: &mut Value, filler: &str) {
-  match value {
-    Value::Null | Value::Bool(_) | Value::Number(_) => {}
-    Value::String(text) => *text = filler.to_string(),
-    Value::Sequence(items) => {
-      for item in items {
-        scrub_secret_strings(item, filler);
+  fn entries_mut(&mut self, key: &str) -> Vec<&mut Mapping> {
+    self
+      .as_mapping_mut()
+      .and_then(|map| map.get_mut(Value::from(key)))
+      .and_then(Value::as_sequence_mut)
+      .map_or_else(Vec::new, |seq| seq.iter_mut().filter_map(Value::as_mapping_mut).collect())
+  }
+
+  fn scrub_secret_strings(&mut self, filler: &str) {
+    match self {
+      Self::Null | Self::Bool(_) | Self::Number(_) => {}
+      Self::String(text) => *text = filler.to_string(),
+      Self::Sequence(items) => {
+        for item in items {
+          item.scrub_secret_strings(filler);
+        }
       }
-    }
-    Value::Mapping(map) => {
-      for child in map.values_mut() {
-        scrub_secret_strings(child, filler);
+      Self::Mapping(map) => {
+        for child in map.values_mut() {
+          child.scrub_secret_strings(filler);
+        }
       }
+      Self::Tagged(tagged) => tagged.value.scrub_secret_strings(filler),
     }
-    Value::Tagged(tagged) => scrub_secret_strings(&mut tagged.value, filler),
   }
 }
-
-/// The `key` list of `root` as mutable mappings; entries that are not
-/// mappings contribute nothing.
-fn entries_mut<'a>(root: &'a mut Value, key: &str) -> Vec<&'a mut Mapping> {
-  root
-    .as_mapping_mut()
-    .and_then(|map| map.get_mut(Value::String(key.to_string())))
-    .and_then(Value::as_sequence_mut)
-    .map_or_else(Vec::new, |seq| seq.iter_mut().filter_map(Value::as_mapping_mut).collect())
-}
-
 #[cfg(test)]
 mod tests {
   use arkham_config::config::RuleCfg;
@@ -892,6 +737,7 @@ mod tests {
 
   use super::*;
   use crate::adapt::write_state;
+  use crate::test_support::WarnCapture;
 
   fn kube_identity(protocol: AmbientProtocol, name: &str) -> ContextIdentity {
     identities(&[ContextRef {
@@ -1559,7 +1405,8 @@ users:
 - name: oidc
   user: {auth-provider: {name: oidc, config: {access-token: oidc-access-token, id-token: oidc-id-token, refresh-token: oidc-refresh-token, client-secret: oidc-client-secret}}}
 ";
-    let adapted = adapt_doc(doc);
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let adapted = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || adapt_doc(doc));
     for secret in [
       "alice-token",
       "oidc-access-token",
@@ -1569,6 +1416,16 @@ users:
     ] {
       assert!(!adapted.decoy.contains(secret), "{secret} survives: {}", adapted.decoy);
     }
+    for secret in ["oidc-access-token", "oidc-id-token", "oidc-refresh-token", "oidc-client-secret"] {
+      assert!(
+        !adapted.fragment.contains(secret),
+        "{secret} is a grant value: {}",
+        adapted.fragment
+      );
+    }
+    let rules = rules_from(&adapted.fragment);
+    assert_eq!(rules.len(), 1, "an auth-provider-only user is not a grant: {}", adapted.fragment);
+    assert!(!adapted.fragment.contains("https://10.2.0.1:6443"), "{}", adapted.fragment);
     let oidc = kube_identity(AmbientProtocol::KubernetesUser, "oidc");
     assert!(
       !adapted.decoy.contains(&oidc.secret()),
@@ -1577,6 +1434,49 @@ users:
     );
     assert!(adapted.decoy.contains("name: staging"), "{}", adapted.decoy);
     assert!(adapted.decoy.contains("name: oidc"), "{}", adapted.decoy);
+    let logged = lines.lock().unwrap().join("\n");
+    assert!(logged.contains("staging"), "{logged}");
+    assert!(logged.contains("auth-provider"), "{logged}");
+  }
+
+  #[test]
+  fn current_auth_provider_fails_the_file() {
+    let doc = BEARER_DOC.replace(
+      "user: {token: k3s-token, client-certificate-data: Q0VSVA==, client-key-data: S0VZ}",
+      "user: {auth-provider: {name: oidc, config: {access-token: oidc-access-token}}}",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("current auth-provider fails the file");
+    let text = err.to_string();
+    assert!(text.contains("uses an auth-provider"), "{text}");
+    assert!(!text.contains("oidc-access-token"), "{text}");
+  }
+
+  #[test]
+  fn token_beside_auth_provider_keeps_the_token_grant() {
+    let doc = "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {cluster: prod, user: alice}
+clusters:
+- name: prod
+  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}
+users:
+- name: alice
+  user: {token: alice-token, auth-provider: {name: oidc, config: {access-token: oidc-access-token, client-secret: oidc-client-secret}}}
+";
+    let adapted = adapt_doc(doc);
+    let rules = rules_from(&adapted.fragment);
+    assert_eq!(rules.len(), 1, "{}", adapted.fragment);
+    assert!(adapted.fragment.contains("https://10.0.0.1:6443"), "{}", adapted.fragment);
+    assert!(!adapted.fragment.contains("oidc-access-token"), "{}", adapted.fragment);
+    assert!(!adapted.fragment.contains("oidc-client-secret"), "{}", adapted.fragment);
+    assert!(!adapted.decoy.contains("alice-token"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("oidc-access-token"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("oidc-client-secret"), "{}", adapted.decoy);
+    assert!(adapted.decoy.contains("token: "), "{}", adapted.decoy);
   }
 
   #[test]
@@ -1619,41 +1519,6 @@ users:
     fs::write(&stale, "stale").unwrap();
     write_state(&grants, &[]).unwrap();
     assert!(!stale.exists(), "removed rewrites stop granting");
-  }
-
-  struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-  impl tracing::Subscriber for WarnCapture {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-      *metadata.level() <= tracing::Level::WARN
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-      tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-      let mut message = String::new();
-      event.record(&mut WarnVisit(&mut message));
-      self.0.lock().unwrap().push(message);
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-  }
-
-  struct WarnVisit<'a>(&'a mut String);
-
-  impl tracing::field::Visit for WarnVisit<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-      use std::fmt::Write as _;
-      let _ = write!(self.0, "{}={value:?};", field.name());
-    }
   }
 }
 
