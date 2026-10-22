@@ -503,26 +503,15 @@ run_guest() {
   }
 
   echo "--- ${backend}: kubectl in the guest"
-  guest sh -s <<'GUEST'
-set -eu
-if command -v kubectl >/dev/null 2>&1; then
-  exit 0
-fi
-arch=$(uname -m)
-case "$arch" in
-  x86_64) karch=amd64 ;;
-  aarch64) karch=arm64 ;;
-  *) echo "no kubectl for $arch" >&2; exit 1 ;;
-esac
-if ! command -v curl >/dev/null 2>&1; then
-  echo "curl is required to fetch kubectl" >&2
-  exit 1
-fi
-mkdir -p /tmp/arkham-bin
-ver=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
-curl -fsSL -o /tmp/arkham-bin/kubectl "https://dl.k8s.io/release/${ver}/bin/linux/${karch}/kubectl"
-chmod +x /tmp/arkham-bin/kubectl
-GUEST
+  # A download from the guest is captured by the proxy and reset. Copy the
+  # host binary when the image does not already have kubectl.
+  if ! guest sh -c 'command -v kubectl >/dev/null 2>&1'; then
+    host_kubectl=$(command -v kubectl)
+    host_kubectl=$(readlink -f "$host_kubectl")
+    guest mkdir -p /tmp/arkham-bin
+    docker compose -f "$compose" cp "$host_kubectl" agent:/tmp/arkham-bin/kubectl
+    docker compose -f "$compose" exec -T -u 0 agent chmod 755 /tmp/arkham-bin/kubectl
+  fi
 
   local try=0
   echo "--- ${backend}: --context get ns"
@@ -551,7 +540,7 @@ GUEST
   local guest_host=""
   shopt -s nullglob
   local candidate
-  for candidate in "$statedir"/arkham/ws/*/files/*; do
+  for candidate in "$statedir"/arkham/ws/*/files/* "$statedir"/arkham/ws/*/files/*/*; do
     if [ -f "$candidate" ] && grep -q 'kind: Config' "$candidate"; then
       guest_host=$candidate
     fi

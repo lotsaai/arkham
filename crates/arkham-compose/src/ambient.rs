@@ -286,7 +286,7 @@ impl AmbientDeriver<'_> {
     Ok(())
   }
 
-  /// `KUBECONFIG` files merged in order, mounted writable at `{home}/.kube/config`.
+  /// `KUBECONFIG` files merged in order, mounted writable as `{home}/.kube`.
   ///
   /// # Errors
   ///
@@ -329,8 +329,8 @@ impl AmbientDeriver<'_> {
         return Ok(());
       }
     };
-    let dest = format!("{}/.kube/config", self.home);
-    self.collector.twin_mode(adapted, "kube-config", &dest, false)
+    let dest = format!("{}/.kube", self.home);
+    self.collector.twin_in_dir(adapted, "kube-config", "config", &dest)
   }
 
   /// The guest CA for the kubeconfig and talosconfig adapters, loaded on
@@ -754,10 +754,10 @@ mod moved_suite {
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
       .expect("kubeconfig twin");
     assert!(!mount.ro, "kubeconfig decoy is writable");
-    let body = fs::read_to_string(&mount.host).unwrap();
+    let body = fs::read_to_string(mount.host.join("config")).unwrap();
     assert!(!body.contains("carol-token"), "{body}");
   }
 
@@ -799,10 +799,10 @@ mod moved_suite {
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
       .expect("merged kubeconfig twin");
     assert!(!mount.ro, "kubeconfig decoy is writable");
-    let body = fs::read_to_string(&mount.host).unwrap();
+    let body = fs::read_to_string(mount.host.join("config")).unwrap();
     assert!(body.contains("current-context: prod"), "{body}");
     assert!(body.contains("name: prod") && body.contains("name: staging"), "{body}");
     assert_eq!(body.matches("name: prod").count(), 2, "later prod is not a second context: {body}");
