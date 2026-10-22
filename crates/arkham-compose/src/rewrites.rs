@@ -255,20 +255,12 @@ impl RewriteCollector {
   }
 
   fn clear_children(dir: &Path) -> Result<(), Error> {
-    let entries = fs::read_dir(dir).map_err(|source| Error::ReadFile {
-      path: dir.to_path_buf(),
-      source,
-    })?;
+    let read_err = |path: PathBuf, source| Error::ReadFile { path, source };
+    let entries = fs::read_dir(dir).map_err(|source| read_err(dir.to_path_buf(), source))?;
     for entry in entries {
-      let entry = entry.map_err(|source| Error::ReadFile {
-        path: dir.to_path_buf(),
-        source,
-      })?;
+      let entry = entry.map_err(|source| read_err(dir.to_path_buf(), source))?;
       let path = entry.path();
-      let kind = entry.file_type().map_err(|source| Error::ReadFile {
-        path: path.clone(),
-        source,
-      })?;
+      let kind = entry.file_type().map_err(|source| read_err(path.clone(), source))?;
       let removed = if kind.is_dir() {
         fs::remove_dir_all(&path)
       } else {

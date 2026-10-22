@@ -299,10 +299,7 @@ impl AmbientDeriver<'_> {
       }
       match fs::read(&path) {
         Ok(content) => loaded.push((path, content)),
-        Err(err) => {
-          tracing::warn!(source = %path.display(), %err, "kubeconfig source skipped");
-          return Ok(());
-        }
+        Err(err) => tracing::warn!(source = %path.display(), %err, "kubeconfig source skipped"),
       }
     }
     let Some((first, _)) = loaded.first() else {
