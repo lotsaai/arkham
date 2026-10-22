@@ -62,8 +62,9 @@ pub(crate) struct DeriveInputs<'a> {
 /// written.
 ///
 /// ponytail: no opt-out exists yet; none has been asked for.
-/// `KUBECONFIG`/`TALOSCONFIG` honor a single path — a list warns and falls
-/// back to the default.
+/// `KUBECONFIG` is a `:`-separated list merged in order. An empty value means
+/// the default path. `TALOSCONFIG` honors a single path: a list warns and
+/// falls back to the default.
 pub(crate) fn derive_sources(inputs: &DeriveInputs<'_>) -> Result<RewriteOutputs, Error> {
   let DeriveInputs {
     files_dir,
@@ -240,65 +241,96 @@ impl AmbientDeriver<'_> {
     }
   }
 
-  /// The kubeconfig and talosconfig at their default paths, honoring a
-  /// single-path `KUBECONFIG`/`TALOSCONFIG` override.
+  /// The kubeconfig and talosconfig at their default paths. `KUBECONFIG` is a
+  /// `:`-separated list. `TALOSCONFIG` is one path.
   ///
   /// # Errors
   ///
   /// Returns an error when a twin output cannot be written.
   fn kube_and_talos(&mut self) -> Result<(), Error> {
-    for (name, env_name, default, twin_name, twin_dest) in [
-      ("kubeconfig", "KUBECONFIG", ".kube/config", "kube-config", ".kube/config"),
-      ("talosconfig", "TALOSCONFIG", ".talos/config", "talos-config", ".talos/config"),
-    ] {
-      let path = env_source(env_name, default, self.host_home);
+    self.kube()?;
+    let path = env_source("TALOSCONFIG", ".talos/config", self.host_home);
+    if self.declared.contains(&path) || !path.is_file() {
+      return Ok(());
+    }
+    let content = match fs::read(&path) {
+      Ok(content) => content,
+      Err(err) => {
+        tracing::warn!(source = %path.display(), %err, "talosconfig source skipped: it cannot be read");
+        return Ok(());
+      }
+    };
+    let guests_dir = self.guests_dir;
+    let ca = match self.ca() {
+      Ok(ca) => ca,
+      Err(err) => {
+        tracing::warn!(source = %path.display(), %err, "talosconfig source skipped: the guest CA is unavailable");
+        return Ok(());
+      }
+    };
+    let adapted = match talos::adapt(&path, &content, ca, guests_dir) {
+      Ok(found) => {
+        tracing::debug!(source = %path.display(), skipped = found.skipped.len(), "talos contexts left out of the grant set");
+        found.grants
+      }
+      Err(err) => {
+        tracing::warn!(source = %path.display(), %err, "talosconfig source skipped");
+        return Ok(());
+      }
+    };
+    if adapted.is_empty() {
+      tracing::warn!(source = %path.display(), "talosconfig source skipped: it does not map onto a grant");
+      return Ok(());
+    }
+    let dest = format!("{}/.talos/config", self.home);
+    self.collector.twin_mode(adapted, "talos-config", &dest, false)
+  }
+
+  /// `KUBECONFIG` files merged in order, mounted writable at `{home}/.kube/config`.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the twin output cannot be written.
+  fn kube(&mut self) -> Result<(), Error> {
+    let mut loaded = Vec::new();
+    for path in kube_paths(self.host_home) {
       if self.declared.contains(&path) || !path.is_file() {
         continue;
       }
-      let Ok(content) = fs::read(&path) else {
-        tracing::warn!(source = %path.display(), "{name} source skipped: it cannot be read");
-        continue;
-      };
-      let guests_dir = self.guests_dir;
-      let ca = match self.ca() {
-        Ok(ca) => ca,
+      match fs::read(&path) {
+        Ok(content) => loaded.push((path, content)),
         Err(err) => {
-          tracing::warn!(source = %path.display(), %err, "{name} source skipped: the guest CA is unavailable");
-          continue;
+          tracing::warn!(source = %path.display(), %err, "kubeconfig source skipped");
+          return Ok(());
         }
-      };
-      let (adapted, writable) = match name {
-        "kubeconfig" => (
-          kube::adapt(&path, &content, ca, guests_dir)
-            .ok()
-            .flatten()
-            .map(|adapted| vec![adapted])
-            .unwrap_or_default(),
-          false,
-        ),
-        _ => match talos::adapt(&path, &content, ca, guests_dir) {
-          Ok(found) => {
-            tracing::debug!(source = %path.display(), skipped = found.skipped.len(), "talos contexts left out of the grant set");
-            (found.grants, true)
-          }
-          Err(err) => {
-            tracing::warn!(source = %path.display(), %err, "talosconfig source skipped");
-            continue;
-          }
-        },
-      };
-      if adapted.is_empty() {
-        tracing::warn!(source = %path.display(), "{name} source skipped: it does not map onto a grant");
-        continue;
-      }
-      let dest = format!("{}/{twin_dest}", self.home);
-      if writable {
-        self.collector.twin_mode(adapted, twin_name, &dest, false)?;
-      } else {
-        self.collector.twin(adapted, twin_name, &dest)?;
       }
     }
-    Ok(())
+    let Some((first, _)) = loaded.first() else {
+      return Ok(());
+    };
+    let first = first.clone();
+    let guests_dir = self.guests_dir;
+    let ca = match self.ca() {
+      Ok(ca) => ca,
+      Err(err) => {
+        tracing::warn!(source = %first.display(), %err, "kubeconfig source skipped: the guest CA is unavailable");
+        return Ok(());
+      }
+    };
+    let view: Vec<(&Path, &[u8])> = loaded.iter().map(|(path, content)| (path.as_path(), content.as_slice())).collect();
+    let adapted = match kube::adapt_sources(&view, ca, guests_dir) {
+      Ok(Some(adapted)) => vec![adapted],
+      Ok(None) => {
+        tracing::warn!(source = %first.display(), "kubeconfig source skipped: it does not map onto a grant");
+        return Ok(());
+      }
+      Err(err) => {
+        tracing::warn!(source = %first.display(), %err, "kubeconfig source skipped");
+        return Ok(());
+      }
+    };
+    let dest = format!("{}/.kube/config", self.home);
+    self.collector.twin_mode(adapted, "kube-config", &dest, false)
   }
 
   /// The guest CA for the kubeconfig and talosconfig adapters, loaded on
@@ -326,8 +358,22 @@ impl AmbientDeriver<'_> {
   }
 }
 
-/// The source path one `KUBECONFIG`-style override names, or the default
-/// under the host home.
+/// Paths named by `KUBECONFIG`, split on `:`. An empty value, an empty list,
+/// or an unset variable is `~/.kube/config`.
+fn kube_paths(host_home: &Path) -> Vec<PathBuf> {
+  let default = host_home.join(".kube").join("config");
+  match env::var("KUBECONFIG") {
+    Ok(value) if !value.trim().is_empty() => {
+      let paths: Vec<PathBuf> = value.split(':').filter(|part| !part.is_empty()).map(PathBuf::from).collect();
+      if paths.is_empty() { vec![default] } else { paths }
+    }
+    _ => vec![default],
+  }
+}
+
+/// The source path one `TALOSCONFIG`-style override names, or the default
+/// under the host home. A colon-separated list keeps the default: talosctl
+/// does not split the variable.
 fn env_source(env_name: &str, default: &str, host_home: &Path) -> PathBuf {
   match env::var(env_name) {
     Ok(value) if value.trim().is_empty() => host_home.join(default),
@@ -679,6 +725,186 @@ mod moved_suite {
       !containers.contains(&"/home/eng/.kube/config".to_string()),
       "the broken kubeconfig derives nothing: {containers:?}"
     );
+  }
+
+  /// The kubeconfig twin is writable, so `kubectl config use-context` can rewrite it.
+  #[test]
+  fn kubeconfig_mounts_writable() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    fs::create_dir_all(host.path().join(".kube")).unwrap();
+    fs::write(
+      host.path().join(".kube").join("config"),
+      "apiVersion: v1\nkind: Config\ncurrent-context: dev\ncontexts:\n- name: dev\n  context: {cluster: dev, user: carol}\nclusters:\n- name: dev\n  cluster: {server: https://10.9.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: carol\n  user: {token: carol-token}\n",
+    )
+    .unwrap();
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
+      .expect("kubeconfig twin");
+    assert!(!mount.ro, "kubeconfig decoy is writable");
+    let body = fs::read_to_string(&mount.host).unwrap();
+    assert!(!body.contains("carol-token"), "{body}");
+  }
+
+  /// `KUBECONFIG=a:b` merges in order. A later file adds names and does not replace earlier ones.
+  #[test]
+  fn kubeconfig_list_merges_files_in_order() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let first = host.path().join("first.yaml");
+    let second = host.path().join("second.yaml");
+    fs::write(
+      &first,
+      "apiVersion: v1\nkind: Config\ncurrent-context: prod\ncontexts:\n- name: prod\n  context: {cluster: prod, user: alice}\nclusters:\n- name: prod\n  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: alice\n  user: {token: alice-token}\n",
+    )
+    .unwrap();
+    fs::write(
+      &second,
+      "apiVersion: v1\nkind: Config\ncurrent-context: staging\ncontexts:\n- name: prod\n  context: {cluster: evil, user: mallory}\n- name: staging\n  context: {cluster: staging, user: bob}\nclusters:\n- name: evil\n  cluster: {server: https://10.9.0.9:6443, certificate-authority-data: Q0E=}\n- name: staging\n  cluster: {server: https://10.2.0.1:6443, certificate-authority-data: Q1RFU1Q=}\nusers:\n- name: mallory\n  user: {token: mallory-token}\n- name: bob\n  user: {token: bob-token}\n",
+    )
+    .unwrap();
+    set_env("KUBECONFIG", format!("{}:{}", first.display(), second.display()));
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
+      .expect("merged kubeconfig twin");
+    assert!(!mount.ro, "kubeconfig decoy is writable");
+    let body = fs::read_to_string(&mount.host).unwrap();
+    assert!(body.contains("current-context: prod"), "{body}");
+    assert!(body.contains("name: prod") && body.contains("name: staging"), "{body}");
+    assert_eq!(body.matches("name: prod").count(), 2, "later prod is not a second context: {body}");
+    assert!(
+      body.contains("cluster: prod") && body.contains("user: alice"),
+      "the first prod stays: {body}"
+    );
+    assert!(
+      body.contains("name: evil") && body.contains("name: mallory"),
+      "a new cluster or user name is added: {body}"
+    );
+    assert!(
+      !body.contains("mallory-token") && !body.contains("alice-token") && !body.contains("bob-token"),
+      "{body}"
+    );
+    let fragment: String = outputs.grants.iter().map(|grant| grant.fragment.as_str()).collect();
+    assert!(fragment.contains("https://10.0.0.1:6443"), "{fragment}");
+    assert!(fragment.contains("https://10.2.0.1:6443"), "{fragment}");
+    assert!(
+      !fragment.contains("https://10.9.0.9:6443"),
+      "a context that lost the name grants nothing: {fragment}"
+    );
+  }
+
+  /// An ambiguous current context is warned with the typed error and skipped.
+  #[test]
+  fn ambiguous_current_kubeconfig_warns_and_skips() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let source = host.path().join("kube.yaml");
+    fs::write(
+      &source,
+      "apiVersion: v1\nkind: Config\ncurrent-context: prod\ncontexts:\n- name: prod\n  context: {cluster: shared, user: alice}\n- name: staging\n  context: {cluster: shared, user: bob}\nclusters:\n- name: shared\n  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: alice\n  user: {client-certificate-data: Q0VSVA==, client-key-data: S0VZ}\n- name: bob\n  user: {client-certificate-data: Qk9C, client-key-data: S0VZ}\n",
+    )
+    .unwrap();
+    set_env("KUBECONFIG", &source);
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outputs = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || {
+      derive_sources(&DeriveInputs {
+        files_dir: &work.path().join("files"),
+        root: work.path(),
+        registry: &Registry::load(None).unwrap(),
+        decoys: &[],
+        expander: &build_expander(HashMap::new()),
+        home: "/home/eng",
+        host_home: Some(host.path()),
+        guests_dir: &work.path().join("guests"),
+        rewrites: &[],
+      })
+      .unwrap()
+    });
+    assert!(
+      !outputs.mounts.iter().any(|mount| mount.container.ends_with(".kube/config")),
+      "ambiguous current context derives nothing"
+    );
+    let logged = lines.lock().unwrap().join("\n");
+    assert!(logged.contains("indistinguishable"), "{logged}");
+    assert!(logged.contains("alice") && logged.contains("bob"), "{logged}");
+  }
+
+  struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+  impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+      *metadata.level() <= tracing::Level::WARN
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+      tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+      let mut message = String::new();
+      event.record(&mut WarnVisit(&mut message));
+      self.0.lock().unwrap().push(message);
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+  }
+
+  struct WarnVisit<'a>(&'a mut String);
+
+  impl tracing::field::Visit for WarnVisit<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+      use std::fmt::Write as _;
+      let _ = write!(self.0, "{}={value:?};", field.name());
+    }
   }
 
   /// An empty `TALOSCONFIG` is unset: the default path under the host home.

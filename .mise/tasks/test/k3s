@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-#MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer + cert auth)"
+#MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer + cert auth, two token contexts)"
 #MISE depends=["build:debug"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
@@ -356,3 +356,86 @@ run_leg cert "$scratch/cert-kubeconfig" 18099
 run_leg bearer "$scratch/token-kubeconfig" 18100
 
 echo "k3s substitution proven: bearer + cert auth"
+
+# Two token users of one API server. The proxy selects the real token from
+# the bearer decoy, and the copied decoy is a normal file so use-context can
+# rewrite it. Cert users of one server stay the fail-closed compose case.
+run_multi() {
+  local source=$scratch/multi-kubeconfig
+  KUBECONFIG="$scratch/cert-kubeconfig" kubectl create serviceaccount arkham-alpha >/dev/null
+  KUBECONFIG="$scratch/cert-kubeconfig" kubectl create clusterrolebinding arkham-alpha --clusterrole=cluster-admin --serviceaccount=default:arkham-alpha >/dev/null
+  KUBECONFIG="$scratch/cert-kubeconfig" kubectl create serviceaccount arkham-beta >/dev/null
+  KUBECONFIG="$scratch/cert-kubeconfig" kubectl create clusterrolebinding arkham-beta --clusterrole=cluster-admin --serviceaccount=default:arkham-beta >/dev/null
+  local token_alpha token_beta
+  token_alpha=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl create token arkham-alpha --duration=3600s)
+  token_beta=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl create token arkham-beta --duration=3600s)
+
+  cp "$scratch/token-kubeconfig" "$source"
+  local cluster context orig_user
+  context=$(KUBECONFIG="$source" kubectl config current-context)
+  cluster=$(KUBECONFIG="$source" kubectl config view --minify -o 'jsonpath={.contexts[0].context.cluster}')
+  orig_user=$(KUBECONFIG="$source" kubectl config view --minify -o 'jsonpath={.contexts[0].context.user}')
+  KUBECONFIG="$source" kubectl config set-credentials alpha --token="$token_alpha" >/dev/null
+  KUBECONFIG="$source" kubectl config set-credentials beta --token="$token_beta" >/dev/null
+  KUBECONFIG="$source" kubectl config set-context alpha --cluster="$cluster" --user=alpha >/dev/null
+  KUBECONFIG="$source" kubectl config set-context beta --cluster="$cluster" --user=beta >/dev/null
+  KUBECONFIG="$source" kubectl config use-context alpha >/dev/null
+  KUBECONFIG="$source" kubectl config delete-context "$context" >/dev/null
+  KUBECONFIG="$source" kubectl config delete-user "$orig_user" >/dev/null
+
+  echo "--- multi: real --context and use-context"
+  KUBECONFIG="$source" kubectl --context alpha get ns --request-timeout=30s
+  KUBECONFIG="$source" kubectl --context beta get ns --request-timeout=30s
+  KUBECONFIG="$source" kubectl config use-context beta >/dev/null
+  KUBECONFIG="$source" kubectl get ns --request-timeout=30s
+  KUBECONFIG="$source" kubectl config use-context alpha >/dev/null
+
+  local name=multi port=18101
+  local ws=$scratch/ws-$name
+  mkdir -p "$ws/.config/arkham"
+  printf '%s\n' '[[workspace.file_rewrite]]' "source = \"$source\"" 'dest = "{home}/.kube/config"' 'format = "kubeconfig"' >"$ws/.config/arkham/config.toml"
+  local statedir=$scratch/state-$name
+  XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
+  shopt -s nullglob
+  kubedirs=()
+  for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
+  decoys=()
+  for d in "$statedir"/arkham/ws/*/files/00-*; do decoys+=("$d"); done
+  shopt -u nullglob
+  if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
+    echo "init generated no kube state under $statedir" >&2
+    exit 1
+  fi
+  local kubedir=${kubedirs[0]} decoy=${decoys[0]}
+  sed "s|/arkham/grants|$kubedir|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
+  cp "$decoy" "$scratch/proxy-$name.yaml"
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster "$cluster" --proxy-url="http://127.0.0.1:$port" >/dev/null
+  if grep -F -q -e "$token_alpha" -e "$token_beta" -- "$decoy" "$scratch/proxy-$name.yaml"; then
+    echo "real token reached the guest kubeconfig" >&2
+    exit 1
+  fi
+
+  XDG_STATE_HOME=$statedir FNOX_CONFIG_DIR=$scratch/fnox ARKHAM_CONFIG="$scratch/host-layer-$name.toml" ARKHAM_CA_FILE="$scratch/config/arkham/ca.pem" ARKHAM_LISTEN="127.0.0.1:$port" "$arkham" serve &
+  serve_pid=$!
+  sleep 2
+
+  echo "--- multi: decoy --context through the proxy"
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl --context alpha get ns --request-timeout=30s
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl --context beta get ns --request-timeout=30s
+  echo "--- multi: decoy use-context then get ns"
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context beta >/dev/null
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get ns --request-timeout=30s
+  local current
+  current=$(KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config current-context)
+  if [ "$current" != beta ]; then
+    echo "use-context left current-context as ${current}" >&2
+    exit 1
+  fi
+
+  kill "$serve_pid" 2>/dev/null || true
+  serve_pid=""
+}
+
+run_multi
+
+echo "k3s multi-context proven: --context and use-context"
