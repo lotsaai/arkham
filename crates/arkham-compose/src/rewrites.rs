@@ -195,14 +195,15 @@ impl RewriteCollector {
   ///
   /// `nats context select` renames a temp file onto `context.txt` inside this
   /// directory. A rename onto a single-file bind mount fails with `EBUSY`.
+  /// The directory stays, because a container may already have it mounted.
   ///
   /// # Errors
   ///
   /// Returns an error when a directory or file cannot be written.
   pub(crate) fn mount_directory(&mut self, name: &str, container: &str, files: &[(String, Vec<u8>)]) -> Result<(), Error> {
     let dir = self.files_dir.join(name);
-    if dir.exists() {
-      fs::remove_dir_all(&dir).map_err(|source| Error::RemoveFile { path: dir.clone(), source })?;
+    if dir.is_dir() {
+      Self::clear_children(&dir)?;
     }
     fs::create_dir_all(&dir).map_err(|source| Error::CreateDir { path: dir.clone(), source })?;
     for (rel, bytes) in files {
@@ -225,6 +226,31 @@ impl RewriteCollector {
       container: PathBuf::from(container),
       ro: false,
     });
+    Ok(())
+  }
+
+  fn clear_children(dir: &Path) -> Result<(), Error> {
+    let entries = fs::read_dir(dir).map_err(|source| Error::ReadFile {
+      path: dir.to_path_buf(),
+      source,
+    })?;
+    for entry in entries {
+      let entry = entry.map_err(|source| Error::ReadFile {
+        path: dir.to_path_buf(),
+        source,
+      })?;
+      let path = entry.path();
+      let kind = entry.file_type().map_err(|source| Error::ReadFile {
+        path: path.clone(),
+        source,
+      })?;
+      let removed = if kind.is_dir() {
+        fs::remove_dir_all(&path)
+      } else {
+        fs::remove_file(&path)
+      };
+      removed.map_err(|source| Error::RemoveFile { path, source })?;
+    }
     Ok(())
   }
 
