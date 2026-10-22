@@ -593,5 +593,18 @@ GUEST
   echo "k3s guest multi-context proven: ambient kubeconfig via ${backend}"
 }
 
+# Compose names ghcr.io/casualjim/arkham:$version. That tag is not published
+# for the version under test, so tag this binary before `arkham up`.
+image_version=$("$arkham" --version)
+image_version=${image_version##* }
+if [ -z "$image_version" ]; then
+  echo "arkham --version did not report a version" >&2
+  exit 1
+fi
+image_ctx=$scratch/arkham-image
+mkdir -p "$image_ctx"
+cp "$arkham" "$image_ctx/arkham"
+docker build -t "ghcr.io/casualjim/arkham:${image_version}" -f "$proj_dir/Dockerfile" "$image_ctx"
+
 run_guest tproxy
 run_guest tun
