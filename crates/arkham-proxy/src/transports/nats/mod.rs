@@ -361,9 +361,9 @@ where
     let mut upgrade = false;
     if cleartext && let Some(verdict) = up.take_info_tls() {
       match verdict {
-        machine::InfoVerdict::Flags(info) if info.tls_required => upgrade = true,
+        machine::InfoVerdict::Flags(true) => upgrade = true,
         machine::InfoVerdict::Unreadable => return Err(Error::NatsInfoUnreadable),
-        machine::InfoVerdict::Flags(_) => {}
+        machine::InfoVerdict::Flags(false) => {}
       }
     }
     match rewritten {

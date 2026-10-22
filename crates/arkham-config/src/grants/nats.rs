@@ -13,7 +13,7 @@ use std::str::FromStr;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use secrecy::{ExposeSecret as _, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use strum::{EnumIter, IntoEnumIterator as _, IntoStaticStr};
 use url::Url;
 
@@ -152,19 +152,25 @@ pub struct NatsPrepared {
 }
 
 /// Auth fields of a decoy context file.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct NatsContextAuth {
   /// Context `user`.
+  #[serde(skip_serializing_if = "String::is_empty")]
   pub user: String,
   /// Context `password`.
+  #[serde(skip_serializing_if = "String::is_empty")]
   pub password: String,
   /// Context `token`.
+  #[serde(skip_serializing_if = "String::is_empty")]
   pub token: String,
   /// Context `nkey`. A path, not a seed.
+  #[serde(skip_serializing_if = "String::is_empty")]
   pub nkey: String,
   /// Context `creds`. A path, not the file body.
+  #[serde(skip_serializing_if = "String::is_empty")]
   pub creds: String,
   /// Context `user_jwt`. The JWT text, not a path.
+  #[serde(skip_serializing_if = "String::is_empty")]
   pub user_jwt: String,
 }
 
@@ -207,7 +213,7 @@ impl NatsPlain {
 
   /// Connection string. An empty password stays `user:@host`.
   #[must_use]
-  pub fn connection_string(&self, scheme: &str, host: &str, port: Option<u16>, query: &[(&str, &str)]) -> String {
+  pub fn connection_string(&self, scheme: &str, host: &str, port: Option<u16>, query: &[(&str, String)]) -> String {
     let host_part = if host.contains(':') {
       format!("[{host}]")
     } else {

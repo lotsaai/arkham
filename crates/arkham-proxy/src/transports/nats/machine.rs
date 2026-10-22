@@ -759,18 +759,11 @@ impl Down {
   }
 }
 
-/// TLS flag from one completed INFO object. Absent `tls_required` stays false.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct InfoTls {
-  /// INFO `tls_required`.
-  pub(crate) tls_required: bool,
-}
-
 /// What a finished INFO line says about TLS on a cleartext upstream.
 #[derive(Debug)]
 pub(crate) enum InfoVerdict {
   /// The object ended, or `tls_required` was already true.
-  Flags(InfoTls),
+  Flags(bool),
   /// The object did not end, and `tls_required` was not true.
   Unreadable,
 }
@@ -780,6 +773,12 @@ pub(crate) enum InfoVerdict {
 enum InfoKey {
   TlsRequired,
   Nonce,
+}
+
+/// The first depth-1 `nonce` field, including an empty value.
+enum SeenNonce {
+  No,
+  Yes(Option<String>),
 }
 
 /// actson events for one INFO object.
@@ -794,10 +793,8 @@ struct InfoParse {
   mark: usize,
   depth: u32,
   key: Option<InfoKey>,
-  tls: InfoTls,
-  nonce: Option<String>,
-  /// The first `nonce` field was seen, even when its value was empty.
-  nonce_seen: bool,
+  tls_required: bool,
+  nonce: SeenNonce,
   ended: bool,
   failed: bool,
 }
@@ -810,9 +807,8 @@ impl InfoParse {
       mark: 0,
       depth: 0,
       key: None,
-      tls: InfoTls::default(),
-      nonce: None,
-      nonce_seen: false,
+      tls_required: false,
+      nonce: SeenNonce::No,
       ended: false,
       failed: false,
     }
@@ -881,12 +877,15 @@ impl InfoParse {
         }
       }
     }
-    let verdict = if self.tls.tls_required || self.ended {
-      InfoVerdict::Flags(self.tls)
+    let verdict = if self.tls_required || self.ended {
+      InfoVerdict::Flags(self.tls_required)
     } else {
       InfoVerdict::Unreadable
     };
-    let nonce = if self.failed { None } else { self.nonce };
+    let nonce = match self.nonce {
+      SeenNonce::Yes(text) if !self.failed => text,
+      SeenNonce::Yes(_) | SeenNonce::No => None,
+    };
     (verdict, nonce)
   }
 
@@ -936,7 +935,7 @@ impl InfoParse {
 
   fn note_bool(&mut self, value: bool) {
     if self.depth == 1 && matches!(self.key, Some(InfoKey::TlsRequired)) {
-      self.tls.tls_required = value;
+      self.tls_required = value;
     }
     self.key = None;
   }
@@ -955,11 +954,8 @@ impl InfoParse {
         return;
       }
     };
-    if self.depth == 1 && matches!(self.key, Some(InfoKey::Nonce)) && !self.nonce_seen {
-      self.nonce_seen = true;
-      if !self.failed {
-        self.nonce = if text.is_empty() { None } else { Some(text.to_string()) };
-      }
+    if self.depth == 1 && matches!(self.key, Some(InfoKey::Nonce)) && matches!(self.nonce, SeenNonce::No) {
+      self.nonce = SeenNonce::Yes((!self.failed && !text.is_empty()).then(|| text.to_string()));
     }
     self.key = None;
   }

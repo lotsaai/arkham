@@ -25,8 +25,6 @@ use url::Url;
 
 mod credential;
 
-use credential::CredentialRef;
-
 use crate::adapt::{BLOB_PREFIX_NATS, GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, render_fragment};
 use crate::error::Error;
 use crate::rewrites::RewriteCollector;
@@ -210,11 +208,18 @@ impl GuestCred {
 }
 
 /// TLS bytes read once for a context. Every server of that context shares them.
+#[derive(PartialEq, Eq)]
 struct TlsMaterial {
   handshake_first: bool,
   cert: Option<Arc<[u8]>>,
   key: Option<Arc<[u8]>>,
   ca: Option<Arc<[u8]>>,
+}
+
+/// Query pairs and grant blobs for one dial's TLS material.
+struct TlsQuery {
+  pairs: Vec<(&'static str, String)>,
+  blobs: Vec<(String, Vec<u8>)>,
 }
 
 /// Upstream dial compared within one host and port.
@@ -223,24 +228,12 @@ struct Dial {
   host: String,
   port: u16,
   real_tls: bool,
-  handshake_first: bool,
-  cert: Option<Arc<[u8]>>,
-  key: Option<Arc<[u8]>>,
-  ca: Option<Arc<[u8]>>,
-}
-
-struct TlsQuery {
-  pairs: Vec<(String, String)>,
-  blobs: Vec<(String, Vec<u8>)>,
+  tls: Arc<TlsMaterial>,
 }
 
 impl Dial {
   fn same_material(&self, other: &Self) -> bool {
-    self.real_tls == other.real_tls
-      && self.handshake_first == other.handshake_first
-      && self.cert == other.cert
-      && self.key == other.key
-      && self.ca == other.ca
+    self.real_tls == other.real_tls && self.tls == other.tls
   }
 
   fn blob_name(bytes: &[u8], kind: &str) -> String {
@@ -254,19 +247,19 @@ impl Dial {
     if !self.real_tls {
       return TlsQuery { pairs, blobs };
     }
-    if self.handshake_first {
-      pairs.push(("handshake_first".to_string(), "true".to_string()));
+    if self.tls.handshake_first {
+      pairs.push(("handshake_first", "true".to_string()));
     }
     for (kind, field, bytes) in [
-      ("crt", "sslcert", self.cert.as_deref()),
-      ("key", "sslkey", self.key.as_deref()),
-      ("ca", "sslrootcert", self.ca.as_deref()),
+      ("crt", "sslcert", self.tls.cert.as_deref()),
+      ("key", "sslkey", self.tls.key.as_deref()),
+      ("ca", "sslrootcert", self.tls.ca.as_deref()),
     ] {
       let Some(bytes) = bytes else {
         continue;
       };
       let name = Self::blob_name(bytes, kind);
-      pairs.push((field.to_string(), format!("{GRANTS_STATE_DIR}/rules.d/{name}")));
+      pairs.push((field, format!("{GRANTS_STATE_DIR}/rules.d/{name}")));
       blobs.push((name, bytes.to_vec()));
     }
     TlsQuery { pairs, blobs }
@@ -279,6 +272,16 @@ struct ContextReady {
   guest: Option<GuestCred>,
   decoy: String,
   servers: Vec<ServerReady>,
+}
+
+impl ContextReady {
+  fn tree_files(&self) -> Vec<(String, Vec<u8>)> {
+    let mut files = vec![(format!("context/{}.json", self.identity.name), self.decoy.as_bytes().to_vec())];
+    if let Some(guest) = &self.guest {
+      files.push((guest.tree_path.clone(), guest.bytes.as_bytes().to_vec()));
+    }
+    files
+  }
 }
 
 /// One server of a [`ContextReady`]. Blobs travel with the server a clash keeps.
@@ -294,28 +297,8 @@ fn decoy_doc(doc: &Map<String, Value>, public_url: &str, fake: &NatsPlain, guest
   let mut out = kept_doc(doc, public_url);
   let written = guest.map(GuestCred::written);
   let auth = fake.context_auth(written.as_deref());
-  match fake {
-    NatsPlain::UserPass { .. } => {
-      out.insert("user".to_string(), Value::String(auth.user));
-      out.insert("password".to_string(), Value::String(auth.password));
-    }
-    NatsPlain::UserToken { .. } => {
-      out.insert("user".to_string(), Value::String(auth.user));
-      out.insert("password".to_string(), Value::String(auth.password));
-      out.insert("token".to_string(), Value::String(auth.token));
-    }
-    NatsPlain::Jwt(_) => {
-      out.insert("user_jwt".to_string(), Value::String(auth.user_jwt));
-    }
-    NatsPlain::Token(_) => {
-      out.insert("token".to_string(), Value::String(auth.token));
-    }
-    NatsPlain::Nkey(_) => {
-      out.insert("nkey".to_string(), Value::String(auth.nkey));
-    }
-    NatsPlain::Creds { .. } => {
-      out.insert("creds".to_string(), Value::String(auth.creds));
-    }
+  if let Ok(Value::Object(fields)) = serde_json::to_value(auth) {
+    out.extend(fields);
   }
   out
 }
@@ -402,7 +385,7 @@ impl<'a> NatsContextTree<'a> {
     tree.extend(shared);
     let mut grants = Vec::new();
     for ctx in contexts {
-      Self::push_tree(&mut tree, &ctx);
+      tree.extend(ctx.tree_files());
       for server in ctx.servers {
         grants.push(Self::grant_of(&ctx.identity, server)?);
       }
@@ -471,18 +454,18 @@ impl<'a> NatsContextTree<'a> {
     if let Some(feature) = NatsUnsupported::of(&doc) {
       return Ok(Err(NatsSkip::new(name, NatsSkipCause::Unsupported(feature))));
     }
-    if let Err(cause) = Self::apply_nsc(&mut doc) {
+    if let Err(cause) = self.apply_nsc(&mut doc) {
       return Ok(Err(NatsSkip::new(name, cause)));
     }
     let Some(servers) = ServerUrl::parse_list(text(&doc, "url")) else {
       return Ok(Err(NatsSkip::new(name, NatsSkipCause::ServerUrl)));
     };
+    let public_url = ServerUrl::public_list(&servers);
     let real = match self.credential(&doc, &servers) {
       Ok(real) => real,
       Err(cause) => return Ok(Err(NatsSkip::new(name, cause))),
     };
     let Some(real) = real else {
-      let public_url = ServerUrl::public_list(&servers);
       let Ok(decoy) = serde_json::to_string_pretty(&kept_doc(&doc, &public_url)) else {
         return Ok(Err(NatsSkip::new(name, NatsSkipCause::Rejected)));
       };
@@ -493,7 +476,6 @@ impl<'a> NatsContextTree<'a> {
       Ok(material) => material,
       Err(cause) => return Ok(Err(NatsSkip::new(name, cause))),
     };
-    let public_url = ServerUrl::public_list(&servers);
     let decoy_value = decoy_doc(&doc, &public_url, &fake, guest.as_ref());
     let Ok(decoy) = serde_json::to_string_pretty(&decoy_value) else {
       return Ok(Err(NatsSkip::new(name, NatsSkipCause::Rejected)));
@@ -508,13 +490,8 @@ impl<'a> NatsContextTree<'a> {
         return Ok(Err(NatsSkip::new(name, NatsSkipCause::Rejected)));
       };
       let query = dial.tls_query();
-      let pairs = query
-        .pairs
-        .iter()
-        .map(|(key, value)| (key.as_str(), value.as_str()))
-        .collect::<Vec<_>>();
       let scheme = if dial.real_tls { "tls" } else { "nats" };
-      let Some(real_url) = server.auth_string(scheme, &real, &pairs) else {
+      let Some(real_url) = server.auth_string(scheme, &real, &query.pairs) else {
         return Ok(Err(NatsSkip::new(name, NatsSkipCause::Rejected)));
       };
       if let Err(err) = NatsScope::from_strings(&fake_url, &real_url) {
@@ -554,34 +531,17 @@ impl<'a> NatsContextTree<'a> {
     for indexes in groups.into_values() {
       let at = indexes
         .iter()
-        .position(|(ci, _)| {
-          contexts
-            .get(*ci)
-            .is_some_and(|ctx| selected.is_some_and(|name| ctx.identity.name == name))
-        })
+        .position(|(ci, _)| selected.is_some_and(|name| contexts[*ci].identity.name == name))
         .unwrap_or(0);
-      let Some(&(cci, csi)) = indexes.get(at) else {
-        continue;
-      };
-      let Some(canonical_ctx) = contexts.get(cci) else {
-        continue;
-      };
-      let Some(canonical) = canonical_ctx.servers.get(csi) else {
-        continue;
-      };
-      let canonical_name = canonical_ctx.identity.name.clone();
-      let canonical_dial = canonical.dial.clone();
+      let (cci, csi) = indexes[at];
+      let canonical_name = contexts[cci].identity.name.clone();
+      let canonical_dial = contexts[cci].servers[csi].dial.clone();
       let selected_here = selected.is_some_and(|name| canonical_name == name);
       for &(ci, si) in &indexes {
-        let Some(server) = contexts.get(ci).and_then(|ctx| ctx.servers.get(si)) else {
-          continue;
-        };
-        if server.dial.same_material(&canonical_dial) {
+        if contexts[ci].servers[si].dial.same_material(&canonical_dial) {
           continue;
         }
-        let Some(other) = contexts.get(ci).map(|ctx| ctx.identity.name.clone()) else {
-          continue;
-        };
+        let other = contexts[ci].identity.name.clone();
         let cause = NatsSkipCause::Dial {
           other: if selected_here { other.clone() } else { canonical_name.clone() },
           host: canonical_dial.host.clone(),
@@ -597,12 +557,7 @@ impl<'a> NatsContextTree<'a> {
     drop_at.sort_unstable();
     drop_at.dedup();
     for (ci, si) in drop_at.into_iter().rev() {
-      let Some(ctx) = contexts.get_mut(ci) else {
-        continue;
-      };
-      if si < ctx.servers.len() {
-        ctx.servers.remove(si);
-      }
+      contexts[ci].servers.remove(si);
     }
     contexts.retain(|ctx| !ctx.servers.is_empty());
     Ok((contexts, skipped))
@@ -629,26 +584,12 @@ impl<'a> NatsContextTree<'a> {
         ))
       });
       if ctx.servers.is_empty() {
-        shared.push((format!("context/{}.json", ctx.identity.name), ctx.decoy.into_bytes()));
-        if let Some(guest) = ctx.guest {
-          shared.push((guest.tree_path, guest.bytes.into_bytes()));
-        }
+        shared.extend(ctx.tree_files());
         continue;
       }
       kept.push(ctx);
     }
     (kept, shared)
-  }
-
-  fn push_tree(tree: &mut Vec<(String, Vec<u8>)>, ctx: &ContextReady) {
-    let path = format!("context/{}.json", ctx.identity.name);
-    if tree.iter().any(|(found, _)| found == &path) {
-      return;
-    }
-    tree.push((path, ctx.decoy.as_bytes().to_vec()));
-    if let Some(guest) = &ctx.guest {
-      tree.push((guest.tree_path.clone(), guest.bytes.as_bytes().to_vec()));
-    }
   }
 
   fn grant_of(identity: &ContextIdentity, server: ServerReady) -> Result<RewriteAdapted, Error> {
@@ -676,36 +617,20 @@ impl<'a> NatsContextTree<'a> {
     })
   }
 
-  fn tls_material(&self, doc: &Map<String, Value>) -> Result<TlsMaterial, NatsSkipCause> {
-    let handshake_first = doc.get("tls_first").and_then(Value::as_bool).unwrap_or(false);
+  fn tls_material(&self, doc: &Map<String, Value>) -> Result<Arc<TlsMaterial>, NatsSkipCause> {
+    let read = |raw: &str| self.tls_file(raw).map(|bytes| bytes.map(Arc::<[u8]>::from));
     let cert = text(doc, "cert");
     let key = text(doc, "key");
-    let ca = text(doc, "ca");
     let paired = !cert.is_empty() && !key.is_empty();
-    let cert = if paired {
-      CredentialRef::tls_file(cert, self.host_home, self.root)?.map(Arc::<[u8]>::from)
-    } else {
-      None
-    };
-    let key = if paired {
-      CredentialRef::tls_file(key, self.host_home, self.root)?.map(Arc::<[u8]>::from)
-    } else {
-      None
-    };
-    let ca = if ca.is_empty() {
-      None
-    } else {
-      CredentialRef::tls_file(ca, self.host_home, self.root)?.map(Arc::<[u8]>::from)
-    };
-    Ok(TlsMaterial {
-      handshake_first,
-      cert,
-      key,
-      ca,
-    })
+    Ok(Arc::new(TlsMaterial {
+      handshake_first: doc.get("tls_first").and_then(Value::as_bool).unwrap_or(false),
+      cert: if paired { read(cert)? } else { None },
+      key: if paired { read(key)? } else { None },
+      ca: read(text(doc, "ca"))?,
+    }))
   }
 
-  fn dial(server: &ServerUrl, material: &TlsMaterial) -> Result<Dial, NatsSkipCause> {
+  fn dial(server: &ServerUrl, material: &Arc<TlsMaterial>) -> Result<Dial, NatsSkipCause> {
     let real_tls = server.url.scheme() == "tls" || material.handshake_first || material.cert.is_some() || material.ca.is_some();
     let Some(host) = server.url.host_str() else {
       return Err(NatsSkipCause::ServerUrl);
@@ -714,10 +639,7 @@ impl<'a> NatsContextTree<'a> {
       host: host.to_ascii_lowercase(),
       port: server.url.port().unwrap_or(NATS_DEFAULT_PORT),
       real_tls,
-      handshake_first: material.handshake_first,
-      cert: material.cert.clone(),
-      key: material.key.clone(),
-      ca: material.ca.clone(),
+      tls: Arc::clone(material),
     })
   }
 
@@ -729,26 +651,26 @@ impl<'a> NatsContextTree<'a> {
     let user_jwt = text(doc, "user_jwt");
     let user_seed = text(doc, "user_seed");
     let primary = if !user.is_empty() {
-      let password = CredentialRef::literal_text(text(doc, "password"), self.host_home, self.root)?;
+      let password = self.literal_text(text(doc, "password"))?;
       Some(NatsPlain::UserPass {
         user: user.to_string(),
         pass: password,
       })
     } else if !creds.is_empty() {
-      Some(CredentialRef::creds(creds, self.host_home, self.root)?)
+      Some(self.creds(creds)?)
     } else if !nkey.is_empty() {
-      Some(NatsPlain::Nkey(CredentialRef::nkey(nkey, self.host_home, self.root)?))
+      Some(NatsPlain::Nkey(self.nkey(nkey)?))
     } else if !user_jwt.is_empty() && !user_seed.is_empty() {
-      Some(CredentialRef::paired(user_seed, user_jwt, self.host_home, self.root)?)
+      Some(self.paired(user_seed, user_jwt)?)
     } else if !user_jwt.is_empty() {
-      Some(NatsPlain::Jwt(CredentialRef::user_jwt(user_jwt, self.host_home, self.root)?))
+      Some(NatsPlain::Jwt(self.literal_text(user_jwt)?))
     } else {
       None
     };
     let with_token = if token_raw.is_empty() {
       primary
     } else {
-      let token = CredentialRef::literal_text(token_raw, self.host_home, self.root)?;
+      let token = self.literal_text(token_raw)?;
       match primary {
         None => Some(NatsPlain::Token(token)),
         Some(NatsPlain::UserPass { user, pass }) => Some(NatsPlain::UserToken { user, pass, token }),
@@ -766,12 +688,12 @@ impl<'a> NatsContextTree<'a> {
     Ok(with_token)
   }
 
-  fn apply_nsc(doc: &mut Map<String, Value>) -> Result<(), NatsSkipCause> {
+  fn apply_nsc(&self, doc: &mut Map<String, Value>) -> Result<(), NatsSkipCause> {
     let nsc = text(doc, "nsc");
     if nsc.is_empty() {
       return Ok(());
     }
-    let (creds, service) = CredentialRef::nsc_profile(nsc)?;
+    let (creds, service) = self.nsc_profile(nsc)?;
     if text(doc, "creds").is_empty() && !creds.is_empty() {
       doc.insert("creds".to_string(), Value::String(creds));
     }
@@ -833,7 +755,7 @@ impl ServerUrl {
     }
   }
 
-  fn auth_string(&self, scheme: &str, auth: &NatsPlain, query: &[(&str, &str)]) -> Option<String> {
+  fn auth_string(&self, scheme: &str, auth: &NatsPlain, query: &[(&str, String)]) -> Option<String> {
     let host = match self.url.host()? {
       url::Host::Domain(host) => host.to_string(),
       url::Host::Ipv4(addr) => addr.to_string(),
@@ -843,15 +765,10 @@ impl ServerUrl {
   }
 
   fn public(&self) -> String {
-    let host = match self.url.host() {
-      Some(url::Host::Ipv6(addr)) => format!("[{addr}]"),
-      Some(host) => host.to_string(),
-      None => "localhost".to_string(),
-    };
-    match self.url.port() {
-      Some(port) => format!("{}://{host}:{port}", self.url.scheme()),
-      None => format!("{}://{host}", self.url.scheme()),
-    }
+    let mut url = self.url.clone();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
   }
 
   fn public_list(servers: &[Self]) -> String {
@@ -1114,7 +1031,7 @@ mod tests {
     let guest = String::from_utf8(decoy_bytes(&found, "nk").to_vec()).unwrap();
     assert!(!guest.contains(&seed));
     NatsSeed::from_seed(SecretString::from(guest.trim().to_string())).expect("decoy seed");
-    fs::write(&nkey, format!("# operator key\n{seed}\n")).unwrap();
+    fs::write(&nkey, "# operator key\n").unwrap();
     let found = adapt(&root, "/home/eng", home.path()).expect("directory stays").expect("tree");
     assert!(found.grants.is_empty(), "{:?}", found.skipped);
     assert!(found.skipped.iter().any(|skip| matches!(
@@ -1428,6 +1345,28 @@ mod tests {
         .iter()
         .any(|skip| matches!(skip.cause, NatsSkipCause::Credential { .. }))
     );
+  }
+
+  /// A decorated nkey file is the seed on the host. The guest file stays a decoy.
+  #[test]
+  fn decorated_nkey_file_grants() {
+    let home = tempdir().unwrap();
+    let root = home.path().join(".config").join("nats");
+    let seed = user_seed();
+    let nkey = root.join("user.nk");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&nkey, format!("{SEED_BEGIN}\n{seed}\n{SEED_END}\n")).unwrap();
+    write_context(
+      &root,
+      "demo",
+      &format!(r#"{{"url":"tls://nats.internal:4222","nkey":"{}"}}"#, nkey.display()),
+    );
+    let found = adapted(&root, home.path());
+    let real = rule_of(&found).real.expect("decorated nkey").expose_secret().to_string();
+    assert!(real.contains(&seed), "{real}");
+    let guest = String::from_utf8(decoy_bytes(&found, "nk").to_vec()).unwrap();
+    assert!(!guest.contains(&seed), "{guest}");
+    assert!(found.skipped.is_empty(), "{:?}", found.skipped);
   }
 
   #[test]
