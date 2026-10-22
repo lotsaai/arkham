@@ -761,6 +761,98 @@ mod moved_suite {
     assert!(!body.contains("carol-token"), "{body}");
   }
 
+  #[test]
+  fn existing_kube_config_file_still_inits() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    fs::create_dir_all(host.path().join(".kube")).unwrap();
+    fs::write(
+      host.path().join(".kube").join("config"),
+      "apiVersion: v1\nkind: Config\ncurrent-context: dev\ncontexts:\n- name: dev\n  context: {cluster: dev, user: carol}\nclusters:\n- name: dev\n  cluster: {server: https://10.9.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: carol\n  user: {token: carol-token}\n",
+    )
+    .unwrap();
+    let files = work.path().join("files");
+    fs::create_dir_all(&files).unwrap();
+    let legacy = files.join("kube-config");
+    fs::write(&legacy, "legacy-twin").unwrap();
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &files,
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    assert_eq!(fs::read_to_string(&legacy).unwrap(), "legacy-twin");
+    assert!(legacy.is_file(), "the old twin stays a file");
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .expect("kubeconfig twin");
+    assert_eq!(mount.host, files.join("kube-home"));
+    assert!(mount.host.is_dir());
+    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    assert!(!body.contains("carol-token"), "{body}");
+  }
+
+  #[test]
+  fn kube_home_is_cleared_on_init() {
+    use arkham_config::registry::Registry;
+    use std::collections::HashMap;
+
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    fs::create_dir_all(host.path().join(".kube")).unwrap();
+    fs::write(
+      host.path().join(".kube").join("config"),
+      "apiVersion: v1\nkind: Config\ncurrent-context: dev\ncontexts:\n- name: dev\n  context: {cluster: dev, user: carol}\nclusters:\n- name: dev\n  cluster: {server: https://10.9.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: carol\n  user: {token: carol-token}\n",
+    )
+    .unwrap();
+    let files = work.path().join("files");
+    let home = files.join("kube-home");
+    fs::create_dir_all(home.join("cache")).unwrap();
+    fs::write(home.join("cache").join("discovery"), "stale").unwrap();
+    fs::write(home.join("config.lock"), "lock").unwrap();
+    fs::write(home.join("extra"), "guest-file").unwrap();
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &files,
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .expect("kubeconfig twin");
+    assert_eq!(mount.host, home);
+    assert!(home.is_dir(), "the directory itself stays");
+    assert!(!home.join("config.lock").exists());
+    assert!(!home.join("cache").exists());
+    assert!(!home.join("extra").exists());
+    let body = fs::read_to_string(home.join("config")).unwrap();
+    assert!(body.contains("current-context: dev"), "{body}");
+    assert!(!body.contains("carol-token"), "{body}");
+  }
+
   /// `KUBECONFIG=a:b` merges in order. A later file adds names and does not replace earlier ones.
   #[test]
   fn kubeconfig_list_merges_files_in_order() {
