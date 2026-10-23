@@ -8,9 +8,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::Error;
 
-/// Load an upstream client identity (mTLS) from the entry's PEM paths: the
-/// certificate chain and its key, ready for the relay's egress. Only the
-/// entry names this identity; nothing invents one.
+/// Load an upstream client identity (mTLS) from the entry's PEM paths.
 ///
 /// # Errors
 ///

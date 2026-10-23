@@ -1,8 +1,3 @@
-//! SMTP serve path. The AUTH machine lives in `arkham-smtp`.
-//!
-//! `smtp://` is cleartext until `STARTTLS`. `smtps://` is TLS from the first
-//! byte. AUTH swaps on either leg.
-
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -24,8 +19,6 @@ pub(crate) struct SmtpTransport;
 impl Transport for SmtpTransport {
   type Scope = SmtpScope;
 
-  /// The `smtp://` / `smtps://` arm. Implicit TLS settles here and relays.
-  /// `STARTTLS` upgrades in the cleartext opening, then both sockets relay.
   async fn serve<G>(&self, ServeStream { mut guest, params, scope }: ServeStream<'_, G, SmtpScope>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -43,9 +36,6 @@ impl Transport for SmtpTransport {
     let guest_head = initial.to_vec();
     let mut guest_tls: Option<(Vec<u8>, String)> = None;
     if scope.is_downstream_tls {
-      // Transparent capture has no CONNECT authority. A ClientHello with no
-      // SNI still has a name: the scope was chosen by port, and its
-      // downstream host is the name that client checks the leaf against.
       let authority = host.or(Some(scope.downstream.host.as_str()));
       let Some((hello_buf, identity, sni_name)) = guest_tls_opening(&mut guest, initial, budget, authority, &state.mint).await? else {
         return Ok(());
@@ -55,8 +45,6 @@ impl Transport for SmtpTransport {
     }
 
     let upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;
-    // Key the swap on the scope host. The captured address is not the name
-    // in the connection string, and keying on it would miss the grant.
     let matched_name = server_name
       .as_deref()
       .filter(|name| scope.downstream.host.eq_ignore_ascii_case(name));

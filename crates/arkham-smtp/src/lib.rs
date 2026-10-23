@@ -1,7 +1,4 @@
 //! SMTP grant parsing and the AUTH wire machine.
-//!
-//! Cleartext and TLS both swap. The shared TLS leg and the relay live in
-//! `arkham-wire`.
 
 mod error;
 mod machine;

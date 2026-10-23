@@ -1,5 +1,3 @@
-//! SMTP grant assembly. The connection-string law lives in `arkham-smtp`.
-
 use secrecy::ExposeSecret as _;
 
 use arkham_smtp::{Error as SmtpError, SmtpScope};
@@ -8,12 +6,6 @@ use super::{Credential, Grant};
 use crate::config::RuleCfg;
 use crate::error::Error;
 
-/// Assemble one SMTP grant from its rule. Cleartext and TLS both swap.
-///
-/// # Errors
-///
-/// Returns an error when either string fails the connection-string law, or
-/// when a `tls` row tries to state what only the real string may state.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
   let fake = rule
     .value

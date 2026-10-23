@@ -1,6 +1,4 @@
 //! Shared TLS legs, the byte substitution machine, and the relay.
-//!
-//! Protocol crates depend on this crate. It depends on no grant type.
 
 pub mod engine;
 mod error;

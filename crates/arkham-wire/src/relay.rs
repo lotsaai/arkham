@@ -1,7 +1,4 @@
 //! Bidirectional pump through two wire directions.
-//!
-//! One FIFO carries replies, framing facts, and terminal intent. A separate
-//! signal carries the upgrade decision, so a refusal can leave the relay running.
 
 use std::io::{Error as IoError, ErrorKind};
 
@@ -24,7 +21,6 @@ pub enum ToResponse {
   /// The request direction failed or failed closed: end the relay now.
   RequestsEnded,
   /// The next extended response with this id is the upgrade result.
-  /// Sent before the upgrade request is written.
   ArmUpgrade(u64),
   /// The upgrade request was withheld. The response pump decides with this id.
   Handoff(u64),
