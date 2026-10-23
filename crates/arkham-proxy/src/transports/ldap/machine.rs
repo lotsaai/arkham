@@ -8,8 +8,8 @@
 //! huge length. A message id outside the RFC 4511 range closes the
 //! downstream leg and is forwarded upstream; its body is not peeked. The
 //! upstream needle suffix is released when the message ends, because that
-//! frame cannot grow. A cleartext upstream keeps the decoy. A diagnostic
-//! that still carries the real password closes the leg.
+//! frame cannot grow. Cleartext and TLS both swap. A diagnostic that still
+//! carries the real password closes the leg.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -68,9 +68,8 @@ pub(crate) struct Ldap {
   pending_starttls: Option<bool>,
   /// Upstream needle hold-back. Same window [`Raw`] keeps, not a frame buffer.
   held: Vec<u8>,
-  /// A `StartTLS` request is recognized and not emitted. The upstream writer
-  /// is already TLS, so the request must not be forwarded.
-  hold_starttls: bool,
+  /// What to do with the next `StartTLS` request.
+  starttls_mode: StartTlsMode,
   /// The request just framed was held.
   local_starttls: bool,
   handoff: Option<u64>,
@@ -84,8 +83,6 @@ struct Down {
   downstream_dn: String,
   upstream_dn: String,
   label: String,
-  /// Rewrite a matching simple bind. False while the upstream writer is cleartext.
-  swap: bool,
   /// Operations and abandons waiting for the upstream machine.
   notes: VecDeque<PeerFact>,
   /// Message id of the request currently being classified.
@@ -102,8 +99,16 @@ struct Up {
   clear_id: Option<u32>,
   /// Client operations still waiting for a final response. The flag is abandonable.
   open: Vec<(u32, bool)>,
-  /// The session is already TLS. A further `StartTLS` is `operationsError`.
-  blocked: bool,
+}
+
+/// What the next `StartTLS` request does.
+enum StartTlsMode {
+  /// Notice it and hand it to the relay.
+  Notice,
+  /// Withhold it so the guest can upgrade locally.
+  Hold,
+  /// The session is already TLS. Forward it as an ordinary message.
+  Forward,
 }
 
 /// Where the cursor is. `Peek` holds only the credential or `StartTLS` bytes
@@ -223,10 +228,9 @@ struct ResultCut {
 }
 
 impl Ldap {
-  /// Fresh leg. `swap` is downstream only: a simple bind is rewritten when
-  /// the upstream writer is already TLS. A cleartext upstream keeps the decoy.
+  /// Fresh leg. A simple bind is rewritten on cleartext and on TLS.
   /// Upstream always redacts a diagnostic that carries the real password.
-  pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction, swap: bool) -> Self {
+  pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction) -> Self {
     let down = if dir == Direction::Downstream {
       grants.iter().find_map(|grant| {
         let scope = grant.ldap(Some(host), port)?;
@@ -236,7 +240,6 @@ impl Ldap {
           downstream_dn: scope.downstream.dn.clone(),
           upstream_dn: scope.upstream.dn.clone(),
           label: grant.credential().map(|credential| credential.label.clone()).unwrap_or_default(),
-          swap,
           notes: VecDeque::new(),
           msg_id: None,
         })
@@ -259,7 +262,6 @@ impl Ldap {
           expect_id: None,
           clear_id: None,
           open: Vec::new(),
-          blocked: false,
         })
       })
     } else {
@@ -275,25 +277,21 @@ impl Ldap {
       starttls_ok: None,
       pending_starttls: None,
       held: Vec::new(),
-      hold_starttls: false,
+      starttls_mode: StartTlsMode::Notice,
       local_starttls: false,
       handoff: None,
       closed: false,
     }
   }
 
-  /// Withhold the next `StartTLS` request. The response pump decides whether
-  /// that handoff upgrades or answers `operationsError`.
+  /// Withhold the next `StartTLS` request so the guest can upgrade locally.
   pub(crate) fn hold_starttls(&mut self) {
-    self.hold_starttls = true;
+    self.starttls_mode = StartTlsMode::Hold;
   }
 
-  /// The session is already TLS. A local `StartTLS` is `operationsError`
-  /// even when nothing is outstanding.
-  pub(crate) fn block_starttls(&mut self) {
-    if let Some(up) = self.up.as_mut() {
-      up.blocked = true;
-    }
+  /// A later `StartTLS` on a session that is already TLS is an ordinary message.
+  pub(crate) fn forward_starttls(&mut self) {
+    self.starttls_mode = StartTlsMode::Forward;
   }
 
   /// Message id of a `StartTLS` request framed by the last `feed`, once.
@@ -432,20 +430,8 @@ impl Wire for Ldap {
     ready.then(|| self.handoff.take()).flatten()
   }
 
-  fn local_upgrade(&mut self, id: u64) -> LocalUpgrade {
-    let Some(up) = self.up.as_ref() else {
-      return LocalUpgrade::Proceed;
-    };
-    if !up.blocked && up.open.is_empty() {
-      return LocalUpgrade::Proceed;
-    }
-    let Ok(id) = u32::try_from(id) else {
-      return LocalUpgrade::Close;
-    };
-    match extended_result(id, ResultCode::OperationsError, false) {
-      Ok(bytes) => LocalUpgrade::Refuse(bytes),
-      Err(_) => LocalUpgrade::Close,
-    }
+  fn local_upgrade(&mut self, _id: u64) -> LocalUpgrade {
+    LocalUpgrade::Proceed
   }
 
   fn arm_upgrade(&mut self, id: u64) {
@@ -583,7 +569,7 @@ impl Ldap {
     if let Some(need) = self.note(&class, peek)? {
       return Ok(ClassAct::Need(need));
     }
-    if self.down.as_ref().is_some_and(|down| down.swap) && class.op == BIND_REQUEST_TAG {
+    if self.down.is_some() && class.op == BIND_REQUEST_TAG {
       peek.kind = Kind::Bind;
     } else if self.down.is_some() && class.op == EXTENDED_REQUEST_TAG {
       peek.kind = Kind::ExtReq;
@@ -674,14 +660,23 @@ impl Ldap {
         Ok(Step::Done)
       }
       ExtParse::StartTls { id } => {
-        if !self.hold_starttls {
+        if matches!(self.starttls_mode, StartTlsMode::Forward) {
+          if let Some(down) = self.down.as_mut()
+            && let Some(msg_id) = down.msg_id.take()
+          {
+            down.notes.push_back(PeerFact::Open(msg_id, true));
+          }
+          self.phase = self.release(std::mem::take(&mut peek.buf), peek.left, out, hits).await?;
+          return Ok(Step::Done);
+        }
+        if !matches!(self.starttls_mode, StartTlsMode::Hold) {
           self.pass(&peek.buf, out, hits).await?;
         }
         if peek.left == 0 {
           self.prefix = input.to_vec();
           *input = &[];
           self.starttls = Some(id);
-          self.local_starttls = self.hold_starttls;
+          self.local_starttls = matches!(self.starttls_mode, StartTlsMode::Hold);
           self.phase = self.finish_message(out);
         } else {
           self.phase = Phase::Tail { left: peek.left, id };
@@ -784,7 +779,7 @@ impl Ldap {
       self.phase = Phase::Tail { left, id };
       return Ok(());
     };
-    if !self.hold_starttls {
+    if !matches!(self.starttls_mode, StartTlsMode::Hold) {
       self.pass(chunk, out, hits).await?;
     }
     *input = input.get(n..).unwrap_or_default();
@@ -793,7 +788,7 @@ impl Ldap {
       self.prefix = input.to_vec();
       *input = &[];
       self.starttls = Some(id);
-      self.local_starttls = self.hold_starttls;
+      self.local_starttls = matches!(self.starttls_mode, StartTlsMode::Hold);
       self.phase = self.finish_message(out);
     } else {
       self.phase = Phase::Tail { left, id };
@@ -1423,11 +1418,11 @@ mod tests {
   }
 
   fn down() -> Ldap {
-    Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream, true)
+    Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream)
   }
 
   fn up() -> Ldap {
-    Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Upstream, false)
+    Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Upstream)
   }
 
   fn bind_frame(id: u32, dn: &str, password: &str) -> Vec<u8> {
@@ -1520,20 +1515,37 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn cleartext_bind_forwards_the_decoy() {
+  async fn cleartext_bind_swaps_the_password() {
     let frame = bind_frame(1, DN, FAKE_PW);
-    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream, false);
+    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream);
     let out = emit(&mut machine, &frame).await;
-    assert_eq!(out, frame);
+    let message: LdapMessage = rasn::ber::decode(&out).unwrap();
+    let ProtocolOp::BindRequest(request) = message.protocol_op else {
+      panic!("bind");
+    };
+    let AuthenticationChoice::Simple(password) = request.authentication else {
+      panic!("simple");
+    };
+    assert_eq!(password.as_ref(), REAL_PW.as_bytes());
+    assert!(!contains_bytes(&out, FAKE_PW.as_bytes()));
   }
 
   #[tokio::test]
-  async fn starttls_is_noticed_while_the_password_stays_put() {
+  async fn starttls_is_noticed_and_the_bind_swaps() {
+    let frame = starttls_frame(2);
     let mut bytes = bind_frame(1, DN, FAKE_PW);
-    bytes.extend_from_slice(&starttls_frame(2));
-    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream, false);
+    bytes.extend_from_slice(&frame);
+    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream);
     let out = emit(&mut machine, &bytes).await;
-    assert_eq!(out, bytes);
+    let (message, rest) = rasn::ber::decode_with_remainder::<LdapMessage>(&out).unwrap();
+    let ProtocolOp::BindRequest(request) = message.protocol_op else {
+      panic!("bind");
+    };
+    let AuthenticationChoice::Simple(password) = request.authentication else {
+      panic!("simple");
+    };
+    assert_eq!(password.as_ref(), REAL_PW.as_bytes());
+    assert_eq!(rest, frame.as_slice());
     assert_eq!(machine.take_starttls(), Some(2));
   }
 
@@ -1584,7 +1596,7 @@ mod tests {
       },
       scope: Box::new(parsed),
     }];
-    let mut machine = Ldap::new(&grants, "ldap", 389, Direction::Downstream, true);
+    let mut machine = Ldap::new(&grants, "ldap", 389, Direction::Downstream);
     let out = emit(&mut machine, &bind_frame(1, dn, fake)).await;
     let message: LdapMessage = rasn::ber::decode(&out).unwrap();
     let ProtocolOp::BindRequest(request) = message.protocol_op else {
@@ -1685,7 +1697,7 @@ mod tests {
 
   #[tokio::test]
   async fn differing_dns_swap_with_the_password() {
-    let mut machine = Ldap::new(&grant(DN, "cn=svc,dc=example,dc=com"), "ldap", 389, Direction::Downstream, true);
+    let mut machine = Ldap::new(&grant(DN, "cn=svc,dc=example,dc=com"), "ldap", 389, Direction::Downstream);
     let out = emit(&mut machine, &bind_frame(1, DN, FAKE_PW)).await;
     let message: LdapMessage = rasn::ber::decode(&out).unwrap();
     let ProtocolOp::BindRequest(request) = message.protocol_op else {
@@ -1705,7 +1717,7 @@ mod tests {
       0x80, 0x84, 0x00, 0x01, 0x00, 0x00, // name length 65536
     ];
     msg.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
-    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream, false);
+    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream);
     let out = emit(&mut machine, &msg).await;
     assert_eq!(out, msg);
   }
@@ -1906,8 +1918,8 @@ mod tests {
       upstream.apply_peer_note(fact);
     }
     assert!(
-      matches!(upstream.local_upgrade(3), LocalUpgrade::Refuse(_)),
-      "a bind cannot be abandoned"
+      matches!(upstream.local_upgrade(3), LocalUpgrade::Proceed),
+      "a bind that cannot be abandoned does not refuse StartTLS here"
     );
   }
 
@@ -1943,10 +1955,7 @@ mod tests {
       )),
     );
     let _ = upstream.feed(&rasn::ber::encode(&response).unwrap()).await;
-    assert!(
-      matches!(upstream.local_upgrade(2), LocalUpgrade::Refuse(_)),
-      "StartTLS during SASL is operationsError"
-    );
+    assert!(matches!(upstream.local_upgrade(2), LocalUpgrade::Proceed));
   }
 
   #[tokio::test]
@@ -2009,26 +2018,10 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn outstanding_bind_refuses_the_local_upgrade() {
+  async fn outstanding_bind_still_proceeds() {
     let mut upstream = up();
     upstream.apply_peer_note(PeerFact::Open(1, false));
-    let LocalUpgrade::Refuse(bytes) = upstream.local_upgrade(2) else {
-      panic!("operationsError");
-    };
-    let message: LdapMessage = rasn::ber::decode(&bytes).unwrap();
-    assert_eq!(message.message_id, 2);
-    let ProtocolOp::ExtendedResp(body) = message.protocol_op else {
-      panic!("extended");
-    };
-    assert_eq!(body.result_code, ResultCode::OperationsError);
-    assert!(body.response_name.is_none());
-  }
-
-  #[tokio::test]
-  async fn blocked_session_refuses_starttls_with_nothing_outstanding() {
-    let mut upstream = up();
-    upstream.block_starttls();
-    assert!(matches!(upstream.local_upgrade(4), LocalUpgrade::Refuse(_)));
+    assert!(matches!(upstream.local_upgrade(2), LocalUpgrade::Proceed));
   }
 
   #[test]

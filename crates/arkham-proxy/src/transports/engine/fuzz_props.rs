@@ -480,9 +480,8 @@ fn ldap_grants() -> Vec<Grant> {
 fn ldap_leg(leg: LdapLeg) -> Ldap {
   let grants = ldap_grants();
   match leg {
-    LdapLeg::DownSwap => Ldap::new(&grants, "ldap", 389, Direction::Downstream, true),
-    LdapLeg::DownClear => Ldap::new(&grants, "ldap", 389, Direction::Downstream, false),
-    LdapLeg::Up => Ldap::new(&grants, "ldap", 389, Direction::Upstream, false),
+    LdapLeg::DownSwap | LdapLeg::DownClear => Ldap::new(&grants, "ldap", 389, Direction::Downstream),
+    LdapLeg::Up => Ldap::new(&grants, "ldap", 389, Direction::Upstream),
   }
 }
 

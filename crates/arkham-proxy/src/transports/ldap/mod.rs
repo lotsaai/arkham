@@ -9,13 +9,15 @@
 pub(crate) mod machine;
 
 use std::io::{Error as IoError, ErrorKind};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -34,10 +36,6 @@ use crate::transports::engine::{Direction, Ldap, Rewritten, Wire};
 use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
 use machine::starttls_success;
 use rama::tls::client::ClientAuth;
-
-/// First byte of a TLS record carrying a handshake. An `ldaps` guest leg
-/// opens with it; a cleartext `ldap` scope never serves it.
-const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 
 /// LDAP transport. `ldaps://` settles TLS before the machine runs.
 /// `ldap://` stays plaintext until `StartTLS`, then mints the guest leaf
@@ -152,9 +150,6 @@ impl Transport for LdapTransport {
       };
       server_name = Some(sni_name);
       guest_tls = Some((hello_buf, identity));
-    } else if initial.first() == Some(&TLS_RECORD_HANDSHAKE) {
-      tracing::debug!("TLS opening on a cleartext ldap scope; closing");
-      return Ok(());
     }
 
     let upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;
@@ -226,25 +221,24 @@ impl LdapTransport {
   {
     let OpenGuest { stream, head, tls } = guest;
     let scope = pump.scope;
-    let swap = scope.is_upstream_tls;
     match (tls, scope.is_upstream_tls) {
-      (None, false) => relay(Prefixed::new(head, stream), upstream, pump.ctx, swap).await,
+      (None, false) => relay(Prefixed::new(head, stream), upstream, pump.ctx).await,
       (Some((hello_buf, identity)), false) => {
         let plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
           .await?;
-        relay(plain, upstream, pump.ctx, swap).await
+        relay(plain, upstream, pump.ctx).await
       }
       (None, true) => {
         let plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(Prefixed::new(head, stream), plain, pump.ctx, swap).await
+        relay(Prefixed::new(head, stream), plain, pump.ctx).await
       }
       (Some((hello_buf, identity)), true) => {
         let guest_plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
           .await?;
         let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(guest_plain, server_plain, pump.ctx, swap).await
+        relay(guest_plain, server_plain, pump.ctx).await
       }
     }
   }
@@ -257,7 +251,6 @@ impl LdapTransport {
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
-    let swap = !pump.upgrade_upstream;
     match read_first(
       &mut guest,
       &mut server,
@@ -270,7 +263,7 @@ impl LdapTransport {
     {
       First::Eof | First::Close => Ok(()),
       First::Relay(prefix) => {
-        let (mut downstream, mut upstream) = ldap_pair(pump.ctx, swap);
+        let (mut downstream, mut upstream) = ldap_pair(pump.ctx);
         if !pump.upgrade_upstream {
           downstream.hold_starttls();
         }
@@ -292,7 +285,7 @@ impl LdapTransport {
   {
     tracing::debug!(id = open.id, prefix = open.request.len(), "ldap starttls");
     let (success, server_rest) = if pump.upgrade_upstream {
-      let mut upstream = Ldap::new(pump.ctx.grants, pump.ctx.host, pump.ctx.port, Direction::Upstream, false);
+      let mut upstream = Ldap::new(pump.ctx.grants, pump.ctx.host, pump.ctx.port, Direction::Upstream);
       upstream.expect_starttls(open.id);
       read_starttls_result(&mut server, &mut guest, &mut upstream, pump.budget).await?
     } else {
@@ -346,35 +339,125 @@ impl LdapTransport {
   }
 
   /// Accept the guest TLS leg once, then relay. `local` writes the success
-  /// here because the server socket is already TLS. `pump.budget` bounds the
-  /// `ClientHello` read.
-  async fn protect<G, S>(&self, mut guest: G, server: S, accept: Accept<'_>, pump: &Pump<'_>) -> Result<(), Error>
+  /// here because the server socket is already TLS. Bytes still arriving on
+  /// that socket are written to the guest until the `ClientHello` is read.
+  /// `pump.budget` bounds that read.
+  async fn protect<G, S>(&self, guest: G, server: S, accept: Accept<'_>, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
-    if accept.local {
-      let Ok(id) = u32::try_from(accept.id) else {
+    let Accept {
+      guest_prefix,
+      server_prefix,
+      id,
+      local,
+    } = accept;
+    let (guest, server, opened) = if local {
+      let Ok(id) = u32::try_from(id) else {
         return Ok(());
       };
       let bytes = starttls_success(id).map_err(|source| Error::LdapEncode { source })?;
-      write_guest(&mut guest, &bytes).await?;
-    }
-    let authority = Some(pump.scope.downstream.host.as_str());
-    let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, accept.guest_prefix, pump.budget, authority, pump.mint).await?
-    else {
+      forward_until_hello(guest, Prefixed::new(server_prefix, server), guest_prefix, pump, &bytes).await?
+    } else {
+      let mut guest = guest;
+      let opened = guest_tls_opening(
+        &mut guest,
+        guest_prefix,
+        pump.budget,
+        Some(pump.scope.downstream.host.as_str()),
+        pump.mint,
+      )
+      .await?;
+      (guest, Prefixed::new(server_prefix, server), opened)
+    };
+    let Some((hello_buf, identity, _)) = opened else {
       return Ok(());
     };
     let guest_plain = self
       .accept_guest(&identity, Prefixed::new(hello_buf, guest), pump.scope.guest_tls)
       .await?;
-    let server = Prefixed::new(accept.server_prefix, server);
     if accept.local {
-      relay(guest_plain, server, pump.ctx, true).await
+      relay(guest_plain, server, pump.ctx).await
     } else {
       let server_plain = self.connect_server(pump.scope, pump.scope.upstream.host.as_str(), server).await?;
-      relay(guest_plain, server_plain, pump.ctx, true).await
+      relay(guest_plain, server_plain, pump.ctx).await
     }
+  }
+}
+
+/// Write `success`, then copy server bytes to the guest until the guest
+/// presents a `ClientHello` or closes. In-flight LDAP results stay on the
+/// cleartext leg.
+async fn forward_until_hello<G, S>(
+  guest: G,
+  server: S,
+  prefix: &[u8],
+  pump: &Pump<'_>,
+  success: &[u8],
+) -> Result<(G, S, Option<(Vec<u8>, String, String)>), Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  let mut guest = guest;
+  write_guest(&mut guest, success).await?;
+  let (mut guest_read, mut guest_write) = tokio::io::split(guest);
+  let (mut server_read, server_write) = tokio::io::split(server);
+  let mut buf = vec![0u8; 8 * 1024];
+  let opened = {
+    let mut guest_io = GuestRead { inner: &mut guest_read };
+    let mut hello = Box::pin(guest_tls_opening(
+      &mut guest_io,
+      prefix,
+      pump.budget,
+      Some(pump.scope.downstream.host.as_str()),
+      pump.mint,
+    ));
+    loop {
+      tokio::select! {
+        biased;
+        result = &mut hello => break result?,
+        result = server_read.read(&mut buf) => {
+          let n = read_count(result).map_err(|source| Error::UpstreamRead { source })?;
+          if n == 0 {
+            break hello.await?;
+          }
+          let Some(chunk) = buf.get(..n) else {
+            return Err(Error::UpstreamRead {
+              source: IoError::new(ErrorKind::InvalidData, "ldap server read"),
+            });
+          };
+          write_guest(&mut guest_write, chunk).await?;
+        }
+      }
+    }
+  };
+  Ok((guest_read.unsplit(guest_write), server_read.unsplit(server_write), opened))
+}
+
+/// `guest_tls_opening` takes a read/write stream and only reads the hello.
+struct GuestRead<R> {
+  inner: R,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for GuestRead<R> {
+  fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    Pin::new(&mut self.inner).poll_read(cx, buf)
+  }
+}
+
+impl<R: Unpin> AsyncWrite for GuestRead<R> {
+  fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    Poll::Ready(Err(IoError::new(ErrorKind::Unsupported, "ldap client hello write")))
+  }
+
+  fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    Poll::Ready(Ok(()))
+  }
+
+  fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    Poll::Ready(Ok(()))
   }
 }
 
@@ -416,18 +499,18 @@ fn read_count(result: Result<usize, IoError>) -> Result<usize, IoError> {
   }
 }
 
-/// Read the guest one byte at a time until the first message is `StartTLS`
-/// or it is clearly something else. A bind stops there, so the rest of it
-/// stays in the socket. After a `StartTLS` OID, the control tail is read in
-/// chunks of at most the unread count and is not kept. `forward` writes
-/// that request upstream. Otherwise the tail is discarded, which is the
-/// path when the upstream leg is already TLS. Bytes after the tail stay unread.
+/// Read the guest until the first message is `StartTLS` or the cursor emits.
+/// Bytes after that stay unread. A swapping bind emits when the password is
+/// decided, so the prefix can be the whole message. After a `StartTLS` OID,
+/// the control tail is read in chunks of at most the unread count and is not
+/// kept. `forward` writes that request upstream. Otherwise the tail is
+/// discarded, which is the path when the upstream leg is already TLS.
 async fn read_first<R, W>(guest: &mut R, upstream: &mut W, forward: bool, grants: &[Grant], host: &str, port: u16) -> Result<First, Error>
 where
   R: AsyncRead + Unpin,
   W: AsyncWrite + Unpin,
 {
-  let mut probe = Ldap::new(grants, host, port, Direction::Downstream, false);
+  let mut probe = Ldap::new(grants, host, port, Direction::Downstream);
   let mut got = Vec::new();
   let mut byte = [0u8; 1];
   loop {
@@ -629,27 +712,22 @@ where
   Ok(())
 }
 
-/// Pump one settled pair. `swap` is set only when `server` is already TLS,
-/// and a further `StartTLS` on that session is `operationsError`.
-async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>, swap: bool) -> Result<(), Error>
+/// Pump one settled pair. A later `StartTLS` is forwarded to the server.
+async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  let (mut downstream, mut upstream) = ldap_pair(ctx, swap);
-  if swap {
-    downstream.hold_starttls();
-    upstream.block_starttls();
-  }
+  let (mut downstream, mut upstream) = ldap_pair(ctx);
+  downstream.forward_starttls();
   relay_guarded(guest, server, &mut downstream, &mut upstream, &[], &[]).await
 }
 
-/// Both directions for an LDAP scope. `swap` applies to the downstream leg:
-/// a cleartext upstream must keep the decoy.
-pub(crate) fn ldap_pair(ctx: &PairCtx<'_>, swap: bool) -> (Ldap, Ldap) {
+/// Both directions for an LDAP scope. Cleartext and TLS both swap.
+pub(crate) fn ldap_pair(ctx: &PairCtx<'_>) -> (Ldap, Ldap) {
   (
-    Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream, swap),
-    Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream, false),
+    Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream),
+    Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream),
   )
 }
 
@@ -818,7 +896,7 @@ mod tests {
       panic!("relay");
     };
     assert_eq!(upstream.into_inner(), [] as [u8; 0]);
-    assert!(prefix.len() < frame.len());
+    assert_ne!(prefix, [] as [u8; 0]);
     assert!(frame.starts_with(&prefix));
     let mut rest = Vec::new();
     std::io::Read::read_to_end(&mut guest, &mut rest).unwrap();
