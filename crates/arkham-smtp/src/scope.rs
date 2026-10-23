@@ -1,9 +1,4 @@
-//! SMTP connection-string law and the scope it produces.
-//!
-//! `smtp://` is a cleartext session that may upgrade with STARTTLS.
-//! `smtps://` is implicit TLS from the first byte. AUTH swaps on either
-//! leg. `starttls=required` on an `smtp://` string records that the server
-//! demands the upgrade. Trust and identity ride the real string on either scheme.
+//! SMTP connection strings and the scope they produce.
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -37,12 +32,6 @@ pub struct SmtpLeg {
 }
 
 /// An SMTP rule's scope: both legs of its one connection-string mapping.
-///
-/// Each string states its own transport in its scheme. `smtp://` is
-/// cleartext. `smtps://` is TLS from the first byte. Trust and identity
-/// ride the real string's query (`sslrootcert`, `sslcert`/`sslkey`) on
-/// either scheme. The rule's `tls` table states the guest leg's mode,
-/// keyed by the rule's env name.
 #[derive(Debug, Clone)]
 pub struct SmtpScope {
   /// The guest's leg, from the rule's stated fake connection string.
@@ -66,9 +55,6 @@ pub struct SmtpScope {
 }
 
 /// Why one `smtp://` or `smtps://` string was rejected.
-///
-/// The text names the field or the problem. It never includes the connection
-/// string: that string carries the user and the password.
 #[derive(Debug, thiserror::Error)]
 pub enum SmtpUriError {
   /// The string is not `smtp://` or `smtps://`.

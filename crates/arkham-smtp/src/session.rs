@@ -1,13 +1,4 @@
 //! Cleartext SMTP opening, then the shared relay.
-//!
-//! The greeting, `EHLO` / `HELO`, `HELP` / `VRFY` / `EXPN`, an `AUTH` that
-//! still precedes `STARTTLS`, and `STARTTLS` plus its acceptance run
-//! lockstep. Reply bytes are redacted as they arrive. The hold-back flushes
-//! on newline or EOF. A read that passes the final newline returns those
-//! bytes to the next server reader. A non-`220` answer to `STARTTLS`
-//! returns to that loop. After the upgrade, or when the guest sends anything
-//! else, both sockets go to [`relay_guarded`]. Implicit TLS skips the
-//! opening. AUTH swaps on cleartext and on TLS.
 
 use std::io::ErrorKind;
 use std::pin::Pin;
@@ -45,8 +36,6 @@ pub enum ServerLeg {
   Upgraded(Box<ClientTlsStream<HeadThen<TcpStream>>>),
 }
 
-/// Bytes already taken from a socket, then the socket. The head is dropped
-/// once the next reader has consumed it.
 /// Socket reads that start with bytes already taken from that socket.
 pub struct HeadThen<S> {
   head: Vec<u8>,
@@ -231,8 +220,7 @@ impl<S> std::fmt::Debug for HeadThen<S> {
   }
 }
 
-/// Run the dialogue. Implicit TLS is already settled and goes straight to
-/// the relay. A cleartext guest reads the opening, then relays.
+/// Run the dialogue.
 ///
 /// # Errors
 ///

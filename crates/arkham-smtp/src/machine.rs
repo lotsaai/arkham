@@ -1,22 +1,4 @@
-//! SMTP wire format: AUTH credential rewrite, then the shared relay.
-//!
-//! Downstream buffers one command line, capped like a Redis command.
-//! [`smtp_proto::Request::parse`] classifies that line: the verb, the AUTH
-//! mechanism, and a `BDAT` size. `AUTH PLAIN`, `AUTH LOGIN`, `AUTH XOAUTH2`,
-//! and `AUTH OAUTHBEARER` reframe to the upstream spelling at any length,
-//! inline or on the continuation line after a `334`. The SASL payload itself
-//! stays local, because the parser does not swap credentials. `DATA` stays a
-//! command until the matching upstream reply is a final `354`; a `530` or
-//! `503` leaves the next command in command mode. The body then passes bytes
-//! until the terminating dot, holding back only the suffix that might still
-//! grow into `\r\n.\r\n`. `BDAT n` passes the next `n` octets and nothing
-//! more. Every other command is forwarded as it arrives. Upstream redacts
-//! through [`Raw`], including a real password longer than its decoy. A `334`
-//! challenge is not rewritten. Replies stay on [`Raw`]: smtp-proto parses
-//! them only through a receiver that buffers.
-//!
-//! `AUTH CRAM-MD5` and `AUTH DIGEST-MD5` are challenge-response mechanisms
-//! and are relayed unchanged.
+//! SMTP AUTH rewrite, then the shared relay.
 
 use std::borrow::Cow;
 use std::sync::Arc;

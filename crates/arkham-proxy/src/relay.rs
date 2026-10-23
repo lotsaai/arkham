@@ -1,5 +1,3 @@
-//! Bidirectional pump. The implementation lives in `arkham-wire`.
-
 pub(crate) use arkham_wire::relay::{RelayEnd, RelayUpgrade, log_hits};
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -7,11 +5,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::Error;
 use arkham_wire::engine::Wire;
 
-/// Bidirectional relay through the two directions' wire formats.
-///
-/// # Errors
-///
-/// Returns an error when a direction cannot be read or written.
 pub(crate) async fn relay_guarded<G, S, M>(
   guest: G,
   server: S,
@@ -30,11 +23,6 @@ where
     .map_err(Into::into)
 }
 
-/// [`relay_guarded`], plus an upgrade handoff that returns both sockets.
-///
-/// # Errors
-///
-/// Returns an error when a direction cannot be read or written.
 pub(crate) async fn relay_stop<G, S, M>(
   guest: G,
   server: S,

@@ -1,7 +1,4 @@
 //! Byte substitution shared by every protocol machine.
-//!
-//! Grant eligibility stays in the proxy, next to the grant types. This module
-//! is the scan, the hold-back, and the wire trait.
 
 use std::borrow::Cow;
 

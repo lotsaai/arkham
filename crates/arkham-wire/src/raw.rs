@@ -1,6 +1,4 @@
-//! Raw wire: no format. [`Raw::from_pairs`] holds back the longest needle
-//! minus one so a match split across chunks is substituted whole. Grant
-//! selection stays with the caller.
+//! Raw wire: no format.
 
 use std::borrow::Cow;
 
@@ -35,9 +33,6 @@ impl Wire for Raw {
       let flushed = std::mem::take(&mut self.held);
       return std::future::ready((Rewritten::Emit(Cow::Owned(flushed)), Vec::new()));
     }
-    // Probe for a hit without copying the whole chunk: fully-inside matches
-    // scan the chunk in place; boundary matches scan a tiny tail window. On
-    // a hit, fall back to the full held+chunk replace.
     let hit = self.pairs.iter().any(|pair| {
       find_new_match(chunk, &pair.needle, 0)
         || (!self.held.is_empty() && {
@@ -58,10 +53,6 @@ impl Wire for Raw {
         let out = Cow::Borrowed(&chunk[..emit_len]);
         return std::future::ready((Rewritten::Emit(out), Vec::new()));
       }
-      // The previous chunk ended on a needle prefix. This chunk does not
-      // finish it, so those bytes are emitted ahead of the chunk. The new
-      // hold-back is a suffix of the combined bytes, at most the longest
-      // needle minus one.
       let mut combined = std::mem::take(&mut self.held);
       combined.extend_from_slice(chunk);
       let hold = needle_prefix_suffix_len(&combined, &self.pairs, self.tail_size);
@@ -71,7 +62,6 @@ impl Wire for Raw {
     }
     let mut combined = std::mem::take(&mut self.held);
     combined.extend_from_slice(chunk);
-    // Emit past every complete match so none is sliced by the hold-back.
     let emit_len = needle_safe_emit_len(&combined, &self.pairs, self.tail_size);
     self.held = combined.split_off(emit_len);
     let (new_emit, hits) = replace_in(&combined, &self.pairs, Location::Body);

@@ -1,9 +1,4 @@
 //! Shared TLS legs: guest accept, upstream connect, and the handshake budget.
-//!
-//! A protocol passes its ALPN identifier and its [`Verify`] mode. The leaf
-//! cache keys on the server name, the client-certificate demand, and that
-//! identifier. Protocols that still keep a private cache call [`cached_leaf`]
-//! with their own map.
 
 use std::path::Path;
 use std::pin::Pin;
@@ -29,9 +24,7 @@ use rama::tls::client::ClientAuth;
 use crate::identity::client_identity;
 use crate::{Error, GuestTlsMode, RootCert};
 
-/// Leaf for one name, cached. Minted before insert so two guests naming the
-/// same host keygen at most twice. `alpn` is offered when the protocol's
-/// clients look for an identifier.
+/// Leaf for one name, cached.
 ///
 /// # Errors
 ///
