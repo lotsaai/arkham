@@ -11,7 +11,7 @@ use crate::Error;
 use crate::connection::dial_marked;
 use crate::identity::CandidateParams;
 use crate::relay::relay_guarded;
-use crate::transports::engine::{Direction, Raw};
+use crate::transports::engine::{Direction, Raw, raw_new};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
 
 /// The `tcp://` transport: opaque bytes, equal-length substitution.
@@ -67,7 +67,7 @@ where
 /// Cleartext non-HTTP bytes: raw equal-length swap on tcp grants.
 pub(crate) fn raw_tcp_pair(ctx: &PairCtx<'_>) -> (Raw, Raw) {
   (
-    Raw::new(ctx.grants, Scheme::Tcp, ctx.host, ctx.port, Direction::Downstream),
-    Raw::new(ctx.grants, Scheme::Tcp, ctx.host, ctx.port, Direction::Upstream),
+    raw_new(ctx.grants, Scheme::Tcp, ctx.host, ctx.port, Direction::Downstream),
+    raw_new(ctx.grants, Scheme::Tcp, ctx.host, ctx.port, Direction::Upstream),
   )
 }

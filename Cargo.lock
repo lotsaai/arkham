@@ -427,6 +427,8 @@ dependencies = [
 name = "arkham-config"
 version = "0.3.31"
 dependencies = [
+ "arkham-smtp",
+ "arkham-wire",
  "base62",
  "base64 0.22.1",
  "clap",
@@ -530,6 +532,8 @@ dependencies = [
  "arkham-config",
  "arkham-pki",
  "arkham-plugin",
+ "arkham-smtp",
+ "arkham-wire",
  "async-compat",
  "async-nats",
  "async-trait",
@@ -564,7 +568,6 @@ dependencies = [
  "secrecy",
  "serde_amqp",
  "serde_json",
- "smtp-proto",
  "strum 0.28.0",
  "tempfile",
  "thiserror 2.0.21",
@@ -572,6 +575,23 @@ dependencies = [
  "tokio-postgres",
  "tokio-rustls 0.26.6",
  "tracing",
+ "url",
+]
+
+[[package]]
+name = "arkham-smtp"
+version = "0.3.31"
+dependencies = [
+ "arkham-wire",
+ "base64 0.22.1",
+ "percent-encoding",
+ "proptest",
+ "secrecy",
+ "smtp-proto",
+ "strum 0.28.0",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls 0.26.6",
  "url",
 ]
 
@@ -619,6 +639,22 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tun",
+]
+
+[[package]]
+name = "arkham-wire"
+version = "0.3.31"
+dependencies = [
+ "arkham-pki",
+ "dashmap",
+ "rama",
+ "rustls 0.23.46",
+ "rustls-native-certs",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls 0.26.6",
+ "tracing",
 ]
 
 [[package]]

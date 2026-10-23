@@ -470,4 +470,54 @@ pub enum Error {
     /// Missing bundle path.
     path: PathBuf,
   },
+  /// An SMTP grant-parse failure reached the proxy.
+  #[error(transparent)]
+  Smtp(arkham_smtp::Error),
+}
+
+impl From<arkham_wire::Error> for Error {
+  fn from(err: arkham_wire::Error) -> Self {
+    match err {
+      arkham_wire::Error::Pki(source) => Self::Pki(source),
+      arkham_wire::Error::ReadFile { path, source } => Self::ReadFile { path, source },
+      arkham_wire::Error::RequestHeadToUpstream { source } => Self::RequestHeadToUpstream { source },
+      arkham_wire::Error::RequestHeadFlush { source } => Self::RequestHeadFlush { source },
+      arkham_wire::Error::RequestFlushToUpstream { source } => Self::RequestFlushToUpstream { source },
+      arkham_wire::Error::RequestChunkToUpstream { source } => Self::RequestChunkToUpstream { source },
+      arkham_wire::Error::GuestRead { source } => Self::GuestRead { source },
+      arkham_wire::Error::UpstreamRead { source } => Self::UpstreamRead { source },
+      arkham_wire::Error::ResponseFlushToGuest { source } => Self::ResponseFlushToGuest { source },
+      arkham_wire::Error::ResponseChunkToGuest { source } => Self::ResponseChunkToGuest { source },
+      arkham_wire::Error::GuestFlush { source } => Self::GuestFlush { source },
+      arkham_wire::Error::FinalGuestFlush { source } => Self::FinalGuestFlush { source },
+      arkham_wire::Error::ProtocolReplyToGuest { source } => Self::ProtocolReplyToGuest { source },
+      arkham_wire::Error::ProtocolReplyFlush { source } => Self::ProtocolReplyFlush { source },
+      arkham_wire::Error::GuestCertificate { path, source } => Self::GuestCertificate { path, source },
+      arkham_wire::Error::EmptyChain { path } => Self::EmptyChain { path },
+      arkham_wire::Error::ClientKey { path, source } => Self::ClientKey { path, source },
+      arkham_wire::Error::GuestTls { source } => Self::GuestTls { source },
+      arkham_wire::Error::ServerTls { source } => Self::ServerTls { source },
+      arkham_wire::Error::TlsServerName { source } => Self::TlsServerName { source },
+      arkham_wire::Error::HandshakeTimeout => Self::HandshakeTimeout,
+      arkham_wire::Error::EmptyClientIdentity { path } => Self::EmptyClientIdentity { path },
+      arkham_wire::Error::ClientIdentity { path, source } => Self::ClientIdentity { path, source },
+      arkham_wire::Error::MtlsGuestRoots { source } => Self::MtlsGuestRoots { source },
+      arkham_wire::Error::MtlsGuestVerifier { source } => Self::MtlsGuestVerifier { source },
+      arkham_wire::Error::MtlsLeaf { source } => Self::MtlsLeaf { source },
+      arkham_wire::Error::SslRootCert { path, source } => Self::SslRootCert { path, source },
+      arkham_wire::Error::EmptyRootCert { path } => Self::EmptyRootCert { path },
+      arkham_wire::Error::SystemStore { source } => Self::SystemStore { source },
+      arkham_wire::Error::EmptySystemStore => Self::EmptySystemStore,
+    }
+  }
+}
+
+impl From<arkham_smtp::Error> for Error {
+  fn from(err: arkham_smtp::Error) -> Self {
+    match err {
+      arkham_smtp::Error::Wire(source) => Self::from(source),
+      arkham_smtp::Error::LegAlreadyTls => Self::SmtpLegAlreadyTls,
+      other => Self::Smtp(other),
+    }
+  }
 }

@@ -8,6 +8,8 @@ repository = "https://github.com/casualjim/arkham"
 publish = false
 
 [dependencies]
+arkham-smtp = { workspace = true }
+arkham-wire = { workspace = true }
 base62 = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }

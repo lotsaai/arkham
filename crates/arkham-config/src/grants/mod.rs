@@ -13,6 +13,8 @@ mod redis;
 mod smtp;
 
 pub use amqp::{AmqpLeg, AmqpScope, AmqpUriError};
+pub use arkham_smtp::{SmtpLeg, SmtpScope, SmtpUriError};
+pub use arkham_wire::{GuestTlsMode, RootCert};
 pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub(crate) use nats::NatsUriScheme;
 pub use nats::{
@@ -21,7 +23,6 @@ pub use nats::{
 };
 pub use postgres::{PostgresLeg, PostgresScope, SslMode, SslNegotiation};
 pub use redis::{RedisLeg, RedisScope};
-pub use smtp::{SmtpLeg, SmtpScope, SmtpUriError};
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -165,18 +166,6 @@ pub struct Credential {
   pub value: SecretString,
 }
 
-/// How the guest leg treats client certificates. The mode is arkham's own
-/// configuration, carried by the rule's `tls` table, never by an entry URL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum GuestTlsMode {
-  /// Terminate TLS and never ask the guest for a client certificate.
-  #[default]
-  Tls,
-  /// Request a client certificate and admit only ones arkham's own CA signs.
-  Mtls,
-}
-
 /// Allow entry for a bearer-style credential: an endpoint, plus the upstream
 /// client identity an https entry names for mTLS.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,16 +202,6 @@ pub struct SshScope {
   pub identity: PathBuf,
   /// Decoy public key (`authorized_keys` format) the guest leg admits.
   pub guest_key: PathBuf,
-}
-
-/// Upstream trust anchor an entry names with `sslrootcert`: a PEM path, or
-/// libpq's `system` spelling for the platform trust store.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum RootCert {
-  /// PEM trust anchors read from this path.
-  Path(PathBuf),
-  /// The platform trust store.
-  System,
 }
 
 /// Parse one `allow` entry into typed parts. The `url` crate does the
@@ -486,7 +465,9 @@ impl Grant {
       Grant::Token { allow, .. } => allow.iter().any(|entry| endpoint_match(entry, scheme, host, port)),
       Grant::Postgres { scope, .. } => PostgresScope::matches(scope, scheme, host, port),
       Grant::Redis { scope, .. } => RedisScope::matches(scope, scheme, host, port),
-      Grant::Smtp { scope, .. } => SmtpScope::matches(scope, scheme, host, port),
+      Grant::Smtp { scope, .. } => {
+        matches!(scheme, Scheme::Smtp | Scheme::Smtps) && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
+      }
       Grant::Ldap { scope, .. } => LdapScope::matches(scope, scheme, host, port),
       Grant::Nats { scope, .. } => NatsScope::matches(scope, scheme, host, port),
       Grant::Amqp { scope, .. } => AmqpScope::matches(scope, scheme, host, port),

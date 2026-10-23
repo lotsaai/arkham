@@ -21,10 +21,11 @@ Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates
 ### Terminology
 
 - **Face**: the `arkham` binary (`src/main.rs`, `src/commands/`, `src/fwd/`): owns clap parsing, config-load dispatch, the fail-closed `with_capture` select, and the global allocator. It calls into the libraries; no library calls back into it.
-- **Config core**: `arkham-config`: owns `Cli`, `ServeArgs`, and the `CliCommand` dispatch trait, the confique overlay, rule schema, `fake_for`, grant matching (`HostPat`, `EndpointScope`'s `FromStr`, `uri_match`, `Grant::matches`), the host registry, and plugin resolution records.
+- **Config core**: `arkham-config`: owns `Cli`, `ServeArgs`, and the `CliCommand` dispatch trait, the confique overlay, rule schema, `fake_for`, grant matching (`HostPat`, `EndpointScope`'s `FromStr`, `uri_match`, `Grant::matches`), the host registry, and plugin resolution records. Connection-string parsing for a protocol that has its own crate lives in that crate. Config calls it.
 - **Secrets source**: `arkham-fnox`: owns fnox discovery layers, value resolution, and provider-credential export.
 - **PKI**: `arkham-pki`: owns the signing CA, leaf and client-pair generation, and the SSH key helpers (host key load-or-generate, decoy keys, `known_hosts` pinning).
-- **Proxy core**: `arkham-proxy`: owns `ProxyState`, `serve`, `serve_connect_stream` / `serve_transparent_stream`, `relay_guarded`, connection sniffing with SNI resolved through rama's ClientHello parser, and the substitution engines (`transports/http`, `transports/postgres`, `transports/redis`, `transports/smtp`, `transports/ldap`, `transports/nats`, `transports/amqp`, `transports/ssh`, `transports/tcp`, and the shared machine in `transports/engine`).
+- **Wire base**: `arkham-wire`: owns the shared TLS legs, the byte substitution machine, and `relay_guarded`. It depends on no grant type.
+- **Proxy core**: `arkham-proxy`: owns `ProxyState`, `serve`, `serve_connect_stream` / `serve_transparent_stream`, connection sniffing with SNI resolved through rama's ClientHello parser, and the substitution engines that have not moved into a protocol crate (`transports/http`, `transports/postgres`, `transports/redis`, `transports/ldap`, `transports/nats`, `transports/amqp`, `transports/ssh`, `transports/tcp`). SMTP substitution lives in `arkham-smtp`. The proxy calls it.
 - **Plugin host**: `arkham-plugin`: owns wasmtime component-model hosting of rewrite guests around the in-core value swap.
 - **Stack generation**: `arkham-compose`: owns compose/stack generation, path expansion, confinement entry, and ambient source adapters (git, jj, ssh, nats, kube, talos). The stack-command args (`Init`, `Up`, `Down`, `Logs`, `Agent`, `Fwd`) live here behind `arkham-config`'s `CliCommand` trait.
 - **Capture backends**: `arkham-tproxy`, `arkham-tun`, `arkham-ebpf` (userspace halves): own packet capture and hand accepted streams to the proxy core.
@@ -33,10 +34,12 @@ Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates
 | Crate | Role | Dependencies Allowed |
 |---|---|---|
 | `arkham` (binary) | Face: CLI dispatch, `with_capture`, allocator | `arkham-config`, `arkham-fnox`, `arkham-pki`, `arkham-proxy`, `arkham-compose`, `arkham-tproxy`, `arkham-tun`, `arkham-ebpf`; external `clap`, `eyre`, `tokio`, `tracing` |
-| `arkham-config` | Config overlay, grants, registry, CLI types | No workspace crates; external `base62`, `base64`, `clap`, `code-workspace`, `confique`, `dirs`, `hex`, `jwt`, `nkeys`, `percent-encoding`, `secrecy`, `serde`, `serde_json`, `sha2`, `strum`, `toml`, `tracing`, `url`, `validator`, `thiserror` |
+| `arkham-config` | Config overlay, grants, registry, CLI types | `arkham-wire`, `arkham-smtp`; external `base62`, `base64`, `clap`, `code-workspace`, `confique`, `dirs`, `hex`, `jwt`, `nkeys`, `percent-encoding`, `secrecy`, `serde`, `serde_json`, `sha2`, `strum`, `toml`, `tracing`, `url`, `validator`, `thiserror` |
+| `arkham-wire` | Shared TLS legs, byte machine, relay | `arkham-pki`; external `dashmap`, `rama` (boring, tcp), `rustls`, `rustls-native-certs`, `serde`, `thiserror`, `tokio`, `tokio-rustls`, `tracing` |
+| `arkham-smtp` | SMTP grant parsing and AUTH substitution | `arkham-wire`; external `base64`, `percent-encoding`, `secrecy`, `smtp-proto`, `strum`, `thiserror`, `tokio`, `tokio-rustls`, `url` |
 | `arkham-fnox` | fnox discovery and value resolution | `arkham-config`; external `fnox-core`, `miette`, `secrecy`, `serde`, `tokio`, `toml`, `tracing`, `thiserror` |
 | `arkham-pki` | CA, leaf generation, SSH key helpers | No workspace crates; external `rama` (boring), `rcgen`, `rand`, `russh`, `rustls`, `time`, `tracing`, `thiserror` |
-| `arkham-proxy` | MITM relay and substitution engines | `arkham-config`, `arkham-pki`, `arkham-plugin`; external `amq-protocol`, `base64`, `bytes`, `fe2o3-amqp-types`, `rama`, `rasn`, `rasn-ldap`, `rustls`, `rustls-native-certs`, `tokio-rustls`, `httparse`, `httlib-hpack`, `nkeys`, `pgwire`, `russh`, `secrecy`, `serde_amqp`, `serde_json`, `smtp-proto`, `strum`, `url`, `tracing`, `thiserror` |
+| `arkham-proxy` | MITM relay and substitution engines | `arkham-config`, `arkham-pki`, `arkham-plugin`, `arkham-wire`, `arkham-smtp`; external `amq-protocol`, `base64`, `bytes`, `fe2o3-amqp-types`, `rama`, `rasn`, `rasn-ldap`, `rustls`, `rustls-native-certs`, `tokio-rustls`, `httparse`, `httlib-hpack`, `nkeys`, `pgwire`, `russh`, `secrecy`, `serde_amqp`, `serde_json`, `strum`, `url`, `tracing`, `thiserror` |
 | `arkham-plugin` | WASM rewrite-guest host | `arkham-config`; external `wasmtime`, `wasmtime-wasi`, `tracing`, `thiserror` |
 | `arkham-compose` | Stack generation and confinement | `arkham-config`, `arkham-fnox`, `arkham-pki`; external `base64`, `clap`, `dirs`, `gix-config`, `gix-discover`, `libc`, `regex`, `secrecy`, `serde`, `serde_yaml`, `shellexpand`, `toml`, `toml_edit`, `tracing`, `url`, `xpanda`, `tokio`, `thiserror` |
 | `arkham-tproxy` | Kernel TPROXY capture backend | `arkham-config`, `arkham-pki`, `arkham-proxy`; external `futures-util`, `libc`, `netlink-packet-core`, `netlink-packet-netfilter`, `netlink-sys`, `rama` (tcp), `rtnetlink`, `rustls`, `secrecy`, `tokio-rustls`, `tracing`, `thiserror` |
@@ -48,12 +51,12 @@ Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates
 
 1. **Face depends on the libraries only.** `arkham` (binary) may depend on any library crate; no library crate may depend on the binary.
 2. **Dependencies point downward only.** A crate may depend only on the crates named in its `Dependencies Allowed` row; adding a new workspace dependency is a boundary change and needs an AGENTS.md row update.
-3. **`arkham-config` is the bottom.** It depends on no workspace crate; every rule, grant, and registry type flows out of it, never into it.
+3. **`arkham-wire` is the bottom of the proxy stack.** It depends on `arkham-pki` only among workspace crates. `arkham-config` depends on `arkham-wire` for the shared TLS types and on each protocol crate for that protocol's grant types. It does not depend on the proxy, fnox, compose, or a capture backend.
 4. **`arkham-pki` is a leaf.** It depends on no workspace crate; PKI never imports proxy, compose, fnox, or backend types.
 5. **`arkham-fnox` depends on `arkham-config` only.** Value resolution reads rule shapes from config; it never imports proxy, pki, compose, plugin, or backends.
 6. **`arkham-plugin` depends on `arkham-config` only.** The guest host reads grant and plugin records; it never imports proxy internals, PKI, fnox values, or compose.
-7. **`arkham-proxy` is the sole substitution owner.** Only `arkham-proxy` (`transports/*`, `relay`, `connection`) implements fake-to-real and real-to-fake swaps; backends and the face reuse `serve_transparent_stream` and never reimplement MITM logic.
-8. **`arkham-config` is the sole grant gate.** Only `arkham-config` (`grants/`) implements `EndpointScope` parsing / `uri_match` / `Grant::matches`; proxy, plugin, and backends call it and never reimplement host matching.
+7. **Substitution for a protocol crate lives in that crate.** `arkham-smtp` owns the SMTP swap. Protocols that have not moved still swap in `arkham-proxy`. The shared relay lives in `arkham-wire`. Backends and the face reuse `serve_transparent_stream` and never reimplement MITM logic.
+8. **`arkham-config` is the sole grant gate.** Only `arkham-config` (`grants/`) implements `EndpointScope` parsing / `uri_match` / `Grant::matches`. Connection-string parsing for a protocol crate lives in that crate, and config calls it. Proxy, plugin, and backends never reimplement host matching.
 9. **Capture backends depend on the proxy core, never the reverse.** `arkham-tproxy`, `arkham-tun`, `arkham-ebpf` may depend on `arkham-proxy` (plus `arkham-config`, and `arkham-pki` for tproxy/tun); `arkham-proxy` never imports a backend.
 10. **`arkham-compose` never touches the relay.** It may depend on `arkham-config`, `arkham-fnox`, `arkham-pki`; it never imports `arkham-proxy`, `arkham-plugin`, or any capture backend.
 11. **`arkham-ebpf-programs` is fully isolated.** It depends on `aya-ebpf` only, inherits no workspace lints, ships no host code, and every host-wide command excludes it (`--exclude arkham-ebpf-programs`); `dist = false` keeps it out of releases.
@@ -117,7 +120,7 @@ Banned domain vocabulary with required replacements: "birth"/"born" → "join"/"
 
 ### Proxy core: trusts typed inputs, degrades to opaque forward
 
-- Responsibility: `arkham-proxy` accepts on the explicit listener or via a backend's `serve_transparent_stream`, resolves the identity through rama's ClientHello parser (SNI) or the HTTP `Host` head, mints the leaf, peeks H1 vs H2-preface vs raw, then pumps guest chunks through the request machine (fake to real) and server chunks through the response machine (real to fake) around the plugin hooks.
+- Responsibility: `arkham-proxy` accepts on the explicit listener or via a backend's `serve_transparent_stream`, resolves the identity through rama's ClientHello parser (SNI) or the HTTP `Host` head, mints the leaf, peeks H1 vs H2-preface vs raw, then pumps guest chunks through the request machine (fake to real) and server chunks through the response machine (real to fake) around the plugin hooks. A protocol crate owns that protocol's machine. The proxy calls it.
 - Validation: none repeated; typed grants and resolved secrets are trusted. Malformed client traffic closes quietly (`Ok(())`), framing uncertainty degrades to opaque scan-and-forward, never blocks.
 - Normalization: per-connection `tokio::spawn` under 10s pre-auth/dial budgets; `ProxyState` behind plain `Arc` (write-once, no reload); leaf issuance bounded by the `MintBucket` burst guard.
 - ❌ SIN: returning `Ok(())` early to hide a resolution failure, or adding a fallback path around a missing grant.
@@ -204,7 +207,7 @@ When adding a config setting or ambient source: extend `arkham-config` schema pl
 - [ ] No `.unwrap()` or `.expect()` in production paths
 - [ ] **Error boundary**: one `Error` + `Result` at root per boundary crate, children import from root, `eyre` only at the edge
 - [ ] Grant gate intact: matching only in `arkham-config`, no second parser
-- [ ] Substitution intact: swaps only in `arkham-proxy`, backends reuse `serve_transparent_stream`
+- [ ] Substitution intact: a protocol crate owns its swap, other swaps stay in `arkham-proxy`, backends reuse `serve_transparent_stream`
 - [ ] BPF isolation intact: host commands keep `--exclude arkham-ebpf-programs`, map structs stay byte-explicit, no workspace-hack crate added
 - [ ] All public items have doc comments; no debug `println!` or `dbg!`
 - [ ] No hardcoded credentials; no spec ids in code comments or error strings

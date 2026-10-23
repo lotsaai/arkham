@@ -1,28 +1,20 @@
-//! SMTP vertical: the cleartext opening, then the shared relay.
+//! SMTP serve path. The AUTH machine lives in `arkham-smtp`.
 //!
-//! `smtp://` is cleartext until `STARTTLS`. The opening reads the greeting
-//! and the upgrade, then both sockets go to `relay_guarded`. `smtps://` is
-//! TLS from the first byte and relays immediately. AUTH swaps on either leg.
-//! An upstream TLS leg verifies the chain and the host name.
-
-mod machine;
-mod session;
-
-#[cfg(test)]
-pub(crate) use machine::{MAX_COMMAND, Smtp};
-#[cfg(test)]
-pub(crate) use session::{GuestLeg, acceptance_reply, plain_guest};
+//! `smtp://` is cleartext until `STARTTLS`. `smtps://` is TLS from the first
+//! byte. AUTH swaps on either leg.
 
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use arkham_config::grants::SmtpScope;
+use arkham_config::grants::{Scheme, SmtpScope};
+use arkham_smtp::{AuthMaterial, Dialogue, plain_guest, plain_server, run, tls_guest, tls_server};
 
 use super::{ServeStream, Transport};
 use crate::Error;
 use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
+use crate::transports::engine::{Direction, eligible_pairs};
 use crate::transports::tls::{UpstreamTls, Verify, finish};
 
 /// SMTP transport. Each connection string states its own leg.
@@ -74,9 +66,9 @@ impl Transport for SmtpTransport {
       Some((hello_buf, identity)) => {
         let mode = scope.guest_tls;
         let tls = finish(budget, legs.accept_guest(&identity, Prefixed::new(hello_buf, guest), mode, None)).await?;
-        session::tls_guest(tls)
+        tls_guest(tls)
       }
-      None => session::plain_guest(Prefixed::new(guest_head, guest)),
+      None => plain_guest(Prefixed::new(guest_head, guest)),
     };
     let server_leg = if scope.is_upstream_tls {
       let server_name = scope.upstream.host.as_str();
@@ -99,21 +91,32 @@ impl Transport for SmtpTransport {
           .await
       })
       .await?;
-      session::tls_server(tls)
+      tls_server(tls)
     } else {
-      session::plain_server(upstream)
+      plain_server(upstream)
     };
-    session::run(session::Dialogue {
+    let label = snapshot
+      .grants
+      .iter()
+      .find_map(|grant| {
+        grant.smtp(Some(host_key), port)?;
+        grant.credential().map(|credential| credential.label.clone())
+      })
+      .unwrap_or_default();
+    let material = AuthMaterial::from_scope(scope, &label);
+    let pairs = eligible_pairs(&snapshot.grants, Scheme::Smtp, host_key, port, Direction::Upstream);
+    run(Dialogue {
       legs,
       scope,
       guest: guest_leg,
       server: server_leg,
-      grants: &snapshot.grants,
-      host: host_key,
-      port,
+      material,
+      pairs,
+      leaf: host_key,
       budget,
     })
     .await
+    .map_err(Error::from)
   }
 }
 

@@ -1,0 +1,23 @@
+[package]
+name = "arkham-wire"
+version = "0.3.31"
+edition = "2024"
+description = "grant-scoped MITM proxy: shared TLS legs, byte substitution, and the relay"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-pki = { workspace = true }
+dashmap = { workspace = true }
+rama = { workspace = true, features = ["boring", "tcp"] }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

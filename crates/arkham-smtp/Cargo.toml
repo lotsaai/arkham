@@ -1,0 +1,26 @@
+[package]
+name = "arkham-smtp"
+version = "0.3.31"
+edition = "2024"
+description = "grant-scoped MITM proxy: SMTP grant parsing and AUTH substitution"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-wire = { workspace = true }
+base64 = { workspace = true }
+percent-encoding = { workspace = true }
+secrecy = { workspace = true }
+smtp-proto = { workspace = true }
+strum = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
