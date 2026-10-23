@@ -89,12 +89,6 @@ pub enum AmqpUriError {
     /// `sslmode`, `ssl`, or `sslnegotiation`.
     key: String,
   },
-  /// TLS material on a cleartext string, which never opens TLS.
-  #[error("bad connection string: {key} is legal only on amqps://")]
-  CleartextMaterial {
-    /// `sslrootcert`, `sslcert`, or `sslkey`.
-    key: &'static str,
-  },
   /// A path query was empty.
   #[error("bad connection string: {key} needs a path")]
   EmptyMaterial {
@@ -198,9 +192,7 @@ fn amqp_tls(uri: &AmqpUri) -> Result<AmqpTls, AmqpUriError> {
   let mut client_key = None;
   for (key, value) in &uri.query {
     let material = |key: &'static str| {
-      if uri.scheme != Scheme::Amqps {
-        Err(AmqpUriError::CleartextMaterial { key })
-      } else if value.is_empty() {
+      if value.is_empty() {
         Err(AmqpUriError::EmptyMaterial { key })
       } else {
         Ok(PathBuf::from(value))
@@ -289,9 +281,6 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
     if tls.root_cert.is_some() {
       return Err(Error::AmqpTrust { label: label.to_string() });
     }
-    if tls.guest_tls_mode == GuestTlsMode::Mtls && !scope.is_downstream_tls {
-      return Err(Error::AmqpCleartextMtls { label: label.to_string() });
-    }
     scope.guest_tls = tls.guest_tls_mode;
   }
   let credential = Credential {
@@ -330,13 +319,23 @@ mod tests {
       (format!("amqps://{USER}:{PASS}@mq.internal?sslcert="), "sslcert needs a path"),
       (format!("amqps://{USER}:{PASS}@mq.internal?unknown=1"), "unknown query"),
       (format!("amqps://{USER}:{PASS}@mq.internal?sslcert=/c.pem"), "come together"),
-      (format!("amqp://{USER}:{PASS}@mq.internal?sslrootcert=system"), "amqps"),
     ];
     for (real, problem) in queried {
       let err = AmqpScope::from_strings(&fake, &real).expect_err("rejected string");
       assert_hides(&real, &err.to_string(), problem);
       assert_hides(&fake, &err.to_string(), problem);
     }
+  }
+
+  #[test]
+  fn amqp_cleartext_string_keeps_tls_material() {
+    let fake = format!("amqp://{USER}:{PASS}@mq.internal");
+    let real = format!("amqp://{USER}:{PASS}@mq.internal?sslrootcert=system&sslcert=/c.pem&sslkey=/k.pem");
+    let scope = AmqpScope::from_strings(&fake, &real).expect("cleartext material loads");
+    assert!(!scope.is_upstream_tls);
+    assert_eq!(scope.root_cert, Some(crate::grants::RootCert::System));
+    assert_eq!(scope.client_cert.as_deref(), Some(std::path::Path::new("/c.pem")));
+    assert_eq!(scope.client_key.as_deref(), Some(std::path::Path::new("/k.pem")));
   }
 
   #[test]

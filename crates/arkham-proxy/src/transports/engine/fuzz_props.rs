@@ -481,9 +481,8 @@ fn amqp_leg(leg: AmqpLeg) -> Amqp {
     scope: Box::new(scope),
   }];
   match leg {
-    AmqpLeg::DownSwap => Amqp::new(&grants, "mq", 5672, Direction::Downstream, true),
-    AmqpLeg::DownClear => Amqp::new(&grants, "mq", 5672, Direction::Downstream, false),
-    AmqpLeg::Up => Amqp::new(&grants, "mq", 5672, Direction::Upstream, false),
+    AmqpLeg::DownSwap | AmqpLeg::DownClear => Amqp::new(&grants, "mq", 5672, Direction::Downstream),
+    AmqpLeg::Up => Amqp::new(&grants, "mq", 5672, Direction::Upstream),
   }
   .expect("secret fits")
 }
@@ -943,7 +942,7 @@ proptest! {
     let byte = run_amqp(leg, &data, &byte_cuts);
     prop_assert_eq!(once.1, split.1);
     prop_assert_eq!(once.1, byte.1);
-    prop_assert_eq!(once.1, matches!(leg, AmqpLeg::DownSwap) && amqp_open_refused(&data));
+    prop_assert_eq!(once.1, !matches!(leg, AmqpLeg::Up) && amqp_open_refused(&data));
     if once.1 {
       return Ok(());
     }
@@ -955,12 +954,13 @@ proptest! {
     let plain_real = [b"\0svc\0".as_slice(), AMQP_REAL.as_bytes()].concat();
     match leg {
       AmqpLeg::Up => prop_assert!(!contains_bytes(&out, AMQP_REAL.as_bytes())),
-      AmqpLeg::DownClear => prop_assert_eq!(&out, &data),
-      AmqpLeg::DownSwap if contains_bytes(&data, &plain_fake) && contains_bytes(&data, b"\x05PLAIN") => {
+      AmqpLeg::DownSwap | AmqpLeg::DownClear
+        if contains_bytes(&data, &plain_fake) && contains_bytes(&data, b"\x05PLAIN") =>
+      {
         prop_assert!(contains_bytes(&out, &plain_real));
         prop_assert!(!contains_bytes(&out, AMQP_FAKE.as_bytes()));
       }
-      AmqpLeg::DownSwap => prop_assert_eq!(&out, &data),
+      AmqpLeg::DownSwap | AmqpLeg::DownClear => prop_assert_eq!(&out, &data),
     }
   }
 

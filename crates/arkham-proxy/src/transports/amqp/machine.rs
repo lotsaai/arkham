@@ -271,7 +271,8 @@ impl Amqp {
   ///
   /// Returns [`crate::Error::AmqpSecretTooLong`] when the upstream password cannot fit in one
   /// 0-9-1 body frame under the protocol minimum frame size.
-  pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction, swap: bool) -> Result<Self, crate::Error> {
+  /// Cleartext and TLS both swap.
+  pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction) -> Result<Self, crate::Error> {
     let found = grants.iter().find_map(|grant| {
       let scope = grant.amqp(Some(host), port)?;
       let label = grant.credential().map(|credential| credential.label.clone()).unwrap_or_default();
@@ -281,7 +282,7 @@ impl Amqp {
       secret_fits(scope.upstream.password.expose_secret().len())?;
     }
     let down = match &found {
-      Some((scope, label)) if dir == Direction::Downstream && swap => Some(Down {
+      Some((scope, label)) if dir == Direction::Downstream => Some(Down {
         fake: scope.downstream.password.expose_secret().as_bytes().to_vec(),
         user: scope.upstream.user.as_bytes().to_vec(),
         real: scope.upstream.password.expose_secret().as_bytes().to_vec(),
@@ -291,7 +292,7 @@ impl Amqp {
       _ => None,
     };
     let up = match found {
-      Some((scope, label)) if dir == Direction::Upstream && scope.is_upstream_tls => Some(CredentialPair {
+      Some((scope, label)) if dir == Direction::Upstream => Some(CredentialPair {
         needle: scope.upstream.password.expose_secret().as_bytes().to_vec(),
         replacement: scope.downstream.password.expose_secret().as_bytes().to_vec(),
         label,
@@ -2116,15 +2117,15 @@ mod tests {
 
   fn down(swap: bool) -> Amqp {
     let real_scheme = if swap { "amqps" } else { "amqp" };
-    Amqp::new(&grants(real_scheme), "mq", 5672, Direction::Downstream, swap).expect("secret fits")
+    Amqp::new(&grants(real_scheme), "mq", 5672, Direction::Downstream).expect("secret fits")
   }
 
   fn up() -> Amqp {
-    Amqp::new(&grants("amqps"), "mq", 5672, Direction::Upstream, false).expect("secret fits")
+    Amqp::new(&grants("amqps"), "mq", 5672, Direction::Upstream).expect("secret fits")
   }
 
   fn up_clear() -> Amqp {
-    Amqp::new(&grants("amqp"), "mq", 5672, Direction::Upstream, false).expect("secret fits")
+    Amqp::new(&grants("amqp"), "mq", 5672, Direction::Upstream).expect("secret fits")
   }
 
   fn up_password(real: &str) -> Amqp {
@@ -2137,7 +2138,7 @@ mod tests {
       },
       scope: Box::new(scope),
     }];
-    Amqp::new(&grants, "mq", 5672, Direction::Upstream, false).expect("secret fits")
+    Amqp::new(&grants, "mq", 5672, Direction::Upstream).expect("secret fits")
   }
 
   fn encode_frame(frame: &AMQPFrame) -> Vec<u8> {
@@ -2668,11 +2669,13 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn amqp_plain_start_ok_keeps_the_decoy_when_upstream_is_cleartext() {
+  async fn amqp_plain_start_ok_swaps_when_upstream_is_cleartext() {
     let wire = start_ok("PLAIN", plain("agent", FAKE));
     let out = run(&mut down(false), &wire).await.expect("emitted");
-    assert_eq!(out, wire);
-    assert!(!contains(&out, REAL));
+    let (mechanism, response) = start_ok_response(&out);
+    assert_eq!(mechanism, "PLAIN");
+    assert_eq!(response, plain("svc", REAL));
+    assert!(!contains(&out, FAKE));
   }
 
   #[tokio::test]
@@ -2684,14 +2687,13 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn amqp_sasl_init_plain_swaps_only_when_upstream_is_tls() {
+  async fn amqp_sasl_init_plain_swaps_on_cleartext_and_tls() {
     let wire = sasl_init("PLAIN", Some(plain("agent", FAKE)));
-    let out = run(&mut down(true), &wire).await.expect("emitted");
-    assert_eq!(sasl_init_response(&out), plain("svc", REAL));
-    assert!(!contains(&out, FAKE));
-    let out = run(&mut down(false), &wire).await.expect("emitted");
-    assert_eq!(out, wire);
-    assert!(!contains(&out, REAL));
+    for mut machine in [down(true), down(false)] {
+      let out = run(&mut machine, &wire).await.expect("emitted");
+      assert_eq!(sasl_init_response(&out), plain("svc", REAL));
+      assert!(!contains(&out, FAKE));
+    }
   }
 
   #[tokio::test]
@@ -3494,7 +3496,7 @@ mod tests {
       scope: Box::new(scope),
     }];
     assert!(matches!(
-      Amqp::new(&grants, "mq", 5672, Direction::Upstream, false),
+      Amqp::new(&grants, "mq", 5672, Direction::Upstream),
       Err(crate::Error::AmqpSecretTooLong { len }) if len == password.len()
     ));
   }
@@ -3697,26 +3699,31 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn a_cleartext_upstream_does_not_withhold_a_prefix() {
+  async fn a_cleartext_upstream_hides_a_split_password() {
     let (prefix, rest) = password_split();
     let mut input = header_10().to_vec();
     input.extend(transfer(1, true, prefix));
     input.extend(transfer(1, false, rest));
     let mut machine = up_clear();
     let rewritten = machine.feed(&input).await.0;
-    let Rewritten::Emit(emitted) = rewritten else {
-      panic!("cleartext upstream withheld or closed");
-    };
-    assert_eq!(emitted.into_owned(), input);
-    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+    match rewritten {
+      Rewritten::Emit(emitted) => {
+        assert_ne!(emitted.as_ref(), input.as_slice());
+        assert!(!contains(&emitted, REAL));
+      }
+      Rewritten::Close => {}
+      Rewritten::Hold => panic!("cleartext upstream dropped the password frames"),
+    }
   }
 
   #[tokio::test]
-  async fn a_cleartext_downstream_forwards_the_open_unchanged() {
+  async fn a_cleartext_downstream_lowers_the_open() {
+    let room = u32::try_from(hold_room()).unwrap();
+    let offered = 4_096u32;
     let mut guest_side = down(false);
-    let client = after_sasl(&open_frame(4_096));
+    let client = after_sasl(&open_frame(offered));
     let out = feed_open(&mut guest_side, &client).await;
-    assert_eq!(out, client);
+    assert_eq!(forwarded_open_max(&out), offered - room);
   }
 
   #[tokio::test]
