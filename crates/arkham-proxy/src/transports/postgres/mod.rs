@@ -4,18 +4,17 @@
 mod auth;
 pub(crate) mod machine;
 
-use dashmap::DashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
+use rustls::client::WantsClientCert;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, ServerConfig, SignatureScheme};
+use rustls::{ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore, ServerConfig, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::server::TlsStream as ServerTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use arkham_config::grants::{GuestTlsMode, PostgresScope, RootCert, SslMode, SslNegotiation};
 use arkham_pki::ca::CertAuthority;
@@ -23,13 +22,12 @@ use arkham_pki::ca::CertAuthority;
 use super::PairCtx;
 use super::{ServeStream, TlsHalves, Transport};
 use crate::Error;
-use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening};
+use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Direction, Postgres};
 use crate::transports::engine::{GuestOpening, read_guest_opening, request_upstream_tls};
-use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
-use rama::tls::client::ClientAuth;
+use crate::transports::tls::cached_roots;
 
 /// Postgres transport: guest leaves under the `postgresql` ALPN, upstream
 /// handshakes under libpq's `sslmode` law.
@@ -64,41 +62,45 @@ impl PostgresTransport {
 impl TlsHalves for PostgresTransport {
   type Scope = PostgresScope;
 
-  /// Accept the guest's TLS, minting the leaf for `sni` on first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the handshake fails.
-  async fn accept_guest<G>(&self, name: &str, guest: G, guest_tls: GuestTlsMode) -> Result<ServerTlsStream<G>, Error>
-  where
-    G: AsyncRead + AsyncWrite + Unpin,
-  {
-    // A real server offers this identifier, and a direct-TLS client looks for
-    // it (PostgreSQL 17). Classic clients offer no ALPN and see none.
-    let config = match guest_tls {
-      GuestTlsMode::Tls => cached_leaf(&self.ca, &self.leaves, name, Some(POSTGRESQL_ALPN))?,
-      // `mtls` asks the guest for a client certificate and admits only ones
-      // this arkham's own CA signs — the same anchor that mints the leaves.
-      GuestTlsMode::Mtls => cached_leaf_mtls(&self.ca, &self.leaves, name, Some(POSTGRESQL_ALPN))?,
-    };
-    TlsAcceptor::from(config)
-      .accept(guest)
-      .await
-      .map_err(|err| Error::GuestPostgresTls { source: err })
+  fn ca(&self) -> &CertAuthority {
+    &self.ca
   }
 
-  /// Handshake the server, verifying only what the entry asked to verify.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the named trust anchor cannot be read, when the
-  /// server name is unusable, or when the handshake fails.
-  async fn connect_server<S>(&self, scope: &PostgresScope, server_name: &str, server: S) -> Result<ClientTlsStream<S>, Error>
-  where
-    S: AsyncRead + AsyncWrite + Unpin,
-  {
-    let roots = match &scope.root_cert {
-      Some(root) => Some(cached_roots(&self.roots, root)?),
+  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
+    &self.leaves
+  }
+
+  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
+    &self.roots
+  }
+
+  fn tls_label(&self) -> &'static str {
+    "postgres"
+  }
+
+  fn guest_alpn(&self) -> Option<&'static [u8]> {
+    // A real server offers this identifier, and a direct-TLS client looks for
+    // it (PostgreSQL 17). Classic clients offer no ALPN and see none.
+    Some(POSTGRESQL_ALPN)
+  }
+
+  fn server_alpn(&self, scope: &PostgresScope) -> Option<&'static [u8]> {
+    // Direct TLS is defined by this identifier, on both ends (RFC 9113 does
+    // the same for `h2`). A negotiated-shape client offers nothing.
+    (scope.negotiation == SslNegotiation::Direct).then_some(POSTGRESQL_ALPN)
+  }
+
+  fn root_cert<'a>(&self, scope: &'a PostgresScope) -> Option<&'a RootCert> {
+    scope.root_cert.as_ref()
+  }
+
+  fn client_paths<'a>(&self, scope: &'a PostgresScope) -> Option<(&'a Path, &'a Path)> {
+    Some((scope.client_cert.as_deref()?, scope.client_key.as_deref()?))
+  }
+
+  fn client_builder(&self, scope: &PostgresScope) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>, Error> {
+    let roots = match self.root_cert(scope) {
+      Some(root) => Some(cached_roots(self.roots(), root)?),
       None => None,
     };
     let verifier = EgressCertVerifier {
@@ -106,35 +108,11 @@ impl TlsHalves for PostgresTransport {
       check_name: scope.ssl == SslMode::VerifyFull,
       provider: Arc::clone(&self.provider),
     };
-    let builder = ClientConfig::builder()
-      .dangerous()
-      .with_custom_certificate_verifier(Arc::new(verifier));
-    let mut config = match (&scope.client_cert, &scope.client_key) {
-      // The entry names the proxy's client identity, so the upstream leg
-      // presents it; nothing else invents one.
-      (Some(cert), Some(key)) => {
-        let ClientAuth::Single(data) = client_identity(cert, key)? else {
-          return Err(Error::EmptyClientIdentity { path: cert.clone() });
-        };
-        builder
-          .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|err| Error::ClientIdentity {
-            path: cert.clone(),
-            source: err,
-          })?
-      }
-      _ => builder.with_no_client_auth(),
-    };
-    if scope.negotiation == SslNegotiation::Direct {
-      // Direct TLS is defined by this identifier, on both ends (RFC 9113 does
-      // the same for `h2`). A negotiated-shape client offers nothing.
-      config.alpn_protocols = vec![POSTGRESQL_ALPN.to_vec()];
-    }
-    let name = ServerName::try_from(server_name.to_string()).map_err(|err| Error::PostgresServerName { source: err.into() })?;
-    TlsConnector::from(Arc::new(config))
-      .connect(name, server)
-      .await
-      .map_err(|err| Error::ServerPostgresTls { source: err })
+    Ok(
+      ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier)),
+    )
   }
 }
 

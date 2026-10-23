@@ -14,27 +14,21 @@ pub(crate) use machine::{MAX_COMMAND, Smtp};
 #[cfg(test)]
 pub(crate) use session::{GuestLeg, acceptance_reply, plain_guest};
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::server::TlsStream as ServerTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use arkham_config::grants::{GuestTlsMode, RootCert, SmtpScope};
+use arkham_config::grants::{RootCert, SmtpScope};
 use arkham_pki::ca::CertAuthority;
-use arkham_pki::ca::generate_domain_pair;
 
 use super::{PairCtx, ServeStream, TlsHalves, Transport};
 use crate::Error;
-use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening};
+use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
-use rama::tls::client::ClientAuth;
 
 /// First byte of a TLS record carrying a handshake. A cleartext `smtp`
 /// scope never serves one; implicit TLS is `smtps`.
@@ -61,167 +55,33 @@ impl SmtpTransport {
       roots: DashMap::new(),
     })
   }
-
-  // TODO: `leaf`, `leaf_mtls`, and `roots_for` match the Redis transport.
-  // A later TLS protocol should share them instead of copying them again.
-  /// Leaf for one name, cached. Minted before insert so two guests naming
-  /// the same host keygen at most twice.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted.
-  fn leaf(&self, sni: &str) -> Result<Arc<ServerConfig>, Error> {
-    if let Some(config) = self.leaves.get(sni) {
-      return Ok(config.clone());
-    }
-    // SMTP has no ALPN identifier; a real server offers none either.
-    let config = Arc::new((*self.ca.generate_domain_cert(sni)?.server_config).clone());
-    self.leaves.insert(sni.to_string(), Arc::clone(&config));
-    Ok(config)
-  }
-
-  /// `mtls` variant of [`Self::leaf`]: the same leaf, demanding a client
-  /// certificate this arkham's CA can verify.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the verifier cannot
-  /// be built.
-  fn leaf_mtls(&self, sni: &str) -> Result<Arc<ServerConfig>, Error> {
-    let cache_key = format!("{sni}|mtls");
-    if let Some(config) = self.leaves.get(&cache_key) {
-      return Ok(config.clone());
-    }
-    let (chain, key_der) = generate_domain_pair(&self.ca, sni)?;
-    let mut roots = RootCertStore::empty();
-    roots
-      .add(self.ca.cert_der().clone())
-      .map_err(|err| Error::MtlsGuestRoots { source: err })?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
-      .build()
-      .map_err(|err| Error::MtlsGuestVerifier { source: err.into() })?;
-    let config = Arc::new(
-      rustls::server::ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(chain, key_der)
-        .map_err(|err| Error::MtlsLeaf { source: err })?,
-    );
-    self.leaves.insert(cache_key, Arc::clone(&config));
-    Ok(config)
-  }
-
-  /// Trust anchors for the upstream leg: the real string's `sslrootcert`,
-  /// or the platform store when it names none.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the anchor cannot be read or holds no certificates.
-  fn roots_for(&self, root: &RootCert) -> Result<Arc<RootCertStore>, Error> {
-    if let Some(store) = self.roots.get(root) {
-      return Ok(store.clone());
-    }
-    let store = match root {
-      RootCert::Path(path) => {
-        let pem = std::fs::read(path).map_err(|err| Error::SslRootCert {
-          path: path.clone(),
-          source: err.into(),
-        })?;
-        let mut store = RootCertStore::empty();
-        let mut anchors = 0usize;
-        for cert in CertificateDer::pem_slice_iter(&pem) {
-          let cert = cert.map_err(|err| Error::SslRootCert {
-            path: path.clone(),
-            source: err.into(),
-          })?;
-          store.add(cert).map_err(|err| Error::SslRootCert {
-            path: path.clone(),
-            source: err.into(),
-          })?;
-          anchors += 1;
-        }
-        if anchors == 0 {
-          return Err(Error::EmptyRootCert { path: path.clone() });
-        }
-        store
-      }
-      RootCert::System => {
-        let mut native = rustls_native_certs::load_native_certs();
-        if !native.errors.is_empty() {
-          return Err(Error::SystemStore {
-            source: native.errors.remove(0).into(),
-          });
-        }
-        let mut store = RootCertStore::empty();
-        for cert in native.certs {
-          store.add(cert).map_err(|err| Error::SystemStore { source: err.into() })?;
-        }
-        if store.is_empty() {
-          return Err(Error::EmptySystemStore);
-        }
-        store
-      }
-    };
-    let store = Arc::new(store);
-    self.roots.insert(root.clone(), Arc::clone(&store));
-    Ok(store)
-  }
 }
 
 impl TlsHalves for SmtpTransport {
   type Scope = SmtpScope;
 
-  /// Accept the guest's TLS, minting the leaf for `name` on first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the handshake fails.
-  async fn accept_guest<G>(&self, name: &str, guest: G, guest_tls: GuestTlsMode) -> Result<ServerTlsStream<G>, Error>
-  where
-    G: AsyncRead + AsyncWrite + Unpin,
-  {
-    let config = match guest_tls {
-      GuestTlsMode::Tls => self.leaf(name)?,
-      GuestTlsMode::Mtls => self.leaf_mtls(name)?,
-    };
-    TlsAcceptor::from(config)
-      .accept(guest)
-      .await
-      .map_err(|err| Error::GuestSmtpTls { source: err })
+  fn ca(&self) -> &CertAuthority {
+    &self.ca
   }
 
-  /// Handshake the server. The chain and the host name are verified
-  /// against the real string's `sslrootcert`, or the platform store.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the trust anchor cannot be read, when the server
-  /// name is unusable, or when the handshake fails.
-  async fn connect_server<S>(&self, scope: &SmtpScope, server_name: &str, server: S) -> Result<ClientTlsStream<S>, Error>
-  where
-    S: AsyncRead + AsyncWrite + Unpin,
-  {
-    let root = scope.root_cert.clone().unwrap_or(RootCert::System);
-    let roots = self.roots_for(&root)?;
-    let builder = ClientConfig::builder().with_root_certificates(roots);
-    let config = match (&scope.client_cert, &scope.client_key) {
-      (Some(cert), Some(key)) => {
-        let ClientAuth::Single(data) = client_identity(cert, key)? else {
-          return Err(Error::EmptyClientIdentity { path: cert.clone() });
-        };
-        builder
-          .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|err| Error::ClientIdentity {
-            path: cert.clone(),
-            source: err,
-          })?
-      }
-      _ => builder.with_no_client_auth(),
-    };
-    let name = ServerName::try_from(server_name.to_string()).map_err(|err| Error::SmtpServerName { source: err.into() })?;
-    TlsConnector::from(Arc::new(config))
-      .connect(name, server)
-      .await
-      .map_err(|err| Error::ServerSmtpTls { source: err })
+  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
+    &self.leaves
+  }
+
+  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
+    &self.roots
+  }
+
+  fn tls_label(&self) -> &'static str {
+    "smtp"
+  }
+
+  fn root_cert<'a>(&self, scope: &'a SmtpScope) -> Option<&'a RootCert> {
+    scope.root_cert.as_ref()
+  }
+
+  fn client_paths<'a>(&self, scope: &'a SmtpScope) -> Option<(&'a Path, &'a Path)> {
+    Some((scope.client_cert.as_deref()?, scope.client_key.as_deref()?))
   }
 }
 

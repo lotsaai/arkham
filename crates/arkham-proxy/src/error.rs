@@ -244,128 +244,29 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
-  /// A guest Postgres TLS handshake fails.
-  #[error("guest postgres TLS: {source}")]
-  GuestPostgresTls {
+  /// A guest TLS handshake fails.
+  #[error("guest {protocol} TLS: {source}")]
+  GuestTls {
+    /// Protocol that accepted the guest.
+    protocol: &'static str,
     /// Underlying handshake failure.
     #[source]
     source: IoError,
   },
-  /// A server Postgres TLS handshake fails.
-  #[error("server postgres TLS: {source}")]
-  ServerPostgresTls {
+  /// A server TLS handshake fails.
+  #[error("server {protocol} TLS: {source}")]
+  ServerTls {
+    /// Protocol that connected upstream.
+    protocol: &'static str,
     /// Underlying handshake failure.
     #[source]
     source: IoError,
   },
-  /// A Postgres upstream name cannot become a TLS server name.
-  #[error("postgres server name: {source}")]
-  PostgresServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// A guest Redis TLS handshake fails.
-  #[error("guest redis TLS: {source}")]
-  GuestRedisTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A server Redis TLS handshake fails.
-  #[error("server redis TLS: {source}")]
-  ServerRedisTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A Redis upstream name cannot become a TLS server name.
-  #[error("redis server name: {source}")]
-  RedisServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// A guest SMTP TLS handshake fails.
-  #[error("guest smtp TLS: {source}")]
-  GuestSmtpTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A guest LDAP TLS handshake fails.
-  #[error("guest ldap TLS: {source}")]
-  GuestLdapTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A server SMTP TLS handshake fails.
-  #[error("server smtp TLS: {source}")]
-  ServerSmtpTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A server LDAP TLS handshake fails.
-  #[error("server ldap TLS: {source}")]
-  ServerLdapTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// An SMTP upstream name cannot become a TLS server name.
-  #[error("smtp server name: {source}")]
-  SmtpServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// An LDAP upstream name cannot become a TLS server name.
-  #[error("ldap server name: {source}")]
-  LdapServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// A guest NATS TLS handshake fails.
-  #[error("guest nats TLS: {source}")]
-  GuestNatsTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A guest AMQP TLS handshake fails.
-  #[error("guest amqp TLS: {source}")]
-  GuestAmqpTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A server NATS TLS handshake fails.
-  #[error("server nats TLS: {source}")]
-  ServerNatsTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A server AMQP TLS handshake fails.
-  #[error("server amqp TLS: {source}")]
-  ServerAmqpTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A NATS upstream name cannot become a TLS server name.
-  #[error("nats server name: {source}")]
-  NatsServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// An AMQP upstream name cannot become a TLS server name.
-  #[error("amqp server name: {source}")]
-  AmqpServerName {
+  /// An upstream name cannot become a TLS server name.
+  #[error("{protocol} server name: {source}")]
+  ServerName {
+    /// Protocol that read the name.
+    protocol: &'static str,
     /// Underlying name failure.
     #[source]
     source: Box<dyn StdError + Send + Sync>,
