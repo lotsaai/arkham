@@ -47,7 +47,7 @@ mod tests {
 
   use crate::transports::engine::{Direction, Ldap};
   use arkham_config::grants::{Credential, Grant, LdapScope};
-  use rasn_ldap::{ExtendedRequest, LdapMessage, ProtocolOp, ResultCode};
+  use rasn_ldap::{ExtendedRequest, LdapMessage, ProtocolOp};
   use secrecy::SecretString;
 
   use arkham_wire::relay::{ChunkStep, ToResponse, on_upstream_chunk};
@@ -77,8 +77,8 @@ mod tests {
   fn pair() -> (Ldap, Ldap) {
     let grants = grants();
     (
-      Ldap::new(&grants, "ldap", 389, Direction::Downstream, true),
-      Ldap::new(&grants, "ldap", 389, Direction::Upstream, false),
+      Ldap::new(&grants, "ldap", 389, Direction::Downstream),
+      Ldap::new(&grants, "ldap", 389, Direction::Upstream),
     )
   }
 
@@ -104,23 +104,23 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn open_bind_refuses_starttls_before_any_bind_result() {
+  async fn open_bind_still_hands_off_starttls() {
     let (mut down, mut up) = pair();
     down.hold_starttls();
     let (guest_relay, mut guest) = tokio::io::duplex(4096);
     let (server_relay, _server) = tokio::io::duplex(4096);
     let relay = tokio::spawn(async move { relay_stop(guest_relay, server_relay, &mut down, &mut up, &[], &[]).await });
     guest.write_all(&bind_and_starttls()).await.unwrap();
-    let mut buf = [0u8; 512];
-    let read = tokio::time::timeout(Duration::from_millis(500), guest.read(&mut buf)).await;
-    relay.abort();
-    let n = read.expect("operationsError before the bind result").unwrap();
-    let message: LdapMessage = rasn::ber::decode(&buf[..n]).unwrap();
-    let ProtocolOp::ExtendedResp(body) = message.protocol_op else {
-      panic!("starttls response");
+    let end = tokio::time::timeout(Duration::from_secs(1), relay)
+      .await
+      .expect("handoff")
+      .unwrap()
+      .unwrap();
+    let RelayEnd::Upgrade(upgrade) = end else {
+      panic!("upgrade");
     };
-    assert_eq!(message.message_id, 2);
-    assert_eq!(body.result_code, ResultCode::OperationsError);
+    assert!(upgrade.local);
+    assert_eq!(upgrade.id, 2);
   }
 
   fn starttls(id: u32) -> Vec<u8> {
@@ -155,7 +155,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn split_entry_gets_operations_error_after_the_whole_entry() {
+  async fn split_entry_upgrades_after_the_whole_entry() {
     let (entry, split) = big_entry();
     let (mut down, mut up) = pair();
     down.hold_starttls();
@@ -173,25 +173,24 @@ mod tests {
     guest.write_all(&starttls(2)).await.unwrap();
     let mut early = [0u8; 64];
     let early = tokio::time::timeout(Duration::from_millis(200), guest.read(&mut early)).await;
-    assert!(early.is_err(), "operationsError landed inside the entry");
+    assert!(early.is_err(), "the upgrade landed inside the entry");
     server.write_all(&entry[split..]).await.unwrap();
-    let mut rest = vec![0u8; entry.len() - split + 256];
-    let n = tokio::time::timeout(Duration::from_secs(1), guest.read(&mut rest))
+    let end = tokio::time::timeout(Duration::from_secs(1), relay)
+      .await
+      .expect("upgrade after the entry")
+      .unwrap()
+      .unwrap();
+    let RelayEnd::Upgrade(upgrade) = end else {
+      panic!("upgrade");
+    };
+    assert!(upgrade.local);
+    assert_eq!(upgrade.id, 2);
+    let mut got = vec![0u8; entry.len() - split];
+    tokio::time::timeout(Duration::from_secs(1), guest.read_exact(&mut got))
       .await
       .expect("entry tail")
       .unwrap();
-    relay.abort();
-    let mut stream = entry[..split].to_vec();
-    stream.extend_from_slice(&rest[..n]);
-    let (decoded, after) = decode_one(&stream);
-    assert_eq!(decoded, rasn::ber::decode(&entry).unwrap());
-    let (refusal, leftover) = decode_one(after);
-    assert_eq!(leftover, &b""[..]);
-    let ProtocolOp::ExtendedResp(body) = refusal.protocol_op else {
-      panic!("starttls response");
-    };
-    assert_eq!(refusal.message_id, 2);
-    assert_eq!(body.result_code, ResultCode::OperationsError);
+    assert_eq!(got, entry[split..]);
   }
 
   #[tokio::test]
@@ -356,12 +355,6 @@ mod tests {
     );
     let bytes = rasn::ber::encode(&LdapMessage::new(1, ProtocolOp::SearchResEntry(entry))).unwrap();
     (bytes, 64)
-  }
-
-  fn decode_one(bytes: &[u8]) -> (LdapMessage, &[u8]) {
-    let message: LdapMessage = rasn::ber::decode(bytes).unwrap();
-    let encoded = rasn::ber::encode(&message).unwrap();
-    (message, bytes.get(encoded.len()..).unwrap_or_default())
   }
 
   struct StallWrite<T> {

@@ -1,5 +1,4 @@
-//! LDAP simple bind through the MITM: a cleartext upstream keeps the decoy,
-//! `StartTLS` swaps only after the upgrade, and LDAPS swaps from the first byte.
+//! LDAP simple bind through the MITM. Cleartext and TLS both swap.
 
 use super::*;
 use arkham_config::grants::LdapScope;
@@ -90,7 +89,7 @@ async fn connect_through_proxy(proxy_addr: SocketAddr, stub_port: u16) -> TcpStr
 }
 
 #[tokio::test]
-async fn ldap_cleartext_bind_forwards_the_decoy() {
+async fn ldap_cleartext_bind_swaps_the_password() {
   let fx = mitm_fixture(|port| {
     vec![ldap_grant(
       &format!("ldap://{}:{FAKE}@localhost:{port}", user(DN)),
@@ -101,7 +100,7 @@ async fn ldap_cleartext_bind_forwards_the_decoy() {
   let stub_task = tokio::spawn(async move {
     let (mut conn, _) = fx.stub.accept().await.unwrap();
     let request = read_message(&mut conn).await;
-    assert_eq!(simple_password(&request), FAKE.as_bytes());
+    assert_eq!(simple_password(&request), VALUE.as_bytes());
     let response = LdapMessage::new(
       request.message_id,
       ProtocolOp::BindResponse(BindResponse::new(
@@ -238,13 +237,13 @@ where
       }
       ProtocolOp::ExtendedResp(body) => {
         assert_eq!(message.message_id, 2);
-        assert_eq!(body.result_code, ResultCode::OperationsError);
+        assert_eq!(body.result_code, ResultCode::Success);
         saw_starttls = true;
       }
       _ => panic!("pipelined response"),
     }
   }
-  assert!(saw_bind && saw_starttls, "bind result and starttls operationsError");
+  assert!(saw_bind && saw_starttls, "bind result and starttls success");
 }
 
 struct Inbox<S> {
@@ -334,7 +333,7 @@ async fn ldap_starttls_then_bind_swaps_the_password() {
 /// cloned handles and `extended`. It flushes each message on its own, so
 /// only this byte guest puts both in one read.
 #[tokio::test]
-async fn ldap_pipelined_bind_then_starttls_is_operations_error() {
+async fn ldap_pipelined_bind_then_starttls_upgrades() {
   ldap_flow(Flow::Pipelined).await;
 }
 
@@ -569,14 +568,16 @@ async fn ldap_tls_without_sni_mints_for_the_grant_host() {
 }
 
 #[test]
-fn ldap_mtls_plaintext_guest_is_rejected_at_load() {
+fn ldap_mtls_on_a_cleartext_fake_still_loads() {
   let fake = format!("ldap://{}:{FAKE}@localhost:389", user(DN));
   let real = format!("ldaps://{}:{VALUE}@localhost:636", user(DN));
-  let Err(err) = super::resolve_mtls_grants("LDAP_URL", &fake, &real) else {
-    panic!("mtls on an ldap fake with an ldaps real must be rejected");
+  let grants = super::resolve_mtls_grants("LDAP_URL", &fake, &real).expect("mtls on a cleartext ldap fake still loads");
+  let Some(Grant::Ldap { scope, credential }) = grants.first() else {
+    panic!("an ldap grant");
   };
-  assert!(matches!(err.as_ref(), arkham_config::Error::LdapCleartextMtls { .. }), "{err}");
-  let text = err.to_string();
-  assert!(!text.contains(FAKE), "mtls rejection included a credential");
-  assert!(!text.contains(VALUE), "mtls rejection included a credential");
+  assert_eq!(scope.guest_tls, arkham_config::grants::GuestTlsMode::Mtls);
+  assert!(!scope.is_downstream_tls);
+  assert!(scope.is_upstream_tls);
+  assert_eq!(credential.fake, FAKE);
+  assert_eq!(credential.value.expose_secret(), VALUE);
 }

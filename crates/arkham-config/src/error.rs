@@ -487,14 +487,6 @@ pub enum Error {
     /// Rule label.
     label: String,
   },
-  /// `guest_tls_mode = mtls` on an `ldap://` fake whose real string is `ldaps://`.
-  #[error(
-    "rule `{label}`: mtls on an ldap:// fake is rejected when the real string is ldaps://, because a bind is rewritten before the guest can present a client certificate"
-  )]
-  LdapCleartextMtls {
-    /// Rule label.
-    label: String,
-  },
   /// A NATS connection string, or the pair of them, does not parse.
   #[error("rule `{label}`: {source}")]
   NatsScope {

@@ -925,19 +925,6 @@ mod tests {
     cfg.rules.get_mut("t").unwrap().tls = tls;
   }
 
-  fn assert_mtls_rejected(fake: &str, real: &str, secrets: &[&str], pred: impl Fn(&crate::Error) -> bool) {
-    let mut cfg = cfg_with_db(fake, real);
-    mtls_on(&mut cfg);
-    let Err(err) = resolve(&cfg) else {
-      panic!("mtls on a cleartext fake must be rejected");
-    };
-    assert!(pred(&err), "{err}");
-    let text = err.to_string();
-    for secret in secrets {
-      assert!(!text.contains(secret), "mtls rejection included a credential");
-    }
-  }
-
   /// A resolved postgres scope, through [`resolve`] exactly as serve does.
   fn postgres_scope(fake: &str, real: &str) -> PostgresScope {
     let resolved = resolve(&cfg_with_db(fake, real)).unwrap();
@@ -1195,13 +1182,21 @@ mod tests {
   }
 
   #[test]
-  fn ldap_mtls_on_a_cleartext_fake_is_rejected() {
-    assert_mtls_rejected(
+  fn ldap_mtls_on_a_cleartext_fake_still_loads() {
+    let mut cfg = cfg_with_db(
       "ldap://cn%3Ddir:arkham_fake_ldap_pass@ldap.internal:389",     // betterleaks:allow
       "ldaps://cn%3Ddir:arkham_real_ldap_pass_01@ldap.internal:636", // betterleaks:allow
-      &["arkham_fake_ldap_pass", "arkham_real_ldap_pass_01", "cn=dir"], // betterleaks:allow
-      |err| matches!(err, crate::Error::LdapCleartextMtls { .. }),
     );
+    mtls_on(&mut cfg);
+    let resolved = resolve(&cfg).expect("mtls on a cleartext ldap fake still loads");
+    let Some(Grant::Ldap { scope, credential }) = resolved.grants.first() else {
+      panic!("an ldap rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(!scope.is_downstream_tls);
+    assert!(scope.is_upstream_tls);
+    assert_eq!(credential.fake, "arkham_fake_ldap_pass");
+    assert_eq!(credential.value.expose_secret(), "arkham_real_ldap_pass_01");
   }
 
   #[test]
