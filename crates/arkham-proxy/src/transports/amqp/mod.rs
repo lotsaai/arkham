@@ -24,8 +24,6 @@ use crate::transports::engine::{Amqp, Direction};
 use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
 use rama::tls::client::ClientAuth;
 
-const TLS_RECORD_HANDSHAKE: u8 = 0x16;
-
 #[derive(Debug)]
 pub(crate) struct AmqpTransport {
   ca: CertAuthority,
@@ -115,9 +113,6 @@ impl Transport for AmqpTransport {
       };
       server_name = Some(sni_name);
       guest_tls = Some((hello_buf, identity));
-    } else if initial.first() == Some(&TLS_RECORD_HANDSHAKE) {
-      tracing::debug!("TLS opening on a cleartext amqp scope; closing");
-      return Ok(());
     }
 
     let upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;
@@ -167,21 +162,20 @@ impl AmqpTransport {
     S: AsyncRead + AsyncWrite + Unpin,
   {
     let OpenGuest { stream, head, tls } = guest;
-    let swap = scope.is_upstream_tls;
     let upstream_name = scope.upstream.host.as_str();
     match (tls, scope.is_upstream_tls) {
-      (None, false) => relay(Prefixed::new(head, stream), upstream, ctx, swap).await,
+      (None, false) => relay(Prefixed::new(head, stream), upstream, ctx).await,
       (Some((hello_buf, identity)), false) => {
         let plain = within(
           budget,
           self.accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls),
         )
         .await?;
-        relay(plain, upstream, ctx, swap).await
+        relay(plain, upstream, ctx).await
       }
       (None, true) => {
         let plain = within(budget, self.connect_server(scope, upstream_name, upstream)).await?;
-        relay(Prefixed::new(head, stream), plain, ctx, swap).await
+        relay(Prefixed::new(head, stream), plain, ctx).await
       }
       (Some((hello_buf, identity)), true) => {
         let guest_plain = within(
@@ -190,7 +184,7 @@ impl AmqpTransport {
         )
         .await?;
         let server_plain = within(budget, self.connect_server(scope, upstream_name, upstream)).await?;
-        relay(guest_plain, server_plain, ctx, swap).await
+        relay(guest_plain, server_plain, ctx).await
       }
     }
   }
@@ -203,18 +197,18 @@ async fn within<T>(budget: Duration, handshake: impl Future<Output = Result<T, E
   }
 }
 
-async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>, swap: bool) -> Result<(), Error>
+async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  let (mut downstream, mut upstream) = amqp_pair(ctx, swap)?;
+  let (mut downstream, mut upstream) = amqp_pair(ctx)?;
   relay_guarded(guest, server, &mut downstream, &mut upstream, &[], &[]).await
 }
 
-pub(crate) fn amqp_pair(ctx: &PairCtx<'_>, swap: bool) -> Result<(Amqp, Amqp), Error> {
+pub(crate) fn amqp_pair(ctx: &PairCtx<'_>) -> Result<(Amqp, Amqp), Error> {
   Ok((
-    Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream, swap)?,
-    Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream, false)?,
+    Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream)?,
+    Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream)?,
   ))
 }

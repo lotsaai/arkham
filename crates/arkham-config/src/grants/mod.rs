@@ -1483,7 +1483,7 @@ mod tests {
   }
 
   #[test]
-  fn amqp_mtls_rejects_a_cleartext_fake() {
+  fn amqp_mtls_on_a_cleartext_fake_still_loads() {
     let mut cfg = cfg_with_db(
       "amqp://agent:arkham_fake_amqp_pass@mq.internal",        // betterleaks:allow
       "amqps://svc:arkham_real_amqp_pass_01@mq.internal:5671", // betterleaks:allow
@@ -1501,13 +1501,13 @@ mod tests {
       },
     );
     cfg.rules.get_mut("t").unwrap().tls = tls;
-    let err = resolve(&cfg).expect_err("mtls on a cleartext fake");
-    assert!(matches!(err, crate::Error::AmqpCleartextMtls { .. }), "{err}");
-    let text = err.to_string();
-    assert!(text.contains("amqps://"), "{text}");
-    for secret in ["arkham_fake_amqp_pass", "arkham_real_amqp_pass_01", "agent", "svc"] {
-      assert!(!text.contains(secret), "{text} contains {secret}");
-    }
+    let resolved = resolve(&cfg).expect("mtls on a cleartext fake still loads");
+    let Some(Grant::Amqp { scope, .. }) = resolved.grants.first() else {
+      panic!("an amqp rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(!scope.is_downstream_tls);
+    assert!(scope.is_upstream_tls);
   }
 
   #[test]
