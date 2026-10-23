@@ -443,7 +443,7 @@ async fn amqps_broker_stalls_tls_and_the_leg_closes_within_budget() {
     .await
     .expect("broker TLS stall closed the leg within the handshake budget");
   let err = joined.expect("serve task").expect_err("handshake budget");
-  assert!(matches!(err, crate::Error::HandshakeTimeout), "{err}");
+  assert!(matches!(err, crate::Error::Wire(arkham_wire::Error::HandshakeTimeout)), "{err}");
   drop(client_end);
   stall.abort();
 }

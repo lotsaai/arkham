@@ -3,10 +3,9 @@ use std::time::Duration;
 use secrecy::ExposeSecret as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 use arkham_amqp::{Amqp, SaslSwap};
-use arkham_config::grants::{AmqpScope, Grant, GuestTlsMode};
+use arkham_config::grants::{AmqpScope, Grant};
 use arkham_wire::engine::Direction;
 use arkham_wire::tls::TlsLegs;
 
@@ -100,7 +99,11 @@ where
   match (tls, scope.is_upstream_tls) {
     (None, false) => relay(Prefixed::new(head, stream), upstream, ctx).await,
     (Some((hello_buf, identity)), false) => {
-      let plain = accept_guest(legs, &identity, Prefixed::new(hello_buf, stream), scope.guest_tls, budget).await?;
+      let plain = finish(
+        budget,
+        legs.accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls, None),
+      )
+      .await?;
       relay(plain, upstream, ctx).await
     }
     (None, true) => {
@@ -108,20 +111,15 @@ where
       relay(Prefixed::new(head, stream), plain, ctx).await
     }
     (Some((hello_buf, identity)), true) => {
-      let guest_plain = accept_guest(legs, &identity, Prefixed::new(hello_buf, stream), scope.guest_tls, budget).await?;
+      let guest_plain = finish(
+        budget,
+        legs.accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls, None),
+      )
+      .await?;
       let server_plain = connect_server(legs, scope, upstream_name, upstream, budget).await?;
       relay(guest_plain, server_plain, ctx).await
     }
   }
-}
-
-async fn accept_guest<G>(legs: &TlsLegs, name: &str, guest: G, mode: GuestTlsMode, budget: Duration) -> Result<ServerTlsStream<G>, Error>
-where
-  G: AsyncRead + AsyncWrite + Unpin,
-{
-  finish(budget, legs.accept_guest(name, guest, mode, None))
-    .await
-    .map_err(Error::from)
 }
 
 async fn connect_server<S>(
