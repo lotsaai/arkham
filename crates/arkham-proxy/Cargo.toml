@@ -15,6 +15,7 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 arkham-config = { workspace = true }
+arkham-ldap = { workspace = true }
 arkham-pki = { workspace = true }
 arkham-plugin = { workspace = true }
 arkham-smtp = { workspace = true }
@@ -25,8 +26,6 @@ httparse = { workspace = true }
 memchr = { workspace = true }
 pgwire = { workspace = true, features = ["client-api-aws-lc-rs", "server-api-aws-lc-rs"] }
 rama = { workspace = true, features = ["boring", "tcp"] }
-rasn = { workspace = true }
-rasn-ldap = { workspace = true }
 russh = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
@@ -59,6 +58,8 @@ nkeys = { workspace = true }
 pgwire = { workspace = true, features = ["server-api-aws-lc-rs"] }
 pretty_assertions = { workspace = true }
 proptest = { workspace = true }
+rasn = { workspace = true }
+rasn-ldap = { workspace = true }
 redis = { workspace = true }
 tempfile = { workspace = true }
 tokio-postgres = { workspace = true }

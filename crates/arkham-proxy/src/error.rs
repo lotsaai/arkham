@@ -268,27 +268,6 @@ pub enum Error {
   /// A TLS handshake exceeded the configured budget.
   #[error("TLS handshake timed out")]
   HandshakeTimeout,
-  /// A guest LDAP TLS handshake fails.
-  #[error("guest ldap TLS: {source}")]
-  GuestLdapTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A server LDAP TLS handshake fails.
-  #[error("server ldap TLS: {source}")]
-  ServerLdapTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// An LDAP upstream name cannot become a TLS server name.
-  #[error("ldap server name: {source}")]
-  LdapServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
   /// A guest NATS TLS handshake fails.
   #[error("guest nats TLS: {source}")]
   GuestNatsTls {
@@ -379,13 +358,6 @@ pub enum Error {
   /// An SMTP leg was asked to start TLS when it was already in TLS.
   #[error("smtp leg is already TLS")]
   SmtpLegAlreadyTls,
-  /// An LDAP message this proxy built could not be encoded.
-  #[error("ldap encode: {source}")]
-  LdapEncode {
-    /// Underlying encoder failure.
-    #[source]
-    source: rasn::error::EncodeError,
-  },
   /// Postgres authentication did not finish inside the handshake budget.
   #[error("postgres authentication timed out")]
   PostgresAuthTimeout,
@@ -473,6 +445,9 @@ pub enum Error {
   /// An SMTP grant-parse failure reached the proxy.
   #[error(transparent)]
   Smtp(arkham_smtp::Error),
+  /// An LDAP encode or grant-parse failure reached the proxy.
+  #[error(transparent)]
+  Ldap(#[from] arkham_ldap::Error),
 }
 
 impl From<arkham_wire::Error> for Error {

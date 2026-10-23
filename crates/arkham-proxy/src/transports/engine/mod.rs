@@ -10,13 +10,12 @@ mod fuzz_props;
 pub(crate) use super::amqp::machine::Amqp;
 pub(crate) use super::http::h2::H2;
 pub(crate) use super::http::machine::Http;
-pub(crate) use super::ldap::machine::Ldap;
 pub(crate) use super::postgres::machine::{GuestOpening, Postgres, read_guest_opening, request_upstream_tls};
 pub(crate) use super::redis::machine::Redis;
 pub(crate) use super::ssh::legs::{LegKeys, SshLegs, SshLegsFiles, Upstream};
 pub(crate) use arkham_wire::engine::{
-  CredentialPair, Direction, Hit, LocalUpgrade, Location, PeerFact, Rewritten, UpgradeNote, Wire, find_new_match, max_tail_size,
-  needle_prefix_suffix_len, needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
+  CredentialPair, Direction, Hit, Location, PeerFact, Rewritten, Wire, find_new_match, max_tail_size, needle_prefix_suffix_len,
+  needle_safe_emit_len, replace_bytes, replace_in, response_has_no_body, scan_with_tail,
 };
 pub(crate) use arkham_wire::raw::Raw;
 

@@ -73,6 +73,7 @@ arkham-compose = { path = "crates/arkham-compose" }
 arkham-config = { path = "crates/arkham-config" }
 arkham-ebpf = { path = "crates/arkham-ebpf" }
 arkham-fnox = { path = "crates/arkham-fnox" }
+arkham-ldap = { path = "crates/arkham-ldap" }
 arkham-pki = { path = "crates/arkham-pki" }
 arkham-plugin = { path = "crates/arkham-plugin" }
 arkham-proxy = { path = "crates/arkham-proxy" }

@@ -13,9 +13,9 @@ mod redis;
 mod smtp;
 
 pub use amqp::{AmqpLeg, AmqpScope, AmqpUriError};
+pub use arkham_ldap::{LdapLeg, LdapScope, LdapUriError};
 pub use arkham_smtp::{SmtpLeg, SmtpScope, SmtpUriError};
 pub use arkham_wire::{GuestTlsMode, RootCert};
-pub use ldap::{LdapLeg, LdapScope, LdapUriError};
 pub(crate) use nats::NatsUriScheme;
 pub use nats::{
   AuthField, AuthSign, FieldPresence, NATS_DEFAULT_PORT, NatsAuth, NatsClientIdentity, NatsEndpoint, NatsField, NatsPair, NatsPlain,
@@ -468,7 +468,9 @@ impl Grant {
       Grant::Smtp { scope, .. } => {
         matches!(scheme, Scheme::Smtp | Scheme::Smtps) && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
       }
-      Grant::Ldap { scope, .. } => LdapScope::matches(scope, scheme, host, port),
+      Grant::Ldap { scope, .. } => {
+        matches!(scheme, Scheme::Ldap | Scheme::Ldaps) && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
+      }
       Grant::Nats { scope, .. } => NatsScope::matches(scope, scheme, host, port),
       Grant::Amqp { scope, .. } => AmqpScope::matches(scope, scheme, host, port),
       Grant::Ssh { allow } => allow.iter().any(|entry| ssh_match(entry, scheme, host, port)),
