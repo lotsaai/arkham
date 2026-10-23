@@ -531,9 +531,9 @@ struct SwapGrant {
 /// Whether CONNECT carries the real values.
 #[derive(Debug)]
 enum Policy {
-  /// The server leg is cleartext: CONNECT keeps the decoy.
+  /// No grant covers this endpoint. CONNECT is forwarded.
   Forward,
-  /// The server leg is TLS. Each grant is tried until one CONNECT matches.
+  /// A grant covers this endpoint. Each grant is tried until one CONNECT matches.
   Swap { auths: Vec<SwapGrant> },
 }
 
