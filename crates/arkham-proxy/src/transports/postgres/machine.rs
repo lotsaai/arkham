@@ -20,7 +20,7 @@ use pgwire::messages::startup::{GssEncRequest, SslRequest, Startup};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::Error;
-use crate::transports::engine::{Direction, Hit, Raw, Rewritten, Wire};
+use crate::transports::engine::{Direction, Hit, Raw, Rewritten, Wire, raw_new};
 
 /// Cap for one greeting message. Real `StartupMessages` are hundreds of
 /// bytes; anything past this is a drip or an attack, never a greeting.
@@ -59,7 +59,7 @@ impl Postgres {
     };
     Self {
       state,
-      inner: Raw::new(grants, Scheme::Postgres, host, port, dir),
+      inner: raw_new(grants, Scheme::Postgres, host, port, dir),
       reply: None,
       user_rewrite: grants.iter().find_map(|grant| grant.postgres(Some(host), port)).and_then(|scope| {
         if scope.upstream.user.is_some() && scope.upstream.user != scope.downstream.user {

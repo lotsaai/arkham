@@ -26,7 +26,7 @@ use secrecy::ExposeSecret as _;
 
 use crate::transports::engine::{
   CredentialPair, Direction, Hit, LocalUpgrade, Location, PeerFact, Raw, Rewritten, UpgradeNote, Wire, find_new_match,
-  needle_prefix_suffix_len, replace_bytes,
+  needle_prefix_suffix_len, raw_new, replace_bytes,
 };
 
 /// `StartTLS` extended operation OID (RFC 4511).
@@ -269,7 +269,7 @@ impl Ldap {
       down,
       up,
       phase: Phase::Head(Vec::new()),
-      forward: Raw::new(&[], Scheme::Ldap, host, port, dir),
+      forward: raw_new(&[], Scheme::Ldap, host, port, dir),
       starttls: None,
       prefix: Vec::new(),
       starttls_ok: None,

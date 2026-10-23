@@ -76,8 +76,10 @@ arkham-fnox = { path = "crates/arkham-fnox" }
 arkham-pki = { path = "crates/arkham-pki" }
 arkham-plugin = { path = "crates/arkham-plugin" }
 arkham-proxy = { path = "crates/arkham-proxy" }
+arkham-smtp = { path = "crates/arkham-smtp" }
 arkham-tproxy = { path = "crates/arkham-tproxy" }
 arkham-tun = { path = "crates/arkham-tun" }
+arkham-wire = { path = "crates/arkham-wire" }
 
 # One declaration per external dependency so versions cannot drift between
 # crates. rama tracks main deliberately: its 0.5 line is unpublished.

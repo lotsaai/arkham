@@ -14,20 +14,21 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use arkham_config::grants::{Grant, SmtpScope};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
-use super::machine::{MAX_COMMAND, Smtp, is_opening_command, is_starttls};
-use crate::Error;
-use crate::relay::{log_hits, relay_guarded};
-use crate::transports::engine::{Direction, Rewritten, Wire};
-use crate::transports::tls::{TlsLegs, UpstreamTls, Verify, finish};
+use arkham_wire::engine::{CredentialPair, Direction, Rewritten, Wire};
+use arkham_wire::relay::{log_hits, relay_guarded};
+use arkham_wire::tls::{TlsLegs, UpstreamTls, Verify, finish};
+
+use crate::error::Error;
+use crate::machine::{AuthMaterial, MAX_COMMAND, Smtp, is_opening_command, is_starttls};
+use crate::scope::SmtpScope;
 
 /// Guest socket, cleartext or terminated TLS.
-pub(crate) enum GuestLeg<G> {
+pub enum GuestLeg<G> {
   /// Bytes still in the clear.
   Plain(G),
   /// TLS terminated with a leaf minted for the grant host.
@@ -35,7 +36,7 @@ pub(crate) enum GuestLeg<G> {
 }
 
 /// Upstream socket, cleartext or TLS.
-pub(super) enum ServerLeg {
+pub enum ServerLeg {
   /// Bytes still in the clear.
   Plain(TcpStream),
   /// TLS to the real server from the first byte.
@@ -47,7 +48,7 @@ pub(super) enum ServerLeg {
 /// Bytes already taken from a socket, then the socket. The head is dropped
 /// once the next reader has consumed it.
 /// Socket reads that start with bytes already taken from that socket.
-pub(super) struct HeadThen<S> {
+pub struct HeadThen<S> {
   head: Vec<u8>,
   at: usize,
   inner: S,
@@ -181,23 +182,53 @@ impl AsyncWrite for ServerLeg {
 
 /// One SMTP dialogue: both sockets, the grant that keys the swap, and
 /// the handshake budget.
-pub(super) struct Dialogue<'a, G> {
+#[derive(Debug)]
+pub struct Dialogue<'a, G> {
   /// Shared TLS legs. A mid-session `STARTTLS` handshake uses them.
-  pub(super) legs: &'a TlsLegs,
+  pub legs: &'a TlsLegs,
   /// Both legs of the matched rule.
-  pub(super) scope: &'a SmtpScope,
+  pub scope: &'a SmtpScope,
   /// Guest socket, cleartext or already terminated.
-  pub(super) guest: GuestLeg<G>,
+  pub guest: GuestLeg<G>,
   /// Upstream socket, cleartext or already encrypted.
-  pub(super) server: ServerLeg,
-  /// Grants the framing machines may swap.
-  pub(super) grants: &'a [Grant],
-  /// Host the leaf is minted for and the swap is keyed on.
-  pub(super) host: &'a str,
-  /// Port the swap is keyed on.
-  pub(super) port: u16,
+  pub server: ServerLeg,
+  /// AUTH bytes the downstream machine swaps.
+  pub material: AuthMaterial,
+  /// Upstream needles. The real password is the needle and the decoy is the replacement.
+  pub pairs: Vec<CredentialPair>,
+  /// Host the leaf is minted for.
+  pub leaf: &'a str,
   /// Budget for a mid-stream TLS handshake.
-  pub(super) budget: Duration,
+  pub budget: Duration,
+}
+
+impl<G> std::fmt::Debug for GuestLeg<G> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Plain(_) => f.write_str("Plain"),
+      Self::Tls(_) => f.write_str("Tls"),
+    }
+  }
+}
+
+impl std::fmt::Debug for ServerLeg {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::Plain(_) => f.write_str("Plain"),
+      Self::Tls(_) => f.write_str("Tls"),
+      Self::Upgraded(_) => f.write_str("Upgraded"),
+    }
+  }
+}
+
+impl<S> std::fmt::Debug for HeadThen<S> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("HeadThen")
+      .field("head", &self.head.len())
+      .field("at", &self.at)
+      .field("inner", &std::any::type_name::<S>())
+      .finish()
+  }
 }
 
 /// Run the dialogue. Implicit TLS is already settled and goes straight to
@@ -207,7 +238,7 @@ pub(super) struct Dialogue<'a, G> {
 ///
 /// Returns an error when a leg cannot be read, written, or upgraded.
 /// A framing machine that closes, or a peer that hangs up, ends quietly.
-pub(super) async fn run<G>(dialogue: Dialogue<'_, G>) -> Result<(), Error>
+pub async fn run<G>(dialogue: Dialogue<'_, G>) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
 {
@@ -216,16 +247,18 @@ where
     scope,
     guest,
     server,
-    grants,
-    host,
-    port,
+    material,
+    pairs,
+    leaf,
     budget,
   } = dialogue;
-  let mut down = Smtp::new(grants, host, port, Direction::Downstream);
-  let mut up = Smtp::new(grants, host, port, Direction::Upstream);
+  let mut down = Smtp::new(Direction::Downstream, material.clone(), Vec::new());
+  let mut up = Smtp::new(Direction::Upstream, material, pairs);
   Smtp::share_data_gate(&down, &mut up);
   if !guest.is_plain() {
-    return relay_guarded(guest, server, &mut down, &mut up, &[], &[]).await;
+    return relay_guarded(guest, server, &mut down, &mut up, &[], &[])
+      .await
+      .map_err(Error::from);
   }
   Opening {
     legs,
@@ -234,7 +267,7 @@ where
     server,
     down: &mut down,
     up: &mut up,
-    leaf: host,
+    leaf,
     budget,
   }
   .run()
@@ -268,7 +301,10 @@ where
     }
     lead = greeting.rest;
     loop {
-      let Some(line) = guest_line(&mut self.guest).await.map_err(|source| Error::GuestRead { source })? else {
+      let Some(line) = guest_line(&mut self.guest)
+        .await
+        .map_err(|source| Error::Wire(arkham_wire::Error::GuestRead { source }))?
+      else {
         return Ok(());
       };
       if is_starttls(&line) {
@@ -281,7 +317,9 @@ where
           StarttlsStep::Upgrade(rest) => {
             let guest = upgrade_guest(self.legs, self.scope, self.guest, self.leaf, self.budget).await?;
             let server = upgrade_server(self.legs, self.scope, self.server, self.budget, rest).await?;
-            return relay_guarded(guest, server, self.down, self.up, &[], &[]).await;
+            return relay_guarded(guest, server, self.down, self.up, &[], &[])
+              .await
+              .map_err(Error::from);
           }
           StarttlsStep::Local => {
             self.down.queue_starttls_ready();
@@ -289,15 +327,25 @@ where
               write_guest(&mut self.guest, &reply).await?;
             }
             let guest = upgrade_guest(self.legs, self.scope, self.guest, self.leaf, self.budget).await?;
-            return relay_guarded(guest, self.server, self.down, self.up, &[], &lead).await;
+            return relay_guarded(guest, self.server, self.down, self.up, &[], &lead)
+              .await
+              .map_err(Error::from);
           }
-          StarttlsStep::Relay(rest) => return relay_guarded(self.guest, self.server, self.down, self.up, &[], &rest).await,
+          StarttlsStep::Relay(rest) => {
+            return relay_guarded(self.guest, self.server, self.down, self.up, &[], &rest)
+              .await
+              .map_err(Error::from);
+          }
         }
       }
       if self.down.awaiting_auth_payload() || is_opening_command(&line) {
         match forward_down(self.down, &mut self.server, &line).await? {
           Forwarded::Stop => return Ok(()),
-          Forwarded::Held => return relay_guarded(self.guest, self.server, self.down, self.up, &[], &lead).await,
+          Forwarded::Held => {
+            return relay_guarded(self.guest, self.server, self.down, self.up, &[], &lead)
+              .await
+              .map_err(Error::from);
+          }
           Forwarded::Sent => {}
         }
         let reply = acceptance_reply(&mut self.server, self.up, &mut self.guest, &lead).await?;
@@ -307,7 +355,9 @@ where
         lead = reply.rest;
         continue;
       }
-      return relay_guarded(self.guest, self.server, self.down, self.up, &line, &lead).await;
+      return relay_guarded(self.guest, self.server, self.down, self.up, &line, &lead)
+        .await
+        .map_err(Error::from);
     }
   }
 
@@ -385,7 +435,7 @@ where
 {
   let plain = match guest {
     GuestLeg::Plain(stream) => stream,
-    GuestLeg::Tls(_) => return Err(Error::SmtpLegAlreadyTls),
+    GuestLeg::Tls(_) => return Err(Error::LegAlreadyTls),
   };
   let mode = scope.guest_tls;
   let tls = finish(budget, legs.accept_guest(leaf, plain, mode, None)).await?;
@@ -395,7 +445,7 @@ where
 async fn upgrade_server(legs: &TlsLegs, scope: &SmtpScope, server: ServerLeg, budget: Duration, rest: Vec<u8>) -> Result<ServerLeg, Error> {
   let plain = match server {
     ServerLeg::Plain(stream) => stream,
-    ServerLeg::Tls(_) | ServerLeg::Upgraded(_) => return Err(Error::SmtpLegAlreadyTls),
+    ServerLeg::Tls(_) | ServerLeg::Upgraded(_) => return Err(Error::LegAlreadyTls),
   };
   let server_name = scope.upstream.host.as_str();
   let root = scope.root_cert.as_ref();
@@ -432,8 +482,11 @@ where
   guest
     .write_all(bytes)
     .await
-    .map_err(|source| Error::ResponseChunkToGuest { source })?;
-  guest.flush().await.map_err(|source| Error::ResponseChunkToGuest { source })?;
+    .map_err(|source| Error::Wire(arkham_wire::Error::ResponseChunkToGuest { source }))?;
+  guest
+    .flush()
+    .await
+    .map_err(|source| Error::Wire(arkham_wire::Error::ResponseChunkToGuest { source }))?;
   Ok(())
 }
 
@@ -441,8 +494,11 @@ async fn write_server(server: &mut ServerLeg, bytes: &[u8]) -> Result<(), Error>
   server
     .write_all(bytes)
     .await
-    .map_err(|source| Error::RequestChunkToUpstream { source })?;
-  server.flush().await.map_err(|source| Error::RequestChunkToUpstream { source })?;
+    .map_err(|source| Error::Wire(arkham_wire::Error::RequestChunkToUpstream { source }))?;
+  server
+    .flush()
+    .await
+    .map_err(|source| Error::Wire(arkham_wire::Error::RequestChunkToUpstream { source }))?;
   Ok(())
 }
 
@@ -533,7 +589,7 @@ where
     let n = match reader.read(&mut buf).await {
       Ok(n) => n,
       Err(err) if err.kind() == ErrorKind::UnexpectedEof => 0,
-      Err(source) => return Err(Error::UpstreamRead { source }),
+      Err(source) => return Err(Error::Wire(arkham_wire::Error::UpstreamRead { source })),
     };
     if n == 0 {
       if !saw {
@@ -560,8 +616,10 @@ where
 }
 
 fn chunk_bytes(buf: &[u8], n: usize) -> Result<&[u8], Error> {
-  buf.get(..n).ok_or_else(|| Error::UpstreamRead {
-    source: std::io::Error::other("reply read past the chunk"),
+  buf.get(..n).ok_or_else(|| {
+    Error::Wire(arkham_wire::Error::UpstreamRead {
+      source: std::io::Error::other("reply read past the chunk"),
+    })
   })
 }
 
@@ -583,9 +641,9 @@ where
   let mut saw_newline = false;
   while i < bytes.len() {
     let Some(&byte) = bytes.get(i) else {
-      return Err(Error::UpstreamRead {
+      return Err(Error::Wire(arkham_wire::Error::UpstreamRead {
         source: std::io::Error::other("reply read past the chunk"),
-      });
+      }));
     };
     i = i.saturating_add(1);
     if byte != b'\n' {
@@ -594,9 +652,9 @@ where
     }
     saw_newline = true;
     let Some(line) = bytes.get(start..i) else {
-      return Err(Error::UpstreamRead {
+      return Err(Error::Wire(arkham_wire::Error::UpstreamRead {
         source: std::io::Error::other("reply read past the chunk"),
-      });
+      }));
     };
     append_fed(up, emit, line).await?;
     append_fed(up, emit, &[]).await?;
@@ -690,14 +748,17 @@ where
   guest
     .write_all(bytes)
     .await
-    .map_err(|source| Error::ResponseChunkToGuest { source })
+    .map_err(|source| Error::Wire(arkham_wire::Error::ResponseChunkToGuest { source }))
 }
 
 async fn flush_guest<G>(guest: &mut GuestLeg<G>) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
 {
-  guest.flush().await.map_err(|source| Error::ResponseChunkToGuest { source })
+  guest
+    .flush()
+    .await
+    .map_err(|source| Error::Wire(arkham_wire::Error::ResponseChunkToGuest { source }))
 }
 
 fn is_220(code: [u8; 3]) -> bool {
@@ -705,22 +766,26 @@ fn is_220(code: [u8; 3]) -> bool {
 }
 
 /// Cleartext guest leg.
-pub(crate) fn plain_guest<G>(stream: G) -> GuestLeg<G> {
+#[must_use]
+pub fn plain_guest<G>(stream: G) -> GuestLeg<G> {
   GuestLeg::Plain(stream)
 }
 
 /// Guest leg whose TLS is already terminated.
-pub(super) fn tls_guest<G>(stream: ServerTlsStream<G>) -> GuestLeg<G> {
+#[must_use]
+pub fn tls_guest<G>(stream: ServerTlsStream<G>) -> GuestLeg<G> {
   GuestLeg::Tls(Box::new(stream))
 }
 
 /// Cleartext upstream leg.
-pub(super) fn plain_server(stream: TcpStream) -> ServerLeg {
+#[must_use]
+pub fn plain_server(stream: TcpStream) -> ServerLeg {
   ServerLeg::Plain(stream)
 }
 
 /// Upstream leg whose TLS handshake already finished.
-pub(super) fn tls_server(stream: ClientTlsStream<TcpStream>) -> ServerLeg {
+#[must_use]
+pub fn tls_server(stream: ClientTlsStream<TcpStream>) -> ServerLeg {
   ServerLeg::Tls(Box::new(stream))
 }
 
@@ -730,11 +795,15 @@ mod tests {
   use std::sync::{Arc, Mutex, PoisonError};
   use std::task::{Context, Poll};
 
-  use arkham_config::grants::{Credential, GuestTlsMode, SmtpLeg, SmtpScope};
   use secrecy::SecretString;
   use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+  use arkham_wire::GuestTlsMode;
+  use arkham_wire::engine::CredentialPair;
+
   use super::{Direction, Smtp, Wire};
+  use crate::AuthMaterial;
+  use crate::scope::{SmtpLeg, SmtpScope};
 
   #[derive(Default)]
   struct WriteLog {
@@ -896,7 +965,7 @@ mod tests {
     out
   }
 
-  fn upstream() -> Smtp {
+  fn upstream_with(real: &str) -> Smtp {
     let scope = SmtpScope {
       downstream: SmtpLeg {
         host: "mail".into(),
@@ -909,7 +978,7 @@ mod tests {
         host: "mail".into(),
         port: 587,
         user: "agent@demo.test".into(),
-        password: SecretString::from(REAL_PASS),
+        password: SecretString::from(real),
       },
       is_upstream_tls: true,
       starttls_required: false,
@@ -918,15 +987,17 @@ mod tests {
       client_key: None,
       guest_tls: GuestTlsMode::default(),
     };
-    let grant = arkham_config::grants::Grant::Smtp {
-      credential: Credential {
-        label: "smtp".into(),
-        fake: FAKE_PASS.into(),
-        value: SecretString::from(REAL_PASS),
-      },
-      scope: Box::new(scope),
-    };
-    Smtp::new(std::slice::from_ref(&grant), "mail", 587, Direction::Upstream)
+    let material = AuthMaterial::from_scope(&scope, "smtp");
+    let pairs = vec![CredentialPair {
+      needle: real.as_bytes().to_vec(),
+      replacement: FAKE_PASS.as_bytes().to_vec(),
+      label: "smtp".into(),
+    }];
+    Smtp::new(Direction::Upstream, material, pairs)
+  }
+
+  fn upstream() -> Smtp {
+    upstream_with(REAL_PASS)
   }
 
   /// The opening writes the machine's output, so a reply that echoes the
@@ -1169,36 +1240,7 @@ mod tests {
   #[tokio::test]
   async fn opening_reply_redacts_a_longer_real_password() {
     const LONG_REAL: &str = "real-smtp-pass-extended"; // betterleaks:allow
-    let scope = SmtpScope {
-      downstream: SmtpLeg {
-        host: "mail".into(),
-        port: 587,
-        user: "agent@demo.test".into(),
-        password: SecretString::from(FAKE_PASS),
-      },
-      is_downstream_tls: false,
-      upstream: SmtpLeg {
-        host: "mail".into(),
-        port: 587,
-        user: "agent@demo.test".into(),
-        password: SecretString::from(LONG_REAL),
-      },
-      is_upstream_tls: true,
-      starttls_required: false,
-      root_cert: None,
-      client_cert: None,
-      client_key: None,
-      guest_tls: GuestTlsMode::default(),
-    };
-    let grant = arkham_config::grants::Grant::Smtp {
-      credential: Credential {
-        label: "smtp".into(),
-        fake: FAKE_PASS.into(),
-        value: SecretString::from(LONG_REAL),
-      },
-      scope: Box::new(scope),
-    };
-    let mut up = Smtp::new(std::slice::from_ref(&grant), "mail", 587, Direction::Upstream);
+    let mut up = upstream_with(LONG_REAL);
     let reply = format!("535 5.7.8 authentication failed for {LONG_REAL}\r\n");
     let out = redact_reply(&mut up, reply.as_bytes()).await;
     let text = String::from_utf8(out).unwrap();
@@ -1212,35 +1254,6 @@ mod tests {
   #[tokio::test]
   async fn long_reply_redacts_the_password() {
     const LONG_REAL: &str = "real-smtp-pass-extended"; // betterleaks:allow
-    let scope = SmtpScope {
-      downstream: SmtpLeg {
-        host: "mail".into(),
-        port: 587,
-        user: "agent@demo.test".into(),
-        password: SecretString::from(FAKE_PASS),
-      },
-      is_downstream_tls: false,
-      upstream: SmtpLeg {
-        host: "mail".into(),
-        port: 587,
-        user: "agent@demo.test".into(),
-        password: SecretString::from(LONG_REAL),
-      },
-      is_upstream_tls: true,
-      starttls_required: false,
-      root_cert: None,
-      client_cert: None,
-      client_key: None,
-      guest_tls: GuestTlsMode::default(),
-    };
-    let grant = arkham_config::grants::Grant::Smtp {
-      credential: Credential {
-        label: "smtp".into(),
-        fake: FAKE_PASS.into(),
-        value: SecretString::from(LONG_REAL),
-      },
-      scope: Box::new(scope),
-    };
     let pass = LONG_REAL.as_bytes();
     let start = super::MAX_COMMAND.saturating_sub(4);
     let lead = b"535 ";
@@ -1255,7 +1268,7 @@ mod tests {
     payload.extend_from_slice(&[0x16, 0x03, 0x01]);
     let mut cursor = std::io::Cursor::new(payload);
     let mut guest = super::plain_guest(std::io::Cursor::new(Vec::new()));
-    let mut up = Smtp::new(std::slice::from_ref(&grant), "mail", 587, Direction::Upstream);
+    let mut up = upstream_with(LONG_REAL);
     let done = super::acceptance_reply(&mut cursor, &mut up, &mut guest, &[]).await.unwrap();
     let code = done.code.unwrap();
     assert_eq!(code, *b"535");

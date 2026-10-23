@@ -13,12 +13,10 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use super::{Rewritten, Wire};
 
-impl Rewritten<'_> {
-  pub(crate) fn emit_bytes(self) -> Vec<u8> {
-    match self {
-      Self::Emit(bytes) => bytes.into_owned(),
-      Self::Hold | Self::Close => Vec::new(),
-    }
+pub(crate) fn emit_bytes(rewritten: Rewritten<'_>) -> Vec<u8> {
+  match rewritten {
+    Rewritten::Emit(bytes) => bytes.into_owned(),
+    Rewritten::Hold | Rewritten::Close => Vec::new(),
   }
 }
 
@@ -58,7 +56,7 @@ pub(crate) async fn feed_parts<M: Wire>(m: &mut M, data: &[u8], splits: &[usize]
     if cut > prev {
       let (rewritten, chunk_hits) = m.feed(&data[prev..cut]).await;
       closed |= matches!(rewritten, Rewritten::Close);
-      out.extend_from_slice(&rewritten.emit_bytes());
+      out.extend_from_slice(&emit_bytes(rewritten));
       hits += chunk_hits.len();
       prev = cut;
     }
@@ -66,12 +64,12 @@ pub(crate) async fn feed_parts<M: Wire>(m: &mut M, data: &[u8], splits: &[usize]
   if prev < data.len() {
     let (rewritten, chunk_hits) = m.feed(&data[prev..]).await;
     closed |= matches!(rewritten, Rewritten::Close);
-    out.extend_from_slice(&rewritten.emit_bytes());
+    out.extend_from_slice(&emit_bytes(rewritten));
     hits += chunk_hits.len();
   }
   let (rewritten, chunk_hits) = m.feed(&[]).await;
   closed |= matches!(rewritten, Rewritten::Close);
-  out.extend_from_slice(&rewritten.emit_bytes());
+  out.extend_from_slice(&emit_bytes(rewritten));
   hits += chunk_hits.len();
   (out, hits, closed)
 }

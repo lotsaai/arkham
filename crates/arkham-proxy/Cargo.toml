@@ -17,6 +17,8 @@ dashmap = { workspace = true }
 arkham-config = { workspace = true }
 arkham-pki = { workspace = true }
 arkham-plugin = { workspace = true }
+arkham-smtp = { workspace = true }
+arkham-wire = { workspace = true }
 fe2o3-amqp-types = { workspace = true }
 httlib-hpack = { workspace = true }
 httparse = { workspace = true }
@@ -31,7 +33,6 @@ rustls-native-certs = { workspace = true }
 secrecy = { workspace = true }
 serde_amqp = { workspace = true }
 serde_json = { workspace = true }
-smtp-proto = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

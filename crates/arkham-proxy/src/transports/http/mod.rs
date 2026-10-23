@@ -31,7 +31,7 @@ use crate::identity::{CandidateParams, Hello, read_client_hello, read_http_head}
 use crate::into_box_error;
 use crate::mint::MintHandle;
 use crate::relay::relay_guarded;
-use crate::transports::engine::{Direction, H2, Http, Raw};
+use crate::transports::engine::{Direction, H2, Http, Raw, raw_new};
 use crate::transports::tcp;
 use crate::transports::tcp::raw_tcp_pair;
 
@@ -353,8 +353,8 @@ pub(crate) fn https_h2_pair(ctx: &PairCtx<'_>) -> (H2, H2) {
 /// grants.
 pub(crate) fn raw_tls_pair(ctx: &PairCtx<'_>) -> (Raw, Raw) {
   (
-    Raw::new(ctx.grants, Scheme::Https, ctx.host, ctx.port, Direction::Downstream),
-    Raw::new(ctx.grants, Scheme::Https, ctx.host, ctx.port, Direction::Upstream),
+    raw_new(ctx.grants, Scheme::Https, ctx.host, ctx.port, Direction::Downstream),
+    raw_new(ctx.grants, Scheme::Https, ctx.host, ctx.port, Direction::Upstream),
   )
 }
 

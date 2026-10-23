@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use arkham_config::grants::{Grant, RedisLeg, Scheme};
 use secrecy::ExposeSecret as _;
 
-use crate::transports::engine::{Direction, Hit, Location, Raw, Rewritten, Wire};
+use crate::transports::engine::{Direction, Hit, Location, Raw, Rewritten, Wire, raw_new};
 
 /// Cap for one buffered command. Real AUTH and HELLO commands are tens of
 /// bytes; anything past this is a drip or an attack, never an auth command.
@@ -62,7 +62,7 @@ impl Redis {
       .flatten();
     Self {
       downstream,
-      inner: Raw::new(grants, Scheme::Redis, host, port, dir),
+      inner: raw_new(grants, Scheme::Redis, host, port, dir),
     }
   }
 

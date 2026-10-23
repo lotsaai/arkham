@@ -22,12 +22,14 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use arkham_config::grants::{Grant, Scheme};
 use base64::Engine as _;
 use secrecy::ExposeSecret as _;
 use smtp_proto::{AUTH_LOGIN, AUTH_OAUTHBEARER, AUTH_PLAIN, AUTH_XOAUTH2, Request};
 
-use crate::transports::engine::{Direction, Hit, Location, Raw, Rewritten, Wire};
+use arkham_wire::engine::{CredentialPair, Direction, Hit, Location, Rewritten, Wire};
+use arkham_wire::raw::Raw;
+
+use crate::scope::SmtpScope;
 
 /// Cap for one buffered AUTH line. A real AUTH command is a few kilobytes;
 /// anything past this is a drip or an attack, never an auth command.
@@ -63,7 +65,7 @@ struct Down {
   /// Suffix of a `DATA` body that may still grow into [`DATA_END`].
   tail: Vec<u8>,
   phase: Phase,
-  creds: Option<Creds>,
+  creds: AuthMaterial,
   /// Guest-bound bytes queued for [`Wire::take_reply`].
   reply: Option<Vec<u8>>,
   closed: bool,
@@ -177,29 +179,53 @@ enum Phase {
   },
 }
 
-/// The credential pair one grant contributes to this connection.
-struct Creds {
-  fake_user: Vec<u8>,
-  real_user: Vec<u8>,
-  fake_pass: Vec<u8>,
-  real_pass: Vec<u8>,
-  label: String,
+/// AUTH identity and secret for one SMTP connection.
+#[derive(Clone)]
+pub struct AuthMaterial {
+  /// Decoy username the guest presents.
+  pub fake_user: Vec<u8>,
+  /// Real username the upstream expects.
+  pub real_user: Vec<u8>,
+  /// Decoy password the guest presents.
+  pub fake_pass: Vec<u8>,
+  /// Real password the upstream expects.
+  pub real_pass: Vec<u8>,
+  /// Rule label. Logs carry this, never the secret.
+  pub label: String,
+}
+
+impl AuthMaterial {
+  /// Bytes the downstream machine swaps, taken from the matched scope.
+  #[must_use]
+  pub fn from_scope(scope: &SmtpScope, label: &str) -> Self {
+    Self {
+      fake_user: scope.downstream.user.as_bytes().to_vec(),
+      real_user: scope.upstream.user.as_bytes().to_vec(),
+      fake_pass: scope.downstream.password.expose_secret().as_bytes().to_vec(),
+      real_pass: scope.upstream.password.expose_secret().as_bytes().to_vec(),
+      label: label.to_string(),
+    }
+  }
+}
+
+impl std::fmt::Debug for AuthMaterial {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("AuthMaterial")
+      .field("fake_user", &self.fake_user.len())
+      .field("real_user", &self.real_user.len())
+      .field("fake_pass", &self.fake_pass.len())
+      .field("real_pass", &self.real_pass.len())
+      .field("label", &self.label)
+      .finish()
+  }
 }
 
 impl Smtp {
-  /// Fresh leg. A direction with no covering grant still frames `DATA` and
-  /// `BDAT`; it just has nothing to swap. Upstream is always [`Raw`].
-  pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction) -> Self {
-    let creds = grants.iter().find_map(|grant| {
-      let scope = grant.smtp(Some(host), port)?;
-      Some(Creds {
-        fake_user: scope.downstream.user.as_bytes().to_vec(),
-        real_user: scope.upstream.user.as_bytes().to_vec(),
-        fake_pass: scope.downstream.password.expose_secret().as_bytes().to_vec(),
-        real_pass: scope.upstream.password.expose_secret().as_bytes().to_vec(),
-        label: grant.credential().map(|credential| credential.label.clone()).unwrap_or_default(),
-      })
-    });
+  /// Fresh leg. Downstream swaps AUTH with `material`. Upstream redacts `pairs`.
+  ///
+  /// Both legs still frame `DATA` and `BDAT` when `pairs` is empty.
+  #[must_use]
+  pub(crate) fn new(dir: Direction, material: AuthMaterial, pairs: Vec<CredentialPair>) -> Self {
     let gate = Arc::new(DataGate::new());
     match dir {
       Direction::Downstream => Self {
@@ -207,7 +233,7 @@ impl Smtp {
           buf: Vec::new(),
           tail: Vec::new(),
           phase: Phase::Command,
-          creds,
+          creds: material,
           reply: None,
           closed: false,
           gate: Arc::clone(&gate),
@@ -218,7 +244,7 @@ impl Smtp {
       },
       Direction::Upstream => Self {
         down: None,
-        raw: Some(Raw::length_changing(grants, Scheme::Smtp, host, port, Direction::Upstream)),
+        raw: Some(Raw::from_pairs(pairs)),
         gate,
         scan: ReplyScan::default(),
       },
@@ -525,30 +551,22 @@ fn rewrite_down_line(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
   match down.phase {
     Phase::Plain => {
       down.phase = Phase::Command;
-      let Some(creds) = down.creds.as_ref() else {
-        return (line.to_vec(), Vec::new());
-      };
+      let creds = &down.creds;
       rewrite_plain_line(line, creds)
     }
     Phase::LoginUser => {
       down.phase = Phase::LoginPass;
-      let Some(creds) = down.creds.as_ref() else {
-        return (line.to_vec(), Vec::new());
-      };
+      let creds = &down.creds;
       rewrite_token_line(line, &creds.fake_user, &creds.real_user, creds)
     }
     Phase::LoginPass => {
       down.phase = Phase::Command;
-      let Some(creds) = down.creds.as_ref() else {
-        return (line.to_vec(), Vec::new());
-      };
+      let creds = &down.creds;
       rewrite_token_line(line, &creds.fake_pass, &creds.real_pass, creds)
     }
     Phase::Bearer => {
       down.phase = Phase::Command;
-      let Some(creds) = down.creds.as_ref() else {
-        return (line.to_vec(), Vec::new());
-      };
+      let creds = &down.creds;
       rewrite_bearer_line(line, creds)
     }
     Phase::Command => rewrite_command(line, down, cmd),
@@ -595,9 +613,7 @@ fn rewrite_auth(line: &[u8], down: &mut Down, mechanism: u64, initial: &str) -> 
         down.phase = Phase::Plain;
         return (line.to_vec(), Vec::new());
       };
-      let Some(creds) = down.creds.as_ref() else {
-        return (line.to_vec(), Vec::new());
-      };
+      let creds = &down.creds;
       rewrite_auth_arg(line, b"PLAIN", arg, ending, creds, rewrite_plain_raw)
     }
     AUTH_LOGIN => {
@@ -605,9 +621,7 @@ fn rewrite_auth(line: &[u8], down: &mut Down, mechanism: u64, initial: &str) -> 
         down.phase = Phase::LoginUser;
         return (line.to_vec(), Vec::new());
       };
-      let Some(creds) = down.creds.as_ref() else {
-        return (line.to_vec(), Vec::new());
-      };
+      let creds = &down.creds;
       let (rewritten, hits) = rewrite_token_line(&join_line(arg, ending), &creds.fake_user, &creds.real_user, creds);
       down.phase = Phase::LoginPass;
       let arg_body = line_body(&rewritten);
@@ -625,9 +639,7 @@ fn rewrite_bearer(line: &[u8], down: &mut Down, mech: &[u8], initial: Option<&[u
     down.phase = Phase::Bearer;
     return (line.to_vec(), Vec::new());
   };
-  let Some(creds) = down.creds.as_ref() else {
-    return (line.to_vec(), Vec::new());
-  };
+  let creds = &down.creds;
   rewrite_auth_arg(line, mech, arg, ending, creds, rewrite_bearer_raw)
 }
 
@@ -679,8 +691,8 @@ fn rewrite_auth_arg(
   mech: &[u8],
   arg: &[u8],
   ending: &[u8],
-  creds: &Creds,
-  rewrite: fn(&[u8], &Creds) -> Option<Vec<u8>>,
+  creds: &AuthMaterial,
+  rewrite: fn(&[u8], &AuthMaterial) -> Option<Vec<u8>>,
 ) -> (Vec<u8>, Vec<Hit>) {
   let Some(raw) = b64_decode(arg) else {
     return (line.to_vec(), Vec::new());
@@ -692,7 +704,7 @@ fn rewrite_auth_arg(
 }
 
 /// A continuation line carrying a SASL PLAIN payload.
-fn rewrite_plain_line(line: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
+fn rewrite_plain_line(line: &[u8], creds: &AuthMaterial) -> (Vec<u8>, Vec<Hit>) {
   let body = line_body(line);
   let Some(raw) = b64_decode(body) else {
     return (line.to_vec(), Vec::new());
@@ -706,7 +718,7 @@ fn rewrite_plain_line(line: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
 }
 
 /// A continuation line whose whole payload is one token (LOGIN user or password).
-fn rewrite_token_line(line: &[u8], from: &[u8], to: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
+fn rewrite_token_line(line: &[u8], from: &[u8], to: &[u8], creds: &AuthMaterial) -> (Vec<u8>, Vec<Hit>) {
   if from == to {
     return (line.to_vec(), Vec::new());
   }
@@ -722,7 +734,7 @@ fn rewrite_token_line(line: &[u8], from: &[u8], to: &[u8], creds: &Creds) -> (Ve
 }
 
 /// A continuation line carrying an XOAUTH2 or OAUTHBEARER payload.
-fn rewrite_bearer_line(line: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
+fn rewrite_bearer_line(line: &[u8], creds: &AuthMaterial) -> (Vec<u8>, Vec<Hit>) {
   let Some(raw) = b64_decode(line_body(line)) else {
     return (line.to_vec(), Vec::new());
   };
@@ -735,7 +747,7 @@ fn rewrite_bearer_line(line: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
 }
 
 /// SASL PLAIN: `authzid NUL authcid NUL password`.
-fn rewrite_plain_raw(raw: &[u8], creds: &Creds) -> Option<Vec<u8>> {
+fn rewrite_plain_raw(raw: &[u8], creds: &AuthMaterial) -> Option<Vec<u8>> {
   let (zid, cid, pass) = split_plain(raw)?;
   let mut cid_out = cid.to_vec();
   let mut pass_out = pass.to_vec();
@@ -768,7 +780,7 @@ fn rewrite_plain_raw(raw: &[u8], creds: &Creds) -> Option<Vec<u8>> {
 
 /// XOAUTH2 (`user=…\x01auth=Bearer …\x01\x01`) and OAUTHBEARER
 /// (`n,a=…,\x01…auth=Bearer …\x01\x01`). The bearer token is the password.
-fn rewrite_bearer_raw(raw: &[u8], creds: &Creds) -> Option<Vec<u8>> {
+fn rewrite_bearer_raw(raw: &[u8], creds: &AuthMaterial) -> Option<Vec<u8>> {
   let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
   if creds.fake_pass != creds.real_pass
     && let Some((start, end)) = marked_span(raw, b"auth=Bearer ", |byte| byte == SASL_SEP)
@@ -816,7 +828,7 @@ fn marked_span(raw: &[u8], marker: &[u8], ends: impl Fn(u8) -> bool) -> Option<(
   Some((start, end))
 }
 
-fn hit(creds: &Creds) -> Hit {
+fn hit(creds: &AuthMaterial) -> Hit {
   Hit {
     label: creds.label.clone(),
     location: Location::BasicAuth,
@@ -898,9 +910,12 @@ fn trim_ascii(text: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-  use super::*;
-  use arkham_config::grants::{Credential, GuestTlsMode, SmtpLeg, SmtpScope};
   use secrecy::SecretString;
+
+  use arkham_wire::GuestTlsMode;
+
+  use super::*;
+  use crate::scope::SmtpLeg;
 
   const FAKE_USER: &str = "agent@demo.test";
   const REAL_USER: &str = "agent@demo.test";
@@ -931,27 +946,40 @@ mod tests {
     }
   }
 
-  fn grant(fake_user: &str, real_user: &str) -> Vec<Grant> {
-    grant_pass(fake_user, real_user, FAKE_PASS, REAL_PASS)
+  fn material(fake_user: &str, real_user: &str, fake_pass: &str, real_pass: &str) -> AuthMaterial {
+    AuthMaterial::from_scope(&scope(fake_user, real_user, fake_pass, real_pass), "smtp")
   }
 
-  fn grant_pass(fake_user: &str, real_user: &str, fake_pass: &str, real_pass: &str) -> Vec<Grant> {
-    vec![Grant::Smtp {
-      credential: Credential {
-        label: "smtp".into(),
-        fake: fake_pass.into(),
-        value: SecretString::from(real_pass),
-      },
-      scope: Box::new(scope(fake_user, real_user, fake_pass, real_pass)),
+  fn upstream_pairs(real_pass: &str, fake_pass: &str) -> Vec<CredentialPair> {
+    vec![CredentialPair {
+      needle: real_pass.as_bytes().to_vec(),
+      replacement: fake_pass.as_bytes().to_vec(),
+      label: "smtp".into(),
     }]
   }
 
+  fn down_of(fake_user: &str, real_user: &str) -> Smtp {
+    Smtp::new(
+      Direction::Downstream,
+      material(fake_user, real_user, FAKE_PASS, REAL_PASS),
+      Vec::new(),
+    )
+  }
+
+  fn up_of(fake_user: &str, real_user: &str, fake_pass: &str, real_pass: &str) -> Smtp {
+    Smtp::new(
+      Direction::Upstream,
+      material(fake_user, real_user, fake_pass, real_pass),
+      upstream_pairs(real_pass, fake_pass),
+    )
+  }
+
   fn down() -> Smtp {
-    Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Downstream)
+    down_of(FAKE_USER, REAL_USER)
   }
 
   fn up() -> Smtp {
-    Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Upstream)
+    up_of(FAKE_USER, REAL_USER, FAKE_PASS, REAL_PASS)
   }
 
   /// Downstream and upstream legs that share the `DATA` reply permit.
@@ -994,7 +1022,7 @@ mod tests {
 
   #[tokio::test]
   async fn plain_inline_swaps_a_different_user() {
-    let mut machine = Smtp::new(&grant("guest@demo.test", "real@demo.test"), "mail", 587, Direction::Downstream);
+    let mut machine = down_of("guest@demo.test", "real@demo.test");
     let line = format!("AUTH PLAIN {}\r\n", plain("guest@demo.test", FAKE_PASS));
     let (out, hits) = emit(&mut machine, line.as_bytes()).await;
     assert_eq!(hits, 1);
@@ -1015,7 +1043,7 @@ mod tests {
 
   #[tokio::test]
   async fn plain_on_a_cleartext_leg_swaps_the_password() {
-    let mut machine = Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Downstream);
+    let mut machine = down();
     let line = format!("AUTH PLAIN {}\r\n", plain(FAKE_USER, FAKE_PASS));
     let (out, hits) = emit(&mut machine, line.as_bytes()).await;
     assert_eq!(hits, 1);
@@ -1065,7 +1093,7 @@ mod tests {
 
   #[tokio::test]
   async fn oauthbearer_swaps_the_bearer() {
-    let mut machine = Smtp::new(&grant("guest@demo.test", "real@demo.test"), "mail", 587, Direction::Downstream);
+    let mut machine = down_of("guest@demo.test", "real@demo.test");
     let raw = format!("n,a=guest@demo.test,\x01host=mail\x01auth=Bearer {FAKE_PASS}\x01\x01");
     let encoded = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
     let (out, hits) = emit(&mut machine, format!("AUTH OAUTHBEARER {encoded}\r\n").as_bytes()).await;
@@ -1117,7 +1145,7 @@ mod tests {
 
   #[tokio::test]
   async fn response_redacts_the_password_and_leaves_the_username() {
-    let mut machine = Smtp::new(&grant("guest@demo.test", "a"), "mail", 587, Direction::Upstream);
+    let mut machine = up_of("guest@demo.test", "a", FAKE_PASS, REAL_PASS);
     let line = format!("535 5.7.8 a rejected {REAL_PASS}\r\n");
     let (out, hits) = emit_flushed(&mut machine, line.as_bytes()).await;
     assert_eq!(hits, 1);
@@ -1223,12 +1251,7 @@ mod tests {
   #[tokio::test]
   async fn response_redacts_a_longer_real_password() {
     const LONG_REAL: &str = "real-smtp-pass-extended"; // betterleaks:allow
-    let mut machine = Smtp::new(
-      &grant_pass(FAKE_USER, REAL_USER, FAKE_PASS, LONG_REAL),
-      "mail",
-      587,
-      Direction::Upstream,
-    );
+    let mut machine = up_of(FAKE_USER, REAL_USER, FAKE_PASS, LONG_REAL);
     let line = format!("535 5.7.8 authentication failed for {LONG_REAL}\r\n");
     let split = line.find(LONG_REAL).unwrap().saturating_add(4);
     let (head, head_hits) = emit(&mut machine, line.as_bytes().get(..split).unwrap_or(&[])).await;
@@ -1282,8 +1305,8 @@ mod tests {
       fn arbitrary_bytes_do_not_panic(chunks in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..80), 0..6)) {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(async {
-          let mut down = Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Downstream);
-          let mut up_leg = Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Upstream);
+          let mut down = down();
+          let mut up_leg = up();
           Smtp::share_data_gate(&down, &mut up_leg);
           for chunk in &chunks {
             let _ = down.feed(chunk).await;

@@ -12,7 +12,7 @@ use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
 use validator::ValidationErrors;
 
-use crate::grants::{AmqpUriError, LdapUriError, NatsUriError, Scheme, SmtpUriError};
+use crate::grants::{AmqpUriError, LdapUriError, NatsUriError, Scheme};
 
 /// Every way config loading, validation, and grant resolution can fail.
 #[derive(Debug, thiserror::Error)]
@@ -472,27 +472,9 @@ pub enum Error {
     /// Rule label.
     label: String,
   },
-  /// An SMTP connection string does not parse.
-  #[error("rule `{label}`: {source}")]
-  SmtpScope {
-    /// Rule label.
-    label: String,
-    /// Parse failure.
-    #[source]
-    source: SmtpUriError,
-  },
-  /// An SMTP rule states its upstream identity outside the connection string.
-  #[error("rule `{label}`: smtp states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
-  SmtpIdentity {
-    /// Rule label.
-    label: String,
-  },
-  /// An SMTP rule states its upstream trust outside the connection string.
-  #[error("rule `{label}`: smtp states upstream trust in its connection string (`sslrootcert`), never in the rule table")]
-  SmtpTrust {
-    /// Rule label.
-    label: String,
-  },
+  /// An SMTP connection string, identity row, or trust row was rejected.
+  #[error(transparent)]
+  Smtp(#[from] arkham_smtp::Error),
   /// An LDAP rule states its upstream identity outside the connection string.
   #[error("rule `{label}`: ldap states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
   LdapIdentity {
