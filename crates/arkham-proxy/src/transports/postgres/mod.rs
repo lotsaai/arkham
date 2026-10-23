@@ -16,7 +16,7 @@ use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Direction, GuestOpening, Postgres, read_guest_opening, request_upstream_tls};
-use crate::transports::tls::{Pending, UpstreamTls, Verify, settle};
+use crate::transports::tls::{Leg, UpstreamTls, Verify, finish};
 
 /// ALPN identifier for direct Postgres TLS.
 const POSTGRESQL_ALPN: &[u8] = b"postgresql";
@@ -98,16 +98,18 @@ impl Transport for PostgresTransport {
       mint: Some(state.mint_handle()),
     };
     let legs = &state.legs;
-    let guest_pending = match guest_tls {
+    let guest_leg = match guest_tls {
       Some((hello_buf, identity)) => {
         let mode = scope.guest_tls;
-        Pending::Tls(async move {
-          legs
-            .accept_guest(&identity, Prefixed::new(hello_buf, guest), mode, Some(POSTGRESQL_ALPN))
-            .await
-        })
+        Leg::Tls(
+          finish(
+            budget,
+            legs.accept_guest(&identity, Prefixed::new(hello_buf, guest), mode, Some(POSTGRESQL_ALPN)),
+          )
+          .await?,
+        )
       }
-      None => Pending::Plain(Prefixed::new(guest_head, guest)),
+      None => Leg::Plain(Prefixed::new(guest_head, guest)),
     };
     let server_name = scope.upstream.host.as_str();
     let root = scope.root_cert.as_ref();
@@ -117,10 +119,11 @@ impl Transport for PostgresTransport {
     let client_cert = scope.client_cert.as_deref();
     let client_key = scope.client_key.as_deref();
     let alpn = (scope.negotiation == SslNegotiation::Direct).then_some(POSTGRESQL_ALPN);
-    let upstream_pending = if accepted {
-      Pending::Tls(async move {
-        legs
-          .connect_upstream(
+    let upstream_leg = if accepted {
+      Leg::Tls(
+        finish(
+          budget,
+          legs.connect_upstream(
             &UpstreamTls {
               server_name,
               root,
@@ -130,13 +133,13 @@ impl Transport for PostgresTransport {
               alpn,
             },
             upstream,
-          )
-          .await
-      })
+          ),
+        )
+        .await?,
+      )
     } else {
-      Pending::Plain(upstream)
+      Leg::Plain(upstream)
     };
-    let (guest_leg, upstream_leg) = settle(guest_pending, upstream_pending, budget).await?;
     relay(guest_leg, upstream_leg, &ctx, scope, budget).await
   }
 }

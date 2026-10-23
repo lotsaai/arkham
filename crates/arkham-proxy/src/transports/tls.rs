@@ -150,32 +150,9 @@ pub(crate) fn cached_roots(roots: &DashMap<RootCert, Arc<RootCertStore>>, root: 
   Ok(store)
 }
 
-const HEX: &[u8; 16] = b"0123456789abcdef";
-
-/// Cache key for one leaf. The name, the client-certificate demand, and the
-/// ALPN identifier are all part of the leaf a peer will see.
 fn leaf_cache_key(sni: &str, alpn: Option<&[u8]>, mtls: bool) -> String {
-  let mut key = String::with_capacity(sni.len().saturating_add(24));
-  key.push_str(sni);
-  key.push('|');
-  key.push(if mtls { 'm' } else { 't' });
-  key.push('|');
-  let Some(alpn) = alpn else {
-    return key;
-  };
-  for byte in alpn {
-    let hi = usize::from(byte >> 4);
-    let lo = usize::from(byte & 0x0f);
-    let Some(hi) = HEX.get(hi) else {
-      continue;
-    };
-    let Some(lo) = HEX.get(lo) else {
-      continue;
-    };
-    key.push(char::from(*hi));
-    key.push(char::from(*lo));
-  }
-  key
+  let alpn = alpn.map(|bytes| bytes.escape_ascii().to_string()).unwrap_or_default();
+  format!("{sni}|{}|{alpn}", if mtls { 'm' } else { 't' })
 }
 
 /// How an upstream certificate is checked.
@@ -185,48 +162,27 @@ pub(crate) enum Verify {
   Full,
   /// libpq. A missing root accepts the certificate. A present root checks
   /// the chain, and the host name only when `name` is set.
-  Libpq {
-    /// Check the certificate's host name.
-    name: bool,
-  },
+  Libpq { name: bool },
 }
 
-/// What one upstream handshake needs. The caller already decided that this
-/// leg speaks TLS.
+/// What one upstream handshake needs. The caller already decided that this leg speaks TLS.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamTls<'a> {
-  /// Name the certificate must match when verification checks it.
   pub(crate) server_name: &'a str,
-  /// Trust anchor from the connection string, when it names one.
   pub(crate) root: Option<&'a RootCert>,
-  /// Which checks to run.
   pub(crate) verify: Verify,
-  /// PEM client certificate, when the upstream asks for one.
   pub(crate) client_cert: Option<&'a Path>,
-  /// PEM client key paired with `client_cert`.
   pub(crate) client_key: Option<&'a Path>,
-  /// ALPN identifier to offer, when the protocol has one.
   pub(crate) alpn: Option<&'a [u8]>,
 }
 
-/// One side of a connection before the handshake, or the plaintext stream.
-pub(crate) enum Pending<P, F> {
-  /// No handshake. The stream is already the byte stream.
-  Plain(P),
-  /// Handshake future. `settle` applies the budget.
-  Tls(F),
-}
-
-/// One side after [`settle`].
+/// One side after the handshake budget. Plaintext stays the original stream.
 pub(crate) enum Leg<P, T> {
-  /// The original stream.
   Plain(P),
-  /// The stream after the handshake.
   Tls(T),
 }
 
-/// Shared guest and upstream TLS legs. Protocols differ by ALPN and by
-/// [`Verify`]. The handshake itself is this one path.
+/// Shared guest and upstream TLS legs. Protocols differ by ALPN and by [`Verify`].
 pub(crate) struct TlsLegs {
   ca: CertAuthority,
   leaves: DashMap<String, Arc<ServerConfig>>,
@@ -235,11 +191,6 @@ pub(crate) struct TlsLegs {
 }
 
 impl TlsLegs {
-  /// Build the caches over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
   pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
     Ok(Self {
       ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
@@ -251,11 +202,6 @@ impl TlsLegs {
     })
   }
 
-  /// Accept the guest's TLS, minting the leaf for `name` on first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the handshake fails.
   pub(crate) async fn accept_guest<G>(
     &self,
     name: &str,
@@ -276,12 +222,6 @@ impl TlsLegs {
       .map_err(|err| Error::GuestTls { source: err })
   }
 
-  /// Handshake the upstream under `request`.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the trust anchor or client identity cannot be
-  /// read, when the server name is unusable, or when the handshake fails.
   pub(crate) async fn connect_upstream<S>(&self, request: &UpstreamTls<'_>, server: S) -> Result<ClientTlsStream<S>, Error>
   where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -323,11 +263,6 @@ impl TlsLegs {
   }
 }
 
-/// Present the named client identity, or none when the entry names neither file.
-///
-/// # Errors
-///
-/// Returns an error when the identity cannot be read or is empty.
 fn with_identity(builder: impl IdentityBuilder, cert: Option<&Path>, key: Option<&Path>) -> Result<ClientConfig, Error> {
   match (cert, key) {
     (Some(cert), Some(key)) => {
@@ -345,16 +280,13 @@ fn with_identity(builder: impl IdentityBuilder, cert: Option<&Path>, key: Option
   }
 }
 
-/// The two rustls client builders expose the same two methods under different types.
 trait IdentityBuilder {
-  /// Install a client certificate.
   fn with_cert(
     self,
     chain: Vec<CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
   ) -> Result<ClientConfig, RustlsError>;
 
-  /// Present no client certificate.
   fn with_none(self) -> ClientConfig;
 }
 
@@ -372,35 +304,10 @@ impl IdentityBuilder for rustls::ConfigBuilder<ClientConfig, rustls::client::Wan
   }
 }
 
-/// Run the handshake on each TLS side, under one budget, and leave plaintext sides alone.
-///
-/// # Errors
-///
-/// Returns an error when a handshake fails or exceeds `budget`.
-pub(crate) async fn settle<GP, GF, GT, SP, SF, ST>(
-  guest: Pending<GP, GF>,
-  upstream: Pending<SP, SF>,
-  budget: Duration,
-) -> Result<(Leg<GP, GT>, Leg<SP, ST>), Error>
-where
-  GF: Future<Output = Result<GT, Error>>,
-  SF: Future<Output = Result<ST, Error>>,
-{
-  let guest = settle_one(guest, budget).await?;
-  let upstream = settle_one(upstream, budget).await?;
-  Ok((guest, upstream))
-}
-
-async fn settle_one<P, F, T>(side: Pending<P, F>, budget: Duration) -> Result<Leg<P, T>, Error>
-where
-  F: Future<Output = Result<T, Error>>,
-{
-  match side {
-    Pending::Plain(plain) => Ok(Leg::Plain(plain)),
-    Pending::Tls(handshake) => match tokio::time::timeout(budget, handshake).await {
-      Ok(result) => result.map(Leg::Tls),
-      Err(_elapsed) => Err(Error::HandshakeTimeout),
-    },
+pub(crate) async fn finish<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+  match tokio::time::timeout(budget, handshake).await {
+    Ok(result) => result,
+    Err(_elapsed) => Err(Error::HandshakeTimeout),
   }
 }
 
