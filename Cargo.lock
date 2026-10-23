@@ -427,6 +427,7 @@ dependencies = [
 name = "arkham-config"
 version = "0.3.31"
 dependencies = [
+ "arkham-ldap",
  "arkham-smtp",
  "arkham-wire",
  "base62",
@@ -498,6 +499,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkham-ldap"
+version = "0.3.31"
+dependencies = [
+ "arkham-wire",
+ "percent-encoding",
+ "proptest",
+ "rasn",
+ "rasn-ldap",
+ "secrecy",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "arkham-pki"
 version = "0.3.31"
 dependencies = [
@@ -530,6 +546,7 @@ dependencies = [
  "actson",
  "amq-protocol",
  "arkham-config",
+ "arkham-ldap",
  "arkham-pki",
  "arkham-plugin",
  "arkham-smtp",

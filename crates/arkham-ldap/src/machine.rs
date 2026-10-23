@@ -1,32 +1,20 @@
-//! LDAP wire format: simple-bind password rewrite over a streamed BER cursor.
-//!
-//! Bytes go through [`Raw`] (downstream) or the engine's needle hold-back
-//! (upstream). A message is not accumulated. The cursor peeks a bind only
-//! until the simple password, and an extended operation only until the
-//! `StartTLS` OID or the result code and diagnostic. Everything after that
-//! is forwarded as it arrives, including a body whose header announced a
-//! huge length. A message id outside the RFC 4511 range closes the
-//! downstream leg and is forwarded upstream; its body is not peeked. The
-//! upstream needle suffix is released when the message ends, because that
-//! frame cannot grow. Cleartext and TLS both swap. A diagnostic that still
-//! carries the real password closes the leg.
+//! LDAP simple-bind substitution. Cleartext and TLS both swap the password.
+//! A diagnostic that still carries the real password closes the leg.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
 
-use arkham_config::grants::{Grant, Scheme};
+use arkham_wire::engine::{
+  CredentialPair, Direction, Hit, LocalUpgrade, Location, PeerFact, Rewritten, UpgradeNote, Wire, find_new_match, needle_prefix_suffix_len,
+  replace_bytes,
+};
+use arkham_wire::raw::Raw;
 use rasn::prelude::OctetString;
 use rasn_ldap::{
   AbandonRequest, AddRequest, AddResponse, BindRequest, BindResponse, CompareRequest, CompareResponse, DelRequest, DelResponse,
   ExtendedResponse, LdapMessage, LdapString, ModifyDnRequest, ModifyDnResponse, ModifyRequest, ModifyResponse, ProtocolOp, ResultCode,
   SearchRequest, SearchResultDone,
-};
-use secrecy::ExposeSecret as _;
-
-use crate::transports::engine::{
-  CredentialPair, Direction, Hit, LocalUpgrade, Location, PeerFact, Raw, Rewritten, UpgradeNote, Wire, find_new_match,
-  needle_prefix_suffix_len, raw_new, replace_bytes,
 };
 
 /// `StartTLS` extended operation OID (RFC 4511).
@@ -51,7 +39,7 @@ const CONTEXT_0: u8 = 0x80;
 const MAX_INT: u32 = 2_147_483_647;
 
 /// One LDAP direction leg.
-pub(crate) struct Ldap {
+pub struct Ldap {
   down: Option<Down>,
   up: Option<Up>,
   phase: Phase,
@@ -227,51 +215,78 @@ struct ResultCut {
   after_inside: usize,
 }
 
+/// Password and DN pair for one LDAP grant. The caller already matched the grant.
+#[derive(Clone)]
+pub struct BindSwap {
+  /// Grant label. Logs carry this, never the password.
+  pub label: String,
+  /// Decoy password the guest presents.
+  pub fake: String,
+  /// Real password the upstream expects.
+  pub real: String,
+  /// Bind DN on the guest leg.
+  pub downstream_dn: String,
+  /// Bind DN on the upstream leg.
+  pub upstream_dn: String,
+}
+
+impl std::fmt::Debug for BindSwap {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("BindSwap")
+      .field("label", &self.label)
+      .field("downstream_dn", &self.downstream_dn)
+      .field("upstream_dn", &self.upstream_dn)
+      .finish_non_exhaustive()
+  }
+}
+
+impl std::fmt::Debug for Ldap {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Ldap")
+      .field("closed", &self.closed)
+      .field("local_starttls", &self.local_starttls)
+      .finish_non_exhaustive()
+  }
+}
+
 impl Ldap {
   /// Fresh leg. A simple bind is rewritten on cleartext and on TLS.
   /// Upstream always redacts a diagnostic that carries the real password.
-  pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction) -> Self {
-    let down = if dir == Direction::Downstream {
-      grants.iter().find_map(|grant| {
-        let scope = grant.ldap(Some(host), port)?;
+  #[must_use]
+  pub fn new(swap: Option<BindSwap>, dir: Direction) -> Self {
+    let (down, up) = match (dir, swap) {
+      (Direction::Downstream, Some(swap)) => (
         Some(Down {
-          fake: scope.downstream.password.expose_secret().to_string(),
-          real: scope.upstream.password.expose_secret().to_string(),
-          downstream_dn: scope.downstream.dn.clone(),
-          upstream_dn: scope.upstream.dn.clone(),
-          label: grant.credential().map(|credential| credential.label.clone()).unwrap_or_default(),
+          fake: swap.fake,
+          real: swap.real,
+          downstream_dn: swap.downstream_dn,
+          upstream_dn: swap.upstream_dn,
+          label: swap.label,
           notes: VecDeque::new(),
           msg_id: None,
-        })
-      })
-    } else {
-      None
-    };
-    let up = if dir == Direction::Upstream {
-      grants.iter().find_map(|grant| {
-        let scope = grant.ldap(Some(host), port)?;
-        let real = scope.upstream.password.expose_secret().as_bytes().to_vec();
-        let fake = scope.downstream.password.expose_secret().as_bytes().to_vec();
-        let label = grant.credential().map(|credential| credential.label.clone()).unwrap_or_default();
+        }),
+        None,
+      ),
+      (Direction::Upstream, Some(swap)) => (
+        None,
         Some(Up {
           pair: CredentialPair {
-            needle: real,
-            replacement: fake,
-            label,
+            needle: swap.real.into_bytes(),
+            replacement: swap.fake.into_bytes(),
+            label: swap.label,
           },
           expect_id: None,
           clear_id: None,
           open: Vec::new(),
-        })
-      })
-    } else {
-      None
+        }),
+      ),
+      (_, _) => (None, None),
     };
     Self {
       down,
       up,
       phase: Phase::Head(Vec::new()),
-      forward: raw_new(&[], Scheme::Ldap, host, port, dir),
+      forward: Raw::from_pairs(Vec::new()),
       starttls: None,
       prefix: Vec::new(),
       starttls_ok: None,
@@ -285,27 +300,29 @@ impl Ldap {
   }
 
   /// Withhold the next `StartTLS` request so the guest can upgrade locally.
-  pub(crate) fn hold_starttls(&mut self) {
+  pub fn hold_starttls(&mut self) {
     self.starttls_mode = StartTlsMode::Hold;
   }
 
   /// A later `StartTLS` on a session that is already TLS is an ordinary message.
-  pub(crate) fn forward_starttls(&mut self) {
+  pub fn forward_starttls(&mut self) {
     self.starttls_mode = StartTlsMode::Forward;
   }
 
   /// Message id of a `StartTLS` request framed by the last `feed`, once.
-  pub(crate) fn take_starttls(&mut self) -> Option<u32> {
+  #[must_use]
+  pub fn take_starttls(&mut self) -> Option<u32> {
     self.starttls.take()
   }
 
   /// Bytes after that request. The caller replays them into the handshake.
-  pub(crate) fn take_prefix(&mut self) -> Vec<u8> {
+  #[must_use]
+  pub fn take_prefix(&mut self) -> Vec<u8> {
     std::mem::take(&mut self.prefix)
   }
 
   /// The next extended response with `id` is the `StartTLS` result.
-  pub(crate) fn expect_starttls(&mut self, id: u32) {
+  pub fn expect_starttls(&mut self, id: u32) {
     if let Some(up) = self.up.as_mut() {
       up.expect_id = Some(id);
     }
@@ -315,13 +332,15 @@ impl Ldap {
   ///
   /// The value appears only once that response is complete. A split success
   /// stays pending through `responseName` so the caller keeps reading.
-  pub(crate) fn take_starttls_result(&mut self) -> Option<bool> {
+  #[must_use]
+  pub fn take_starttls_result(&mut self) -> Option<bool> {
     self.starttls_ok.take()
   }
 
   /// Message id and unread control bytes after a recognized `StartTLS` OID.
   /// The opening streams those bytes and does not store them.
-  pub(crate) fn starttls_tail(&self) -> Option<(u32, usize)> {
+  #[must_use]
+  pub fn starttls_tail(&self) -> Option<(u32, usize)> {
     match self.phase {
       Phase::Tail { left, id, .. } => Some((id, left)),
       Phase::Head(_) | Phase::Peek(_) | Phase::Forward(_) => None,
@@ -335,8 +354,8 @@ impl Ldap {
 /// # Errors
 ///
 /// Returns the encoder error when the fixed success message cannot be encoded.
-pub(crate) fn starttls_success(id: u32) -> Result<Vec<u8>, rasn::error::EncodeError> {
-  extended_result(id, ResultCode::Success, true)
+pub fn starttls_success(id: u32) -> Result<Vec<u8>, crate::Error> {
+  extended_result(id, ResultCode::Success, true).map_err(|source| crate::Error::Encode { source })
 }
 
 /// Extended response for `id`. `named` attaches the `StartTLS` OID, which a
@@ -1376,10 +1395,10 @@ fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use arkham_config::grants::{Credential, GuestTlsMode, LdapScope};
+  use crate::LdapScope;
+  use arkham_wire::GuestTlsMode;
   use rasn::types::AsnType as _;
   use rasn_ldap::{AuthenticationChoice, Filter, SearchRequestDerefAliases, SearchRequestScope, UnbindRequest};
-  use secrecy::SecretString;
 
   fn peek_len(ldap: &Ldap) -> usize {
     match &ldap.phase {
@@ -1405,24 +1424,23 @@ mod tests {
     dn.replace('=', "%3D").replace(' ', "%20").replace(',', "%2C")
   }
 
-  fn grant(downstream_dn: &str, upstream_dn: &str) -> Vec<Grant> {
+  fn swap_dns(downstream_dn: &str, upstream_dn: &str) -> BindSwap {
     let parsed = scope(downstream_dn, upstream_dn);
-    vec![Grant::Ldap {
-      credential: Credential {
-        label: "ldap".into(),
-        fake: FAKE_PW.into(),
-        value: SecretString::from(REAL_PW),
-      },
-      scope: Box::new(parsed),
-    }]
+    BindSwap {
+      label: "ldap".into(),
+      fake: FAKE_PW.into(),
+      real: REAL_PW.into(),
+      downstream_dn: parsed.downstream.dn,
+      upstream_dn: parsed.upstream.dn,
+    }
   }
 
   fn down() -> Ldap {
-    Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream)
+    Ldap::new(Some(swap_dns(DN, DN)), Direction::Downstream)
   }
 
   fn up() -> Ldap {
-    Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Upstream)
+    Ldap::new(Some(swap_dns(DN, DN)), Direction::Upstream)
   }
 
   fn bind_frame(id: u32, dn: &str, password: &str) -> Vec<u8> {
@@ -1517,7 +1535,7 @@ mod tests {
   #[tokio::test]
   async fn cleartext_bind_swaps_the_password() {
     let frame = bind_frame(1, DN, FAKE_PW);
-    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream);
+    let mut machine = Ldap::new(Some(swap_dns(DN, DN)), Direction::Downstream);
     let out = emit(&mut machine, &frame).await;
     let message: LdapMessage = rasn::ber::decode(&out).unwrap();
     let ProtocolOp::BindRequest(request) = message.protocol_op else {
@@ -1535,7 +1553,7 @@ mod tests {
     let frame = starttls_frame(2);
     let mut bytes = bind_frame(1, DN, FAKE_PW);
     bytes.extend_from_slice(&frame);
-    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream);
+    let mut machine = Ldap::new(Some(swap_dns(DN, DN)), Direction::Downstream);
     let out = emit(&mut machine, &bytes).await;
     let (message, rest) = rasn::ber::decode_with_remainder::<LdapMessage>(&out).unwrap();
     let ProtocolOp::BindRequest(request) = message.protocol_op else {
@@ -1588,15 +1606,16 @@ mod tests {
       &format!("ldap://{}:{real}@ldap:389", encode_user(dn)),
     )
     .unwrap();
-    let grants = vec![Grant::Ldap {
-      credential: Credential {
+    let mut machine = Ldap::new(
+      Some(BindSwap {
         label: "ldap".into(),
         fake: fake.into(),
-        value: SecretString::from(real),
-      },
-      scope: Box::new(parsed),
-    }];
-    let mut machine = Ldap::new(&grants, "ldap", 389, Direction::Downstream);
+        real: real.into(),
+        downstream_dn: parsed.downstream.dn,
+        upstream_dn: parsed.upstream.dn,
+      }),
+      Direction::Downstream,
+    );
     let out = emit(&mut machine, &bind_frame(1, dn, fake)).await;
     let message: LdapMessage = rasn::ber::decode(&out).unwrap();
     let ProtocolOp::BindRequest(request) = message.protocol_op else {
@@ -1697,7 +1716,7 @@ mod tests {
 
   #[tokio::test]
   async fn differing_dns_swap_with_the_password() {
-    let mut machine = Ldap::new(&grant(DN, "cn=svc,dc=example,dc=com"), "ldap", 389, Direction::Downstream);
+    let mut machine = Ldap::new(Some(swap_dns(DN, "cn=svc,dc=example,dc=com")), Direction::Downstream);
     let out = emit(&mut machine, &bind_frame(1, DN, FAKE_PW)).await;
     let message: LdapMessage = rasn::ber::decode(&out).unwrap();
     let ProtocolOp::BindRequest(request) = message.protocol_op else {
@@ -1717,7 +1736,7 @@ mod tests {
       0x80, 0x84, 0x00, 0x01, 0x00, 0x00, // name length 65536
     ];
     msg.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
-    let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream);
+    let mut machine = Ldap::new(Some(swap_dns(DN, DN)), Direction::Downstream);
     let out = emit(&mut machine, &msg).await;
     assert_eq!(out, msg);
   }

@@ -1,132 +1,41 @@
-//! LDAP vertical: transport halves, a lockstep `StartTLS` opening, and the BER machine.
-//!
-//! `ldaps://` settles TLS, then both sockets go to [`relay_guarded`].
-//! `ldap://` reads only enough of the first message to recognize `StartTLS`.
-//! That one exchange runs lockstep. A bind, a search, and every later byte
-//! go through [`relay_guarded`] with no second session pump and no
-//! hold-until-complete buffer.
-
-pub(crate) mod machine;
+//! LDAP transport. The BER machine lives in `arkham-ldap`.
+//! This module dials, settles TLS on the shared legs, and runs the `StartTLS` opening.
 
 use std::io::{Error as IoError, ErrorKind};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use dashmap::DashMap;
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use secrecy::ExposeSecret as _;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use arkham_config::grants::{Grant, GuestTlsMode, LdapScope, RootCert};
-use arkham_pki::ca::CertAuthority;
+use arkham_config::grants::{Grant, GuestTlsMode, LdapScope};
+use arkham_ldap::{BindSwap, Ldap, starttls_success};
+use arkham_wire::engine::{Direction, Rewritten, Wire};
+use arkham_wire::tls::TlsLegs;
 
 use super::PairCtx;
-use super::{ServeStream, TlsHalves, Transport};
+use super::{ServeStream, Transport};
 use crate::Error;
-use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening};
+use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::mint::MintBucket;
 use crate::relay::{RelayEnd, log_hits, relay_guarded, relay_stop};
-use crate::transports::engine::{Direction, Ldap, Rewritten, Wire};
-use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
-use machine::starttls_success;
-use rama::tls::client::ClientAuth;
+use crate::transports::tls::{UpstreamTls, Verify, finish};
 
 /// LDAP transport. `ldaps://` settles TLS before the machine runs.
-/// `ldap://` stays plaintext until `StartTLS`, then mints the guest leaf
-/// for the scope host and opens TLS upstream.
-#[derive(Debug)]
-pub(crate) struct LdapTransport {
-  ca: CertAuthority,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
-}
-
-impl LdapTransport {
-  /// Build both halves over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
-    })
-  }
-}
-
-impl TlsHalves for LdapTransport {
-  type Scope = LdapScope;
-
-  /// Accept the guest's TLS, minting the leaf for `name` on first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the handshake fails.
-  async fn accept_guest<G>(&self, name: &str, guest: G, guest_tls: GuestTlsMode) -> Result<ServerTlsStream<G>, Error>
-  where
-    G: AsyncRead + AsyncWrite + Unpin,
-  {
-    let config = match guest_tls {
-      GuestTlsMode::Tls => cached_leaf(&self.ca, &self.leaves, name, None)?,
-      GuestTlsMode::Mtls => cached_leaf_mtls(&self.ca, &self.leaves, name, None)?,
-    };
-    TlsAcceptor::from(config)
-      .accept(guest)
-      .await
-      .map_err(|err| Error::GuestLdapTls { source: err })
-  }
-
-  /// Handshake the server. Chain and host name are always verified.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the trust anchor cannot be read, when the server
-  /// name is unusable, or when the handshake fails.
-  async fn connect_server<S>(&self, scope: &LdapScope, server_name: &str, server: S) -> Result<ClientTlsStream<S>, Error>
-  where
-    S: AsyncRead + AsyncWrite + Unpin,
-  {
-    let root = scope.root_cert.clone().unwrap_or(RootCert::System);
-    let roots = cached_roots(&self.roots, &root)?;
-    let builder = ClientConfig::builder().with_root_certificates(roots);
-    let config = match (&scope.client_cert, &scope.client_key) {
-      (Some(cert), Some(key)) => {
-        let ClientAuth::Single(data) = client_identity(cert, key)? else {
-          return Err(arkham_wire::Error::EmptyClientIdentity { path: cert.clone() }.into());
-        };
-        builder
-          .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|err| {
-            Error::from(arkham_wire::Error::ClientIdentity {
-              path: cert.clone(),
-              source: err,
-            })
-          })?
-      }
-      _ => builder.with_no_client_auth(),
-    };
-    let name = ServerName::try_from(server_name.to_string()).map_err(|err| Error::LdapServerName { source: err.into() })?;
-    TlsConnector::from(Arc::new(config))
-      .connect(name, server)
-      .await
-      .map_err(|err| Error::ServerLdapTls { source: err })
-  }
-}
+/// `ldap://` stays cleartext until `StartTLS`.
+#[derive(Debug, Default)]
+pub(crate) struct LdapTransport;
 
 impl Transport for LdapTransport {
   type Scope = LdapScope;
 
-  /// The `ldap://` / `ldaps://` arm. LDAPS settles both legs, then relays.
-  /// Cleartext classifies the first message: `StartTLS` is lockstep, and
-  /// anything else is [`relay_guarded`] from the bytes already read.
+  /// `ldap://` and `ldaps://`. LDAPS settles both legs, then relays.
+  /// Cleartext classifies the first message. `StartTLS` is lockstep.
+  /// Anything else is [`relay_guarded`] from the bytes already read.
   async fn serve<G>(&self, ServeStream { mut guest, params, scope }: ServeStream<'_, G, LdapScope>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -164,11 +73,13 @@ impl Transport for LdapTransport {
       mint: Some(state.mint_handle()),
     };
     let upstream_name = scope.upstream.host.as_str();
+    let legs = &state.legs;
     let pump = Pump {
       scope,
       ctx: &ctx,
       budget,
       mint: &state.mint,
+      legs,
       upgrade_upstream: !scope.is_upstream_tls,
     };
     if scope.is_downstream_tls {
@@ -186,12 +97,65 @@ impl Transport for LdapTransport {
         .await;
     }
     if scope.is_upstream_tls {
-      let plain = self.connect_server(scope, upstream_name, upstream).await?;
+      let plain = connect_server(legs, scope, upstream_name, upstream, budget).await?;
       self.opening(Prefixed::new(guest_head, guest), plain, &pump).await
     } else {
       self.opening(Prefixed::new(guest_head, guest), upstream, &pump).await
     }
   }
+}
+
+/// Accept the guest TLS leg on the shared helper.
+///
+/// # Errors
+///
+/// Returns an error when the leaf cannot be minted, the handshake fails, or
+/// the handshake budget runs out.
+async fn accept_guest<G>(legs: &TlsLegs, name: &str, guest: G, mode: GuestTlsMode, budget: Duration) -> Result<ServerTlsStream<G>, Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  finish(budget, legs.accept_guest(name, guest, mode, None))
+    .await
+    .map_err(Error::from)
+}
+
+/// Handshake the upstream on the shared helper. Chain and host name are verified.
+///
+/// # Errors
+///
+/// Returns an error when the trust anchor or client identity cannot be read,
+/// when the server name is unusable, or when the handshake fails.
+async fn connect_server<S>(
+  legs: &TlsLegs,
+  scope: &LdapScope,
+  server_name: &str,
+  server: S,
+  budget: Duration,
+) -> Result<ClientTlsStream<S>, Error>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  let root = scope.root_cert.as_ref();
+  let client_cert = scope.client_cert.as_deref();
+  let client_key = scope.client_key.as_deref();
+  finish(budget, async move {
+    legs
+      .connect_upstream(
+        &UpstreamTls {
+          server_name,
+          root,
+          verify: Verify::Full,
+          client_cert,
+          client_key,
+          alpn: None,
+        },
+        server,
+      )
+      .await
+  })
+  .await
+  .map_err(Error::from)
 }
 
 /// Guest bytes already read, plus whether that leg opened with TLS.
@@ -207,13 +171,13 @@ struct Pump<'a> {
   ctx: &'a PairCtx<'a>,
   budget: Duration,
   mint: &'a MintBucket,
+  legs: &'a TlsLegs,
   /// `false` when the upstream leg is already TLS, so `StartTLS` is answered here.
   upgrade_upstream: bool,
 }
 
 impl LdapTransport {
-  /// Both legs already know their transport. The password is swapped only
-  /// when the upstream writer is TLS. A cleartext upstream keeps the decoy.
+  /// Both legs already know their transport. Cleartext and TLS both swap.
   async fn relay_settled<G, S>(&self, guest: OpenGuest<G>, upstream: S, pump: &Pump<'_>, upstream_name: &str) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -224,28 +188,23 @@ impl LdapTransport {
     match (tls, scope.is_upstream_tls) {
       (None, false) => relay(Prefixed::new(head, stream), upstream, pump.ctx).await,
       (Some((hello_buf, identity)), false) => {
-        let plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
-          .await?;
+        let plain = accept_guest(pump.legs, &identity, Prefixed::new(hello_buf, stream), scope.guest_tls, pump.budget).await?;
         relay(plain, upstream, pump.ctx).await
       }
       (None, true) => {
-        let plain = self.connect_server(scope, upstream_name, upstream).await?;
+        let plain = connect_server(pump.legs, scope, upstream_name, upstream, pump.budget).await?;
         relay(Prefixed::new(head, stream), plain, pump.ctx).await
       }
       (Some((hello_buf, identity)), true) => {
-        let guest_plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
-          .await?;
-        let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
+        let guest_plain = accept_guest(pump.legs, &identity, Prefixed::new(hello_buf, stream), scope.guest_tls, pump.budget).await?;
+        let server_plain = connect_server(pump.legs, scope, upstream_name, upstream, pump.budget).await?;
         relay(guest_plain, server_plain, pump.ctx).await
       }
     }
   }
 
-  /// Classify the first cleartext message. `StartTLS` stays here; every
-  /// other opening is the shared relay, including a session that never
-  /// upgrades. Swap is on only when the upstream writer is already TLS.
+  /// Classify the first cleartext message. `StartTLS` stays here. Every other
+  /// opening is the shared relay.
   async fn opening<G, S>(&self, mut guest: G, mut server: S, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -255,9 +214,7 @@ impl LdapTransport {
       &mut guest,
       &mut server,
       pump.upgrade_upstream,
-      pump.ctx.grants,
-      pump.ctx.host,
-      pump.ctx.port,
+      bind_swap(pump.ctx.grants, pump.ctx.host, pump.ctx.port),
     )
     .await?
     {
@@ -285,7 +242,7 @@ impl LdapTransport {
   {
     tracing::debug!(id = open.id, prefix = open.request.len(), "ldap starttls");
     let (success, server_rest) = if pump.upgrade_upstream {
-      let mut upstream = Ldap::new(pump.ctx.grants, pump.ctx.host, pump.ctx.port, Direction::Upstream);
+      let mut upstream = Ldap::new(bind_swap(pump.ctx.grants, pump.ctx.host, pump.ctx.port), Direction::Upstream);
       upstream.expect_starttls(open.id);
       read_starttls_result(&mut server, &mut guest, &mut upstream, pump.budget).await?
     } else {
@@ -357,7 +314,7 @@ impl LdapTransport {
       let Ok(id) = u32::try_from(id) else {
         return Ok(());
       };
-      let bytes = starttls_success(id).map_err(|source| Error::LdapEncode { source })?;
+      let bytes = starttls_success(id)?;
       forward_until_hello(guest, Prefixed::new(server_prefix, server), guest_prefix, pump, &bytes).await?
     } else {
       let mut guest = guest;
@@ -374,13 +331,18 @@ impl LdapTransport {
     let Some((hello_buf, identity, _)) = opened else {
       return Ok(());
     };
-    let guest_plain = self
-      .accept_guest(&identity, Prefixed::new(hello_buf, guest), pump.scope.guest_tls)
-      .await?;
-    if accept.local {
+    let guest_plain = accept_guest(
+      pump.legs,
+      &identity,
+      Prefixed::new(hello_buf, guest),
+      pump.scope.guest_tls,
+      pump.budget,
+    )
+    .await?;
+    if local {
       relay(guest_plain, server, pump.ctx).await
     } else {
-      let server_plain = self.connect_server(pump.scope, pump.scope.upstream.host.as_str(), server).await?;
+      let server_plain = connect_server(pump.legs, pump.scope, pump.scope.upstream.host.as_str(), server, pump.budget).await?;
       relay(guest_plain, server_plain, pump.ctx).await
     }
   }
@@ -419,14 +381,17 @@ where
         biased;
         result = &mut hello => break result?,
         result = server_read.read(&mut buf) => {
-          let n = read_count(result).map_err(|source| Error::UpstreamRead { source })?;
+          let n = read_count(result).map_err(|source| arkham_wire::Error::UpstreamRead { source }.into())?;
           if n == 0 {
             break hello.await?;
           }
           let Some(chunk) = buf.get(..n) else {
-            return Err(Error::UpstreamRead {
-              source: IoError::new(ErrorKind::InvalidData, "ldap server read"),
-            });
+            return Err(
+              arkham_wire::Error::UpstreamRead {
+                source: IoError::new(ErrorKind::InvalidData, "ldap server read"),
+              }
+              .into(),
+            );
           };
           write_guest(&mut guest_write, chunk).await?;
         }
@@ -505,16 +470,16 @@ fn read_count(result: Result<usize, IoError>) -> Result<usize, IoError> {
 /// the control tail is read in chunks of at most the unread count and is not
 /// kept. `forward` writes that request upstream. Otherwise the tail is
 /// discarded, which is the path when the upstream leg is already TLS.
-async fn read_first<R, W>(guest: &mut R, upstream: &mut W, forward: bool, grants: &[Grant], host: &str, port: u16) -> Result<First, Error>
+async fn read_first<R, W>(guest: &mut R, upstream: &mut W, forward: bool, swap: Option<BindSwap>) -> Result<First, Error>
 where
   R: AsyncRead + Unpin,
   W: AsyncWrite + Unpin,
 {
-  let mut probe = Ldap::new(grants, host, port, Direction::Downstream);
+  let mut probe = Ldap::new(swap, Direction::Downstream);
   let mut got = Vec::new();
   let mut byte = [0u8; 1];
   loop {
-    let n = read_count(guest.read(&mut byte).await).map_err(|source| Error::from(arkham_wire::Error::GuestRead { source }))?;
+    let n = read_count(guest.read(&mut byte).await).map_err(|source| arkham_wire::Error::GuestRead { source }.into())?;
     if n == 0 {
       return Ok(if got.is_empty() { First::Eof } else { First::Relay(got) });
     }
@@ -580,7 +545,7 @@ where
     upstream
       .write_all(prefix)
       .await
-      .map_err(|source| Error::from(arkham_wire::Error::RequestChunkToUpstream { source }))?;
+      .map_err(|source| arkham_wire::Error::RequestChunkToUpstream { source }.into())?;
   }
   let mut buf = vec![0u8; CONTROL_READ];
   while let Some((_, left)) = probe.starttls_tail() {
@@ -588,7 +553,7 @@ where
     let Some(window) = buf.get_mut(..want) else {
       return Ok(false);
     };
-    let n = read_count(guest.read(window).await).map_err(|source| Error::from(arkham_wire::Error::GuestRead { source }))?;
+    let n = read_count(guest.read(window).await).map_err(|source| arkham_wire::Error::GuestRead { source }.into())?;
     if n == 0 {
       return Ok(false);
     }
@@ -604,17 +569,14 @@ where
       upstream
         .write_all(chunk)
         .await
-        .map_err(|source| Error::from(arkham_wire::Error::RequestChunkToUpstream { source }))?;
+        .map_err(|source| arkham_wire::Error::RequestChunkToUpstream { source }.into())?;
     }
     if probe.starttls_tail().is_none() {
       break;
     }
   }
   if forward {
-    upstream
-      .flush()
-      .await
-      .map_err(|source| Error::from(arkham_wire::Error::RequestHeadFlush { source }))?;
+    upstream.flush().await.map_err(|source| arkham_wire::Error::RequestHeadFlush { source }.into())?;
   }
   Ok(true)
 }
@@ -638,12 +600,15 @@ where
         .into(),
       );
     }
-    let read = tokio::time::timeout(left, server.read(&mut buf)).await.map_err(|_elapsed| {
-      Error::from(arkham_wire::Error::UpstreamRead {
-        source: IoError::new(ErrorKind::TimedOut, "ldap starttls response"),
-      })
-    })?;
-    let n = read_count(read).map_err(|source| Error::from(arkham_wire::Error::UpstreamRead { source }))?;
+    let read = tokio::time::timeout(left, server.read(&mut buf))
+      .await
+      .map_err(|_elapsed| {
+        arkham_wire::Error::UpstreamRead {
+          source: IoError::new(ErrorKind::TimedOut, "ldap starttls response"),
+        }
+        .into()
+      })?;
+    let n = read_count(read).map_err(|source| arkham_wire::Error::UpstreamRead { source }.into())?;
     if n == 0 {
       return Ok((false, Vec::new()));
     }
@@ -689,11 +654,8 @@ where
   guest
     .write_all(bytes)
     .await
-    .map_err(|source| Error::from(arkham_wire::Error::ResponseChunkToGuest { source }))?;
-  guest
-    .flush()
-    .await
-    .map_err(|source| Error::from(arkham_wire::Error::GuestFlush { source }))?;
+    .map_err(|source| arkham_wire::Error::ResponseChunkToGuest { source }.into())?;
+  guest.flush().await.map_err(|source| arkham_wire::Error::GuestFlush { source }.into())?;
   Ok(())
 }
 
@@ -704,11 +666,8 @@ where
   server
     .write_all(bytes)
     .await
-    .map_err(|source| Error::from(arkham_wire::Error::RequestChunkToUpstream { source }))?;
-  server
-    .flush()
-    .await
-    .map_err(|source| Error::from(arkham_wire::Error::RequestHeadFlush { source }))?;
+    .map_err(|source| arkham_wire::Error::RequestChunkToUpstream { source }.into())?;
+  server.flush().await.map_err(|source| arkham_wire::Error::RequestHeadFlush { source }.into())?;
   Ok(())
 }
 
@@ -723,12 +682,25 @@ where
   relay_guarded(guest, server, &mut downstream, &mut upstream, &[], &[]).await
 }
 
-/// Both directions for an LDAP scope. Cleartext and TLS both swap.
+/// The simple-bind swap for the grant that covers this destination.
+fn bind_swap(grants: &[Grant], host: &str, port: u16) -> Option<BindSwap> {
+  grants.iter().find_map(|grant| {
+    let scope = grant.ldap(Some(host), port)?;
+    let label = grant.credential().map(|credential| credential.label.clone()).unwrap_or_default();
+    Some(BindSwap {
+      label,
+      fake: scope.downstream.password.expose_secret().to_string(),
+      real: scope.upstream.password.expose_secret().to_string(),
+      downstream_dn: scope.downstream.dn.clone(),
+      upstream_dn: scope.upstream.dn.clone(),
+    })
+  })
+}
+
+/// Both directions for one LDAP scope. Cleartext and TLS both swap.
 pub(crate) fn ldap_pair(ctx: &PairCtx<'_>) -> (Ldap, Ldap) {
-  (
-    Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream),
-    Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream),
-  )
+  let swap = bind_swap(ctx.grants, ctx.host, ctx.port);
+  (Ldap::new(swap.clone(), Direction::Downstream), Ldap::new(swap, Direction::Upstream))
 }
 
 #[cfg(test)]
@@ -825,7 +797,9 @@ mod tests {
     let mut guest = Cursor::new(bytes);
     let mut upstream = Cursor::new(Vec::new());
     let First::StartTls(StartTlsOpen { id, request, handshake }) =
-      read_first(&mut guest, &mut upstream, true, &grants(), "ldap", 389).await.unwrap()
+      read_first(&mut guest, &mut upstream, true, bind_swap(&grants(), "ldap", 389))
+        .await
+        .unwrap()
     else {
       panic!("starttls");
     };
@@ -851,7 +825,9 @@ mod tests {
     let mut guest = Cursor::new(bytes);
     let mut upstream = Cursor::new(Vec::new());
     let First::StartTls(StartTlsOpen { request, handshake, .. }) =
-      read_first(&mut guest, &mut upstream, true, &grants(), "ldap", 389).await.unwrap()
+      read_first(&mut guest, &mut upstream, true, bind_swap(&grants(), "ldap", 389))
+        .await
+        .unwrap()
     else {
       panic!("starttls");
     };
@@ -875,7 +851,9 @@ mod tests {
     let mut guest = Cursor::new(bytes);
     let mut upstream = Cursor::new(Vec::new());
     let First::StartTls(StartTlsOpen { request, handshake, .. }) =
-      read_first(&mut guest, &mut upstream, false, &grants(), "ldap", 389).await.unwrap()
+      read_first(&mut guest, &mut upstream, false, bind_swap(&grants(), "ldap", 389))
+        .await
+        .unwrap()
     else {
       panic!("starttls");
     };
@@ -892,7 +870,10 @@ mod tests {
     let frame = bind_frame();
     let mut guest = Cursor::new(frame.clone());
     let mut upstream = Cursor::new(Vec::new());
-    let First::Relay(prefix) = read_first(&mut guest, &mut upstream, true, &grants(), "ldap", 389).await.unwrap() else {
+    let First::Relay(prefix) = read_first(&mut guest, &mut upstream, true, bind_swap(&grants(), "ldap", 389))
+      .await
+      .unwrap()
+    else {
       panic!("relay");
     };
     assert_eq!(upstream.into_inner(), [] as [u8; 0]);

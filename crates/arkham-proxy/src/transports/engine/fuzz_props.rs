@@ -1,14 +1,14 @@
 //! Property and fuzz tests: adversarial byte streams through the
-//! substitution machines (HTTP, LDAP, and AMQP), the SNI parser, and grant parsing.
-//! SMTP properties live in `arkham-smtp`. NATS properties live in `transports/nats/props.rs`.
+//! substitution machines (HTTP and AMQP), the SNI parser, and grant parsing.
+//! SMTP properties live in `arkham-smtp`. LDAP properties live in `arkham-ldap`.
+//! NATS properties live in `transports/nats/props.rs`.
 //!
 //! Two families:
 //! - **Invariants** (valid framing, adversarial splits): a token split
 //!   across any arrival boundary must recombine and substitute whole;
 //!   fixed-length bodies must not drift; chunked output must re-parse.
-//!   LDAP uses the same cut loop at 256 cases: one shot, random cuts, and
-//!   one byte at a time must match, the real password must stay off the
-//!   guest-bound leg, and every run ends with the empty EOF flush.
+//!   One shot, random cuts, and one byte at a time must match, and every
+//!   run ends with the empty EOF flush.
 //! - **Crash resistance** (arbitrary bytes): no input, arrival split, or
 //!   pipelining combination may panic or hang.
 //!
@@ -20,8 +20,8 @@ use proptest::prelude::*;
 use arkham_config::grants::{Credential, Grant, Scheme};
 
 use super::super::amqp::machine::MAX_CREDENTIAL_FRAME;
-use super::harness::{block_on, run_split, run_split_h2, run_split_parts};
-use super::{Amqp, Direction, Http, Ldap, Rewritten, Wire, raw_new};
+use super::harness::{run_split, run_split_h2, run_split_parts};
+use super::{Amqp, Direction, Http, raw_new};
 use crate::transports::http::h2::{H2, H2_PREFACE};
 
 /// Needle decoy (request-direction needle) and its real value.
@@ -448,266 +448,8 @@ proptest! {
   }
 }
 
-/// LDAP decoy and real simple-bind passwords. Lengths differ on purpose.
-const LDAP_FAKE: &str = "arkham_fake_ldap_pass"; // betterleaks:allow
-const LDAP_REAL: &str = "arkham_real_ldap_pass_01"; // betterleaks:allow
-const LDAP_DN: &str = "cn=Directory Manager";
-const LDAP_STARTTLS_OID: &[u8] = b"1.3.6.1.4.1.1466.20037";
-
-/// One direction the LDAP properties drive. Guest-bound output is [`LdapLeg::Up`].
-#[derive(Clone, Copy, Debug)]
-enum LdapLeg {
-  DownSwap,
-  DownClear,
-  Up,
-}
-
-fn ldap_grants() -> Vec<Grant> {
-  let user = LDAP_DN.replace('=', "%3D").replace(' ', "%20").replace(',', "%2C");
-  let fake = format!("ldap://{user}:{LDAP_FAKE}@ldap:389");
-  let real = format!("ldap://{user}:{LDAP_REAL}@ldap:389");
-  let scope = arkham_config::grants::LdapScope::from_strings(&fake, &real).expect("ldap scope");
-  vec![Grant::Ldap {
-    credential: Credential {
-      label: "ldap".into(),
-      fake: LDAP_FAKE.into(),
-      value: secrecy::SecretString::from(LDAP_REAL),
-    },
-    scope: Box::new(scope),
-  }]
-}
-
-fn ldap_leg(leg: LdapLeg) -> Ldap {
-  let grants = ldap_grants();
-  match leg {
-    LdapLeg::DownSwap | LdapLeg::DownClear => Ldap::new(&grants, "ldap", 389, Direction::Downstream),
-    LdapLeg::Up => Ldap::new(&grants, "ldap", 389, Direction::Upstream),
-  }
-}
-
-fn ldap_expecting(id: u32) -> Ldap {
-  let mut machine = ldap_leg(LdapLeg::Up);
-  machine.expect_starttls(id);
-  machine
-}
-
-struct LdapFed {
-  out: Vec<u8>,
-  closed: bool,
-  starttls: Option<bool>,
-}
-
-/// Drain an LDAP cursor the way [`run_split`] drains HTTP, then one empty EOF flush.
-///
-/// A finished message already released a held needle suffix. EOF still runs
-/// `finish`: it emits a suffix that release left behind, and it closes a
-/// partial message.
-fn run_ldap(mut machine: Ldap, data: &[u8], splits: &[usize]) -> LdapFed {
-  let mut out = Vec::new();
-  let mut closed = false;
-  let mut prev = 0usize;
-  for &cut in splits.iter().chain(std::iter::once(&data.len())) {
-    if cut > prev && cut <= data.len() {
-      let (rewritten, _) = block_on(machine.feed(&data[prev..cut]));
-      match rewritten {
-        Rewritten::Emit(bytes) => out.extend_from_slice(&bytes),
-        Rewritten::Hold => {}
-        Rewritten::Close => closed = true,
-      }
-      prev = cut;
-    }
-  }
-  let (rewritten, _) = block_on(machine.feed(&[]));
-  match rewritten {
-    Rewritten::Emit(bytes) => out.extend_from_slice(&bytes),
-    Rewritten::Hold => {}
-    Rewritten::Close => closed = true,
-  }
-  LdapFed {
-    out,
-    closed,
-    starttls: machine.take_starttls_result(),
-  }
-}
-
-fn ldap_splits_match(machine: impl Fn() -> Ldap, data: &[u8], cuts: &[usize]) -> Result<(), TestCaseError> {
-  let once = run_ldap(machine(), data, &[]);
-  let split = run_ldap(machine(), data, cuts);
-  let byte_cuts: Vec<usize> = (1..data.len()).collect();
-  let byte = run_ldap(machine(), data, &byte_cuts);
-  prop_assert_eq!(&once.out, &split.out);
-  prop_assert_eq!(&once.out, &byte.out);
-  prop_assert_eq!(once.closed, split.closed);
-  prop_assert_eq!(once.closed, byte.closed);
-  prop_assert_eq!(once.starttls, split.starttls);
-  prop_assert_eq!(once.starttls, byte.starttls);
-  prop_assert!(!once.closed);
-  Ok(())
-}
-
-fn ldap_contains(hay: &[u8], needle: &[u8]) -> bool {
+fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
   !needle.is_empty() && hay.len() >= needle.len() && hay.windows(needle.len()).any(|window| window == needle)
-}
-
-fn ber_len(len: usize) -> Vec<u8> {
-  if len < 0x80 {
-    return vec![u8::try_from(len).expect("short length")];
-  }
-  if len <= 0xff {
-    return vec![0x81, u8::try_from(len).expect("one-byte length")];
-  }
-  let len = u16::try_from(len).expect("two-byte length");
-  vec![
-    0x82,
-    u8::try_from(len >> 8).expect("length high"),
-    u8::try_from(len & 0xff).expect("length low"),
-  ]
-}
-
-fn ber_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
-  let mut out = Vec::with_capacity(content.len().saturating_add(3));
-  out.push(tag);
-  out.extend(ber_len(content.len()));
-  out.extend_from_slice(content);
-  out
-}
-
-fn ldap_message(id: u32, op: rasn_ldap::ProtocolOp) -> Vec<u8> {
-  rasn::ber::encode(&rasn_ldap::LdapMessage::new(id, op)).expect("ldap frame")
-}
-
-fn ldap_bind(id: u32, password: &str) -> Vec<u8> {
-  ldap_message(
-    id,
-    rasn_ldap::ProtocolOp::BindRequest(rasn_ldap::BindRequest::new(
-      3,
-      rasn_ldap::LdapString::from(LDAP_DN),
-      rasn_ldap::AuthenticationChoice::Simple(rasn::prelude::OctetString::from(password.as_bytes())),
-    )),
-  )
-}
-
-fn ldap_bind_response(id: u32, diagnostic: &str) -> Vec<u8> {
-  ldap_message(
-    id,
-    rasn_ldap::ProtocolOp::BindResponse(rasn_ldap::BindResponse::new(
-      rasn_ldap::ResultCode::InvalidCredentials,
-      rasn_ldap::LdapString::from(""),
-      rasn_ldap::LdapString::from(diagnostic),
-      None,
-      None,
-    )),
-  )
-}
-
-fn ldap_starttls_response(id: u32) -> Vec<u8> {
-  ldap_message(
-    id,
-    rasn_ldap::ProtocolOp::ExtendedResp(rasn_ldap::ExtendedResponse {
-      result_code: rasn_ldap::ResultCode::Success,
-      matched_dn: rasn_ldap::LdapString::from(""),
-      diagnostic_message: rasn_ldap::LdapString::from(""),
-      referral: None,
-      response_name: Some(rasn::prelude::OctetString::from_static(LDAP_STARTTLS_OID)),
-      response_value: None,
-    }),
-  )
-}
-
-fn ldap_wide(id: &[u8], tail: &[u8]) -> Vec<u8> {
-  let mut content = ber_tlv(0x02, id);
-  content.extend_from_slice(tail);
-  ber_tlv(0x30, &content)
-}
-
-fn ldap_forwarded(id: u8, payload: &[u8]) -> Vec<u8> {
-  let mut content = ber_tlv(0x02, &[id]);
-  content.extend(ber_tlv(0x64, payload));
-  ber_tlv(0x30, &content)
-}
-
-/// Text that cannot spell either LDAP password. Both start with `a`.
-fn ldap_plain() -> impl Strategy<Value = String> {
-  proptest::string::string_regex("[b-z]{0,8}").expect("plain text")
-}
-
-fn ldap_safe_message() -> impl Strategy<Value = Vec<u8>> {
-  prop_oneof![
-    (1u8..=127).prop_map(|id| ldap_bind(u32::from(id), LDAP_FAKE)),
-    (1u8..=127).prop_map(|id| ldap_bind(u32::from(id), "guest-pass")),
-    (1u8..=127, ldap_plain()).prop_map(|(id, text)| ldap_bind_response(u32::from(id), &text)),
-    (1u8..=127).prop_map(|id| ldap_bind_response(u32::from(id), &format!("rejected {LDAP_REAL}"))),
-    (1u8..=127, 1usize..LDAP_REAL.len()).prop_map(|(id, k)| {
-      let prefix = LDAP_REAL.get(..k).unwrap_or(LDAP_REAL);
-      ldap_bind_response(u32::from(id), prefix)
-    }),
-    (1u8..=127).prop_map(|id| ldap_starttls_response(u32::from(id))),
-  ]
-}
-
-#[derive(Clone, Debug)]
-enum LdapSecret {
-  Diagnostic { id: u8, pad: String },
-  Body { id: u8, pre: Vec<u8>, post: Vec<u8> },
-  Wide { id: Vec<u8>, pre: Vec<u8>, post: Vec<u8> },
-}
-
-fn ldap_secret_frame(place: &LdapSecret) -> Vec<u8> {
-  match place {
-    LdapSecret::Diagnostic { id, pad } => ldap_bind_response(u32::from(*id), &format!("{pad}{LDAP_REAL}")),
-    LdapSecret::Body { id, pre, post } => {
-      let mut payload = Vec::with_capacity(pre.len().saturating_add(LDAP_REAL.len()).saturating_add(post.len()));
-      payload.extend_from_slice(pre);
-      payload.extend_from_slice(LDAP_REAL.as_bytes());
-      payload.extend_from_slice(post);
-      ldap_forwarded(*id, &payload)
-    }
-    LdapSecret::Wide { id, pre, post } => {
-      let mut tail = Vec::with_capacity(pre.len().saturating_add(LDAP_REAL.len()).saturating_add(post.len()));
-      tail.extend_from_slice(pre);
-      tail.extend_from_slice(LDAP_REAL.as_bytes());
-      tail.extend_from_slice(post);
-      ldap_wide(id, &tail)
-    }
-  }
-}
-
-/// A proper prefix of an accepted frame is not idle. EOF must close it, and
-/// every cut must agree on the bytes emitted before that close.
-fn ldap_truncated_closes_alike(machine: impl Fn() -> Ldap, data: &[u8], cuts: &[usize]) -> Result<(), TestCaseError> {
-  let once = run_ldap(machine(), data, &[]);
-  let split = run_ldap(machine(), data, cuts);
-  let byte_cuts: Vec<usize> = (1..data.len()).collect();
-  let byte = run_ldap(machine(), data, &byte_cuts);
-  prop_assert!(once.closed);
-  prop_assert_eq!(once.closed, split.closed);
-  prop_assert_eq!(once.closed, byte.closed);
-  prop_assert_eq!(&once.out, &split.out);
-  prop_assert_eq!(&once.out, &byte.out);
-  Ok(())
-}
-
-fn ldap_hides_real(data: &[u8], cuts: &[usize]) -> Result<(), TestCaseError> {
-  let once = run_ldap(ldap_leg(LdapLeg::Up), data, &[]);
-  let split = run_ldap(ldap_leg(LdapLeg::Up), data, cuts);
-  let byte_cuts: Vec<usize> = (1..data.len()).collect();
-  let byte = run_ldap(ldap_leg(LdapLeg::Up), data, &byte_cuts);
-  for out in [&once.out, &split.out, &byte.out] {
-    prop_assert!(!ldap_contains(out, LDAP_REAL.as_bytes()));
-  }
-  Ok(())
-}
-
-#[test]
-fn ldap_truncated_prefix_closes_on_eof_for_every_cut() {
-  let frame = ldap_bind_response(1, "invalid");
-  let prefix = &frame[..frame.len() - 1];
-  let once = run_ldap(ldap_leg(LdapLeg::Up), prefix, &[]);
-  assert!(once.closed, "a partial LDAP message must close on EOF");
-  let byte_cuts: Vec<usize> = (1..prefix.len()).collect();
-  let byte = run_ldap(ldap_leg(LdapLeg::Up), prefix, &byte_cuts);
-  assert_eq!(once.closed, byte.closed);
-  assert_eq!(once.out, byte.out);
 }
 
 const AMQP_FAKE: &str = "arkham_fake_amqp_pass"; // betterleaks:allow
@@ -1028,8 +770,11 @@ fn amqp_symbolic_descriptors_rewrite_under_every_split() {
     );
     let (out, closed) = amqp_splits_match(AmqpLeg::DownSwap, &init, &[4, 11]).expect("sasl-init splits");
     assert!(!closed, "wide={wide} sasl-init closed");
-    assert!(ldap_contains(&out, &swapped), "wide={wide} sasl-init kept the decoy");
-    assert!(!ldap_contains(&out, AMQP_FAKE.as_bytes()), "wide={wide} sasl-init leaked the decoy");
+    assert!(contains_bytes(&out, &swapped), "wide={wide} sasl-init kept the decoy");
+    assert!(
+      !contains_bytes(&out, AMQP_FAKE.as_bytes()),
+      "wide={wide} sasl-init leaked the decoy"
+    );
 
     let mut deferred = symbolic_open(AMQP_HEADER_SASL, &amqp_sasl_init("PLAIN", None), "amqp:sasl-init:list", wide);
     deferred.extend(splice_frame_symbol(
@@ -1039,9 +784,9 @@ fn amqp_symbolic_descriptors_rewrite_under_every_split() {
     ));
     let (out, closed) = amqp_splits_match(AmqpLeg::DownSwap, &deferred, &[6, 15]).expect("sasl-response splits");
     assert!(!closed, "wide={wide} sasl-response closed");
-    assert!(ldap_contains(&out, &swapped), "wide={wide} sasl-response kept the decoy");
+    assert!(contains_bytes(&out, &swapped), "wide={wide} sasl-response kept the decoy");
     assert!(
-      !ldap_contains(&out, AMQP_FAKE.as_bytes()),
+      !contains_bytes(&out, AMQP_FAKE.as_bytes()),
       "wide={wide} sasl-response leaked the decoy"
     );
 
@@ -1054,11 +799,11 @@ fn amqp_symbolic_descriptors_rewrite_under_every_split() {
       let (out, closed) = amqp_splits_match(AmqpLeg::Up, &data, &[5, 13]).expect("close splits");
       assert!(!closed, "{name} wide={wide} closed");
       assert!(
-        ldap_contains(&out, AMQP_FAKE.as_bytes()),
+        contains_bytes(&out, AMQP_FAKE.as_bytes()),
         "{name} wide={wide} left the real password"
       );
       assert!(
-        !ldap_contains(&out, AMQP_REAL.as_bytes()),
+        !contains_bytes(&out, AMQP_REAL.as_bytes()),
         "{name} wide={wide} leaked the real password"
       );
     }
@@ -1183,134 +928,6 @@ impl AmqpSecret {
 proptest! {
   #![proptest_config(ProptestConfig::with_cases(256))]
 
-  /// A prefix of an accepted frame closes on EOF, the same way for every cut.
-  #[test]
-  fn prop_ldap_truncated_prefix_closes_alike(
-    leg in prop_oneof![Just(LdapLeg::DownSwap), Just(LdapLeg::DownClear), Just(LdapLeg::Up)],
-    frame in ldap_safe_message(),
-    keep in any::<usize>(),
-    cuts in proptest::collection::vec(any::<usize>(), 0..6),
-  ) {
-    prop_assume!(frame.len() > 1);
-    let end = 1 + (keep % (frame.len() - 1));
-    let prefix = &frame[..end];
-    let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % prefix.len().max(1)).collect();
-    ldap_truncated_closes_alike(|| ldap_leg(leg), prefix, &scaled)?;
-  }
-
-  /// Any cut of one accepted LDAP stream, including one byte at a time, matches one shot.
-  #[test]
-  fn prop_ldap_split_output_is_identical(
-    leg in prop_oneof![Just(LdapLeg::DownSwap), Just(LdapLeg::DownClear), Just(LdapLeg::Up)],
-    first in ldap_safe_message(),
-    second in proptest::option::of(ldap_safe_message()),
-    cuts in proptest::collection::vec(any::<usize>(), 0..6),
-  ) {
-    let mut data = first;
-    if let Some(extra) = second {
-      data.extend(extra);
-    }
-    let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % data.len().max(1)).collect();
-    ldap_splits_match(|| ldap_leg(leg), &data, &scaled)?;
-    if matches!(leg, LdapLeg::Up) {
-      let out = run_ldap(ldap_leg(LdapLeg::Up), &data, &[]);
-      prop_assert!(!ldap_contains(&out.out, LDAP_REAL.as_bytes()));
-    }
-    if matches!(leg, LdapLeg::DownSwap) && ldap_contains(&data, LDAP_FAKE.as_bytes()) {
-      let swapped = run_ldap(ldap_leg(LdapLeg::DownSwap), &data, &[]);
-      prop_assert!(ldap_contains(&swapped.out, LDAP_REAL.as_bytes()));
-      prop_assert!(!ldap_contains(&swapped.out, LDAP_FAKE.as_bytes()));
-    }
-  }
-
-  /// The real password stays out of guest-bound LDAP output for every cut.
-  #[test]
-  fn prop_ldap_guest_output_hides_the_real_password(
-    place in prop_oneof![
-      (1u8..=127, ldap_plain()).prop_map(|(id, pad)| LdapSecret::Diagnostic { id, pad }),
-      (1u8..=127, proptest::collection::vec(any::<u8>(), 0..8), proptest::collection::vec(any::<u8>(), 0..8))
-        .prop_map(|(id, pre, post)| LdapSecret::Body { id, pre, post }),
-      (
-        proptest::collection::vec(any::<u8>(), 5..=8),
-        proptest::collection::vec(any::<u8>(), 0..8),
-        proptest::collection::vec(any::<u8>(), 0..8),
-      ).prop_map(|(id, pre, post)| LdapSecret::Wide { id, pre, post }),
-    ],
-    cuts in proptest::collection::vec(any::<usize>(), 0..6),
-  ) {
-    let data = ldap_secret_frame(&place);
-    let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % data.len().max(1)).collect();
-    ldap_hides_real(&data, &scaled)?;
-    if matches!(place, LdapSecret::Diagnostic { .. }) {
-      ldap_splits_match(|| ldap_leg(LdapLeg::Up), &data, &scaled)?;
-      let out = run_ldap(ldap_leg(LdapLeg::Up), &data, &[]);
-      prop_assert!(ldap_contains(&out.out, LDAP_FAKE.as_bytes()));
-    }
-  }
-
-  /// Fragmented StartTLS reply, held password prefix, and wide message ids.
-  #[test]
-  fn prop_ldap_wide_id_starttls_and_password_prefix(
-    shape in prop_oneof![Just(0u8), Just(1u8), Just(2u8)],
-    id in 1u8..=127u8,
-    id_len in 5usize..=8,
-    k in 1usize..LDAP_REAL.len(),
-    tail in proptest::collection::vec(any::<u8>(), 0..16),
-    cuts in proptest::collection::vec(any::<usize>(), 0..6),
-  ) {
-    match shape {
-      0 => {
-        let frame = ldap_wide(&vec![0x11; id_len], &tail);
-        let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % frame.len().max(1)).collect();
-        let once = run_ldap(ldap_leg(LdapLeg::DownSwap), &frame, &[]);
-        let split = run_ldap(ldap_leg(LdapLeg::DownSwap), &frame, &scaled);
-        let byte_cuts: Vec<usize> = (1..frame.len()).collect();
-        let byte = run_ldap(ldap_leg(LdapLeg::DownSwap), &frame, &byte_cuts);
-        prop_assert!(once.closed);
-        prop_assert_eq!(once.closed, split.closed);
-        prop_assert_eq!(once.closed, byte.closed);
-        prop_assert_eq!(&once.out, &split.out);
-        prop_assert_eq!(&once.out, &byte.out);
-        ldap_splits_match(|| ldap_leg(LdapLeg::Up), &frame, &scaled)?;
-        let wide = run_ldap(ldap_leg(LdapLeg::Up), &frame, &[]);
-        prop_assert_eq!(&wide.out, &frame);
-      }
-      1 => {
-        let frame = ldap_starttls_response(u32::from(id));
-        let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % frame.len().max(1)).collect();
-        ldap_splits_match(|| ldap_expecting(u32::from(id)), &frame, &scaled)?;
-        let full = run_ldap(ldap_expecting(u32::from(id)), &frame, &[]);
-        prop_assert_eq!(full.starttls, Some(true));
-        prop_assert_eq!(&full.out, &frame);
-        for cut in 0..frame.len() {
-          let partial = run_ldap(ldap_expecting(u32::from(id)), &frame[..cut], &[]);
-          prop_assert_eq!(partial.starttls, None);
-        }
-      }
-      _ => {
-        let prefix = LDAP_REAL.get(..k).unwrap_or(LDAP_REAL);
-        let frame = ldap_bind_response(u32::from(id), prefix);
-        let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % frame.len().max(1)).collect();
-        ldap_splits_match(|| ldap_leg(LdapLeg::Up), &frame, &scaled)?;
-        let once = run_ldap(ldap_leg(LdapLeg::Up), &frame, &[]);
-        prop_assert_eq!(&once.out, &frame);
-        let byte_cuts: Vec<usize> = (1..frame.len()).collect();
-        let byte = run_ldap(ldap_leg(LdapLeg::Up), &frame, &byte_cuts);
-        prop_assert_eq!(&byte.out, &frame);
-      }
-    }
-  }
-
-  /// Crash resistance: arbitrary bytes, one cut, either leg, then EOF.
-  #[test]
-  fn prop_ldap_arbitrary_no_panic(
-    data in proptest::collection::vec(any::<u8>(), 0..1024),
-    cut in 0usize..1024,
-    leg in prop_oneof![Just(LdapLeg::DownSwap), Just(LdapLeg::DownClear), Just(LdapLeg::Up)],
-  ) {
-    let _ = run_ldap(ldap_leg(leg), &data, &[cut.min(data.len())]);
-  }
-
   #[test]
   fn prop_amqp_split_output_is_identical(
     server_bound in amqp_server_bound(),
@@ -1337,11 +954,11 @@ proptest! {
     let plain_fake = amqp_plain(AMQP_FAKE);
     let plain_real = [b"\0svc\0".as_slice(), AMQP_REAL.as_bytes()].concat();
     match leg {
-      AmqpLeg::Up => prop_assert!(!ldap_contains(&out, AMQP_REAL.as_bytes())),
+      AmqpLeg::Up => prop_assert!(!contains_bytes(&out, AMQP_REAL.as_bytes())),
       AmqpLeg::DownClear => prop_assert_eq!(&out, &data),
-      AmqpLeg::DownSwap if ldap_contains(&data, &plain_fake) && ldap_contains(&data, b"\x05PLAIN") => {
-        prop_assert!(ldap_contains(&out, &plain_real));
-        prop_assert!(!ldap_contains(&out, AMQP_FAKE.as_bytes()));
+      AmqpLeg::DownSwap if contains_bytes(&data, &plain_fake) && contains_bytes(&data, b"\x05PLAIN") => {
+        prop_assert!(contains_bytes(&out, &plain_real));
+        prop_assert!(!contains_bytes(&out, AMQP_FAKE.as_bytes()));
       }
       AmqpLeg::DownSwap => prop_assert_eq!(&out, &data),
     }
@@ -1364,12 +981,12 @@ proptest! {
     let byte_cuts: Vec<usize> = (1..data.len()).collect();
     for run in [&[][..], &scaled, &byte_cuts] {
       let (out, closed) = run_amqp(AmqpLeg::Up, &data, run);
-      prop_assert!(!ldap_contains(&out, AMQP_REAL.as_bytes()));
+      prop_assert!(!contains_bytes(&out, AMQP_REAL.as_bytes()));
       prop_assert_eq!(closed, !place.is_redacted());
     }
     if place.is_redacted() {
       let (out, _) = amqp_splits_match(AmqpLeg::Up, &data, &scaled)?;
-      prop_assert!(ldap_contains(&out, AMQP_FAKE.as_bytes()));
+      prop_assert!(contains_bytes(&out, AMQP_FAKE.as_bytes()));
     }
   }
 
@@ -1385,7 +1002,7 @@ proptest! {
     let scaled: Vec<usize> = cuts.into_iter().map(|cut| cut % prefix.len()).collect();
     let (out, closed) = amqp_splits_match(AmqpLeg::Up, prefix, &scaled)?;
     prop_assert!(closed);
-    prop_assert!(!ldap_contains(&out, AMQP_REAL.as_bytes()));
+    prop_assert!(!contains_bytes(&out, AMQP_REAL.as_bytes()));
   }
 
   #[test]

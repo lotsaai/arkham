@@ -12,7 +12,7 @@ use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
 use validator::ValidationErrors;
 
-use crate::grants::{AmqpUriError, LdapUriError, NatsUriError, Scheme};
+use crate::grants::{AmqpUriError, NatsUriError, Scheme};
 
 /// Every way config loading, validation, and grant resolution can fail.
 #[derive(Debug, thiserror::Error)]
@@ -149,15 +149,6 @@ pub enum Error {
     label: String,
     /// Parse failure.
     detail: String,
-  },
-  /// An LDAP connection string does not parse.
-  #[error("rule `{label}`: {source}")]
-  LdapScope {
-    /// Rule label.
-    label: String,
-    /// Parse failure.
-    #[source]
-    source: LdapUriError,
   },
   /// An AMQP connection string does not parse.
   #[error("rule `{label}`: {source}")]
@@ -475,18 +466,9 @@ pub enum Error {
   /// An SMTP connection string, identity row, or trust row was rejected.
   #[error(transparent)]
   Smtp(#[from] arkham_smtp::Error),
-  /// An LDAP rule states its upstream identity outside the connection string.
-  #[error("rule `{label}`: ldap states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
-  LdapIdentity {
-    /// Rule label.
-    label: String,
-  },
-  /// An LDAP rule states its upstream trust outside the connection string.
-  #[error("rule `{label}`: ldap states upstream trust in its connection string (`sslrootcert`), never in the rule table")]
-  LdapTrust {
-    /// Rule label.
-    label: String,
-  },
+  /// An LDAP connection string, identity row, or trust row was rejected.
+  #[error(transparent)]
+  Ldap(#[from] arkham_ldap::Error),
   /// A NATS connection string, or the pair of them, does not parse.
   #[error("rule `{label}`: {source}")]
   NatsScope {
