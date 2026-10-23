@@ -118,11 +118,10 @@ impl TlsHalves for NatsTransport {
         builder
           .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
           .map_err(|source| {
-            arkham_wire::Error::ClientIdentity {
+            Error::from(arkham_wire::Error::ClientIdentity {
               path: identity.cert.clone(),
               source,
-            }
-            .into()
+            })
           })?
       }
       None => builder.with_no_client_auth(),
@@ -339,7 +338,7 @@ where
 {
   let mut buf = vec![0u8; OPENING_READ];
   loop {
-    let n = read_count(server.read(&mut buf).await).map_err(|source| arkham_wire::Error::UpstreamRead { source }.into())?;
+    let n = read_count(server.read(&mut buf).await).map_err(|source| Error::from(arkham_wire::Error::UpstreamRead { source }))?;
     let Some(chunk) = buf.get(..n).filter(|chunk| !chunk.is_empty()) else {
       return Ok(None);
     };
@@ -384,7 +383,7 @@ where
     return Ok(Some(initial.to_vec()));
   }
   let mut buf = vec![0u8; OPENING_READ];
-  let n = read_count(guest.read(&mut buf).await).map_err(|source| arkham_wire::Error::GuestRead { source }.into())?;
+  let n = read_count(guest.read(&mut buf).await).map_err(|source| Error::from(arkham_wire::Error::GuestRead { source }))?;
   if n == 0 {
     return Ok(None);
   }
@@ -406,11 +405,11 @@ where
   guest
     .write_all(bytes)
     .await
-    .map_err(|source| arkham_wire::Error::ResponseChunkToGuest { source }.into())?;
+    .map_err(|source| Error::from(arkham_wire::Error::ResponseChunkToGuest { source }))?;
   guest
     .flush()
     .await
-    .map_err(|source| arkham_wire::Error::GuestFlush { source }.into())
+    .map_err(|source| Error::from(arkham_wire::Error::GuestFlush { source }))
 }
 
 #[cfg(test)]

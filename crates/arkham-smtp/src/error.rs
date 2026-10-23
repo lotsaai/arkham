@@ -33,7 +33,7 @@ pub enum Error {
   LegAlreadyTls,
   /// A shared TLS or relay failure.
   #[error(transparent)]
-  Wire(#[from] WireError),
+  Wire(WireError),
 }
 
 /// SMTP result.

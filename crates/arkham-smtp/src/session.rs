@@ -246,7 +246,7 @@ where
   if !guest.is_plain() {
     return relay_guarded(guest, server, &mut down, &mut up, &[], &[])
       .await
-      .map_err(Error::from);
+      .map_err(Error::Wire);
   }
   Opening {
     legs,
@@ -307,7 +307,7 @@ where
             let server = upgrade_server(self.legs, self.scope, self.server, self.budget, rest).await?;
             return relay_guarded(guest, server, self.down, self.up, &[], &[])
               .await
-              .map_err(Error::from);
+              .map_err(Error::Wire);
           }
           StarttlsStep::Local => {
             self.down.queue_starttls_ready();
@@ -317,12 +317,12 @@ where
             let guest = upgrade_guest(self.legs, self.scope, self.guest, self.leaf, self.budget).await?;
             return relay_guarded(guest, self.server, self.down, self.up, &[], &lead)
               .await
-              .map_err(Error::from);
+              .map_err(Error::Wire);
           }
           StarttlsStep::Relay(rest) => {
             return relay_guarded(self.guest, self.server, self.down, self.up, &[], &rest)
               .await
-              .map_err(Error::from);
+              .map_err(Error::Wire);
           }
         }
       }
@@ -332,7 +332,7 @@ where
           Forwarded::Held => {
             return relay_guarded(self.guest, self.server, self.down, self.up, &[], &lead)
               .await
-              .map_err(Error::from);
+              .map_err(Error::Wire);
           }
           Forwarded::Sent => {}
         }
@@ -345,7 +345,7 @@ where
       }
       return relay_guarded(self.guest, self.server, self.down, self.up, &line, &lead)
         .await
-        .map_err(Error::from);
+        .map_err(Error::Wire);
     }
   }
 
@@ -426,7 +426,9 @@ where
     GuestLeg::Tls(_) => return Err(Error::LegAlreadyTls),
   };
   let mode = scope.guest_tls;
-  let tls = finish(budget, legs.accept_guest(leaf, plain, mode, None)).await?;
+  let tls = finish(budget, legs.accept_guest(leaf, plain, mode, None))
+    .await
+    .map_err(Error::Wire)?;
   Ok(GuestLeg::Tls(Box::new(tls)))
 }
 
@@ -459,7 +461,8 @@ async fn upgrade_server(legs: &TlsLegs, scope: &SmtpScope, server: ServerLeg, bu
       )
       .await
   })
-  .await?;
+  .await
+  .map_err(Error::Wire)?;
   Ok(ServerLeg::Upgraded(Box::new(tls)))
 }
 

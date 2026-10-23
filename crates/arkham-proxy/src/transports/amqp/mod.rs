@@ -75,11 +75,10 @@ impl TlsHalves for AmqpTransport {
         builder
           .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
           .map_err(|err| {
-            arkham_wire::Error::ClientIdentity {
+            Error::from(arkham_wire::Error::ClientIdentity {
               path: cert.clone(),
               source: err,
-            }
-            .into()
+            })
           })?
       }
       _ => builder.with_no_client_auth(),
