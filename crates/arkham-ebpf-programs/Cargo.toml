@@ -1,6 +1,6 @@
 [package]
 name = "arkham-ebpf-programs"
-version = "0.3.31"
+version = "0.3.32"
 edition = "2024"
 description = "grant-scoped MITM proxy: eBPF kernel-side programs"
 license = "Apache-2.0"
