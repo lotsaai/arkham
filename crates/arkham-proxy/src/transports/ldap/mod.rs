@@ -2,16 +2,13 @@
 //! This module dials, settles TLS on the shared legs, and runs the `StartTLS` opening.
 
 use std::io::{Error as IoError, ErrorKind};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use secrecy::ExposeSecret as _;
-use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::server::TlsStream as ServerTlsStream;
 
-use arkham_config::grants::{Grant, GuestTlsMode, LdapScope};
+use arkham_config::grants::{Grant, LdapScope};
 use arkham_ldap::{BindSwap, Ldap, starttls_success};
 use arkham_wire::engine::{Direction, Rewritten, Wire};
 use arkham_wire::tls::TlsLegs;
@@ -105,27 +102,6 @@ impl Transport for LdapTransport {
   }
 }
 
-/// Accept the guest TLS leg on the shared helper.
-///
-/// # Errors
-///
-/// Returns an error when the leaf cannot be minted, the handshake fails, or
-/// the handshake budget runs out.
-async fn accept_guest<G>(legs: &TlsLegs, name: &str, guest: G, mode: GuestTlsMode, budget: Duration) -> Result<ServerTlsStream<G>, Error>
-where
-  G: AsyncRead + AsyncWrite + Unpin,
-{
-  finish(budget, legs.accept_guest(name, guest, mode, None))
-    .await
-    .map_err(Error::from)
-}
-
-/// Handshake the upstream on the shared helper. Chain and host name are verified.
-///
-/// # Errors
-///
-/// Returns an error when the trust anchor or client identity cannot be read,
-/// when the server name is unusable, or when the handshake fails.
 async fn connect_server<S>(
   legs: &TlsLegs,
   scope: &LdapScope,
@@ -136,24 +112,20 @@ async fn connect_server<S>(
 where
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  let root = scope.root_cert.as_ref();
-  let client_cert = scope.client_cert.as_deref();
-  let client_key = scope.client_key.as_deref();
-  finish(budget, async move {
-    legs
-      .connect_upstream(
-        &UpstreamTls {
-          server_name,
-          root,
-          verify: Verify::Full,
-          client_cert,
-          client_key,
-          alpn: None,
-        },
-        server,
-      )
-      .await
-  })
+  finish(
+    budget,
+    legs.connect_upstream(
+      &UpstreamTls {
+        server_name,
+        root: scope.root_cert.as_ref(),
+        verify: Verify::Full,
+        client_cert: scope.client_cert.as_deref(),
+        client_key: scope.client_key.as_deref(),
+        alpn: None,
+      },
+      server,
+    ),
+  )
   .await
   .map_err(Error::from)
 }
@@ -188,7 +160,13 @@ impl LdapTransport {
     match (tls, scope.is_upstream_tls) {
       (None, false) => relay(Prefixed::new(head, stream), upstream, pump.ctx).await,
       (Some((hello_buf, identity)), false) => {
-        let plain = accept_guest(pump.legs, &identity, Prefixed::new(hello_buf, stream), scope.guest_tls, pump.budget).await?;
+        let plain = finish(
+          pump.budget,
+          pump
+            .legs
+            .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls, None),
+        )
+        .await?;
         relay(plain, upstream, pump.ctx).await
       }
       (None, true) => {
@@ -196,7 +174,13 @@ impl LdapTransport {
         relay(Prefixed::new(head, stream), plain, pump.ctx).await
       }
       (Some((hello_buf, identity)), true) => {
-        let guest_plain = accept_guest(pump.legs, &identity, Prefixed::new(hello_buf, stream), scope.guest_tls, pump.budget).await?;
+        let guest_plain = finish(
+          pump.budget,
+          pump
+            .legs
+            .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls, None),
+        )
+        .await?;
         let server_plain = connect_server(pump.legs, scope, upstream_name, upstream, pump.budget).await?;
         relay(guest_plain, server_plain, pump.ctx).await
       }
@@ -331,12 +315,11 @@ impl LdapTransport {
     let Some((hello_buf, identity, _)) = opened else {
       return Ok(());
     };
-    let guest_plain = accept_guest(
-      pump.legs,
-      &identity,
-      Prefixed::new(hello_buf, guest),
-      pump.scope.guest_tls,
+    let guest_plain = finish(
       pump.budget,
+      pump
+        .legs
+        .accept_guest(&identity, Prefixed::new(hello_buf, guest), pump.scope.guest_tls, None),
     )
     .await?;
     if local {
@@ -368,9 +351,8 @@ where
   let (mut server_read, server_write) = tokio::io::split(server);
   let mut buf = vec![0u8; 8 * 1024];
   let opened = {
-    let mut guest_io = GuestRead { inner: &mut guest_read };
     let mut hello = Box::pin(guest_tls_opening(
-      &mut guest_io,
+      &mut guest_read,
       prefix,
       pump.budget,
       Some(pump.scope.downstream.host.as_str()),
@@ -381,7 +363,7 @@ where
         biased;
         result = &mut hello => break result?,
         result = server_read.read(&mut buf) => {
-          let n = read_count(result).map_err(|source| arkham_wire::Error::UpstreamRead { source }.into())?;
+          let n = read_count(result).map_err(|source| Error::from(arkham_wire::Error::UpstreamRead { source }))?;
           if n == 0 {
             break hello.await?;
           }
@@ -399,31 +381,6 @@ where
     }
   };
   Ok((guest_read.unsplit(guest_write), server_read.unsplit(server_write), opened))
-}
-
-/// `guest_tls_opening` takes a read/write stream and only reads the hello.
-struct GuestRead<R> {
-  inner: R,
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for GuestRead<R> {
-  fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-    Pin::new(&mut self.inner).poll_read(cx, buf)
-  }
-}
-
-impl<R: Unpin> AsyncWrite for GuestRead<R> {
-  fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<std::io::Result<usize>> {
-    Poll::Ready(Err(IoError::new(ErrorKind::Unsupported, "ldap client hello write")))
-  }
-
-  fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-    Poll::Ready(Ok(()))
-  }
-
-  fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-    Poll::Ready(Ok(()))
-  }
 }
 
 /// Bytes already read around one `StartTLS`, plus whether this side answers it.
@@ -479,7 +436,7 @@ where
   let mut got = Vec::new();
   let mut byte = [0u8; 1];
   loop {
-    let n = read_count(guest.read(&mut byte).await).map_err(|source| arkham_wire::Error::GuestRead { source }.into())?;
+    let n = read_count(guest.read(&mut byte).await).map_err(|source| Error::from(arkham_wire::Error::GuestRead { source }))?;
     if n == 0 {
       return Ok(if got.is_empty() { First::Eof } else { First::Relay(got) });
     }
@@ -545,7 +502,7 @@ where
     upstream
       .write_all(prefix)
       .await
-      .map_err(|source| arkham_wire::Error::RequestChunkToUpstream { source }.into())?;
+      .map_err(|source| Error::from(arkham_wire::Error::RequestChunkToUpstream { source }))?;
   }
   let mut buf = vec![0u8; CONTROL_READ];
   while let Some((_, left)) = probe.starttls_tail() {
@@ -553,7 +510,7 @@ where
     let Some(window) = buf.get_mut(..want) else {
       return Ok(false);
     };
-    let n = read_count(guest.read(window).await).map_err(|source| arkham_wire::Error::GuestRead { source }.into())?;
+    let n = read_count(guest.read(window).await).map_err(|source| Error::from(arkham_wire::Error::GuestRead { source }))?;
     if n == 0 {
       return Ok(false);
     }
@@ -569,14 +526,17 @@ where
       upstream
         .write_all(chunk)
         .await
-        .map_err(|source| arkham_wire::Error::RequestChunkToUpstream { source }.into())?;
+        .map_err(|source| Error::from(arkham_wire::Error::RequestChunkToUpstream { source }))?;
     }
     if probe.starttls_tail().is_none() {
       break;
     }
   }
   if forward {
-    upstream.flush().await.map_err(|source| arkham_wire::Error::RequestHeadFlush { source }.into())?;
+    upstream
+      .flush()
+      .await
+      .map_err(|source| Error::from(arkham_wire::Error::RequestHeadFlush { source }))?;
   }
   Ok(true)
 }
@@ -600,15 +560,12 @@ where
         .into(),
       );
     }
-    let read = tokio::time::timeout(left, server.read(&mut buf))
-      .await
-      .map_err(|_elapsed| {
-        arkham_wire::Error::UpstreamRead {
-          source: IoError::new(ErrorKind::TimedOut, "ldap starttls response"),
-        }
-        .into()
-      })?;
-    let n = read_count(read).map_err(|source| arkham_wire::Error::UpstreamRead { source }.into())?;
+    let read = tokio::time::timeout(left, server.read(&mut buf)).await.map_err(|_elapsed| {
+      Error::from(arkham_wire::Error::UpstreamRead {
+        source: IoError::new(ErrorKind::TimedOut, "ldap starttls response"),
+      })
+    })?;
+    let n = read_count(read).map_err(|source| Error::from(arkham_wire::Error::UpstreamRead { source }))?;
     if n == 0 {
       return Ok((false, Vec::new()));
     }
@@ -654,8 +611,11 @@ where
   guest
     .write_all(bytes)
     .await
-    .map_err(|source| arkham_wire::Error::ResponseChunkToGuest { source }.into())?;
-  guest.flush().await.map_err(|source| arkham_wire::Error::GuestFlush { source }.into())?;
+    .map_err(|source| Error::from(arkham_wire::Error::ResponseChunkToGuest { source }))?;
+  guest
+    .flush()
+    .await
+    .map_err(|source| Error::from(arkham_wire::Error::GuestFlush { source }))?;
   Ok(())
 }
 
@@ -666,8 +626,11 @@ where
   server
     .write_all(bytes)
     .await
-    .map_err(|source| arkham_wire::Error::RequestChunkToUpstream { source }.into())?;
-  server.flush().await.map_err(|source| arkham_wire::Error::RequestHeadFlush { source }.into())?;
+    .map_err(|source| Error::from(arkham_wire::Error::RequestChunkToUpstream { source }))?;
+  server
+    .flush()
+    .await
+    .map_err(|source| Error::from(arkham_wire::Error::RequestHeadFlush { source }))?;
   Ok(())
 }
 

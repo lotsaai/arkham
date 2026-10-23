@@ -348,31 +348,24 @@ impl Ldap {
   }
 }
 
-/// A success extended response for `id`, used when the upstream leg is
-/// already TLS and the `StartTLS` request must not be forwarded.
+/// Success extended response for `id` when the upstream leg is already TLS.
 ///
 /// # Errors
 ///
-/// Returns the encoder error when the fixed success message cannot be encoded.
+/// Returns the encoder error when the message cannot be encoded.
 pub fn starttls_success(id: u32) -> Result<Vec<u8>, crate::Error> {
-  extended_result(id, ResultCode::Success, true).map_err(|source| crate::Error::Encode { source })
-}
-
-/// Extended response for `id`. `named` attaches the `StartTLS` OID, which a
-/// success carries and an `operationsError` does not.
-fn extended_result(id: u32, code: ResultCode, named: bool) -> Result<Vec<u8>, rasn::error::EncodeError> {
   let message = LdapMessage::new(
     id,
     ProtocolOp::ExtendedResp(ExtendedResponse {
-      result_code: code,
+      result_code: ResultCode::Success,
       matched_dn: LdapString::from(""),
       diagnostic_message: LdapString::from(""),
       referral: None,
-      response_name: named.then(|| OctetString::from_static(STARTTLS_OID)),
+      response_name: Some(OctetString::from_static(STARTTLS_OID)),
       response_value: None,
     }),
   );
-  rasn::ber::encode(&message)
+  rasn::ber::encode(&message).map_err(|source| crate::Error::Encode { source })
 }
 
 impl Wire for Ldap {

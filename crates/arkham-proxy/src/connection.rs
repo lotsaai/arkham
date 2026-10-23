@@ -280,7 +280,7 @@ pub(crate) async fn guest_tls_opening<G>(
   mint: &MintBucket,
 ) -> Result<Option<(Vec<u8>, String, String)>, Error>
 where
-  G: AsyncRead + AsyncWrite + Unpin,
+  G: AsyncRead + Unpin,
 {
   let Some(read) = read_client_hello(guest, initial, budget).await? else {
     return Ok(None);
