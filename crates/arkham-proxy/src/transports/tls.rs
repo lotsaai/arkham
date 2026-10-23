@@ -391,16 +391,25 @@ where
   Ok((guest, upstream))
 }
 
+/// Apply the handshake budget to one TLS future.
+///
+/// # Errors
+///
+/// Returns an error when the handshake fails or exceeds `budget`.
+pub(crate) async fn finish<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+  match tokio::time::timeout(budget, handshake).await {
+    Ok(result) => result,
+    Err(_elapsed) => Err(Error::HandshakeTimeout),
+  }
+}
+
 async fn settle_one<P, F, T>(side: Pending<P, F>, budget: Duration) -> Result<Leg<P, T>, Error>
 where
   F: Future<Output = Result<T, Error>>,
 {
   match side {
     Pending::Plain(plain) => Ok(Leg::Plain(plain)),
-    Pending::Tls(handshake) => match tokio::time::timeout(budget, handshake).await {
-      Ok(result) => result.map(Leg::Tls),
-      Err(_elapsed) => Err(Error::HandshakeTimeout),
-    },
+    Pending::Tls(handshake) => finish(budget, handshake).await.map(Leg::Tls),
   }
 }
 

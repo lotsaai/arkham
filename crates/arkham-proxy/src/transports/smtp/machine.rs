@@ -63,9 +63,6 @@ struct Down {
   /// Suffix of a `DATA` body that may still grow into [`DATA_END`].
   tail: Vec<u8>,
   phase: Phase,
-  /// AUTH payloads are rewritten only when the upstream writer is TLS.
-  /// A cleartext upstream forwards the decoy.
-  protected: bool,
   creds: Option<Creds>,
   /// Guest-bound bytes queued for [`Wire::take_reply`].
   reply: Option<Vec<u8>>,
@@ -210,7 +207,6 @@ impl Smtp {
           buf: Vec::new(),
           tail: Vec::new(),
           phase: Phase::Command,
-          protected: false,
           creds,
           reply: None,
           closed: false,
@@ -233,14 +229,6 @@ impl Smtp {
   /// commands; the upstream leg reads the reply that answers `DATA`.
   pub(crate) fn share_data_gate(downstream: &Smtp, upstream: &mut Smtp) {
     upstream.gate = Arc::clone(&downstream.gate);
-  }
-
-  /// Allow AUTH rewriting. True only while the upstream leg is TLS. A
-  /// cleartext upstream forwards the decoy.
-  pub(crate) fn set_protected(&mut self, protected: bool) {
-    if let Some(down) = self.down.as_mut() {
-      down.protected = protected;
-    }
   }
 
   /// True while the next guest line is an AUTH continuation, not a verb.
@@ -534,35 +522,34 @@ fn rewrite_down_line(line: &[u8], down: &mut Down) -> (Vec<u8>, Vec<Hit>) {
   if down.phase != Phase::Command && is_command(line) {
     down.phase = Phase::Command;
   }
-  let protected = down.protected;
   match down.phase {
     Phase::Plain => {
       down.phase = Phase::Command;
       let Some(creds) = down.creds.as_ref() else {
         return (line.to_vec(), Vec::new());
       };
-      rewrite_plain_line(line, creds, protected)
+      rewrite_plain_line(line, creds)
     }
     Phase::LoginUser => {
       down.phase = Phase::LoginPass;
       let Some(creds) = down.creds.as_ref() else {
         return (line.to_vec(), Vec::new());
       };
-      rewrite_token_line(line, &creds.fake_user, &creds.real_user, creds, protected)
+      rewrite_token_line(line, &creds.fake_user, &creds.real_user, creds)
     }
     Phase::LoginPass => {
       down.phase = Phase::Command;
       let Some(creds) = down.creds.as_ref() else {
         return (line.to_vec(), Vec::new());
       };
-      rewrite_token_line(line, &creds.fake_pass, &creds.real_pass, creds, protected)
+      rewrite_token_line(line, &creds.fake_pass, &creds.real_pass, creds)
     }
     Phase::Bearer => {
       down.phase = Phase::Command;
       let Some(creds) = down.creds.as_ref() else {
         return (line.to_vec(), Vec::new());
       };
-      rewrite_bearer_line(line, creds, protected)
+      rewrite_bearer_line(line, creds)
     }
     Phase::Command => rewrite_command(line, down, cmd),
     Phase::Data { .. } | Phase::Bdat { .. } => (line.to_vec(), Vec::new()),
@@ -608,22 +595,20 @@ fn rewrite_auth(line: &[u8], down: &mut Down, mechanism: u64, initial: &str) -> 
         down.phase = Phase::Plain;
         return (line.to_vec(), Vec::new());
       };
-      let protected = down.protected;
       let Some(creds) = down.creds.as_ref() else {
         return (line.to_vec(), Vec::new());
       };
-      rewrite_auth_arg(line, b"PLAIN", arg, ending, creds, protected, rewrite_plain_raw)
+      rewrite_auth_arg(line, b"PLAIN", arg, ending, creds, rewrite_plain_raw)
     }
     AUTH_LOGIN => {
       let Some(arg) = initial else {
         down.phase = Phase::LoginUser;
         return (line.to_vec(), Vec::new());
       };
-      let protected = down.protected;
       let Some(creds) = down.creds.as_ref() else {
         return (line.to_vec(), Vec::new());
       };
-      let (rewritten, hits) = rewrite_token_line(&join_line(arg, ending), &creds.fake_user, &creds.real_user, creds, protected);
+      let (rewritten, hits) = rewrite_token_line(&join_line(arg, ending), &creds.fake_user, &creds.real_user, creds);
       down.phase = Phase::LoginPass;
       let arg_body = line_body(&rewritten);
       (join_auth(b"LOGIN", Some(arg_body), ending), hits)
@@ -640,11 +625,10 @@ fn rewrite_bearer(line: &[u8], down: &mut Down, mech: &[u8], initial: Option<&[u
     down.phase = Phase::Bearer;
     return (line.to_vec(), Vec::new());
   };
-  let protected = down.protected;
   let Some(creds) = down.creds.as_ref() else {
     return (line.to_vec(), Vec::new());
   };
-  rewrite_auth_arg(line, mech, arg, ending, creds, protected, rewrite_bearer_raw)
+  rewrite_auth_arg(line, mech, arg, ending, creds, rewrite_bearer_raw)
 }
 
 /// Size on `BDAT <n> [LAST]`. A line the parser rejects is `None`.
@@ -696,25 +680,24 @@ fn rewrite_auth_arg(
   arg: &[u8],
   ending: &[u8],
   creds: &Creds,
-  protected: bool,
-  rewrite: fn(&[u8], &Creds, bool) -> Option<Vec<u8>>,
+  rewrite: fn(&[u8], &Creds) -> Option<Vec<u8>>,
 ) -> (Vec<u8>, Vec<Hit>) {
   let Some(raw) = b64_decode(arg) else {
     return (line.to_vec(), Vec::new());
   };
-  let Some(rewritten) = rewrite(&raw, creds, protected) else {
+  let Some(rewritten) = rewrite(&raw, creds) else {
     return (line.to_vec(), Vec::new());
   };
   (join_auth(mech, Some(&b64_encode(&rewritten)), ending), vec![hit(creds)])
 }
 
 /// A continuation line carrying a SASL PLAIN payload.
-fn rewrite_plain_line(line: &[u8], creds: &Creds, protected: bool) -> (Vec<u8>, Vec<Hit>) {
+fn rewrite_plain_line(line: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
   let body = line_body(line);
   let Some(raw) = b64_decode(body) else {
     return (line.to_vec(), Vec::new());
   };
-  let Some(rewritten) = rewrite_plain_raw(&raw, creds, protected) else {
+  let Some(rewritten) = rewrite_plain_raw(&raw, creds) else {
     return (line.to_vec(), Vec::new());
   };
   let mut out = b64_encode(&rewritten);
@@ -723,8 +706,8 @@ fn rewrite_plain_line(line: &[u8], creds: &Creds, protected: bool) -> (Vec<u8>, 
 }
 
 /// A continuation line whose whole payload is one token (LOGIN user or password).
-fn rewrite_token_line(line: &[u8], from: &[u8], to: &[u8], creds: &Creds, protected: bool) -> (Vec<u8>, Vec<Hit>) {
-  if !protected || from == to {
+fn rewrite_token_line(line: &[u8], from: &[u8], to: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
+  if from == to {
     return (line.to_vec(), Vec::new());
   }
   let Some(raw) = b64_decode(line_body(line)) else {
@@ -739,11 +722,11 @@ fn rewrite_token_line(line: &[u8], from: &[u8], to: &[u8], creds: &Creds, protec
 }
 
 /// A continuation line carrying an XOAUTH2 or OAUTHBEARER payload.
-fn rewrite_bearer_line(line: &[u8], creds: &Creds, protected: bool) -> (Vec<u8>, Vec<Hit>) {
+fn rewrite_bearer_line(line: &[u8], creds: &Creds) -> (Vec<u8>, Vec<Hit>) {
   let Some(raw) = b64_decode(line_body(line)) else {
     return (line.to_vec(), Vec::new());
   };
-  let Some(rewritten) = rewrite_bearer_raw(&raw, creds, protected) else {
+  let Some(rewritten) = rewrite_bearer_raw(&raw, creds) else {
     return (line.to_vec(), Vec::new());
   };
   let mut out = b64_encode(&rewritten);
@@ -752,10 +735,7 @@ fn rewrite_bearer_line(line: &[u8], creds: &Creds, protected: bool) -> (Vec<u8>,
 }
 
 /// SASL PLAIN: `authzid NUL authcid NUL password`.
-fn rewrite_plain_raw(raw: &[u8], creds: &Creds, protected: bool) -> Option<Vec<u8>> {
-  if !protected {
-    return None;
-  }
+fn rewrite_plain_raw(raw: &[u8], creds: &Creds) -> Option<Vec<u8>> {
   let (zid, cid, pass) = split_plain(raw)?;
   let mut cid_out = cid.to_vec();
   let mut pass_out = pass.to_vec();
@@ -788,10 +768,7 @@ fn rewrite_plain_raw(raw: &[u8], creds: &Creds, protected: bool) -> Option<Vec<u
 
 /// XOAUTH2 (`user=…\x01auth=Bearer …\x01\x01`) and OAUTHBEARER
 /// (`n,a=…,\x01…auth=Bearer …\x01\x01`). The bearer token is the password.
-fn rewrite_bearer_raw(raw: &[u8], creds: &Creds, protected: bool) -> Option<Vec<u8>> {
-  if !protected {
-    return None;
-  }
+fn rewrite_bearer_raw(raw: &[u8], creds: &Creds) -> Option<Vec<u8>> {
   let mut spans: Vec<(usize, usize, Vec<u8>)> = Vec::new();
   if creds.fake_pass != creds.real_pass
     && let Some((start, end)) = marked_span(raw, b"auth=Bearer ", |byte| byte == SASL_SEP)
@@ -970,9 +947,7 @@ mod tests {
   }
 
   fn down() -> Smtp {
-    let mut machine = Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Downstream);
-    machine.set_protected(true);
-    machine
+    Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Downstream)
   }
 
   fn up() -> Smtp {
@@ -1020,7 +995,6 @@ mod tests {
   #[tokio::test]
   async fn plain_inline_swaps_a_different_user() {
     let mut machine = Smtp::new(&grant("guest@demo.test", "real@demo.test"), "mail", 587, Direction::Downstream);
-    machine.set_protected(true);
     let line = format!("AUTH PLAIN {}\r\n", plain("guest@demo.test", FAKE_PASS));
     let (out, hits) = emit(&mut machine, line.as_bytes()).await;
     assert_eq!(hits, 1);
@@ -1040,13 +1014,12 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn plain_before_protect_is_forwarded_unchanged() {
+  async fn plain_on_a_cleartext_leg_swaps_the_password() {
     let mut machine = Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Downstream);
-    machine.set_protected(false);
     let line = format!("AUTH PLAIN {}\r\n", plain(FAKE_USER, FAKE_PASS));
     let (out, hits) = emit(&mut machine, line.as_bytes()).await;
-    assert_eq!(hits, 0);
-    assert_eq!(out, line.as_bytes());
+    assert_eq!(hits, 1);
+    assert_eq!(out, format!("AUTH PLAIN {}\r\n", plain(REAL_USER, REAL_PASS)).into_bytes());
   }
 
   #[tokio::test]
@@ -1093,7 +1066,6 @@ mod tests {
   #[tokio::test]
   async fn oauthbearer_swaps_the_bearer() {
     let mut machine = Smtp::new(&grant("guest@demo.test", "real@demo.test"), "mail", 587, Direction::Downstream);
-    machine.set_protected(true);
     let raw = format!("n,a=guest@demo.test,\x01host=mail\x01auth=Bearer {FAKE_PASS}\x01\x01");
     let encoded = base64::engine::general_purpose::STANDARD.encode(raw.as_bytes());
     let (out, hits) = emit(&mut machine, format!("AUTH OAUTHBEARER {encoded}\r\n").as_bytes()).await;
@@ -1311,7 +1283,6 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
         rt.block_on(async {
           let mut down = Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Downstream);
-          down.set_protected(true);
           let mut up_leg = Smtp::new(&grant(FAKE_USER, REAL_USER), "mail", 587, Direction::Upstream);
           Smtp::share_data_gate(&down, &mut up_leg);
           for chunk in &chunks {

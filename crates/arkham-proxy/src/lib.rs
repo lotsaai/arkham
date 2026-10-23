@@ -177,7 +177,7 @@ impl ProxyState {
     let legs = TlsLegs::new(ca)?;
     let postgres = Arc::new(PostgresTransport);
     let redis = Arc::new(RedisTransport);
-    let smtp = Arc::new(SmtpTransport::new(ca)?);
+    let smtp = Arc::new(SmtpTransport);
     let ldap = Arc::new(LdapTransport::new(ca)?);
     let nats = Arc::new(NatsTransport::new(ca)?);
     let amqp = Arc::new(AmqpTransport::new(ca)?);

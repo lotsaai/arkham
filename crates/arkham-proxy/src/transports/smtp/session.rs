@@ -7,8 +7,7 @@
 //! bytes to the next server reader. A non-`220` answer to `STARTTLS`
 //! returns to that loop. After the upgrade, or when the guest sends anything
 //! else, both sockets go to [`relay_guarded`]. Implicit TLS skips the
-//! opening. A session that never upgrades relays with swapping off, and the
-//! decoy passes through.
+//! opening. AUTH swaps on cleartext and on TLS.
 
 use std::io::ErrorKind;
 use std::pin::Pin;
@@ -21,12 +20,11 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
-use super::SmtpTransport;
 use super::machine::{MAX_COMMAND, Smtp, is_opening_command, is_starttls};
 use crate::Error;
 use crate::relay::{log_hits, relay_guarded};
-use crate::transports::TlsHalves;
 use crate::transports::engine::{Direction, Rewritten, Wire};
+use crate::transports::tls::{TlsLegs, UpstreamTls, Verify, finish};
 
 /// Guest socket, cleartext or terminated TLS.
 pub(crate) enum GuestLeg<G> {
@@ -184,8 +182,8 @@ impl AsyncWrite for ServerLeg {
 /// One SMTP dialogue: both sockets, the grant that keys the swap, and
 /// the handshake budget.
 pub(super) struct Dialogue<'a, G> {
-  /// Transport that mints the guest leaf and dials upstream TLS.
-  pub(super) transport: &'a SmtpTransport,
+  /// Shared TLS legs. A mid-session `STARTTLS` handshake uses them.
+  pub(super) legs: &'a TlsLegs,
   /// Both legs of the matched rule.
   pub(super) scope: &'a SmtpScope,
   /// Guest socket, cleartext or already terminated.
@@ -214,7 +212,7 @@ where
   G: AsyncRead + AsyncWrite + Unpin,
 {
   let Dialogue {
-    transport,
+    legs,
     scope,
     guest,
     server,
@@ -224,16 +222,13 @@ where
     budget,
   } = dialogue;
   let mut down = Smtp::new(grants, host, port, Direction::Downstream);
-  // Swap only when the upstream writer is already TLS (`smtps://`). A
-  // cleartext `smtp://` session forwards the decoy until STARTTLS completes.
-  down.set_protected(scope.is_upstream_tls);
   let mut up = Smtp::new(grants, host, port, Direction::Upstream);
   Smtp::share_data_gate(&down, &mut up);
   if !guest.is_plain() {
     return relay_guarded(guest, server, &mut down, &mut up, &[], &[]).await;
   }
   Opening {
-    transport,
+    legs,
     scope,
     guest,
     server,
@@ -248,7 +243,7 @@ where
 
 /// Cleartext sockets plus the machines they hand to the relay.
 struct Opening<'a, G> {
-  transport: &'a SmtpTransport,
+  legs: &'a TlsLegs,
   scope: &'a SmtpScope,
   guest: GuestLeg<G>,
   server: ServerLeg,
@@ -284,9 +279,8 @@ where
           }
           StarttlsStep::Closed => return Ok(()),
           StarttlsStep::Upgrade(rest) => {
-            let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
-            let server = upgrade_server(self.transport, self.scope, self.server, self.budget, rest).await?;
-            self.down.set_protected(true);
+            let guest = upgrade_guest(self.legs, self.scope, self.guest, self.leaf, self.budget).await?;
+            let server = upgrade_server(self.legs, self.scope, self.server, self.budget, rest).await?;
             return relay_guarded(guest, server, self.down, self.up, &[], &[]).await;
           }
           StarttlsStep::Local => {
@@ -294,8 +288,7 @@ where
             if let Some(reply) = self.down.take_reply() {
               write_guest(&mut self.guest, &reply).await?;
             }
-            let guest = upgrade_guest(self.transport, self.scope, self.guest, self.leaf, self.budget).await?;
-            self.down.set_protected(true);
+            let guest = upgrade_guest(self.legs, self.scope, self.guest, self.leaf, self.budget).await?;
             return relay_guarded(guest, self.server, self.down, self.up, &[], &lead).await;
           }
           StarttlsStep::Relay(rest) => return relay_guarded(self.guest, self.server, self.down, self.up, &[], &rest).await,
@@ -386,13 +379,7 @@ async fn forward_down(down: &mut Smtp, server: &mut ServerLeg, line: &[u8]) -> R
   }
 }
 
-async fn upgrade_guest<G>(
-  transport: &SmtpTransport,
-  scope: &SmtpScope,
-  guest: GuestLeg<G>,
-  leaf: &str,
-  budget: Duration,
-) -> Result<GuestLeg<G>, Error>
+async fn upgrade_guest<G>(legs: &TlsLegs, scope: &SmtpScope, guest: GuestLeg<G>, leaf: &str, budget: Duration) -> Result<GuestLeg<G>, Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
 {
@@ -400,36 +387,42 @@ where
     GuestLeg::Plain(stream) => stream,
     GuestLeg::Tls(_) => return Err(Error::SmtpLegAlreadyTls),
   };
-  let tls = handshake(budget, transport.accept_guest(leaf, plain, scope.guest_tls)).await?;
+  let mode = scope.guest_tls;
+  let tls = finish(budget, legs.accept_guest(leaf, plain, mode, None)).await?;
   Ok(GuestLeg::Tls(Box::new(tls)))
 }
 
-async fn upgrade_server(
-  transport: &SmtpTransport,
-  scope: &SmtpScope,
-  server: ServerLeg,
-  budget: Duration,
-  rest: Vec<u8>,
-) -> Result<ServerLeg, Error> {
+async fn upgrade_server(legs: &TlsLegs, scope: &SmtpScope, server: ServerLeg, budget: Duration, rest: Vec<u8>) -> Result<ServerLeg, Error> {
   let plain = match server {
     ServerLeg::Plain(stream) => stream,
     ServerLeg::Tls(_) | ServerLeg::Upgraded(_) => return Err(Error::SmtpLegAlreadyTls),
   };
-  let name = scope.upstream.host.as_str();
+  let server_name = scope.upstream.host.as_str();
+  let root = scope.root_cert.as_ref();
+  let client_cert = scope.client_cert.as_deref();
+  let client_key = scope.client_key.as_deref();
   let io = HeadThen {
     head: rest,
     at: 0,
     inner: plain,
   };
-  let tls = handshake(budget, transport.connect_server(scope, name, io)).await?;
+  let tls = finish(budget, async move {
+    legs
+      .connect_upstream(
+        &UpstreamTls {
+          server_name,
+          root,
+          verify: Verify::Full,
+          client_cert,
+          client_key,
+          alpn: None,
+        },
+        io,
+      )
+      .await
+  })
+  .await?;
   Ok(ServerLeg::Upgraded(Box::new(tls)))
-}
-
-async fn handshake<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
-  match tokio::time::timeout(budget, handshake).await {
-    Ok(result) => result,
-    Err(_elapsed) => Err(Error::SmtpHandshakeTimeout),
-  }
 }
 
 async fn write_guest<G>(guest: &mut GuestLeg<G>, bytes: &[u8]) -> Result<(), Error>

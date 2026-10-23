@@ -2,10 +2,9 @@
 //! and the rule-to-scope assembly.
 //!
 //! `smtp://` is a cleartext session that may upgrade with STARTTLS.
-//! `smtps://` is implicit TLS from the first byte. The real password is
-//! swapped only once the upstream leg is TLS. `starttls=required` on an
-//! `smtp://` string is what submission (port 587) demands, and it is what
-//! makes trust material legal on that scheme.
+//! `smtps://` is implicit TLS from the first byte. AUTH swaps on either
+//! leg. `starttls=required` on an `smtp://` string records that the server
+//! demands the upgrade. Trust and identity ride the real string on either scheme.
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -34,11 +33,10 @@ pub struct SmtpLeg {
 /// An SMTP rule's scope: both legs of its one connection-string mapping.
 ///
 /// Each string states its own transport in its scheme. `smtp://` is
-/// cleartext (STARTTLS when the peer asks, or when the real string says
-/// `starttls=required`). `smtps://` is TLS from the first byte. Trust and
-/// identity ride the real string's query (`sslrootcert`, `sslcert`/`sslkey`);
-/// the rule's `tls` table states the guest leg's mode, keyed by the rule's
-/// env name.
+/// cleartext. `smtps://` is TLS from the first byte. Trust and identity
+/// ride the real string's query (`sslrootcert`, `sslcert`/`sslkey`) on
+/// either scheme. The rule's `tls` table states the guest leg's mode,
+/// keyed by the rule's env name.
 #[derive(Debug, Clone)]
 pub struct SmtpScope {
   /// The guest's leg, from the rule's stated fake connection string.
@@ -125,12 +123,6 @@ pub enum SmtpUriError {
     /// The rejected key.
     key: String,
   },
-  /// Trust material on a cleartext `smtp://` string.
-  #[error("bad connection string: cleartext `smtp://` carries no TLS state; trust belongs on `smtps://` or `starttls=required`")]
-  TrustOnCleartext,
-  /// Client identity on a cleartext `smtp://` string.
-  #[error("bad connection string: cleartext `smtp://` carries no TLS state; identity belongs on `smtps://` or `starttls=required`")]
-  IdentityOnCleartext,
   /// `sslcert` and `sslkey` were not paired.
   #[error("bad connection string: sslcert and sslkey come together")]
   CertKeyPair,
@@ -239,8 +231,7 @@ impl SmtpUri {
   }
 }
 
-/// Trust and identity from the real string's query. Legal on `smtps://`
-/// and on `smtp://` that requires STARTTLS; cleartext AUTH carries none.
+/// Trust and identity from the real string's query. Legal on cleartext and TLS.
 struct SmtpTls {
   root_cert: Option<RootCert>,
   client_cert: Option<PathBuf>,
@@ -298,7 +289,7 @@ fn reject_fake_query(uri: &SmtpUri) -> Result<(), SmtpUriError> {
   Err(SmtpUriError::FakeUnknown { key: key.clone() })
 }
 
-fn smtp_tls(tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, SmtpUriError> {
+fn smtp_tls(uri: &SmtpUri) -> Result<SmtpTls, SmtpUriError> {
   let mut root_cert = None;
   let mut client_cert = None;
   let mut client_key = None;
@@ -334,14 +325,8 @@ fn smtp_tls(tls_leg: bool, uri: &SmtpUri) -> Result<SmtpTls, SmtpUriError> {
       }
     };
     if let Some(root) = tls_material {
-      if !tls_leg {
-        return Err(SmtpUriError::TrustOnCleartext);
-      }
       root_cert = Some(root);
     }
-  }
-  if !tls_leg && (client_cert.is_some() || client_key.is_some()) {
-    return Err(SmtpUriError::IdentityOnCleartext);
   }
   if client_cert.is_some() != client_key.is_some() {
     return Err(SmtpUriError::CertKeyPair);
@@ -367,12 +352,11 @@ impl SmtpScope {
     let downstream = fake.parse::<SmtpUri>()?;
     let upstream = real.parse::<SmtpUri>()?;
     reject_fake_query(&downstream)?;
-    let upstream_tls = upstream.scheme == Scheme::Smtps || upstream.starttls_required;
     let SmtpTls {
       root_cert,
       client_cert,
       client_key,
-    } = smtp_tls(upstream_tls, &upstream)?;
+    } = smtp_tls(&upstream)?;
     Ok(Self {
       is_downstream_tls: downstream.scheme == Scheme::Smtps,
       downstream: downstream.leg(),
@@ -392,14 +376,12 @@ impl SmtpScope {
   }
 }
 
-/// Assemble one SMTP grant from its rule.
+/// Assemble one SMTP grant from its rule. Cleartext and TLS both swap.
 ///
 /// # Errors
 ///
-/// Returns an error when either string fails the law above, when a `tls`
-/// row tries to state what only the real string may state, or when
-/// `guest_tls_mode` is `mtls` on an `smtp://` fake whose real string is
-/// `smtps://`.
+/// Returns an error when either string fails the law above, or when a `tls`
+/// row tries to state what only the real string may state.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
   let fake = rule
     .value
@@ -424,18 +406,7 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
     if tls.root_cert.is_some() {
       return Err(Error::SmtpTrust { label: label.to_string() });
     }
-    if tls.guest_tls_mode == GuestTlsMode::Mtls && scope.is_upstream_tls && !scope.is_downstream_tls {
-      return Err(Error::SmtpCleartextMtls { label: label.to_string() });
-    }
     scope.guest_tls = tls.guest_tls_mode;
-  }
-  if !scope.is_upstream_tls && !scope.starttls_required {
-    tracing::warn!(
-      label,
-      host = %scope.upstream.host,
-      port = scope.upstream.port,
-      "smtp:// upstream is cleartext; AUTH forwards the decoy until that leg is TLS"
-    );
   }
   let credential = Credential {
     label: label.to_string(),
@@ -450,7 +421,9 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
 
 #[cfg(test)]
 mod tests {
-  use super::{SmtpScope, SmtpUri};
+  use std::path::PathBuf;
+
+  use super::{RootCert, SmtpScope, SmtpUri};
 
   const USER: &str = "agent%40box.test";
   const USER_TEXT: &str = "agent@box.test";
@@ -473,14 +446,6 @@ mod tests {
     }
     let fake = format!("smtp://{USER}:{PASS}@mail.internal:587");
     let queried = [
-      (
-        format!("smtp://{USER}:{PASS}@mail.internal:25?sslrootcert=/ca.pem"),
-        "trust belongs",
-      ),
-      (
-        format!("smtp://{USER}:{PASS}@mail.internal:25?sslcert=/c.pem&sslkey=/c.key"),
-        "identity belongs",
-      ),
       (format!("smtp://{USER}:{PASS}@mail.internal:587?sslmode=require"), "sslmode"),
       (format!("smtps://{USER}:{PASS}@mail.internal:465?sslcert="), "sslcert needs a path"),
     ];
@@ -531,6 +496,19 @@ mod tests {
       assert_hides(&real, &text, key);
       assert!(!text.contains("smtp://"), "{text}");
     }
+  }
+
+  #[test]
+  fn cleartext_real_string_keeps_trust_and_identity() {
+    let fake = format!("smtp://{USER}:{PASS}@mail.internal:587");
+    let trust = format!("smtp://{USER}:{PASS}@mail.internal:25?sslrootcert=/ca.pem");
+    let scope = SmtpScope::from_strings(&fake, &trust).expect("trust on cleartext");
+    assert!(matches!(scope.root_cert, Some(RootCert::Path(ref path)) if path == &PathBuf::from("/ca.pem")));
+    assert!(!scope.is_upstream_tls);
+    let identity = format!("smtp://{USER}:{PASS}@mail.internal:25?sslcert=/c.pem&sslkey=/c.key");
+    let scope = SmtpScope::from_strings(&fake, &identity).expect("identity on cleartext");
+    assert_eq!(scope.client_cert, Some(PathBuf::from("/c.pem")));
+    assert_eq!(scope.client_key, Some(PathBuf::from("/c.key")));
   }
 
   fn assert_hides(entry: &str, text: &str, problem: &str) {
