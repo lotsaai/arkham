@@ -102,13 +102,16 @@ impl TlsHalves for LdapTransport {
     let config = match (&scope.client_cert, &scope.client_key) {
       (Some(cert), Some(key)) => {
         let ClientAuth::Single(data) = client_identity(cert, key)? else {
-          return Err(Error::EmptyClientIdentity { path: cert.clone() });
+          return Err(arkham_wire::Error::EmptyClientIdentity { path: cert.clone() }.into());
         };
         builder
           .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|err| Error::ClientIdentity {
-            path: cert.clone(),
-            source: err,
+          .map_err(|err| {
+            arkham_wire::Error::ClientIdentity {
+              path: cert.clone(),
+              source: err,
+            }
+            .into()
           })?
       }
       _ => builder.with_no_client_auth(),
@@ -429,7 +432,7 @@ where
   let mut got = Vec::new();
   let mut byte = [0u8; 1];
   loop {
-    let n = read_count(guest.read(&mut byte).await).map_err(|source| Error::GuestRead { source })?;
+    let n = read_count(guest.read(&mut byte).await).map_err(|source| arkham_wire::Error::GuestRead { source }.into())?;
     if n == 0 {
       return Ok(if got.is_empty() { First::Eof } else { First::Relay(got) });
     }
@@ -495,7 +498,7 @@ where
     upstream
       .write_all(prefix)
       .await
-      .map_err(|source| Error::RequestChunkToUpstream { source })?;
+      .map_err(|source| arkham_wire::Error::RequestChunkToUpstream { source }.into())?;
   }
   let mut buf = vec![0u8; CONTROL_READ];
   while let Some((_, left)) = probe.starttls_tail() {
@@ -503,7 +506,7 @@ where
     let Some(window) = buf.get_mut(..want) else {
       return Ok(false);
     };
-    let n = read_count(guest.read(window).await).map_err(|source| Error::GuestRead { source })?;
+    let n = read_count(guest.read(window).await).map_err(|source| arkham_wire::Error::GuestRead { source }.into())?;
     if n == 0 {
       return Ok(false);
     }
@@ -519,14 +522,17 @@ where
       upstream
         .write_all(chunk)
         .await
-        .map_err(|source| Error::RequestChunkToUpstream { source })?;
+        .map_err(|source| arkham_wire::Error::RequestChunkToUpstream { source }.into())?;
     }
     if probe.starttls_tail().is_none() {
       break;
     }
   }
   if forward {
-    upstream.flush().await.map_err(|source| Error::RequestHeadFlush { source })?;
+    upstream
+      .flush()
+      .await
+      .map_err(|source| arkham_wire::Error::RequestHeadFlush { source }.into())?;
   }
   Ok(true)
 }
@@ -543,16 +549,20 @@ where
   loop {
     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
     if left.is_zero() {
-      return Err(Error::UpstreamRead {
-        source: IoError::new(ErrorKind::TimedOut, "ldap starttls response"),
-      });
+      return Err(
+        arkham_wire::Error::UpstreamRead {
+          source: IoError::new(ErrorKind::TimedOut, "ldap starttls response"),
+        }
+        .into(),
+      );
     }
-    let read = tokio::time::timeout(left, server.read(&mut buf))
-      .await
-      .map_err(|_elapsed| Error::UpstreamRead {
+    let read = tokio::time::timeout(left, server.read(&mut buf)).await.map_err(|_elapsed| {
+      arkham_wire::Error::UpstreamRead {
         source: IoError::new(ErrorKind::TimedOut, "ldap starttls response"),
-      })?;
-    let n = read_count(read).map_err(|source| Error::UpstreamRead { source })?;
+      }
+      .into()
+    })?;
+    let n = read_count(read).map_err(|source| arkham_wire::Error::UpstreamRead { source }.into())?;
     if n == 0 {
       return Ok((false, Vec::new()));
     }
@@ -598,8 +608,11 @@ where
   guest
     .write_all(bytes)
     .await
-    .map_err(|source| Error::ResponseChunkToGuest { source })?;
-  guest.flush().await.map_err(|source| Error::GuestFlush { source })?;
+    .map_err(|source| arkham_wire::Error::ResponseChunkToGuest { source }.into())?;
+  guest
+    .flush()
+    .await
+    .map_err(|source| arkham_wire::Error::GuestFlush { source }.into())?;
   Ok(())
 }
 
@@ -610,8 +623,11 @@ where
   server
     .write_all(bytes)
     .await
-    .map_err(|source| Error::RequestChunkToUpstream { source })?;
-  server.flush().await.map_err(|source| Error::RequestHeadFlush { source })?;
+    .map_err(|source| arkham_wire::Error::RequestChunkToUpstream { source }.into())?;
+  server
+    .flush()
+    .await
+    .map_err(|source| arkham_wire::Error::RequestHeadFlush { source }.into())?;
   Ok(())
 }
 

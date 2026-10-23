@@ -154,23 +154,35 @@ pub enum Verify {
   Full,
   /// libpq. A missing root accepts the certificate. A present root checks
   /// the chain, and the host name only when `name` is set.
-  Libpq { name: bool },
+  Libpq {
+    /// Check the certificate's host name.
+    name: bool,
+  },
 }
 
 /// What one upstream handshake needs. The caller already decided that this leg speaks TLS.
 #[derive(Debug, Clone, Copy)]
 pub struct UpstreamTls<'a> {
+  /// Name the certificate must match when verification checks it.
   pub server_name: &'a str,
+  /// Trust anchor from the connection string, when it names one.
   pub root: Option<&'a RootCert>,
+  /// Which checks to run.
   pub verify: Verify,
+  /// PEM client certificate, when the upstream asks for one.
   pub client_cert: Option<&'a Path>,
+  /// PEM client key paired with `client_cert`.
   pub client_key: Option<&'a Path>,
+  /// ALPN identifier to offer, when the protocol has one.
   pub alpn: Option<&'a [u8]>,
 }
 
 /// One side after the handshake budget. Plaintext stays the original stream.
+#[derive(Debug)]
 pub enum Leg<P, T> {
+  /// The original stream.
   Plain(P),
+  /// The stream after the handshake.
   Tls(T),
 }
 
@@ -183,6 +195,11 @@ pub struct TlsLegs {
 }
 
 impl TlsLegs {
+  /// Build the caches over the CA that signs guest-facing leaves.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the CA cannot be read back from its own PEM.
   pub fn new(ca: &CertAuthority) -> Result<Self, Error> {
     Ok(Self {
       ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
@@ -194,13 +211,12 @@ impl TlsLegs {
     })
   }
 
-  pub async fn accept_guest<G>(
-    &self,
-    name: &str,
-    guest: G,
-    mode: GuestTlsMode,
-    alpn: Option<&[u8]>,
-  ) -> Result<ServerTlsStream<G>, Error>
+  /// Accept the guest's TLS, minting the leaf for `name` on first use.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the leaf cannot be minted or the handshake fails.
+  pub async fn accept_guest<G>(&self, name: &str, guest: G, mode: GuestTlsMode, alpn: Option<&[u8]>) -> Result<ServerTlsStream<G>, Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
   {
@@ -214,6 +230,11 @@ impl TlsLegs {
       .map_err(|err| Error::GuestTls { source: err })
   }
 
+  /// Handshake the upstream under `request`.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the trust anchor or client identity cannot be read, when the server name is unusable, or when the handshake fails.
   pub async fn connect_upstream<S>(&self, request: &UpstreamTls<'_>, server: S) -> Result<ClientTlsStream<S>, Error>
   where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -296,6 +317,11 @@ impl IdentityBuilder for rustls::ConfigBuilder<ClientConfig, rustls::client::Wan
   }
 }
 
+/// Apply the handshake budget.
+///
+/// # Errors
+///
+/// Returns an error when the handshake fails or exceeds `budget`.
 pub async fn finish<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
   match tokio::time::timeout(budget, handshake).await {
     Ok(result) => result,
@@ -401,5 +427,11 @@ impl ServerCertVerifier for EgressCertVerifier {
 
   fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
     self.provider.signature_verification_algorithms.supported_schemes()
+  }
+}
+
+impl std::fmt::Debug for TlsLegs {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("TlsLegs").finish_non_exhaustive()
   }
 }

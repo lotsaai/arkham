@@ -366,7 +366,7 @@ mod tests {
     let (_dir, cert, key) = identity_files(&pem_block("OPENSSH PRIVATE KEY", b"not-a-key"));
     let err = client_identity(&cert, &key).expect_err("unknown label");
     assert!(
-      matches!(err, crate::Error::ClientKey { .. }),
+      matches!(err, crate::Error::Wire(arkham_wire::Error::ClientKey { .. })),
       "an unrecognized label stays a key parse error"
     );
   }

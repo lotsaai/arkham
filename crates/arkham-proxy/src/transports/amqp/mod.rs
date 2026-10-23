@@ -70,13 +70,16 @@ impl TlsHalves for AmqpTransport {
     let config = match (&scope.client_cert, &scope.client_key) {
       (Some(cert), Some(key)) => {
         let ClientAuth::Single(data) = client_identity(cert, key)? else {
-          return Err(Error::EmptyClientIdentity { path: cert.clone() });
+          return Err(arkham_wire::Error::EmptyClientIdentity { path: cert.clone() }.into());
         };
         builder
           .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|err| Error::ClientIdentity {
-            path: cert.clone(),
-            source: err,
+          .map_err(|err| {
+            arkham_wire::Error::ClientIdentity {
+              path: cert.clone(),
+              source: err,
+            }
+            .into()
           })?
       }
       _ => builder.with_no_client_auth(),

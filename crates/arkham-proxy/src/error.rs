@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use crate::connection::TrustAnchorsError;
 use httparse::Error as HttparseError;
 use russh::Error as RusshError;
-use rustls::Error as RustlsError;
 
 /// Every way proxy setup and connection serving can fail.
 ///
@@ -112,15 +111,6 @@ pub enum Error {
   /// The client head read times out.
   #[error("client head read timed out")]
   HeadTimeout,
-  /// A file cannot be read.
-  #[error("read {path}: {source}", path = path.display())]
-  ReadFile {
-    /// File that could not be read.
-    path: PathBuf,
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
   /// A MITM identity does not parse.
   #[error("bad MITM identity {identity}: {source}")]
   BadIdentity {
@@ -136,138 +126,6 @@ pub enum Error {
   /// The upstream never answers the TLS request.
   #[error("upstream never answered the TLS request")]
   TlsRequestUnanswered,
-  /// The relay fails writing the request head upstream.
-  #[error("relay request head to upstream: {source}")]
-  RequestHeadToUpstream {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails flushing the request head upstream.
-  #[error("relay request head flush: {source}")]
-  RequestHeadFlush {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails flushing the request to upstream.
-  #[error("relay request flush to upstream: {source}")]
-  RequestFlushToUpstream {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails writing a request chunk upstream.
-  #[error("relay request chunk to upstream: {source}")]
-  RequestChunkToUpstream {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails reading the guest.
-  #[error("guest read: {source}")]
-  GuestRead {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails reading upstream.
-  #[error("upstream read: {source}")]
-  UpstreamRead {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails flushing the response to the guest.
-  #[error("relay response flush to guest: {source}")]
-  ResponseFlushToGuest {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails writing a response chunk to the guest.
-  #[error("relay response chunk to guest: {source}")]
-  ResponseChunkToGuest {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails flushing the guest.
-  #[error("relay guest flush: {source}")]
-  GuestFlush {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails on the final guest flush.
-  #[error("relay final guest flush: {source}")]
-  FinalGuestFlush {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails writing a protocol reply to the guest.
-  #[error("relay protocol reply to guest: {source}")]
-  ProtocolReplyToGuest {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// The relay fails flushing a protocol reply.
-  #[error("relay protocol reply flush: {source}")]
-  ProtocolReplyFlush {
-    /// Underlying I/O failure.
-    #[source]
-    source: IoError,
-  },
-  /// A guest certificate chain does not parse.
-  #[error("certificate {path}: {source}", path = path.display())]
-  GuestCertificate {
-    /// Chain file that failed to parse.
-    path: PathBuf,
-    /// Underlying parse failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// A guest chain file holds no certificates.
-  #[error("`{path}` holds no certificates", path = path.display())]
-  EmptyChain {
-    /// Chain file that holds nothing.
-    path: PathBuf,
-  },
-  /// A client key does not parse.
-  #[error("key {path}: {source}", path = path.display())]
-  ClientKey {
-    /// Key file that failed to parse.
-    path: PathBuf,
-    /// Underlying parse failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// A guest TLS handshake fails.
-  #[error("guest TLS: {source}")]
-  GuestTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// An upstream TLS handshake fails.
-  #[error("server TLS: {source}")]
-  ServerTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// An upstream name cannot become a TLS server name.
-  #[error("TLS server name: {source}")]
-  TlsServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// A TLS handshake exceeded the configured budget.
-  #[error("TLS handshake timed out")]
-  HandshakeTimeout,
   /// A guest LDAP TLS handshake fails.
   #[error("guest ldap TLS: {source}")]
   GuestLdapTls {
@@ -396,67 +254,6 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
-  /// The configured client identity is empty.
-  #[error("client identity `{path}` is empty", path = path.display())]
-  EmptyClientIdentity {
-    /// Identity cert file that is empty.
-    path: PathBuf,
-  },
-  /// The client identity does not build.
-  #[error("client identity `{path}`: {source}", path = path.display())]
-  ClientIdentity {
-    /// Identity cert file that failed.
-    path: PathBuf,
-    /// Underlying build failure.
-    #[source]
-    source: RustlsError,
-  },
-  /// The mTLS guest roots do not build.
-  #[error("mtls guest roots: {source}")]
-  MtlsGuestRoots {
-    /// Underlying build failure.
-    #[source]
-    source: RustlsError,
-  },
-  /// The mTLS guest verifier does not build.
-  #[error("mtls guest verifier: {source}")]
-  MtlsGuestVerifier {
-    /// Underlying build failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// The mTLS leaf does not build.
-  #[error("mtls leaf: {source}")]
-  MtlsLeaf {
-    /// Underlying build failure.
-    #[source]
-    source: RustlsError,
-  },
-  /// An `sslrootcert` file fails.
-  #[error("sslrootcert {path}: {source}", path = path.display())]
-  SslRootCert {
-    /// Root file that failed.
-    path: PathBuf,
-    /// Underlying failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// An `sslrootcert` file holds no certificate.
-  #[error("sslrootcert {path}: no certificate in file", path = path.display())]
-  EmptyRootCert {
-    /// Root file that holds nothing.
-    path: PathBuf,
-  },
-  /// The system trust store reports an error.
-  #[error("sslrootcert system store: {source}")]
-  SystemStore {
-    /// Underlying store failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// The system trust store holds no certificates.
-  #[error("sslrootcert system store holds no certificates")]
-  EmptySystemStore,
   /// An egress client identity does not build.
   #[error("client identity: {source}")]
   ClientAuthPolicy {
@@ -473,43 +270,9 @@ pub enum Error {
   /// An SMTP grant-parse failure reached the proxy.
   #[error(transparent)]
   Smtp(arkham_smtp::Error),
-}
-
-impl From<arkham_wire::Error> for Error {
-  fn from(err: arkham_wire::Error) -> Self {
-    match err {
-      arkham_wire::Error::Pki(source) => Self::Pki(source),
-      arkham_wire::Error::ReadFile { path, source } => Self::ReadFile { path, source },
-      arkham_wire::Error::RequestHeadToUpstream { source } => Self::RequestHeadToUpstream { source },
-      arkham_wire::Error::RequestHeadFlush { source } => Self::RequestHeadFlush { source },
-      arkham_wire::Error::RequestFlushToUpstream { source } => Self::RequestFlushToUpstream { source },
-      arkham_wire::Error::RequestChunkToUpstream { source } => Self::RequestChunkToUpstream { source },
-      arkham_wire::Error::GuestRead { source } => Self::GuestRead { source },
-      arkham_wire::Error::UpstreamRead { source } => Self::UpstreamRead { source },
-      arkham_wire::Error::ResponseFlushToGuest { source } => Self::ResponseFlushToGuest { source },
-      arkham_wire::Error::ResponseChunkToGuest { source } => Self::ResponseChunkToGuest { source },
-      arkham_wire::Error::GuestFlush { source } => Self::GuestFlush { source },
-      arkham_wire::Error::FinalGuestFlush { source } => Self::FinalGuestFlush { source },
-      arkham_wire::Error::ProtocolReplyToGuest { source } => Self::ProtocolReplyToGuest { source },
-      arkham_wire::Error::ProtocolReplyFlush { source } => Self::ProtocolReplyFlush { source },
-      arkham_wire::Error::GuestCertificate { path, source } => Self::GuestCertificate { path, source },
-      arkham_wire::Error::EmptyChain { path } => Self::EmptyChain { path },
-      arkham_wire::Error::ClientKey { path, source } => Self::ClientKey { path, source },
-      arkham_wire::Error::GuestTls { source } => Self::GuestTls { source },
-      arkham_wire::Error::ServerTls { source } => Self::ServerTls { source },
-      arkham_wire::Error::TlsServerName { source } => Self::TlsServerName { source },
-      arkham_wire::Error::HandshakeTimeout => Self::HandshakeTimeout,
-      arkham_wire::Error::EmptyClientIdentity { path } => Self::EmptyClientIdentity { path },
-      arkham_wire::Error::ClientIdentity { path, source } => Self::ClientIdentity { path, source },
-      arkham_wire::Error::MtlsGuestRoots { source } => Self::MtlsGuestRoots { source },
-      arkham_wire::Error::MtlsGuestVerifier { source } => Self::MtlsGuestVerifier { source },
-      arkham_wire::Error::MtlsLeaf { source } => Self::MtlsLeaf { source },
-      arkham_wire::Error::SslRootCert { path, source } => Self::SslRootCert { path, source },
-      arkham_wire::Error::EmptyRootCert { path } => Self::EmptyRootCert { path },
-      arkham_wire::Error::SystemStore { source } => Self::SystemStore { source },
-      arkham_wire::Error::EmptySystemStore => Self::EmptySystemStore,
-    }
-  }
+  /// A shared TLS or relay failure.
+  #[error(transparent)]
+  Wire(#[from] arkham_wire::Error),
 }
 
 impl From<arkham_smtp::Error> for Error {
