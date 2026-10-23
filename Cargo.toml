@@ -69,6 +69,7 @@ unneeded_field_pattern = "warn"
 unused_result_ok = "warn"
 
 [workspace.dependencies]
+arkham-amqp = { path = "crates/arkham-amqp" }
 arkham-compose = { path = "crates/arkham-compose" }
 arkham-config = { path = "crates/arkham-config" }
 arkham-ebpf = { path = "crates/arkham-ebpf" }

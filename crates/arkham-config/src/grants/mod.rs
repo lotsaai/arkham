@@ -12,7 +12,7 @@ mod postgres;
 mod redis;
 mod smtp;
 
-pub use amqp::{AmqpLeg, AmqpScope, AmqpUriError};
+pub use arkham_amqp::{AmqpLeg, AmqpScope, AmqpUriError};
 pub use arkham_ldap::{LdapLeg, LdapScope, LdapUriError};
 pub use arkham_smtp::{SmtpLeg, SmtpScope, SmtpUriError};
 pub use arkham_wire::{GuestTlsMode, RootCert};
@@ -472,7 +472,9 @@ impl Grant {
         matches!(scheme, Scheme::Ldap | Scheme::Ldaps) && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
       }
       Grant::Nats { scope, .. } => NatsScope::matches(scope, scheme, host, port),
-      Grant::Amqp { scope, .. } => AmqpScope::matches(scope, scheme, host, port),
+      Grant::Amqp { scope, .. } => {
+        matches!(scheme, Scheme::Amqp | Scheme::Amqps) && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
+      }
       Grant::Ssh { allow } => allow.iter().any(|entry| ssh_match(entry, scheme, host, port)),
     }
   }

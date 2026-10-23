@@ -1,91 +1,25 @@
-pub(crate) mod machine;
-
-use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use secrecy::ExposeSecret as _;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use arkham_config::grants::{AmqpScope, GuestTlsMode, RootCert};
-use arkham_pki::ca::CertAuthority;
+use arkham_amqp::{Amqp, SaslSwap};
+use arkham_config::grants::{AmqpScope, Grant, GuestTlsMode};
+use arkham_wire::engine::Direction;
+use arkham_wire::tls::TlsLegs;
 
 use super::PairCtx;
-use super::{ServeStream, TlsHalves, Transport};
+use super::{ServeStream, Transport};
 use crate::Error;
-use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening};
+use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::relay::relay_guarded;
-use crate::transports::engine::{Amqp, Direction};
-use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
-use rama::tls::client::ClientAuth;
+use crate::transports::tls::{UpstreamTls, Verify, finish};
 
-#[derive(Debug)]
-pub(crate) struct AmqpTransport {
-  ca: CertAuthority,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
-}
-
-impl AmqpTransport {
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
-    })
-  }
-}
-
-impl TlsHalves for AmqpTransport {
-  type Scope = AmqpScope;
-
-  async fn accept_guest<G>(&self, name: &str, guest: G, guest_tls: GuestTlsMode) -> Result<ServerTlsStream<G>, Error>
-  where
-    G: AsyncRead + AsyncWrite + Unpin,
-  {
-    let config = match guest_tls {
-      GuestTlsMode::Tls => cached_leaf(&self.ca, &self.leaves, name, None)?,
-      GuestTlsMode::Mtls => cached_leaf_mtls(&self.ca, &self.leaves, name, None)?,
-    };
-    TlsAcceptor::from(config)
-      .accept(guest)
-      .await
-      .map_err(|err| Error::GuestAmqpTls { source: err })
-  }
-
-  async fn connect_server<S>(&self, scope: &AmqpScope, server_name: &str, server: S) -> Result<ClientTlsStream<S>, Error>
-  where
-    S: AsyncRead + AsyncWrite + Unpin,
-  {
-    let root = scope.root_cert.clone().unwrap_or(RootCert::System);
-    let roots = cached_roots(&self.roots, &root)?;
-    let builder = ClientConfig::builder().with_root_certificates(roots);
-    let config = match (&scope.client_cert, &scope.client_key) {
-      (Some(cert), Some(key)) => {
-        let ClientAuth::Single(data) = client_identity(cert, key)? else {
-          return Err(Error::EmptyClientIdentity { path: cert.clone() });
-        };
-        builder
-          .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|err| Error::ClientIdentity {
-            path: cert.clone(),
-            source: err,
-          })?
-      }
-      _ => builder.with_no_client_auth(),
-    };
-    let name = ServerName::try_from(server_name.to_string()).map_err(|err| Error::AmqpServerName { source: err.into() })?;
-    TlsConnector::from(Arc::new(config))
-      .connect(name, server)
-      .await
-      .map_err(|err| Error::ServerAmqpTls { source: err })
-  }
-}
+#[derive(Debug, Default)]
+pub(crate) struct AmqpTransport;
 
 impl Transport for AmqpTransport {
   type Scope = AmqpScope;
@@ -126,19 +60,20 @@ impl Transport for AmqpTransport {
       plugins: &state.plugins,
       mint: Some(state.mint_handle()),
     };
-    self
-      .relay_settled(
-        OpenGuest {
-          stream: guest,
-          head: guest_head,
-          tls: guest_tls,
-        },
-        upstream,
-        scope,
-        &ctx,
-        budget,
-      )
-      .await
+    let legs = &state.legs;
+    relay_settled(
+      OpenGuest {
+        stream: guest,
+        head: guest_head,
+        tls: guest_tls,
+      },
+      upstream,
+      scope,
+      &ctx,
+      legs,
+      budget,
+    )
+    .await
   }
 }
 
@@ -148,53 +83,77 @@ struct OpenGuest<G> {
   tls: Option<(Vec<u8>, String)>,
 }
 
-impl AmqpTransport {
-  async fn relay_settled<G, S>(
-    &self,
-    guest: OpenGuest<G>,
-    upstream: S,
-    scope: &AmqpScope,
-    ctx: &PairCtx<'_>,
-    budget: Duration,
-  ) -> Result<(), Error>
-  where
-    G: AsyncRead + AsyncWrite + Unpin,
-    S: AsyncRead + AsyncWrite + Unpin,
-  {
-    let OpenGuest { stream, head, tls } = guest;
-    let upstream_name = scope.upstream.host.as_str();
-    match (tls, scope.is_upstream_tls) {
-      (None, false) => relay(Prefixed::new(head, stream), upstream, ctx).await,
-      (Some((hello_buf, identity)), false) => {
-        let plain = within(
-          budget,
-          self.accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls),
-        )
-        .await?;
-        relay(plain, upstream, ctx).await
-      }
-      (None, true) => {
-        let plain = within(budget, self.connect_server(scope, upstream_name, upstream)).await?;
-        relay(Prefixed::new(head, stream), plain, ctx).await
-      }
-      (Some((hello_buf, identity)), true) => {
-        let guest_plain = within(
-          budget,
-          self.accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls),
-        )
-        .await?;
-        let server_plain = within(budget, self.connect_server(scope, upstream_name, upstream)).await?;
-        relay(guest_plain, server_plain, ctx).await
-      }
+async fn relay_settled<G, S>(
+  guest: OpenGuest<G>,
+  upstream: S,
+  scope: &AmqpScope,
+  ctx: &PairCtx<'_>,
+  legs: &TlsLegs,
+  budget: Duration,
+) -> Result<(), Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  let OpenGuest { stream, head, tls } = guest;
+  let upstream_name = scope.upstream.host.as_str();
+  match (tls, scope.is_upstream_tls) {
+    (None, false) => relay(Prefixed::new(head, stream), upstream, ctx).await,
+    (Some((hello_buf, identity)), false) => {
+      let plain = accept_guest(legs, &identity, Prefixed::new(hello_buf, stream), scope.guest_tls, budget).await?;
+      relay(plain, upstream, ctx).await
+    }
+    (None, true) => {
+      let plain = connect_server(legs, scope, upstream_name, upstream, budget).await?;
+      relay(Prefixed::new(head, stream), plain, ctx).await
+    }
+    (Some((hello_buf, identity)), true) => {
+      let guest_plain = accept_guest(legs, &identity, Prefixed::new(hello_buf, stream), scope.guest_tls, budget).await?;
+      let server_plain = connect_server(legs, scope, upstream_name, upstream, budget).await?;
+      relay(guest_plain, server_plain, ctx).await
     }
   }
 }
 
-async fn within<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
-  match tokio::time::timeout(budget, handshake).await {
-    Ok(result) => result,
-    Err(_elapsed) => Err(Error::AmqpHandshakeTimeout),
-  }
+async fn accept_guest<G>(legs: &TlsLegs, name: &str, guest: G, mode: GuestTlsMode, budget: Duration) -> Result<ServerTlsStream<G>, Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin,
+{
+  finish(budget, legs.accept_guest(name, guest, mode, None))
+    .await
+    .map_err(Error::from)
+}
+
+async fn connect_server<S>(
+  legs: &TlsLegs,
+  scope: &AmqpScope,
+  server_name: &str,
+  server: S,
+  budget: Duration,
+) -> Result<ClientTlsStream<S>, Error>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  let root = scope.root_cert.as_ref();
+  let client_cert = scope.client_cert.as_deref();
+  let client_key = scope.client_key.as_deref();
+  finish(budget, async move {
+    legs
+      .connect_upstream(
+        &UpstreamTls {
+          server_name,
+          root,
+          verify: Verify::Full,
+          client_cert,
+          client_key,
+          alpn: None,
+        },
+        server,
+      )
+      .await
+  })
+  .await
+  .map_err(Error::from)
 }
 
 async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>) -> Result<(), Error>
@@ -206,9 +165,23 @@ where
   relay_guarded(guest, server, &mut downstream, &mut upstream, &[], &[]).await
 }
 
-pub(crate) fn amqp_pair(ctx: &PairCtx<'_>) -> Result<(Amqp, Amqp), Error> {
+fn sasl_swap(grants: &[Grant], host: &str, port: u16) -> Option<SaslSwap> {
+  grants.iter().find_map(|grant| {
+    let scope = grant.amqp(Some(host), port)?;
+    let label = grant.credential().map(|credential| credential.label.clone()).unwrap_or_default();
+    Some(SaslSwap {
+      label,
+      fake: scope.downstream.password.expose_secret().as_bytes().to_vec(),
+      user: scope.upstream.user.as_bytes().to_vec(),
+      real: scope.upstream.password.expose_secret().as_bytes().to_vec(),
+    })
+  })
+}
+
+fn amqp_pair(ctx: &PairCtx<'_>) -> Result<(Amqp, Amqp), Error> {
+  let swap = sasl_swap(ctx.grants, ctx.host, ctx.port);
   Ok((
-    Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream)?,
-    Amqp::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream)?,
+    Amqp::new(swap.clone(), Direction::Downstream)?,
+    Amqp::new(swap, Direction::Upstream)?,
   ))
 }
