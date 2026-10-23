@@ -3,7 +3,8 @@
 //!
 //! `nats://` and `tls://` are the two spellings official NATS clients
 //! accept, and both are [`Scheme::Nats`]. A `nats://` real string is a
-//! cleartext upstream, so CONNECT forwards the decoy. A `tls://` real
+//! cleartext upstream, and CONNECT swaps the real credential the same way
+//! it does on TLS. A `tls://` real
 //! string is a TLS upstream: the server sends one cleartext INFO line and
 //! the client upgrades before CONNECT, or with `handshake_first=true` both
 //! legs do TLS before any protocol byte.
@@ -610,7 +611,7 @@ impl NatsAuth {
 /// How the proxy reaches the real server. Only the real string states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NatsUpstream {
-  /// `nats://`. The leg never upgrades and CONNECT carries the decoy.
+  /// `nats://`. The leg never upgrades. CONNECT swaps the same way as TLS.
   Cleartext,
   /// `tls://`. The leg is TLS before CONNECT, verified against `trust`.
   Tls {
@@ -1135,14 +1136,6 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
       return Err(Error::NatsTrust { label: label.to_string() });
     }
     scope.guest_tls = tls.guest_tls_mode;
-  }
-  if scope.upstream_tls == NatsUpstream::Cleartext {
-    tracing::warn!(
-      label,
-      host = %scope.upstream.host,
-      port = scope.upstream.port,
-      "nats:// upstream is cleartext; CONNECT forwards the decoy"
-    );
   }
   let (fake, value) = scope.auth.credential();
   let (fake, value) = (fake.to_string(), value.clone());

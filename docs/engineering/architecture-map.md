@@ -194,16 +194,16 @@ Per-protocol prod lines below are proxy files plus the matching `grants/` file (
 | What | Copies | Base it should use |
 |---|---|---|
 | Transport struct `{ca, leaves, roots}` plus `new` doing `CertAuthority::load(cert_pem,key_pem)` | redis :34-52, smtp :39-57, ldap :41-59, nats :47-65, amqp :25-38, postgres :35-59 | One shared TLS state in `ProxyState` |
-| `serve` opening (`is_downstream_tls` → `guest_tls_opening`, TLS-on-cleartext close, `dial_marked`, `matched_name`, `PairCtx`) | redis :103-139, smtp :110-137, ldap :112-136, amqp :88-110 | Shared helper |
+| `serve` opening (`is_downstream_tls` → `guest_tls_opening`, `dial_marked`, `matched_name`, `PairCtx`) | redis :103-139, smtp :110-137, ldap :112-136, amqp :88-110 | Shared helper |
 | 4-way `(guest_tls, upstream_tls)` leg match | redis :142-159, postgres :195-213, ldap :194-210, amqp :149-171 | Shared helper |
 | `within`/handshake timeout | amqp/mod.rs:176, nats/mod.rs:267, smtp/mod.rs:170, smtp/session.rs:428 | One helper plus one error |
-| `const TLS_RECORD_HANDSHAKE = 0x16` | amqp:22, ldap:35, nats:40, redis:28, smtp:35, postgres/machine.rs:364 | One const |
+| `const TLS_RECORD_HANDSHAKE = 0x16` | nats/mod.rs, postgres/machine.rs | One const |
 | Scan-close-hold "guard" (find a full match → close; else hold `needle_prefix_suffix_len`) | amqp/machine.rs:928-947, ldap/machine.rs:828-851, nats/machine.rs:1164-1179 | No engine primitive exists yet; `Raw` replaces but never closes |
 | Per-protocol handshake-timeout errors (`NatsHandshakeTimeout`, `AmqpHandshakeTimeout`, `SmtpHandshakeTimeout`) | proxy/error.rs:276, 293, 321 | One timeout variant |
 | Grant lookups with identical bodies | grants/mod.rs:514-574 (6 copies) | One generic lookup |
 | `XScope::matches` | redis.rs:225, smtp.rs:390, ldap.rs:279, amqp.rs:263, postgres.rs:287, nats.rs:1102 | Same shape |
 | `Leg`/`Scope` structs (`host`, `port`, `password`, `is_*_tls`, `root_cert`, `client_cert`/`key`, `guest_tls`) | redis.rs:16/35, smtp.rs:23/43, ldap.rs:17/35, amqp.rs:13/33 | Shared leg/scope |
-| `grant()` `rule.tls` loop (`TlsEnvMismatch` / Identity / Trust / CleartextMtls) | redis.rs:240-282, ldap.rs:292-330, smtp.rs:403+, amqp.rs:268+ (I read the first two in full and saw the same error variants in the other two) | Shared |
+| `grant()` `rule.tls` loop (`TlsEnvMismatch` / Identity / Trust) | redis.rs:240-282, ldap.rs:292-330, smtp.rs:403+, amqp.rs:268+ (I read the first two in full and saw the same error variants in the other two) | Shared |
 | Guest-CA load-or-generate | stack.rs:190-203, rewrites.rs:257-278, ambient.rs:311-326 | One loader |
 | `HostTlsCfg` + client cert/key/ca blob naming | kube.rs:370-383, talos.rs:383-398 | Shared |
 
@@ -215,15 +215,9 @@ These are the places a new protocol has to edit today:
 - **lib.rs:75-84, 174-194** `ProxyState` has one field per protocol.
 - **grants/mod.rs:91, 396, 514-586, 682-688** and **config.rs:413-437**.
 
-### Cleartext/TLS rules still on main
-These conflict with the rule that arkham protects against the agent, not against the network.
+### Cleartext swaps the same credential as TLS
 
-| Rule | Where |
-|---|---|
-| TLS hello on a cleartext scope closes the connection | redis/mod.rs:116-120, smtp/mod.rs:120-122, ldap/mod.rs:119-121, amqp/mod.rs:95-97, nats/mod.rs:173-175 |
-| **Swap only when upstream is TLS** | amqp/mod.rs:147 + machine.rs:284 (upstream redaction also gated, :294); ldap/mod.rs:193, 224 + machine.rs:586; nats/mod.rs:179 (`trust.is_some()`) + machine.rs:452-474; grants/nats.rs:1139-1146 warns "CONNECT forwards the decoy" |
-| Errors out on a cleartext INFO with `tls_required` | nats/mod.rs:312-322 |
-| mTLS with a plaintext guest | postgres/mod.rs:156-158, nats/mod.rs:243-245; config rejects `*CleartextMtls` at redis.rs:266, ldap.rs:316, smtp.rs:428, amqp.rs:293 |
+A TLS hello on a cleartext scope, a swap that waited for a TLS upstream, a close on a cleartext NATS INFO with `tls_required`, and an mTLS plaintext-guest refusal are gone. A matched grant swaps the real credential on cleartext the same way it does on TLS. See `AGENTS.md`.
 
 ## 4. One connection, guest → upstream
 

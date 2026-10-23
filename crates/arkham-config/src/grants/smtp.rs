@@ -3,7 +3,7 @@
 //!
 //! `smtp://` is a cleartext session that may upgrade with STARTTLS.
 //! `smtps://` is implicit TLS from the first byte. The real password is
-//! swapped only once the upstream leg is TLS. `starttls=required` on an
+//! swapped on cleartext the same way as on TLS. `starttls=required` on an
 //! `smtp://` string is what submission (port 587) demands, and it is what
 //! makes trust material legal on that scheme.
 
@@ -397,9 +397,7 @@ impl SmtpScope {
 /// # Errors
 ///
 /// Returns an error when either string fails the law above, when a `tls`
-/// row tries to state what only the real string may state, or when
-/// `guest_tls_mode` is `mtls` on an `smtp://` fake whose real string is
-/// `smtps://`.
+/// row tries to state what only the real string may state.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
   let fake = rule
     .value
@@ -424,18 +422,7 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
     if tls.root_cert.is_some() {
       return Err(Error::SmtpTrust { label: label.to_string() });
     }
-    if tls.guest_tls_mode == GuestTlsMode::Mtls && scope.is_upstream_tls && !scope.is_downstream_tls {
-      return Err(Error::SmtpCleartextMtls { label: label.to_string() });
-    }
     scope.guest_tls = tls.guest_tls_mode;
-  }
-  if !scope.is_upstream_tls && !scope.starttls_required {
-    tracing::warn!(
-      label,
-      host = %scope.upstream.host,
-      port = scope.upstream.port,
-      "smtp:// upstream is cleartext; AUTH forwards the decoy until that leg is TLS"
-    );
   }
   let credential = Credential {
     label: label.to_string(),

@@ -5,7 +5,7 @@
 //! with the bytes read past INFO replayed into its handshake. A guest whose
 //! next byte opens a TLS record is terminated here. With `handshake_first`
 //! both legs settle TLS before any protocol byte. CONNECT carries the real
-//! values only when the server leg is TLS.
+//! values on a cleartext server leg the same way it does on TLS.
 
 pub mod machine;
 
@@ -24,7 +24,7 @@ use dashmap::DashMap;
 use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use arkham_config::grants::{Grant, GuestTlsMode, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, RootCert};
+use arkham_config::grants::{Grant, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, RootCert};
 use arkham_pki::ca::CertAuthority;
 
 use super::{ServeStream, TlsHalves, Transport};
@@ -170,14 +170,10 @@ impl NatsTransport {
   where
     G: AsyncRead + AsyncWrite + Unpin,
   {
-    if initial.first() == Some(&TLS_RECORD_HANDSHAKE) {
-      tracing::debug!("TLS before INFO on a nats scope without handshake_first; closing");
-      return Ok(());
-    }
     let upstream = &open.scope.upstream;
     let mut tcp = dial_marked(&upstream.host, upstream.port, open.fwmark).await?;
-    let (mut down, mut up) = open.pair(trust.is_some());
-    let Some(rest) = server_info(&mut tcp, &mut up, &mut down, &mut guest, trust.is_none()).await? else {
+    let (mut down, mut up) = open.pair(true);
+    let Some(rest) = server_info(&mut tcp, &mut up, &mut down, &mut guest).await? else {
       return Ok(());
     };
     if let Some(trust) = trust {
@@ -218,7 +214,7 @@ impl NatsTransport {
     )
     .await?;
     let (mut down, mut up) = open.pair(true);
-    let Some(rest) = server_info(&mut server, &mut up, &mut down, &mut guest, false).await? else {
+    let Some(rest) = server_info(&mut server, &mut up, &mut down, &mut guest).await? else {
       return Ok(());
     };
     relay_guarded(guest, server, &mut down, &mut up, &[], &rest).await
@@ -241,9 +237,6 @@ impl NatsTransport {
       return Ok(());
     };
     if head.first() != Some(&TLS_RECORD_HANDSHAKE) {
-      if open.scope.guest_tls == GuestTlsMode::Mtls {
-        return Err(Error::NatsGuestPlaintext);
-      }
       return relay_guarded(guest, stream, &mut down, &mut up, &head, &first).await;
     }
     let Some((hello_buf, identity, _)) = guest_tls_opening(&mut guest, &head, open.budget, Some(open.authority), open.mint).await? else {
@@ -258,8 +251,8 @@ impl NatsTransport {
   }
 }
 
-/// Both directions for a NATS scope. `swap` is true only when the server
-/// leg is TLS: a cleartext server leg must keep the decoy.
+/// Both directions for a NATS scope. `swap` rewrites CONNECT. Production
+/// passes `true` on every server leg.
 pub(crate) fn nats_pair(grants: &[Grant], host: &str, port: u16, swap: bool) -> (Nats, Nats) {
   (Nats::downstream(grants, host, port, swap), Nats::upstream(grants, host, port))
 }
@@ -271,27 +264,15 @@ async fn within<T>(budget: Duration, step: impl Future<Output = Result<T, Error>
 /// Forward the server's first line, INFO, through `up` to the guest, and
 /// return the bytes read past its LF. On a `tls://` server leg they belong
 /// to the server's TLS, not to NATS. `None` when the server closes first or
-/// `up` closes the leg. `cleartext` is the upstream that will not upgrade:
-/// INFO `tls_required` then closes the session. The line may cross reads.
-/// `up` reads the object with actson as those reads stream, and the check
-/// runs once the read that holds the LF has been framed, before that read
-/// is written to the guest. A line that does not finish an object, and
-/// does not set `tls_required`, closes too. The success path that has seen
-/// LF moves that line's nonce onto `down` before returning the bytes past it.
+/// `up` closes the leg. The line may cross reads. `up` reads the object with
+/// actson as those reads stream. The success path that has seen LF moves
+/// that line's nonce onto `down` before returning the bytes past it.
+/// `tls_required` does not close the session.
 ///
 /// # Errors
 ///
-/// Returns [`Error::NatsTlsRequired`] when `cleartext` is set and the INFO
-/// object sets `tls_required`. Returns [`Error::NatsInfoUnreadable`] when
-/// `cleartext` is set and the object does not finish without that flag.
 /// Returns an error when the server read or the guest write fails.
-pub(crate) async fn server_info<S, G>(
-  server: &mut S,
-  up: &mut Nats,
-  down: &mut Nats,
-  guest: &mut G,
-  cleartext: bool,
-) -> Result<Option<Vec<u8>>, Error>
+pub(crate) async fn server_info<S, G>(server: &mut S, up: &mut Nats, down: &mut Nats, guest: &mut G) -> Result<Option<Vec<u8>>, Error>
 where
   S: AsyncRead + Unpin,
   G: AsyncWrite + Unpin,
@@ -309,18 +290,6 @@ where
     };
     let (rewritten, hits) = up.feed(line).await;
     log_hits(&hits);
-    if cleartext && let Some(verdict) = up.take_info_tls() {
-      match verdict {
-        machine::InfoVerdict::Flags(info) if info.tls_required => {
-          return Err(Error::NatsTlsRequired {
-            tls_available: info.tls_available,
-            tls_verify: info.tls_verify,
-          });
-        }
-        machine::InfoVerdict::Unreadable => return Err(Error::NatsInfoUnreadable),
-        machine::InfoVerdict::Flags(_) => {}
-      }
-    }
     match rewritten {
       Rewritten::Close => return Ok(None),
       Rewritten::Hold => {}
@@ -389,10 +358,8 @@ mod tests {
   use super::server_info;
   use crate::transports::engine::{Rewritten, Wire};
 
-  type OpeningFailure<'a> = (&'a [u8], fn(&crate::Error) -> bool);
-
   #[tokio::test]
-  async fn mtls_plaintext_guest_closes_without_forwarding() {
+  async fn mtls_plaintext_guest_forwards_the_real_password() {
     let ca = CertAuthority::generate().expect("ca");
     let transport = NatsTransport::new(&ca).expect("transport");
     let grants = nats_grants(
@@ -431,12 +398,13 @@ mod tests {
       ),
     )
     .await
-    .expect("plaintext mtls guest must not enter the relay");
-    let err = finished.expect_err("plaintext mtls guest");
-    assert!(matches!(err, crate::Error::NatsGuestPlaintext), "{err}");
+    .expect("plaintext mtls guest reaches the upstream");
+    finished.expect("plaintext mtls guest relay");
     let mut forwarded = Vec::new();
     upstream.read_to_end(&mut forwarded).await.expect("upstream read");
-    assert_eq!(forwarded, b"");
+    let text = String::from_utf8_lossy(&forwarded);
+    assert!(text.contains("real-nats-pass-is-longer"), "{text}");
+    assert!(!text.contains("arkham_fake_nats_pass"), "{text}");
   }
 
   #[tokio::test]
@@ -452,7 +420,7 @@ mod tests {
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
     let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest).await.unwrap();
     assert_eq!(rest, Some(vec![0x16, 0x03, 0x01]));
     assert_eq!(guest, info);
     let Rewritten::Emit(next) = up.feed(b"+OK\r\n").await.0 else {
@@ -462,7 +430,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn cleartext_upstream_closes_when_info_requires_tls() {
+  async fn cleartext_upstream_forwards_info_when_tls_is_required() {
     let grants = nats_grants(
       "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
       "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
@@ -472,18 +440,12 @@ mod tests {
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
     let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
-    assert!(
-      matches!(
-        err,
-        crate::Error::NatsTlsRequired {
-          tls_available: true,
-          tls_verify: false
-        }
-      ),
-      "{err}"
-    );
-    assert_eq!(guest, b"");
+    let line = &info[..info.len() - b"CONNECT {\"x\":1}\r\n".len()];
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest)
+      .await
+      .expect("cleartext INFO is forwarded");
+    assert_eq!(guest, line);
+    assert_eq!(rest.as_deref(), Some(&b"CONNECT {\"x\":1}\r\n"[..]));
   }
 
   #[tokio::test]
@@ -497,162 +459,81 @@ mod tests {
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
     let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap();
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
     assert_eq!(guest, info);
   }
 
-  /// `\u005f` is `_`. A cleartext INFO with that spelling of `tls_required` closes.
+  /// `\u005f` is `_`. That spelling of `tls_required` is still forwarded.
   #[tokio::test]
-  async fn cleartext_info_escaped_tls_required_key_closes() {
-    let grants = nats_grants(
-      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
-      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
-    );
+  async fn escaped_tls_required_key_is_forwarded() {
     let info = b"INFO {\"tls\\u005frequired\":true,\"tls_available\":true,\"tls_verify\":false}\r\n";
-    let mut server = Cursor::new(info.to_vec());
-    let mut guest = Vec::new();
-    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
-    assert!(
-      matches!(
-        err,
-        crate::Error::NatsTlsRequired {
-          tls_available: true,
-          tls_verify: false
-        }
-      ),
-      "{err}"
-    );
-    assert_eq!(guest, b"");
+    let (guest, rest) = forward_info(&[info]).await;
+    assert_eq!(guest, info);
+    assert_eq!(rest, Some(Vec::new()));
   }
 
-  /// A cleartext INFO that never finishes an object, and never sets the flag, closes.
+  /// An INFO line that never finishes an object is forwarded.
   #[tokio::test]
-  async fn cleartext_malformed_info_closes() {
-    let grants = nats_grants(
-      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
-      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
-    );
+  async fn malformed_info_is_forwarded() {
     let info = b"INFO {\"server_id\":\r\n";
-    let mut server = Cursor::new(info.to_vec());
-    let mut guest = Vec::new();
-    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
-    assert!(matches!(err, crate::Error::NatsInfoUnreadable), "{err}");
+    let (guest, rest) = forward_info(&[info]).await;
+    assert_eq!(guest, info);
+    assert_eq!(rest, Some(Vec::new()));
   }
 
-  /// `tls_required` was already true when the object broke, so the close names that flag.
+  /// A broken object after `tls_required` is forwarded.
   #[tokio::test]
-  async fn cleartext_broken_info_after_tls_required_closes() {
-    let grants = nats_grants(
-      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
-      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
-    );
+  async fn broken_info_after_tls_required_is_forwarded() {
     let info = b"INFO {\"tls_required\":true,\r\n";
-    let mut server = Cursor::new(info.to_vec());
-    let mut guest = Vec::new();
-    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
-    assert!(
-      matches!(
-        err,
-        crate::Error::NatsTlsRequired {
-          tls_available: false,
-          tls_verify: false
-        }
-      ),
-      "{err}"
-    );
+    let (guest, rest) = forward_info(&[info]).await;
+    assert_eq!(guest, info);
+    assert_eq!(rest, Some(Vec::new()));
   }
 
-  /// INFO whose newline is not in the same read as `INFO`. The verb and the
-  /// start of `tls_required` arrive first; the value and the LF arrive next.
+  /// INFO whose newline is not in the same read as `INFO`. Bytes past LF stay unread.
   #[tokio::test]
-  async fn cleartext_info_split_across_reads_closes() {
-    let grants = nats_grants(
-      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
-      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
-    );
+  async fn info_split_across_reads_leaves_the_tail_unread() {
     let first: &[u8] = b"INFO {\"server_id\":\"split\",\"tls_req";
     let second: &[u8] = b"uired\":true,\"tls_available\":true,\"tls_verify\":false}\r\nEXTRA";
-    let parts = [first, second];
-    let mut server = SliceReads { parts: &parts, index: 0 };
-    let mut guest = Vec::new();
-    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
-    assert!(
-      matches!(
-        err,
-        crate::Error::NatsTlsRequired {
-          tls_available: true,
-          tls_verify: false
-        }
-      ),
-      "{err}"
-    );
-    assert_eq!(guest, first);
+    let (guest, rest) = forward_info(&[first, second]).await;
+    assert_eq!(guest, [first, &second[..second.len() - b"EXTRA".len()]].concat());
+    assert_eq!(rest.as_deref(), Some(&b"EXTRA"[..]));
   }
 
-  /// The JSON bool itself crosses the read. Only the five-byte token is kept.
+  /// The JSON bool itself crosses the read. The line is still one INFO.
   #[tokio::test]
-  async fn cleartext_info_bool_split_across_reads_closes() {
-    let grants = nats_grants(
-      "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
-      "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
-    );
+  async fn info_bool_split_across_reads_is_one_line() {
     let first: &[u8] = b"INFO {\"tls_required\":tru";
     let second: &[u8] = b"e,\"tls_available\":true,\"tls_verify\":false}\r\n";
-    let parts = [first, second];
-    let mut server = SliceReads { parts: &parts, index: 0 };
-    let mut guest = Vec::new();
-    let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
-    assert!(
-      matches!(
-        err,
-        crate::Error::NatsTlsRequired {
-          tls_available: true,
-          tls_verify: false
-        }
-      ),
-      "{err}"
-    );
-    assert_eq!(guest, first);
+    let (guest, rest) = forward_info(&[first, second]).await;
+    assert_eq!(guest, [first, second].concat());
+    assert_eq!(rest, Some(Vec::new()));
   }
 
-  /// The verb itself crosses the read. The framer already holds those bytes
-  /// until the delimiter, and the completing read still closes.
+  /// The verb itself crosses the read. The framer holds those bytes until the delimiter.
   #[tokio::test]
-  async fn cleartext_info_verb_split_across_reads_closes() {
+  async fn info_verb_split_across_reads_leaves_the_tail_unread() {
+    let first: &[u8] = b"INF";
+    let second: &[u8] = b"O {\"tls_required\":true,\"tls_available\":false,\"tls_verify\":true}\r\nTAIL";
+    let (guest, rest) = forward_info(&[first, second]).await;
+    assert_eq!(guest, [first, &second[..second.len() - b"TAIL".len()]].concat());
+    assert_eq!(rest.as_deref(), Some(&b"TAIL"[..]));
+  }
+
+  async fn forward_info(parts: &[&[u8]]) -> (Vec<u8>, Option<Vec<u8>>) {
     let grants = nats_grants(
       "nats://agent:arkham_fake_nats_pass@nats.internal:4222",    // betterleaks:allow
       "nats://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
     );
-    let first: &[u8] = b"INF";
-    let second: &[u8] = b"O {\"tls_required\":true,\"tls_available\":false,\"tls_verify\":true}\r\nTAIL";
-    let parts = [first, second];
-    let mut server = SliceReads { parts: &parts, index: 0 };
+    let mut server = SliceReads { parts, index: 0 };
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
     let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
-    assert!(
-      matches!(
-        err,
-        crate::Error::NatsTlsRequired {
-          tls_available: false,
-          tls_verify: true
-        }
-      ),
-      "{err}"
-    );
-    assert_eq!(guest, b"");
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest)
+      .await
+      .expect("info forwarded");
+    (guest, rest)
   }
 
   /// A split INFO whose top-level `tls_required` is false is forwarded. Text
@@ -670,7 +551,7 @@ mod tests {
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
     let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap();
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest).await.unwrap();
     assert_eq!(rest, Some(b"EXTRA".to_vec()));
     assert_eq!(guest, &line[..line.len() - b"EXTRA".len()]);
   }
@@ -698,7 +579,7 @@ mod tests {
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
     let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
     assert_eq!(guest, info);
     let line = nkey_connect(fake.public.as_str(), &sig_b64(&fake, b"N0NCE"));
@@ -732,9 +613,9 @@ mod tests {
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
     let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
-    let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
+    let rest = server_info(&mut server, &mut up, &mut down, &mut guest).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
     let line = nkey_connect(fake.public.as_str(), &sig_b64(&fake, b"N0NCE"));
     let (rewritten, hits) = down.feed(line.as_bytes()).await;
@@ -746,54 +627,49 @@ mod tests {
     assert!(!line.contains(real.public.as_str()));
   }
 
-  /// A close, `tls_required`, or an unreadable INFO does not arm a nonce.
+  /// An empty read arms nothing. A finished INFO arms its nonce even when
+  /// `tls_required` is set. A line that does not finish an object does not.
   #[tokio::test]
-  async fn closing_info_does_not_arm_a_nonce() {
+  async fn info_arms_a_nonce_when_the_object_finishes() {
     let (fake_raw, fake) = mint_user();
     let (real_raw, real) = mint_user();
     let grants = nats_grants(
       &format!("nats://nkey:{fake_raw}@nats.internal:4222"),
-      &format!("nats://nkey:{real_raw}@nats.upstream:4222"),
+      &format!("tls://nkey:{real_raw}@nats.upstream:4222"),
     );
     let line = nkey_connect(fake.public.as_str(), &sig_b64(&fake, b"N0NCE"));
-    let cases: Vec<OpeningFailure<'_>> = vec![
-      (b"", |_| false),
-      (b"INFO {\"nonce\":\"N0NCE\",\"tls_required\":true}\r\n", |err| {
-        matches!(
-          err,
-          crate::Error::NatsTlsRequired {
-            tls_available: false,
-            tls_verify: false
-          }
-        )
-      }),
-      (b"INFO {\"nonce\":\"N0NCE\"\r\n", |err| {
-        matches!(err, crate::Error::NatsInfoUnreadable)
-      }),
+    let cases: [(&[u8], bool); 3] = [
+      (b"", false),
+      (b"INFO {\"nonce\":\"N0NCE\",\"tls_required\":true}\r\n", true),
+      (b"INFO {\"nonce\":\"N0NCE\"\r\n", false),
     ];
-    for (wire, expect_err) in cases {
+    for (wire, armed) in cases {
       let mut server = Cursor::new(wire.to_vec());
       let mut guest = Vec::new();
       let mut up = Nats::upstream(&grants, "nats.internal", 4222);
       let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
-      let opened = server_info(&mut server, &mut up, &mut down, &mut guest, true).await;
+      let opened = server_info(&mut server, &mut up, &mut down, &mut guest).await.expect("info read");
       if wire.is_empty() {
-        assert_eq!(opened.unwrap(), None);
+        assert_eq!(opened, None);
       } else {
-        let err = opened.unwrap_err();
-        assert!(expect_err(&err), "{err}");
+        assert_eq!(opened.as_deref(), Some(&[][..]));
+        assert_eq!(guest, wire);
       }
       let (rewritten, hits) = down.feed(line.as_bytes()).await;
-      assert!(hits.is_empty(), "{err_case}", err_case = String::from_utf8_lossy(wire));
       let Rewritten::Emit(bytes) = rewritten else {
-        panic!("forwarded connect");
+        panic!("connect emitted");
       };
-      assert_eq!(bytes.as_ref(), line.as_bytes());
-      assert!(
-        !bytes
-          .windows(real.public.as_str().len())
-          .any(|window| window == real.public.as_bytes())
-      );
+      if armed {
+        assert_eq!(hits.len(), 1);
+        assert!(
+          bytes
+            .windows(real.public.as_str().len())
+            .any(|window| window == real.public.as_bytes())
+        );
+      } else {
+        assert_eq!(hits.len(), 0);
+        assert_eq!(bytes.as_ref(), line.as_bytes());
+      }
     }
   }
 

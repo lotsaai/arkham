@@ -119,16 +119,16 @@ impl RedisUri {
   }
 }
 
-/// Trust and identity from one string's query, allowed only on `rediss://`:
-/// cleartext carries no TLS state, and transport is stated in the scheme,
-/// never in libpq's parameters.
+/// Trust and identity from one string's query. The scheme states the
+/// transport. `sslmode` and `sslnegotiation` are rejected. `sslrootcert`,
+/// `sslcert`, and `sslkey` are stored on either scheme.
 struct RedisTls {
   root_cert: Option<RootCert>,
   client_cert: Option<PathBuf>,
   client_key: Option<PathBuf>,
 }
 
-fn redis_tls(entry: &str, is_tls: bool, uri: &RedisUri) -> Result<RedisTls, String> {
+fn redis_tls(entry: &str, uri: &RedisUri) -> Result<RedisTls, String> {
   let mut root_cert = None;
   let mut client_cert = None;
   let mut client_key = None;
@@ -171,18 +171,8 @@ fn redis_tls(entry: &str, is_tls: bool, uri: &RedisUri) -> Result<RedisTls, Stri
       _ => return Err(format!("bad connection string `{entry}`: unknown query `{key}`")),
     };
     if let Some(root) = tls_material {
-      if !is_tls {
-        return Err(format!(
-          "bad connection string `{entry}`: cleartext `redis://` carries no TLS state; trust belongs on `rediss://`"
-        ));
-      }
       root_cert = Some(root);
     }
-  }
-  if !is_tls && (client_cert.is_some() || client_key.is_some()) {
-    return Err(format!(
-      "bad connection string `{entry}`: cleartext `redis://` carries no TLS state; identity belongs on `rediss://`"
-    ));
   }
   if client_cert.is_some() != client_key.is_some() {
     return Err(format!("bad connection string `{entry}`: sslcert and sslkey come together"));
@@ -208,7 +198,7 @@ impl RedisScope {
       root_cert,
       client_cert,
       client_key,
-    } = redis_tls(real, upstream.scheme == Scheme::Rediss, &upstream)?;
+    } = redis_tls(real, &upstream)?;
     Ok(Self {
       is_downstream_tls: downstream.scheme == Scheme::Rediss,
       downstream: downstream.leg(),
@@ -232,11 +222,8 @@ impl RedisScope {
 ///
 /// # Errors
 ///
-/// Returns an error when either string fails the redis law above, when a
-/// `tls` row tries to state what only the real string may state, or when
-/// `guest_tls_mode` is `mtls` on a cleartext `redis://` fake. AUTH is
-/// rewritten on a cleartext upstream, so a `redis://` real string is
-/// rejected too.
+/// Returns an error when either string fails the redis law above, or when a
+/// `tls` row tries to state what only the real string may state.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
   let fake = rule
     .value
@@ -262,9 +249,6 @@ pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Er
     }
     if tls.root_cert.is_some() {
       return Err(Error::RedisTrust { label: label.to_string() });
-    }
-    if tls.guest_tls_mode == GuestTlsMode::Mtls && !scope.is_downstream_tls {
-      return Err(Error::RedisCleartextMtls { label: label.to_string() });
     }
     scope.guest_tls = tls.guest_tls_mode;
   }

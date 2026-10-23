@@ -19,8 +19,6 @@ use crate::identity::CandidateParams;
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Amqp, Direction};
 
-const TLS_RECORD_HANDSHAKE: u8 = 0x16;
-
 #[derive(Debug)]
 pub(crate) struct AmqpTransport {
   ca: CertAuthority,
@@ -92,9 +90,6 @@ impl Transport for AmqpTransport {
       };
       server_name = Some(sni_name);
       guest_tls = Some((hello_buf, identity));
-    } else if initial.first() == Some(&TLS_RECORD_HANDSHAKE) {
-      tracing::debug!("TLS opening on a cleartext amqp scope; closing");
-      return Ok(());
     }
 
     let upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;
@@ -144,7 +139,7 @@ impl AmqpTransport {
     S: AsyncRead + AsyncWrite + Unpin,
   {
     let OpenGuest { stream, head, tls } = guest;
-    let swap = scope.is_upstream_tls;
+    let swap = true;
     let upstream_name = scope.upstream.host.as_str();
     match (tls, scope.is_upstream_tls) {
       (None, false) => relay(Prefixed::new(head, stream), upstream, ctx, swap).await,

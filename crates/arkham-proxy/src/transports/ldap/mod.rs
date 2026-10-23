@@ -30,10 +30,6 @@ use crate::relay::{RelayEnd, log_hits, relay_guarded, relay_stop};
 use crate::transports::engine::{Direction, Ldap, Rewritten, Wire};
 use machine::starttls_success;
 
-/// First byte of a TLS record carrying a handshake. An `ldaps` guest leg
-/// opens with it; a cleartext `ldap` scope never serves it.
-const TLS_RECORD_HANDSHAKE: u8 = 0x16;
-
 /// LDAP transport. `ldaps://` settles TLS before the machine runs.
 /// `ldap://` stays plaintext until `StartTLS`, then mints the guest leaf
 /// for the scope host and opens TLS upstream.
@@ -116,9 +112,6 @@ impl Transport for LdapTransport {
       };
       server_name = Some(sni_name);
       guest_tls = Some((hello_buf, identity));
-    } else if initial.first() == Some(&TLS_RECORD_HANDSHAKE) {
-      tracing::debug!("TLS opening on a cleartext ldap scope; closing");
-      return Ok(());
     }
 
     let upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;
@@ -181,8 +174,9 @@ struct Pump<'a> {
 }
 
 impl LdapTransport {
-  /// Both legs already know their transport. The password is swapped only
-  /// when the upstream writer is TLS. A cleartext upstream keeps the decoy.
+  /// Both legs already know their transport. The password is swapped on
+  /// cleartext the same way it is on TLS. A further `StartTLS` is refused
+  /// only when the upstream writer is already TLS.
   async fn relay_settled<G, S>(&self, guest: OpenGuest<G>, upstream: S, pump: &Pump<'_>, upstream_name: &str) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
@@ -190,38 +184,38 @@ impl LdapTransport {
   {
     let OpenGuest { stream, head, tls } = guest;
     let scope = pump.scope;
-    let swap = scope.is_upstream_tls;
+    let hold_starttls = scope.is_upstream_tls;
     match (tls, scope.is_upstream_tls) {
-      (None, false) => relay(Prefixed::new(head, stream), upstream, pump.ctx, swap).await,
+      (None, false) => relay(Prefixed::new(head, stream), upstream, pump.ctx, hold_starttls).await,
       (Some((hello_buf, identity)), false) => {
         let plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
           .await?;
-        relay(plain, upstream, pump.ctx, swap).await
+        relay(plain, upstream, pump.ctx, hold_starttls).await
       }
       (None, true) => {
         let plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(Prefixed::new(head, stream), plain, pump.ctx, swap).await
+        relay(Prefixed::new(head, stream), plain, pump.ctx, hold_starttls).await
       }
       (Some((hello_buf, identity)), true) => {
         let guest_plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
           .await?;
         let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(guest_plain, server_plain, pump.ctx, swap).await
+        relay(guest_plain, server_plain, pump.ctx, hold_starttls).await
       }
     }
   }
 
   /// Classify the first cleartext message. `StartTLS` stays here; every
   /// other opening is the shared relay, including a session that never
-  /// upgrades. Swap is on only when the upstream writer is already TLS.
+  /// upgrades. The bind password is swapped either way. A further `StartTLS`
+  /// is held only when the upstream writer is already TLS.
   async fn opening<G, S>(&self, mut guest: G, mut server: S, pump: &Pump<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
-    let swap = !pump.upgrade_upstream;
     match read_first(
       &mut guest,
       &mut server,
@@ -234,7 +228,7 @@ impl LdapTransport {
     {
       First::Eof | First::Close => Ok(()),
       First::Relay(prefix) => {
-        let (mut downstream, mut upstream) = ldap_pair(pump.ctx, swap);
+        let (mut downstream, mut upstream) = ldap_pair(pump.ctx, true);
         if !pump.upgrade_upstream {
           downstream.hold_starttls();
         }
@@ -581,23 +575,22 @@ where
   Ok(())
 }
 
-/// Pump one settled pair. `swap` is set only when `server` is already TLS,
-/// and a further `StartTLS` on that session is `operationsError`.
-async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>, swap: bool) -> Result<(), Error>
+/// Pump one settled pair. The bind password is swapped. `hold_starttls`
+/// refuses a further `StartTLS` when the upstream writer is already TLS.
+async fn relay<G, S>(guest: G, server: S, ctx: &PairCtx<'_>, hold_starttls: bool) -> Result<(), Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  let (mut downstream, mut upstream) = ldap_pair(ctx, swap);
-  if swap {
+  let (mut downstream, mut upstream) = ldap_pair(ctx, true);
+  if hold_starttls {
     downstream.hold_starttls();
     upstream.block_starttls();
   }
   relay_guarded(guest, server, &mut downstream, &mut upstream, &[], &[]).await
 }
 
-/// Both directions for an LDAP scope. `swap` applies to the downstream leg:
-/// a cleartext upstream must keep the decoy.
+/// Both directions for an LDAP scope. `swap` rewrites the downstream bind.
 pub(crate) fn ldap_pair(ctx: &PairCtx<'_>, swap: bool) -> (Ldap, Ldap) {
   (
     Ldap::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream, swap),

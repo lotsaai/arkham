@@ -1,5 +1,9 @@
 # AGENTS.md - arkham
 
+arkham protects against the agent, not against the network: the agent sees fake values only, and cleartext vs TLS never changes behaviour.
+
+Read the codebase and `.agents/skills/add-protocol/SKILL.md` before writing anything. Reuse the existing TCP, TLS, HTTPS, and OAuth layers and never rebuild transport. One crate per protocol, with no protocol code in shared files. Per-protocol work is the wire credential swap plus rewriting that tool's config file with decoys. Use maintained libraries. Invent no rules, skips, refusals, or special cases, and report a blocker instead of choosing an alternative. User docs (`docs/user/**` and `README`) contain no implementation notes and no walls of text.
+
 Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates, swaps format-valid decoy fakes for real secrets only on URI-grant match, and redacts real values back to fakes on responses; everything else splices byte-identical.
 
 ## Crate Roles & Boundaries

@@ -291,7 +291,7 @@ impl Amqp {
       _ => None,
     };
     let up = match found {
-      Some((scope, label)) if dir == Direction::Upstream && scope.is_upstream_tls => Some(CredentialPair {
+      Some((scope, label)) if dir == Direction::Upstream => Some(CredentialPair {
         needle: scope.upstream.password.expose_secret().as_bytes().to_vec(),
         replacement: scope.downstream.password.expose_secret().as_bytes().to_vec(),
         label,
@@ -2668,7 +2668,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn amqp_plain_start_ok_keeps_the_decoy_when_upstream_is_cleartext() {
+  async fn amqp_plain_start_ok_is_unchanged_when_swap_is_off() {
     let wire = start_ok("PLAIN", plain("agent", FAKE));
     let out = run(&mut down(false), &wire).await.expect("emitted");
     assert_eq!(out, wire);
@@ -2684,7 +2684,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn amqp_sasl_init_plain_swaps_only_when_upstream_is_tls() {
+  async fn amqp_sasl_init_plain_follows_the_swap_flag() {
     let wire = sasl_init("PLAIN", Some(plain("agent", FAKE)));
     let out = run(&mut down(true), &wire).await.expect("emitted");
     assert_eq!(sasl_init_response(&out), plain("svc", REAL));
@@ -3697,18 +3697,21 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn a_cleartext_upstream_does_not_withhold_a_prefix() {
+  async fn a_cleartext_upstream_closes_on_the_real_password_like_tls() {
     let (prefix, rest) = password_split();
     let mut input = header_10().to_vec();
     input.extend(transfer(1, true, prefix));
     input.extend(transfer(1, false, rest));
-    let mut machine = up_clear();
-    let rewritten = machine.feed(&input).await.0;
-    let Rewritten::Emit(emitted) = rewritten else {
-      panic!("cleartext upstream withheld or closed");
-    };
-    assert_eq!(emitted.into_owned(), input);
-    assert!(matches!(machine.feed(&[]).await.0, Rewritten::Hold), "machine stays open");
+    let mut clear = up_clear();
+    let mut tls = up();
+    assert!(
+      matches!(clear.feed(&input).await.0, Rewritten::Close),
+      "cleartext upstream delivered the password"
+    );
+    assert!(
+      matches!(tls.feed(&input).await.0, Rewritten::Close),
+      "tls upstream delivered the password"
+    );
   }
 
   #[tokio::test]

@@ -33,6 +33,8 @@ use arkham_config::grants::{Grant, ResolvedConfig, Scheme};
 use arkham_pki::ca::CertAuthority;
 pub(crate) use relay::relay_guarded;
 
+#[cfg(test)]
+mod cleartext_guard;
 mod connection;
 #[cfg(test)]
 mod e2e;

@@ -216,7 +216,7 @@ where
 }
 
 #[tokio::test]
-async fn smtp_auth_before_starttls_stays_the_decoy_and_swaps_after() {
+async fn smtp_auth_swaps_before_and_after_starttls() {
   let fx = starttls_fixture().await;
   let stub_seen = Arc::clone(&fx.seen);
   let acceptor = fx.acceptor.clone();
@@ -239,13 +239,13 @@ async fn smtp_auth_before_starttls_stays_the_decoy_and_swaps_after() {
   let recorded = fx.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
   assert_eq!(recorded.len(), 2, "{recorded:?}");
   assert!(
-    recorded[0].contains(&plain_initial(USER, FAKE)),
-    "pre-upgrade AUTH must carry the decoy: {}",
+    recorded[0].contains(&plain_initial(USER, VALUE)),
+    "pre-upgrade AUTH must carry the real password: {}",
     recorded[0]
   );
   assert!(
-    !recorded[0].contains(&plain_initial(USER, VALUE)),
-    "pre-upgrade AUTH must not carry the real password"
+    !recorded[0].contains(&plain_initial(USER, FAKE)),
+    "pre-upgrade AUTH must not carry the decoy"
   );
   assert!(
     recorded[1].contains(&plain_initial(USER, VALUE)),
@@ -472,10 +472,9 @@ async fn bdat_payload_is_passed_exactly() {
   assert_eq!(recorded, vec![b"hello".to_vec(), Vec::new()]);
 }
 
-/// A session that never upgrades stays cleartext upstream. The decoy
-/// is what the server records; the real password is not on that wire.
+/// A session that never upgrades stays cleartext upstream and still swaps.
 #[tokio::test]
-async fn smtp_cleartext_session_forwards_the_decoy() {
+async fn smtp_cleartext_session_swaps_the_password() {
   let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
   let fx = mitm_fixture(|port| {
     vec![smtp_grant(
@@ -499,13 +498,13 @@ async fn smtp_cleartext_session_forwards_the_decoy() {
   let recorded = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
   assert_eq!(recorded.len(), 1, "{recorded:?}");
   assert!(
-    recorded[0].contains(&plain_initial(USER, FAKE)),
-    "cleartext AUTH must carry the decoy: {}",
+    recorded[0].contains(&plain_initial(USER, VALUE)),
+    "cleartext AUTH must carry the real password: {}",
     recorded[0]
   );
   assert!(
-    !recorded[0].contains(&plain_initial(USER, VALUE)),
-    "cleartext AUTH must not carry the real password"
+    !recorded[0].contains(&plain_initial(USER, FAKE)),
+    "cleartext AUTH must not carry the decoy"
   );
   fx.proxy.abort();
 }
@@ -619,16 +618,13 @@ async fn smtps_without_sni_mints_for_the_grant_host() {
 }
 
 #[test]
-fn smtp_mtls_plaintext_guest_is_rejected_at_load() {
+fn smtp_mtls_on_a_cleartext_fake_loads() {
   let fake = format!("smtp://agent%40demo.test:{FAKE}@localhost:587");
   let real = format!("smtps://agent%40demo.test:{VALUE}@localhost:465");
-  let Err(err) = super::resolve_mtls_grants("SMTP_URL", &fake, &real) else {
-    panic!("mtls on an smtp fake with an smtps real must be rejected");
-  };
-  assert!(matches!(err.as_ref(), arkham_config::Error::SmtpCleartextMtls { .. }), "{err}");
-  let text = err.to_string();
-  assert!(!text.contains(FAKE), "mtls rejection included a credential");
-  assert!(!text.contains(VALUE), "mtls rejection included a credential");
+  let grants = super::resolve_mtls_grants("SMTP_URL", &fake, &real).expect("mtls on an smtp fake loads");
+  let scope = grants.first().and_then(|grant| grant.smtp(None, 587)).expect("scope");
+  assert_eq!(scope.guest_tls, arkham_config::grants::GuestTlsMode::Mtls);
+  assert!(!scope.is_downstream_tls);
 }
 
 /// Read one SMTP line, or `None` when the peer closes or the budget ends.

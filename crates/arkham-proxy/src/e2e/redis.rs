@@ -194,14 +194,11 @@ async fn redis_tls_without_sni_mints_for_the_grant_host() {
 }
 
 #[test]
-fn redis_mtls_plaintext_guest_is_rejected_at_load() {
+fn redis_mtls_on_a_cleartext_fake_loads() {
   let fake = format!("redis://app:{FAKE}@localhost:6379/0");
   let real = format!("rediss://app:{VALUE}@localhost:6379/0");
-  let Err(err) = super::resolve_mtls_grants("REDIS_URL", &fake, &real) else {
-    panic!("mtls on a cleartext redis fake must be rejected");
-  };
-  assert!(matches!(err.as_ref(), arkham_config::Error::RedisCleartextMtls { .. }), "{err}");
-  let text = err.to_string();
-  assert!(!text.contains(FAKE), "mtls rejection included a credential");
-  assert!(!text.contains(VALUE), "mtls rejection included a credential");
+  let grants = super::resolve_mtls_grants("REDIS_URL", &fake, &real).expect("mtls on a cleartext redis fake loads");
+  let scope = grants.first().and_then(|grant| grant.redis(None, 6379)).expect("scope");
+  assert_eq!(scope.guest_tls, arkham_config::grants::GuestTlsMode::Mtls);
+  assert!(!scope.is_downstream_tls);
 }
