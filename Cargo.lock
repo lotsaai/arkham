@@ -391,6 +391,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "arkham-amqp"
+version = "0.3.31"
+dependencies = [
+ "amq-protocol",
+ "arkham-wire",
+ "fe2o3-amqp-types",
+ "memchr",
+ "percent-encoding",
+ "proptest",
+ "secrecy",
+ "serde_amqp",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "arkham-compose"
 version = "0.3.31"
 dependencies = [
@@ -427,6 +445,7 @@ dependencies = [
 name = "arkham-config"
 version = "0.3.31"
 dependencies = [
+ "arkham-amqp",
  "arkham-ldap",
  "arkham-smtp",
  "arkham-wire",
@@ -545,6 +564,7 @@ version = "0.3.31"
 dependencies = [
  "actson",
  "amq-protocol",
+ "arkham-amqp",
  "arkham-config",
  "arkham-ldap",
  "arkham-pki",

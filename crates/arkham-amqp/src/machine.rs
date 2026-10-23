@@ -10,26 +10,22 @@ use amq_protocol::protocol::constants::{FRAME_BODY, FRAME_END, FRAME_HEADER, FRA
 use amq_protocol::protocol::{AMQPClass, channel, connection};
 use amq_protocol::types::ShortString;
 use amq_protocol::types::parsing::{parse_id, parse_long_long_uint, parse_long_uint, parse_short_uint};
-use arkham_config::grants::Grant;
 use fe2o3_amqp_types::definitions::{Error as AmqpError, MAJOR, MINOR, REVISION};
 use fe2o3_amqp_types::performatives::{Close, Detach, End, MaxFrameSize, Open, Transfer};
 use fe2o3_amqp_types::primitives::Binary;
 use fe2o3_amqp_types::sasl::{SaslInit, SaslResponse};
-use secrecy::ExposeSecret as _;
 use serde_amqp::descriptor::Descriptor;
 use serde_amqp::primitives::Symbol;
 use serde_amqp::serde::de::DeserializeOwned;
 use serde_amqp::serde::{Deserialize, Serialize};
 
-use crate::transports::engine::{
+use arkham_wire::engine::{
   CredentialPair, Direction, Hit, Location, Rewritten, Wire, find_new_match, needle_prefix_suffix_len, replace_bytes,
 };
 
 /// Protocol header length. `parse_protocol_header` does not return a partial version.
 const PROTOCOL_HEADER_LEN: usize = 8;
 
-/// A credential or close frame is stored only up to this many bytes.
-/// A larger body or transfer still withholds its tail. Anything else is forwarded.
 pub(crate) const MAX_CREDENTIAL_FRAME: usize = 16_384;
 
 /// Smallest `frame-max` an AMQP 0-9-1 peer can negotiate.
@@ -38,10 +34,8 @@ const MIN_FRAME_091: usize = 4096;
 /// Smallest `max-frame-size` an AMQP 1.0 peer can negotiate.
 const MIN_FRAME_10: usize = 512;
 
-/// Retained payload bytes one connection may hold.
 const CARRY_BYTES: usize = MAX_CREDENTIAL_FRAME;
 
-/// Unfinished links one connection may remember.
 const CARRY_ENTRIES: usize = 32;
 
 const TYPE_CHANNEL_AND_SIZE: usize = 7;
@@ -157,19 +151,45 @@ impl FromStr for SaslMechanism {
   }
 }
 
-pub(crate) struct Amqp {
+/// Password bytes for one AMQP grant. The machine never sees the grant.
+#[derive(Clone)]
+pub struct SaslSwap {
+  /// Grant label. Logs carry this, never the password.
+  pub label: String,
+  /// Decoy password.
+  pub fake: Vec<u8>,
+  /// Upstream SASL user.
+  pub user: Vec<u8>,
+  /// Real password.
+  pub real: Vec<u8>,
+}
+
+impl std::fmt::Debug for SaslSwap {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("SaslSwap")
+      .field("label", &self.label)
+      .field("user", &self.user.len())
+      .finish_non_exhaustive()
+  }
+}
+
+/// AMQP 0-9-1 and 1.0 credential substitution.
+pub struct Amqp {
   down: Option<Down>,
   up: Option<CredentialPair>,
   framer: Framer,
   phase: Phase,
   carries: HashMap<Link, Carry>,
-  /// Bytes withheld so a secret split across reads is visible before it is written.
   tail: Vec<u8>,
-  /// Typed reason for the close, when the machine has one.
   fault: Option<crate::Error>,
-  /// The next AMQP frame is the guest Open and must be lowered.
   lower_open: bool,
   closed: bool,
+}
+
+impl std::fmt::Debug for Amqp {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Amqp").field("closed", &self.closed).finish_non_exhaustive()
+  }
 }
 
 struct Down {
@@ -204,7 +224,6 @@ enum Fwd {
   Delay { left: usize, delay: Delay },
 }
 
-/// The unread tail of one body or transfer. `keep` is withheld. The frame on the wire is shorter.
 struct Delay {
   link: Link,
   new_left: u64,
@@ -267,35 +286,31 @@ enum OpenRewrite {
 }
 
 impl Amqp {
+  /// Cleartext and TLS both swap.
+  ///
   /// # Errors
   ///
-  /// Returns [`crate::Error::AmqpSecretTooLong`] when the upstream password cannot fit in one
+  /// Returns [`crate::Error::SecretTooLong`] when the upstream password cannot fit in one
   /// 0-9-1 body frame under the protocol minimum frame size.
-  /// Cleartext and TLS both swap.
-  pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction) -> Result<Self, crate::Error> {
-    let found = grants.iter().find_map(|grant| {
-      let scope = grant.amqp(Some(host), port)?;
-      let label = grant.credential().map(|credential| credential.label.clone()).unwrap_or_default();
-      Some((scope, label))
-    });
-    if let Some((scope, _)) = &found {
-      secret_fits(scope.upstream.password.expose_secret().len())?;
+  pub fn new(swap: Option<SaslSwap>, dir: Direction) -> Result<Self, crate::Error> {
+    if let Some(swap) = &swap {
+      secret_fits(swap.real.len())?;
     }
-    let down = match &found {
-      Some((scope, label)) if dir == Direction::Downstream => Some(Down {
-        fake: scope.downstream.password.expose_secret().as_bytes().to_vec(),
-        user: scope.upstream.user.as_bytes().to_vec(),
-        real: scope.upstream.password.expose_secret().as_bytes().to_vec(),
-        label: label.clone(),
+    let down = match (&swap, dir) {
+      (Some(swap), Direction::Downstream) => Some(Down {
+        fake: swap.fake.clone(),
+        user: swap.user.clone(),
+        real: swap.real.clone(),
+        label: swap.label.clone(),
         awaiting_response: false,
       }),
       _ => None,
     };
-    let up = match found {
-      Some((scope, label)) if dir == Direction::Upstream => Some(CredentialPair {
-        needle: scope.upstream.password.expose_secret().as_bytes().to_vec(),
-        replacement: scope.downstream.password.expose_secret().as_bytes().to_vec(),
-        label,
+    let up = match swap {
+      Some(swap) if dir == Direction::Upstream => Some(CredentialPair {
+        needle: swap.real,
+        replacement: swap.fake,
+        label: swap.label,
       }),
       _ => None,
     };
@@ -322,7 +337,7 @@ fn secret_fits(len: usize) -> Result<(), crate::Error> {
   let held = len.saturating_sub(1);
   let body = held.saturating_add(TYPE_CHANNEL_AND_SIZE.saturating_add(1));
   if body > MIN_FRAME_091 {
-    return Err(crate::Error::AmqpSecretTooLong { len });
+    return Err(crate::Error::SecretTooLong { len });
   }
   Ok(())
 }
@@ -365,8 +380,6 @@ impl Amqp {
   }
 
   fn finish(&mut self) -> (Rewritten<'static>, Vec<Hit>) {
-    // An Open that never completed is still the guest's bytes. Emit them.
-    // Any other unfinished frame is a protocol error and closes.
     let lower = std::mem::take(&mut self.lower_open);
     let phase = std::mem::replace(&mut self.phase, Phase::Opaque);
     let pending = match phase {
@@ -630,9 +643,6 @@ impl Amqp {
     Ok(Classified::Hold { total, kind })
   }
 
-  /// An AMQP frame with an upstream secret. A transfer that does not decode within
-  /// [`MAX_CREDENTIAL_FRAME`] closes. A decoded close, end, or detach larger than that
-  /// cap closes. A teardown that does not decode is forwarded.
   fn classify_amqp(&self, buf: &[u8], total: usize, data_offset: usize, forward: Classified) -> Result<Classified, ()> {
     if buf.len() < data_offset {
       return Ok(Classified::AbsoluteHead(data_offset));
@@ -1001,7 +1011,7 @@ impl Amqp {
       .saturating_add(kept.len());
     let entries = self.carries.len() + usize::from(!self.carries.contains_key(&link));
     if bytes > CARRY_BYTES || entries > CARRY_ENTRIES {
-      self.fault = Some(crate::Error::AmqpCarryBudget { bytes, entries });
+      self.fault = Some(crate::Error::CarryBudget { bytes, entries });
       return Err(());
     }
     self.carries.insert(
@@ -1014,15 +1024,13 @@ impl Amqp {
     Ok(())
   }
 
-  /// The typed close, when the budget or another named failure produced one.
   fn close_reason(&self) -> Option<&crate::Error> {
     self.fault.as_ref()
   }
 
-  /// Record [`crate::Error::AmqpOpenUnlowered`] when this leg still has to lower the Open.
   fn refuse_open(&mut self) {
     if self.lower_open && self.fault.is_none() {
-      self.fault = Some(crate::Error::AmqpOpenUnlowered);
+      self.fault = Some(crate::Error::OpenUnlowered);
     }
   }
 
@@ -1058,7 +1066,7 @@ impl Amqp {
         .filter(|value| u32::try_from(MIN_FRAME_10).is_ok_and(|min| *value >= min))
     });
     let Some(lowered) = lowered else {
-      self.fault = Some(crate::Error::AmqpFrameMax { offered, room });
+      self.fault = Some(crate::Error::FrameMax { offered, room });
       return Err(());
     };
     open.max_frame_size = MaxFrameSize(lowered);
@@ -1158,7 +1166,6 @@ impl Amqp {
     self.relay(buf, total, &mut opened, held, input, out)
   }
 
-  /// Bytes to write now, and the suffix that stays on the link.
   fn release(&self, opened: &Opened, held: &[u8], payload: &[u8]) -> Result<(Vec<u8>, Vec<u8>), ()> {
     let mut joined = Vec::with_capacity(held.len().saturating_add(payload.len()));
     joined.extend_from_slice(held);
@@ -1442,9 +1449,7 @@ struct Opened {
   transfer: Option<Transfer>,
   /// Bytes spliced in front of this transfer's payload. Empty for 0-9-1.
   lead: Vec<u8>,
-  /// The body or transfer still has bytes after this frame.
   continues: bool,
-  /// Bytes still expected on this link after this frame.
   left: u64,
 }
 
@@ -1875,8 +1880,6 @@ fn decode_10<'de, T: Deserialize<'de>>(buf: &'de [u8]) -> Result<T, ()> {
   serde_amqp::from_slice(body).map_err(|_decode| ())
 }
 
-/// Nested described values in the performatives this machine decodes.
-/// Deeper input is rejected before `from_slice`.
 const PERFORMATIVE_NESTING: usize = 8;
 
 fn consume_value(buf: &[u8], nest: usize) -> Result<usize, ()> {
@@ -2080,65 +2083,59 @@ mod tests {
   use amq_protocol::protocol::{AMQPClass, channel, connection};
   use amq_protocol::types::parsing::parse_id;
   use amq_protocol::types::{AMQPValue, FieldTable};
-  use arkham_config::grants::{AmqpScope, Credential, Grant};
+  use secrecy::ExposeSecret as _;
+
+  use super::SaslSwap;
+  use crate::AmqpScope;
   use fe2o3_amqp_types::definitions::Error as AmqpError;
   use fe2o3_amqp_types::definitions::{Handle, MAJOR, MINOR, REVISION};
   use fe2o3_amqp_types::messaging::{DeliveryState, Rejected};
   use fe2o3_amqp_types::performatives::{ChannelMax, Close, Detach, Flow, MaxFrameSize, Open, Transfer};
   use fe2o3_amqp_types::primitives::{Binary, Symbol};
   use fe2o3_amqp_types::sasl::SaslInit;
-  use secrecy::SecretString;
   use serde_amqp::descriptor::Descriptor;
   use serde_amqp::serde::Serialize;
 
   use super::{Amqp, SaslMechanism};
-  use crate::transports::engine::{Direction, Rewritten, Wire};
+  use arkham_wire::engine::{Direction, Rewritten, Wire};
 
   const FAKE: &str = "arkham_fake_amqp_pass"; // betterleaks:allow
   const REAL: &str = "arkham_real_amqp_pass_longer_01"; // betterleaks:allow
   const HEADER_091: &[u8] = b"AMQP\x00\x00\x09\x01";
   const HEADER_SASL: &[u8] = b"AMQP\x03\x01\x00\x00";
 
-  fn grants(real_scheme: &str) -> Vec<Grant> {
+  fn swap_from(scope: &AmqpScope) -> SaslSwap {
+    SaslSwap {
+      label: "amqp".into(),
+      fake: scope.downstream.password.expose_secret().as_bytes().to_vec(),
+      user: scope.upstream.user.as_bytes().to_vec(),
+      real: scope.upstream.password.expose_secret().as_bytes().to_vec(),
+    }
+  }
+
+  fn down(upstream_tls: bool) -> Amqp {
+    let real_scheme = if upstream_tls { "amqps" } else { "amqp" };
     let scope = AmqpScope::from_strings(
       &format!("amqp://agent:{FAKE}@mq:5672"),
       &format!("{real_scheme}://svc:{REAL}@mq:5672"),
     )
     .unwrap();
-    vec![Grant::Amqp {
-      credential: Credential {
-        label: "amqp".into(),
-        fake: FAKE.into(),
-        value: SecretString::from(REAL),
-      },
-      scope: Box::new(scope),
-    }]
-  }
-
-  fn down(swap: bool) -> Amqp {
-    let real_scheme = if swap { "amqps" } else { "amqp" };
-    Amqp::new(&grants(real_scheme), "mq", 5672, Direction::Downstream).expect("secret fits")
+    Amqp::new(Some(swap_from(&scope)), Direction::Downstream).expect("secret fits")
   }
 
   fn up() -> Amqp {
-    Amqp::new(&grants("amqps"), "mq", 5672, Direction::Upstream).expect("secret fits")
+    let scope = AmqpScope::from_strings(&format!("amqp://agent:{FAKE}@mq:5672"), &format!("amqps://svc:{REAL}@mq:5672")).unwrap();
+    Amqp::new(Some(swap_from(&scope)), Direction::Upstream).expect("secret fits")
   }
 
   fn up_clear() -> Amqp {
-    Amqp::new(&grants("amqp"), "mq", 5672, Direction::Upstream).expect("secret fits")
+    let scope = AmqpScope::from_strings(&format!("amqp://agent:{FAKE}@mq:5672"), &format!("amqp://svc:{REAL}@mq:5672")).unwrap();
+    Amqp::new(Some(swap_from(&scope)), Direction::Upstream).expect("secret fits")
   }
 
   fn up_password(real: &str) -> Amqp {
     let scope = AmqpScope::from_strings(&format!("amqp://agent:{FAKE}@mq:5672"), &format!("amqps://svc:{real}@mq:5672")).unwrap();
-    let grants = vec![Grant::Amqp {
-      credential: Credential {
-        label: "amqp".into(),
-        fake: FAKE.into(),
-        value: SecretString::from(real.to_owned()),
-      },
-      scope: Box::new(scope),
-    }];
-    Amqp::new(&grants, "mq", 5672, Direction::Upstream).expect("secret fits")
+    Amqp::new(Some(swap_from(&scope)), Direction::Upstream).expect("secret fits")
   }
 
   fn encode_frame(frame: &AMQPFrame) -> Vec<u8> {
@@ -3401,7 +3398,7 @@ mod tests {
     }
     assert!(closed, "the carry map kept the held bytes");
     assert!(
-      matches!(machine.close_reason(), Some(crate::Error::AmqpCarryBudget { .. })),
+      matches!(machine.close_reason(), Some(crate::Error::CarryBudget { .. })),
       "the close was not the carry budget"
     );
   }
@@ -3422,7 +3419,7 @@ mod tests {
     }
     assert!(closed, "the carry map kept every link");
     assert!(
-      matches!(machine.close_reason(), Some(crate::Error::AmqpCarryBudget { .. })),
+      matches!(machine.close_reason(), Some(crate::Error::CarryBudget { .. })),
       "the close was not the carry budget"
     );
   }
@@ -3487,17 +3484,9 @@ mod tests {
   fn a_secret_longer_than_the_minimum_frame_is_rejected() {
     let password = "p".repeat(4090);
     let scope = AmqpScope::from_strings(&format!("amqp://agent:{FAKE}@mq:5672"), &format!("amqps://svc:{password}@mq:5672")).unwrap();
-    let grants = vec![Grant::Amqp {
-      credential: Credential {
-        label: "amqp".into(),
-        fake: FAKE.into(),
-        value: SecretString::from(password.clone()),
-      },
-      scope: Box::new(scope),
-    }];
     assert!(matches!(
-      Amqp::new(&grants, "mq", 5672, Direction::Upstream),
-      Err(crate::Error::AmqpSecretTooLong { len }) if len == password.len()
+      Amqp::new(Some(swap_from(&scope)), Direction::Upstream),
+      Err(crate::Error::SecretTooLong { len }) if len == password.len()
     ));
   }
 
@@ -3615,7 +3604,7 @@ mod tests {
       "an open that cannot be lowered was forwarded"
     );
     assert!(
-      matches!(guest_side.close_reason(), Some(crate::Error::AmqpOpenUnlowered)),
+      matches!(guest_side.close_reason(), Some(crate::Error::OpenUnlowered)),
       "the close was not the unlowered open"
     );
   }
@@ -3644,7 +3633,7 @@ mod tests {
       "a bad header after sasl was forwarded"
     );
     assert!(
-      matches!(guest_side.close_reason(), Some(crate::Error::AmqpOpenUnlowered)),
+      matches!(guest_side.close_reason(), Some(crate::Error::OpenUnlowered)),
       "the close was not the unlowered open"
     );
   }
@@ -3663,7 +3652,7 @@ mod tests {
       "a frame where the open header belongs was forwarded"
     );
     assert!(
-      matches!(guest_side.close_reason(), Some(crate::Error::AmqpOpenUnlowered)),
+      matches!(guest_side.close_reason(), Some(crate::Error::OpenUnlowered)),
       "the close was not the unlowered open"
     );
   }
@@ -3750,7 +3739,7 @@ mod tests {
       "an open of 512 was forwarded"
     );
     assert!(
-      matches!(guest_side.close_reason(), Some(crate::Error::AmqpFrameMax { offered: 512, .. })),
+      matches!(guest_side.close_reason(), Some(crate::Error::FrameMax { offered: 512, .. })),
       "the close was not the open headroom failure"
     );
   }

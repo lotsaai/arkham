@@ -133,13 +133,6 @@ pub enum Error {
     #[source]
     source: IoError,
   },
-  /// A guest AMQP TLS handshake fails.
-  #[error("guest amqp TLS: {source}")]
-  GuestAmqpTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
   /// A server NATS TLS handshake fails.
   #[error("server nats TLS: {source}")]
   ServerNatsTls {
@@ -147,23 +140,9 @@ pub enum Error {
     #[source]
     source: IoError,
   },
-  /// A server AMQP TLS handshake fails.
-  #[error("server amqp TLS: {source}")]
-  ServerAmqpTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
   /// A NATS upstream name cannot become a TLS server name.
   #[error("nats server name: {source}")]
   NatsServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
-  },
-  /// An AMQP upstream name cannot become a TLS server name.
-  #[error("amqp server name: {source}")]
-  AmqpServerName {
     /// Underlying name failure.
     #[source]
     source: Box<dyn StdError + Send + Sync>,
@@ -185,34 +164,6 @@ pub enum Error {
   /// A cleartext INFO line did not finish an object, and `tls_required` was not true.
   #[error("nats INFO did not yield tls flags on a cleartext upstream")]
   NatsInfoUnreadable,
-  /// An AMQP TLS handshake exceeded the configured budget.
-  #[error("amqp handshake timed out")]
-  AmqpHandshakeTimeout,
-  /// A secret does not fit the smallest frame either peer can negotiate.
-  #[error("amqp secret of {len} bytes exceeds the minimum frame")]
-  AmqpSecretTooLong {
-    /// Secret length in bytes.
-    len: usize,
-  },
-  /// A guest Open cannot reserve the withheld prefix and stay above the minimum frame size.
-  #[error("amqp open max-frame-size {offered} cannot reserve {room} bytes")]
-  AmqpFrameMax {
-    /// Maximum the guest offered.
-    offered: u32,
-    /// Bytes withheld from a later frame.
-    room: usize,
-  },
-  /// A grant is active and the guest Open could not be lowered.
-  #[error("amqp open could not be lowered")]
-  AmqpOpenUnlowered,
-  /// Retained AMQP payload exceeded the connection carry budget.
-  #[error("amqp carry holds {bytes} bytes across {entries} links")]
-  AmqpCarryBudget {
-    /// Total retained bytes.
-    bytes: usize,
-    /// Carry-map entries.
-    entries: usize,
-  },
   /// An SMTP leg was asked to start TLS when it was already in TLS.
   #[error("smtp leg is already TLS")]
   SmtpLegAlreadyTls,
@@ -248,6 +199,9 @@ pub enum Error {
   /// An LDAP encode or grant-parse failure reached the proxy.
   #[error(transparent)]
   Ldap(#[from] arkham_ldap::Error),
+  /// An AMQP frame or grant-parse failure reached the proxy.
+  #[error(transparent)]
+  Amqp(#[from] arkham_amqp::Error),
 }
 
 impl From<arkham_smtp::Error> for Error {

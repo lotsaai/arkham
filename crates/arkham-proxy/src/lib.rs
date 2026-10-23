@@ -180,7 +180,7 @@ impl ProxyState {
     let smtp = Arc::new(SmtpTransport);
     let ldap = Arc::new(LdapTransport);
     let nats = Arc::new(NatsTransport::new(ca)?);
-    let amqp = Arc::new(AmqpTransport::new(ca)?);
+    let amqp = Arc::new(AmqpTransport);
     Ok(Self {
       config: Arc::new(resolved),
       relay,

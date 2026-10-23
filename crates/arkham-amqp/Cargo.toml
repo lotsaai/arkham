@@ -1,0 +1,27 @@
+[package]
+name = "arkham-amqp"
+version = "0.3.31"
+edition = "2024"
+description = "grant-scoped MITM proxy: AMQP grant parsing and SASL substitution"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-wire = { workspace = true }
+amq-protocol = { workspace = true }
+fe2o3-amqp-types = { workspace = true }
+memchr = { workspace = true }
+percent-encoding = { workspace = true }
+secrecy = { workspace = true }
+serde_amqp = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

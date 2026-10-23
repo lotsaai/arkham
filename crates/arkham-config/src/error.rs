@@ -12,7 +12,7 @@ use toml::ser::Error as TomlSerializeError;
 use url::ParseError as UrlError;
 use validator::ValidationErrors;
 
-use crate::grants::{AmqpUriError, NatsUriError, Scheme};
+use crate::grants::{NatsUriError, Scheme};
 
 /// Every way config loading, validation, and grant resolution can fail.
 #[derive(Debug, thiserror::Error)]
@@ -149,15 +149,6 @@ pub enum Error {
     label: String,
     /// Parse failure.
     detail: String,
-  },
-  /// An AMQP connection string does not parse.
-  #[error("rule `{label}`: {source}")]
-  AmqpScope {
-    /// Rule label.
-    label: String,
-    /// Parse failure.
-    #[source]
-    source: AmqpUriError,
   },
   /// A connection-string rule names a scheme no vertical owns.
   #[error("rule `{label}`: scheme `{scheme:?}` owns no connection-string grant")]
@@ -469,6 +460,9 @@ pub enum Error {
   /// An LDAP connection string, identity row, or trust row was rejected.
   #[error(transparent)]
   Ldap(#[from] arkham_ldap::Error),
+  /// An AMQP connection string, identity row, trust row, or frame failure.
+  #[error(transparent)]
+  Amqp(#[from] arkham_amqp::Error),
   /// A NATS connection string, or the pair of them, does not parse.
   #[error("rule `{label}`: {source}")]
   NatsScope {
@@ -501,18 +495,6 @@ pub enum Error {
     host: String,
     /// Shared fake port.
     port: u16,
-  },
-  /// An AMQP rule states its upstream identity outside the connection string.
-  #[error("rule `{label}`: amqp states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
-  AmqpIdentity {
-    /// Rule label.
-    label: String,
-  },
-  /// An AMQP rule states its upstream trust outside the connection string.
-  #[error("rule `{label}`: amqp states upstream trust in its connection string (`sslrootcert`), never in the rule table")]
-  AmqpTrust {
-    /// Rule label.
-    label: String,
   },
   /// An ssh rule mixes `ssh://` entries with other schemes.
   #[error("rule `{label}`: ssh entries cannot mix with other schemes in one rule")]

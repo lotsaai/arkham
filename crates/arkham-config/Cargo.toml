@@ -8,6 +8,7 @@ repository = "https://github.com/casualjim/arkham"
 publish = false
 
 [dependencies]
+arkham-amqp = { workspace = true }
 arkham-ldap = { workspace = true }
 arkham-smtp = { workspace = true }
 arkham-wire = { workspace = true }
