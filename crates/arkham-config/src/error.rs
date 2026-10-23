@@ -493,14 +493,6 @@ pub enum Error {
     /// Rule label.
     label: String,
   },
-  /// `guest_tls_mode = mtls` on an `smtp://` fake whose real string is `smtps://`.
-  #[error(
-    "rule `{label}`: mtls on an smtp:// fake is rejected when the real string is smtps://, because AUTH is rewritten before the guest can present a client certificate"
-  )]
-  SmtpCleartextMtls {
-    /// Rule label.
-    label: String,
-  },
   /// An LDAP rule states its upstream identity outside the connection string.
   #[error("rule `{label}`: ldap states the upstream identity in its connection string (`sslcert`/`sslkey`), never in the rule table")]
   LdapIdentity {

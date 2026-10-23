@@ -1739,7 +1739,7 @@ mod tests {
   }
 
   #[test]
-  fn smtp_trust_belongs_on_a_tls_leg() {
+  fn smtp_cleartext_string_keeps_trust_and_identity() {
     let scope = smtp_scope(
       "smtp://agent:fake@mail.internal:587", // betterleaks:allow
       "smtp://agent:real@mail.internal:587?starttls=required&sslrootcert=/ca.pem&sslcert=/c.pem&sslkey=/c.key", // betterleaks:allow
@@ -1747,12 +1747,12 @@ mod tests {
     assert_eq!(scope.root_cert, Some(RootCert::Path(PathBuf::from("/ca.pem"))));
     assert_eq!(scope.client_cert, Some(PathBuf::from("/c.pem")));
     assert_eq!(scope.client_key, Some(PathBuf::from("/c.key")));
-    let cfg = cfg_with_db(
+    let clear = smtp_scope(
       "smtp://agent:fake@mail.internal:25",                     // betterleaks:allow
       "smtp://agent:real@mail.internal:25?sslrootcert=/ca.pem", // betterleaks:allow
     );
-    let err = resolve(&cfg).unwrap_err().to_string();
-    assert!(err.contains("no TLS state"), "{err}");
+    assert_eq!(clear.root_cert, Some(RootCert::Path(PathBuf::from("/ca.pem"))));
+    assert!(!clear.is_upstream_tls);
   }
 
   #[test]
@@ -1772,13 +1772,21 @@ mod tests {
   }
 
   #[test]
-  fn smtp_mtls_on_a_cleartext_fake_is_rejected() {
-    assert_mtls_rejected(
-      "smtp://agent:arkham_fake_smtp_pass@mail.internal:587",          // betterleaks:allow
-      "smtps://agent:arkham_real_smtp_pass_01@mail.internal:465",      // betterleaks:allow
-      &["arkham_fake_smtp_pass", "arkham_real_smtp_pass_01", "agent"], // betterleaks:allow
-      |err| matches!(err, crate::Error::SmtpCleartextMtls { .. }),
+  fn smtp_mtls_on_a_cleartext_fake_still_loads() {
+    let mut cfg = cfg_with_db(
+      "smtp://agent:arkham_fake_smtp_pass@mail.internal:587",     // betterleaks:allow
+      "smtps://agent:arkham_real_smtp_pass_01@mail.internal:465", // betterleaks:allow
     );
+    mtls_on(&mut cfg);
+    let resolved = resolve(&cfg).expect("mtls on a cleartext smtp fake still loads");
+    let Some(Grant::Smtp { scope, credential }) = resolved.grants.first() else {
+      panic!("an smtp rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(!scope.is_downstream_tls);
+    assert!(scope.is_upstream_tls);
+    assert_eq!(credential.fake, "arkham_fake_smtp_pass");
+    assert_eq!(credential.value.expose_secret(), "arkham_real_smtp_pass_01");
   }
 
   #[test]

@@ -544,8 +544,7 @@ fn smtp_grants(fake_pass: &str, real_pass: &str) -> Vec<Grant> {
 
 fn smtp_machines(fake_pass: &str, real_pass: &str) -> (Smtp, Smtp) {
   let grants = smtp_grants(fake_pass, real_pass);
-  let mut down = Smtp::new(&grants, "mail", 587, Direction::Downstream);
-  down.set_protected(true);
+  let down = Smtp::new(&grants, "mail", 587, Direction::Downstream);
   let mut up = Smtp::new(&grants, "mail", 587, Direction::Upstream);
   Smtp::share_data_gate(&down, &mut up);
   (down, up)

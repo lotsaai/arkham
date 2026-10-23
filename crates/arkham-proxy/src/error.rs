@@ -268,23 +268,9 @@ pub enum Error {
   /// A TLS handshake exceeded the configured budget.
   #[error("TLS handshake timed out")]
   HandshakeTimeout,
-  /// A guest SMTP TLS handshake fails.
-  #[error("guest smtp TLS: {source}")]
-  GuestSmtpTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
   /// A guest LDAP TLS handshake fails.
   #[error("guest ldap TLS: {source}")]
   GuestLdapTls {
-    /// Underlying handshake failure.
-    #[source]
-    source: IoError,
-  },
-  /// A server SMTP TLS handshake fails.
-  #[error("server smtp TLS: {source}")]
-  ServerSmtpTls {
     /// Underlying handshake failure.
     #[source]
     source: IoError,
@@ -295,13 +281,6 @@ pub enum Error {
     /// Underlying handshake failure.
     #[source]
     source: IoError,
-  },
-  /// An SMTP upstream name cannot become a TLS server name.
-  #[error("smtp server name: {source}")]
-  SmtpServerName {
-    /// Underlying name failure.
-    #[source]
-    source: Box<dyn StdError + Send + Sync>,
   },
   /// An LDAP upstream name cannot become a TLS server name.
   #[error("ldap server name: {source}")]
@@ -397,9 +376,6 @@ pub enum Error {
     /// Carry-map entries.
     entries: usize,
   },
-  /// An SMTP TLS handshake exceeded the configured budget.
-  #[error("smtp handshake timed out")]
-  SmtpHandshakeTimeout,
   /// An SMTP leg was asked to start TLS when it was already in TLS.
   #[error("smtp leg is already TLS")]
   SmtpLegAlreadyTls,
