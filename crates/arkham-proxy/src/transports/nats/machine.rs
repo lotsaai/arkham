@@ -1,11 +1,10 @@
 //! NATS wire format: one [`Framer`] cuts both directions into command lines
 //! and counted payloads.
 //!
-//! Downstream, CONNECT is buffered only while the server leg is TLS, so the
-//! swap can see every field. A cleartext leg forwards CONNECT as it arrives.
+//! Downstream, CONNECT is buffered so the swap can see every field.
 //! Past [`MAX_COMMAND`] the bytes already held and the rest of that line go
-//! out untouched, and the session stays open. When the server leg is TLS,
-//! every auth method rewrites the CONNECT fields [`NatsAuth::fields`] lists,
+//! out untouched, and the session stays open. Cleartext and TLS both
+//! rewrite the CONNECT fields [`NatsAuth::fields`] lists,
 //! and only when each of those fields holds the decoy. A method that signs
 //! does that after the first INFO nonce is armed and the guest signature
 //! verifies under the decoy public key. Every other byte,
@@ -449,28 +448,23 @@ pub(crate) enum Nats {
 }
 
 impl Nats {
-  /// Guest-to-server leg. `swap` is true only when the server writer is
-  /// already TLS. A cleartext server leg keeps the decoy.
-  pub(crate) fn downstream(grants: &[Grant], host: &str, port: u16, swap: bool) -> Self {
-    let policy = if swap {
-      let auths: Vec<SwapGrant> = grants
-        .iter()
-        .filter_map(|grant| {
-          let scope = grant.nats(Some(host), port)?;
-          let label = grant.credential()?.label.clone();
-          Some(SwapGrant {
-            label,
-            auth: scope.auth.clone(),
-          })
+  /// Guest-to-server leg. Cleartext and TLS both swap when a grant matches.
+  pub(crate) fn downstream(grants: &[Grant], host: &str, port: u16) -> Self {
+    let auths: Vec<SwapGrant> = grants
+      .iter()
+      .filter_map(|grant| {
+        let scope = grant.nats(Some(host), port)?;
+        let label = grant.credential()?.label.clone();
+        Some(SwapGrant {
+          label,
+          auth: scope.auth.clone(),
         })
-        .collect();
-      if auths.is_empty() {
-        Policy::Forward
-      } else {
-        Policy::Swap { auths }
-      }
-    } else {
+      })
+      .collect();
+    let policy = if auths.is_empty() {
       Policy::Forward
+    } else {
+      Policy::Swap { auths }
     };
     Self::Down(Down {
       framer: Framer::new(Side::Client),
@@ -1227,8 +1221,8 @@ mod tests {
     )
   }
 
-  fn down(grants: &[Grant], swap: bool) -> Nats {
-    Nats::downstream(grants, "nats.internal", 4222, swap)
+  fn down(grants: &[Grant]) -> Nats {
+    Nats::downstream(grants, "nats.internal", 4222)
   }
 
   fn up(grants: &[Grant]) -> Nats {
@@ -1268,12 +1262,12 @@ mod tests {
     let swapped_pass = format!("CONNECT {{\"name\":\"agent-app\",\"pass\":\"{REAL_PASS}\",\"user\":\"agent\",\"verbose\":false}}\r\n");
     let cases = [
       (
-        "cleartext forwards the decoy",
+        "cleartext swaps user and pass",
         false,
         &pass,
         user_connect("agent", FAKE_PASS),
-        user_connect("agent", FAKE_PASS),
-        0,
+        swapped_pass.clone(),
+        1,
       ),
       (
         "tls swaps user and pass, including a following PING",
@@ -1324,8 +1318,8 @@ mod tests {
         0,
       ),
     ];
-    for (label, swap, grants, input, expect, hits) in cases {
-      let mut machine = down(grants, swap);
+    for (label, _transport, grants, input, expect, hits) in cases {
+      let mut machine = down(grants);
       assert_eq!(feed(&mut machine, input.as_bytes()).await, (emit(&expect), hits), "{label}");
     }
   }
@@ -1333,7 +1327,7 @@ mod tests {
   #[tokio::test]
   async fn partial_connect_at_eof_is_forwarded_unswapped() {
     let grants = user_pass();
-    let mut machine = down(&grants, true);
+    let mut machine = down(&grants);
     let partial = format!("CONNECT {{\"user\":\"agent\",\"pass\":\"{FAKE_PASS}\"}}");
     assert_eq!(feed(&mut machine, partial.as_bytes()).await, (Out::Hold, 0));
     assert_eq!(feed(&mut machine, &[]).await, (emit(&partial), 0));
@@ -1342,7 +1336,7 @@ mod tests {
   #[tokio::test]
   async fn pub_payload_streams_without_a_swap() {
     let grants = user_pass();
-    let mut machine = down(&grants, true);
+    let mut machine = down(&grants);
     let payload = user_connect("agent", FAKE_PASS);
     let payload = payload.trim_end();
     let head = format!("PUB orders {}\r\n", payload.len());
@@ -1412,7 +1406,7 @@ mod tests {
   #[tokio::test]
   async fn eof_flushes_a_held_head_downstream_and_closes_mid_frame_upstream() {
     let grants = user_pass();
-    let mut machine = down(&grants, true);
+    let mut machine = down(&grants);
     assert_eq!(feed(&mut machine, b"PU").await, (Out::Hold, 0));
     assert_eq!(feed(&mut machine, &[]).await, (emit("PU"), 0));
     let mut machine = up(&grants);
@@ -1426,12 +1420,12 @@ mod tests {
   #[tokio::test]
   async fn counted_body_not_followed_by_crlf_closes() {
     let grants = user_pass();
-    let mut machine = down(&grants, true);
+    let mut machine = down(&grants);
     let smuggled = format!("PUB orders 2\r\n{}", user_connect("agent", FAKE_PASS));
     assert_eq!(feed(&mut machine, smuggled.as_bytes()).await, (Out::Close, 0));
     let mut machine = up(&grants);
     assert_eq!(feed(&mut machine, b"MSG orders 1 2\r\nokXX").await, (Out::Close, 0));
-    let mut machine = down(&grants, true);
+    let mut machine = down(&grants);
     assert_eq!(feed(&mut machine, b"PUB orders\r\n").await, (Out::Close, 0));
   }
 
@@ -1443,10 +1437,10 @@ mod tests {
     let follow = user_connect("agent", FAKE_PASS);
     let swapped = format!("CONNECT {{\"name\":\"agent-app\",\"pass\":\"{REAL_PASS}\",\"user\":\"agent\",\"verbose\":false}}\r\n");
     let input = format!("{line}{follow}");
-    let mut machine = down(&grants, true);
+    let mut machine = down(&grants);
     assert_eq!(feed(&mut machine, input.as_bytes()).await, (emit(&format!("{line}{swapped}")), 1));
     let (head, tail) = line.split_at(32);
-    let mut machine = down(&grants, true);
+    let mut machine = down(&grants);
     assert_eq!(feed(&mut machine, head.as_bytes()).await, (Out::Hold, 0));
     assert_eq!(
       feed(&mut machine, format!("{tail}{follow}").as_bytes()).await,
@@ -1462,7 +1456,7 @@ mod tests {
     let follow = user_connect("agent", FAKE_PASS);
     let swapped = format!("CONNECT {{\"name\":\"agent-app\",\"pass\":\"{REAL_PASS}\",\"user\":\"agent\",\"verbose\":false}}\r\n");
     let input = format!("{line}{follow}");
-    let mut machine = down(&grants, true);
+    let mut machine = down(&grants);
     let mut out = String::new();
     let mut hits = 0usize;
     for byte in input.bytes() {
@@ -1484,13 +1478,10 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn cleartext_connect_streams_without_buffering() {
+  async fn an_oversize_connect_is_forwarded() {
     let grants = user_pass();
-    let mut machine = down(&grants, false);
-    let partial = format!("CONNECT {{\"pass\":\"{FAKE_PASS}\"");
-    assert_eq!(feed(&mut machine, partial.as_bytes()).await, (emit(&partial), 0));
-    let mut machine = down(&grants, false);
     let huge = format!("CONNECT {{\"name\":\"{}\"", "a".repeat(MAX_COMMAND));
+    let mut machine = down(&grants);
     assert_eq!(feed(&mut machine, huge.as_bytes()).await, (emit(&huge), 0));
   }
 
@@ -1574,7 +1565,7 @@ mod tests {
     let sig = sig_of(&fake.seed, nonce);
     for nkey in ["1", "{}"] {
       let line = format!("CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":{nkey},\"sig\":\"{sig}\"}}\r\n");
-      let mut down = down(&grants, true);
+      let mut down = down(&grants);
       let mut up = up(&grants);
       arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
       let (out, hits) = feed(&mut down, line.as_bytes()).await;
@@ -1582,7 +1573,7 @@ mod tests {
       assert_eq!(text_of(out), line, "{nkey}");
     }
     let line = format!("CONNECT {{\"jwt\":\"{fake_jwt}\",\"sig\":\"{sig}\"}}\r\n");
-    let mut down = down(&grants, true);
+    let mut down = down(&grants);
     let mut up = up(&grants);
     arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
     let (out, hits) = feed(&mut down, line.as_bytes()).await;
@@ -1599,7 +1590,7 @@ mod tests {
     let grants = jwt_grants(&fake, &real, &fake_jwt, &real_jwt);
     let sig = sig_of(&fake.seed, b"N0NCE");
     let line = format!("CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":null,\"sig\":\"{sig}\"}}\r\n");
-    let mut down = down(&grants, true);
+    let mut down = down(&grants);
     let mut up = up(&grants);
     arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
     let (out, hits) = feed(&mut down, line.as_bytes()).await;
@@ -1620,7 +1611,7 @@ mod tests {
     let mut grants = user_pass();
     grants.extend(nkey_grants(&fake, &real));
     let nonce = b"N0NCE";
-    let mut guest_down = down(&grants, true);
+    let mut guest_down = down(&grants);
     let mut guest_up = up(&grants);
     arm_info(&mut guest_up, &mut guest_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
     let line = nkey_line(fake.seed.public.as_str(), &sig_of(&fake.seed, nonce));
@@ -1636,7 +1627,7 @@ mod tests {
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig).expect("sig bytes");
     assert!(NatsSeed::verify(real.seed.public.as_str(), nonce, &raw));
     assert!(!out.contains(fake.seed.public.as_str()), "{out}");
-    let mut pass_down = down(&grants, true);
+    let mut pass_down = down(&grants);
     let input = user_connect("agent", FAKE_PASS);
     let swapped = format!("CONNECT {{\"name\":\"agent-app\",\"pass\":\"{REAL_PASS}\",\"user\":\"agent\",\"verbose\":false}}\r\n");
     assert_eq!(feed(&mut pass_down, input.as_bytes()).await, (emit(&swapped), 1));
@@ -1648,7 +1639,7 @@ mod tests {
     let real = minted();
     let grants = nkey_grants(&fake, &real);
     let nonce = b"N0NCE";
-    let mut down = down(&grants, true);
+    let mut down = down(&grants);
     let mut up = up(&grants);
     arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\",\"server_id\":\"N1\"}\r\n").await;
     arm_info(&mut up, &mut down, "INFO {\"nonce\":\"OTHER\"}\r\n").await;
@@ -1677,7 +1668,7 @@ mod tests {
     let real = minted();
     let grants = nkey_grants(&fake, &real);
     let nonce = b"N0NCE";
-    let mut guest_down = down(&grants, true);
+    let mut guest_down = down(&grants);
     let mut guest_up = up(&grants);
     arm_info(&mut guest_up, &mut guest_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
     let raw = fake.seed.pair.sign(nonce).expect("fake seed signs");
@@ -1716,7 +1707,7 @@ mod tests {
       nkey_line("not-the-fake-public", &good),
     ];
     for line in cases {
-      let mut down = down(&grants, true);
+      let mut down = down(&grants);
       let mut up = up(&grants);
       arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
       let (out, hits) = feed(&mut down, line.as_bytes()).await;
@@ -1724,11 +1715,11 @@ mod tests {
       assert_original(&text_of(out), &line, real.seed.public.as_str(), &real_sig);
     }
     let line = nkey_line(fake.seed.public.as_str(), &good);
-    let mut pending = down(&grants, true);
+    let mut pending = down(&grants);
     let (out, hits) = feed(&mut pending, line.as_bytes()).await;
     assert_eq!(hits, 0);
     assert_original(&text_of(out), &line, real.seed.public.as_str(), &real_sig);
-    let mut absent_down = down(&grants, true);
+    let mut absent_down = down(&grants);
     let mut absent_up = up(&grants);
     arm_info(&mut absent_up, &mut absent_down, "INFO {\"server_id\":\"N1\"}\r\n").await;
     let (out, hits) = feed(&mut absent_down, line.as_bytes()).await;
@@ -1746,7 +1737,7 @@ mod tests {
     let real_jwt = user_jwt(real.seed.public.as_str());
     let grants = jwt_grants(&fake, &real, &fake_jwt, &real_jwt);
     let nonce = b"N0NCE";
-    let mut guest_down = down(&grants, true);
+    let mut guest_down = down(&grants);
     let mut guest_up = up(&grants);
     arm_info(&mut guest_up, &mut guest_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
     let line = jwt_line(&fake_jwt, &sig_of(&fake.seed, nonce));
@@ -1765,7 +1756,7 @@ mod tests {
       fake.seed.public.as_str(),
       sig_of(&fake.seed, nonce)
     );
-    let mut matching_down = down(&grants, true);
+    let mut matching_down = down(&grants);
     let mut matching_up = up(&grants);
     arm_info(&mut matching_up, &mut matching_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
     let (out, hits) = feed(&mut matching_down, matching.as_bytes()).await;
@@ -1786,7 +1777,7 @@ mod tests {
       "CONNECT {{\"jwt\":\"{fake_jwt}\",\"nkey\":\"not-the-fake-public\",\"sig\":\"{}\",\"verbose\":false}}\r\n",
       sig_of(&fake.seed, nonce)
     );
-    let mut foreign_down = down(&grants, true);
+    let mut foreign_down = down(&grants);
     let mut foreign_up = up(&grants);
     arm_info(&mut foreign_up, &mut foreign_down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
     let (out, hits) = feed(&mut foreign_down, foreign.as_bytes()).await;
@@ -1806,7 +1797,7 @@ mod tests {
       fake.seed.public.as_str(),
       sig_of(&fake.seed, nonce)
     );
-    let mut down = down(&grants, true);
+    let mut down = down(&grants);
     let mut up = up(&grants);
     arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
     let (out, hits) = feed(&mut down, line.as_bytes()).await;
@@ -1815,18 +1806,27 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn cleartext_forwards_the_guest_nkey_line() {
+  async fn cleartext_swaps_a_verifying_nkey_connect() {
     let fake = minted();
     let real = minted();
     let grants = nkey_grants(&fake, &real);
-    let line = nkey_line(fake.seed.public.as_str(), &sig_of(&fake.seed, b"N0NCE"));
-    let mut down = down(&grants, false);
+    let nonce = b"N0NCE";
+    let line = nkey_line(fake.seed.public.as_str(), &sig_of(&fake.seed, nonce));
+    let mut down = down(&grants);
     let mut up = up(&grants);
     arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
     let (out, hits) = feed(&mut down, line.as_bytes()).await;
-    assert_eq!(hits, 0);
-    assert_eq!(text_of(out), line);
-    assert!(!line.contains(real.seed.public.as_str()));
+    let out = text_of(out);
+    assert_eq!(hits, 1, "{out}");
+    let value: serde_json::Value = serde_json::from_str(out.trim().strip_prefix("CONNECT").expect("verb")).expect("json");
+    assert_eq!(
+      value.get("nkey").and_then(serde_json::Value::as_str),
+      Some(real.seed.public.as_str())
+    );
+    let sig = value.get("sig").and_then(serde_json::Value::as_str).expect("sig");
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(sig).expect("sig bytes");
+    assert!(NatsSeed::verify(real.seed.public.as_str(), nonce, &raw));
+    assert!(!out.contains(fake.seed.public.as_str()), "{out}");
   }
 
   #[tokio::test]
@@ -1899,7 +1899,7 @@ mod tests {
     );
     assert!(line.len() > MAX_COMMAND);
     let follow = nkey_line(fake.seed.public.as_str(), &sig);
-    let mut down = down(&grants, true);
+    let mut down = down(&grants);
     let mut up = up(&grants);
     arm_info(&mut up, &mut down, "INFO {\"nonce\":\"N0NCE\"}\r\n").await;
     let (out, hits) = feed(&mut down, format!("{line}{follow}").as_bytes()).await;

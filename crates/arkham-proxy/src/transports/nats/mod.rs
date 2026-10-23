@@ -4,8 +4,8 @@
 //! cleartext INFO line. A `tls://` server leg then upgrades before CONNECT,
 //! with the bytes read past INFO replayed into its handshake. A guest whose
 //! next byte opens a TLS record is terminated here. With `handshake_first`
-//! both legs settle TLS before any protocol byte. CONNECT carries the real
-//! values only when the server leg is TLS.
+//! both legs settle TLS before any protocol byte. Cleartext and TLS both
+//! put the real values in CONNECT.
 
 pub mod machine;
 
@@ -184,8 +184,8 @@ struct Open<'a> {
 impl Open<'_> {
   /// Both directions. Machines key on the grant host, which every
   /// identity this arm serves already matched.
-  fn pair(&self, swap: bool) -> (Nats, Nats) {
-    nats_pair(self.grants, &self.scope.downstream.host, self.port, swap)
+  fn pair(&self) -> (Nats, Nats) {
+    nats_pair(self.grants, &self.scope.downstream.host, self.port)
   }
 }
 
@@ -211,7 +211,7 @@ impl NatsTransport {
     }
     let upstream = &open.scope.upstream;
     let mut tcp = dial_marked(&upstream.host, upstream.port, open.fwmark).await?;
-    let (mut down, mut up) = open.pair(trust.is_some());
+    let (mut down, mut up) = open.pair();
     let Some(rest) = server_info(&mut tcp, &mut up, &mut down, &mut guest, trust.is_none()).await? else {
       return Ok(());
     };
@@ -252,7 +252,7 @@ impl NatsTransport {
       self.accept_guest(&identity, Prefixed::new(hello_buf, guest), open.scope.guest_tls),
     )
     .await?;
-    let (mut down, mut up) = open.pair(true);
+    let (mut down, mut up) = open.pair();
     let Some(rest) = server_info(&mut server, &mut up, &mut down, &mut guest, false).await? else {
       return Ok(());
     };
@@ -293,10 +293,9 @@ impl NatsTransport {
   }
 }
 
-/// Both directions for a NATS scope. `swap` is true only when the server
-/// leg is TLS: a cleartext server leg must keep the decoy.
-pub(crate) fn nats_pair(grants: &[Grant], host: &str, port: u16, swap: bool) -> (Nats, Nats) {
-  (Nats::downstream(grants, host, port, swap), Nats::upstream(grants, host, port))
+/// Both directions for a NATS scope. Cleartext and TLS both swap.
+pub(crate) fn nats_pair(grants: &[Grant], host: &str, port: u16) -> (Nats, Nats) {
+  (Nats::downstream(grants, host, port), Nats::upstream(grants, host, port))
 }
 
 async fn within<T>(budget: Duration, step: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
@@ -436,7 +435,7 @@ mod tests {
     );
     let mut scope = grants.first().and_then(|grant| grant.nats(None, 4222)).cloned().expect("scope");
     scope.guest_tls = GuestTlsMode::Mtls;
-    let (down, up) = nats_pair(&grants, "nats.internal", 4222, true);
+    let (down, up) = nats_pair(&grants, "nats.internal", 4222);
     let (mut upstream, server) = tokio::io::duplex(256);
     let (guest_peer, guest) = tokio::io::duplex(64);
     drop(guest_peer);
@@ -486,7 +485,7 @@ mod tests {
     let mut server = Cursor::new(wire);
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
     assert_eq!(rest, Some(vec![0x16, 0x03, 0x01]));
     assert_eq!(guest, info);
@@ -506,7 +505,7 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
@@ -531,7 +530,7 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let rest = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
     assert_eq!(guest, info);
@@ -548,7 +547,7 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
@@ -574,7 +573,7 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(matches!(err, crate::Error::NatsInfoUnreadable), "{err}");
   }
@@ -590,7 +589,7 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
@@ -618,7 +617,7 @@ mod tests {
     let mut server = SliceReads { parts: &parts, index: 0 };
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
@@ -646,7 +645,7 @@ mod tests {
     let mut server = SliceReads { parts: &parts, index: 0 };
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
@@ -675,7 +674,7 @@ mod tests {
     let mut server = SliceReads { parts: &parts, index: 0 };
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let err = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap_err();
     assert!(
       matches!(
@@ -704,7 +703,7 @@ mod tests {
     let mut server = SliceReads { parts: &parts, index: 0 };
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let rest = server_info(&mut server, &mut up, &mut down, &mut guest, true).await.unwrap();
     assert_eq!(rest, Some(b"EXTRA".to_vec()));
     assert_eq!(guest, &line[..line.len() - b"EXTRA".len()]);
@@ -732,7 +731,7 @@ mod tests {
     let mut server = Cursor::new(info.to_vec());
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
     assert_eq!(guest, info);
@@ -766,7 +765,7 @@ mod tests {
     let mut server = SliceReads { parts: &parts, index: 0 };
     let mut guest = Vec::new();
     let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-    let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+    let mut down = Nats::downstream(&grants, "nats.internal", 4222);
     let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
     assert_eq!(rest, Some(Vec::new()));
     let rest = server_info(&mut server, &mut up, &mut down, &mut guest, false).await.unwrap();
@@ -810,7 +809,7 @@ mod tests {
       let mut server = Cursor::new(wire.to_vec());
       let mut guest = Vec::new();
       let mut up = Nats::upstream(&grants, "nats.internal", 4222);
-      let mut down = Nats::downstream(&grants, "nats.internal", 4222, true);
+      let mut down = Nats::downstream(&grants, "nats.internal", 4222);
       let opened = server_info(&mut server, &mut up, &mut down, &mut guest, true).await;
       if wire.is_empty() {
         assert_eq!(opened.unwrap(), None);
