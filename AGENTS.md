@@ -173,6 +173,7 @@ Do:
 - Reuse the owning boundary: grants from `arkham-config`, leaves from `arkham-pki`, streams from `arkham-proxy::serve_transparent_stream`, stack pieces from `arkham-compose`.
 - Keep the smallest diff that fixes the root cause where all callers route through.
 - Adding a credential-rewriting protocol: follow [`.agents/skills/add-protocol/SKILL.md`](.agents/skills/add-protocol/SKILL.md).
+- Read [docs/engineering/architecture-map.md](docs/engineering/architecture-map.md) before any protocol work.
 
 When adding a capture backend: add an arm to the face dispatch plus one crate that depends on proxy/config only, reusing `serve_transparent_stream`; never copy the `with_capture` block.
 

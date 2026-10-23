@@ -16,29 +16,24 @@ pub(crate) mod fixtures;
 mod props;
 
 use std::io::{Error as IoError, ErrorKind};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use rama::tls::client::ClientAuth;
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::server::TlsStream as ServerTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use arkham_config::grants::{Grant, GuestTlsMode, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, RootCert};
 use arkham_pki::ca::CertAuthority;
 
 use super::{ServeStream, TlsHalves, Transport};
 use crate::Error;
-use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening};
+use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::mint::MintBucket;
 use crate::relay::{log_hits, relay_guarded};
 use crate::transports::engine::{Rewritten, Wire};
-use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
 use machine::Nats;
 
 /// First byte of a TLS record carrying a handshake.
@@ -73,59 +68,29 @@ impl NatsTransport {
 impl TlsHalves for NatsTransport {
   type Scope = NatsTrust;
 
-  /// Accept the guest's TLS, minting the leaf for `name` on first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the handshake fails.
-  async fn accept_guest<G>(&self, name: &str, guest: G, guest_tls: GuestTlsMode) -> Result<ServerTlsStream<G>, Error>
-  where
-    G: AsyncRead + AsyncWrite + Unpin,
-  {
-    let config = match guest_tls {
-      GuestTlsMode::Tls => cached_leaf(&self.ca, &self.leaves, name, None)?,
-      GuestTlsMode::Mtls => cached_leaf_mtls(&self.ca, &self.leaves, name, None)?,
-    };
-    TlsAcceptor::from(config)
-      .accept(guest)
-      .await
-      .map_err(|source| Error::GuestNatsTls { source })
+  fn ca(&self) -> &CertAuthority {
+    &self.ca
   }
 
-  /// Handshake the server under the trust a `tls://` string states. Chain
-  /// and host name are always verified.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the trust anchor or client identity cannot be
-  /// read, when the server name is unusable, or when the handshake fails.
-  async fn connect_server<S>(&self, scope: &NatsTrust, server_name: &str, server: S) -> Result<ClientTlsStream<S>, Error>
-  where
-    S: AsyncRead + AsyncWrite + Unpin,
-  {
-    let roots = cached_roots(&self.roots, &scope.root_cert)?;
-    let builder = ClientConfig::builder().with_root_certificates(roots);
-    let config = match &scope.identity {
-      Some(identity) => {
-        let ClientAuth::Single(data) = client_identity(&identity.cert, &identity.key)? else {
-          return Err(Error::EmptyClientIdentity {
-            path: identity.cert.clone(),
-          });
-        };
-        builder
-          .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|source| Error::ClientIdentity {
-            path: identity.cert.clone(),
-            source,
-          })?
-      }
-      None => builder.with_no_client_auth(),
-    };
-    let name = ServerName::try_from(server_name.to_string()).map_err(|err| Error::NatsServerName { source: err.into() })?;
-    TlsConnector::from(Arc::new(config))
-      .connect(name, server)
-      .await
-      .map_err(|source| Error::ServerNatsTls { source })
+  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
+    &self.leaves
+  }
+
+  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
+    &self.roots
+  }
+
+  fn tls_label(&self) -> &'static str {
+    "nats"
+  }
+
+  fn root_cert<'a>(&self, scope: &'a NatsTrust) -> Option<&'a RootCert> {
+    Some(&scope.root_cert)
+  }
+
+  fn client_paths<'a>(&self, scope: &'a NatsTrust) -> Option<(&'a Path, &'a Path)> {
+    let identity = scope.identity.as_ref()?;
+    Some((identity.cert.as_path(), identity.key.as_path()))
   }
 }
 

@@ -9,31 +9,26 @@
 pub(crate) mod machine;
 
 use std::io::{Error as IoError, ErrorKind};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::server::TlsStream as ServerTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use arkham_config::grants::{Grant, GuestTlsMode, LdapScope, RootCert};
+use arkham_config::grants::{Grant, LdapScope, RootCert};
 use arkham_pki::ca::CertAuthority;
 
 use super::PairCtx;
 use super::{ServeStream, TlsHalves, Transport};
 use crate::Error;
-use crate::connection::{Prefixed, client_identity, dial_marked, guest_tls_opening};
+use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::mint::MintBucket;
 use crate::relay::{RelayEnd, log_hits, relay_guarded, relay_stop};
 use crate::transports::engine::{Direction, Ldap, Rewritten, Wire};
-use crate::transports::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
 use machine::starttls_success;
-use rama::tls::client::ClientAuth;
 
 /// First byte of a TLS record carrying a handshake. An `ldaps` guest leg
 /// opens with it; a cleartext `ldap` scope never serves it.
@@ -67,57 +62,28 @@ impl LdapTransport {
 impl TlsHalves for LdapTransport {
   type Scope = LdapScope;
 
-  /// Accept the guest's TLS, minting the leaf for `name` on first use.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the leaf cannot be minted or the handshake fails.
-  async fn accept_guest<G>(&self, name: &str, guest: G, guest_tls: GuestTlsMode) -> Result<ServerTlsStream<G>, Error>
-  where
-    G: AsyncRead + AsyncWrite + Unpin,
-  {
-    let config = match guest_tls {
-      GuestTlsMode::Tls => cached_leaf(&self.ca, &self.leaves, name, None)?,
-      GuestTlsMode::Mtls => cached_leaf_mtls(&self.ca, &self.leaves, name, None)?,
-    };
-    TlsAcceptor::from(config)
-      .accept(guest)
-      .await
-      .map_err(|err| Error::GuestLdapTls { source: err })
+  fn ca(&self) -> &CertAuthority {
+    &self.ca
   }
 
-  /// Handshake the server. Chain and host name are always verified.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the trust anchor cannot be read, when the server
-  /// name is unusable, or when the handshake fails.
-  async fn connect_server<S>(&self, scope: &LdapScope, server_name: &str, server: S) -> Result<ClientTlsStream<S>, Error>
-  where
-    S: AsyncRead + AsyncWrite + Unpin,
-  {
-    let root = scope.root_cert.clone().unwrap_or(RootCert::System);
-    let roots = cached_roots(&self.roots, &root)?;
-    let builder = ClientConfig::builder().with_root_certificates(roots);
-    let config = match (&scope.client_cert, &scope.client_key) {
-      (Some(cert), Some(key)) => {
-        let ClientAuth::Single(data) = client_identity(cert, key)? else {
-          return Err(Error::EmptyClientIdentity { path: cert.clone() });
-        };
-        builder
-          .with_client_auth_cert(data.cert_chain.clone(), data.private_key.clone_key())
-          .map_err(|err| Error::ClientIdentity {
-            path: cert.clone(),
-            source: err,
-          })?
-      }
-      _ => builder.with_no_client_auth(),
-    };
-    let name = ServerName::try_from(server_name.to_string()).map_err(|err| Error::LdapServerName { source: err.into() })?;
-    TlsConnector::from(Arc::new(config))
-      .connect(name, server)
-      .await
-      .map_err(|err| Error::ServerLdapTls { source: err })
+  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
+    &self.leaves
+  }
+
+  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
+    &self.roots
+  }
+
+  fn tls_label(&self) -> &'static str {
+    "ldap"
+  }
+
+  fn root_cert<'a>(&self, scope: &'a LdapScope) -> Option<&'a RootCert> {
+    scope.root_cert.as_ref()
+  }
+
+  fn client_paths<'a>(&self, scope: &'a LdapScope) -> Option<(&'a Path, &'a Path)> {
+    Some((scope.client_cert.as_deref()?, scope.client_key.as_deref()?))
   }
 }
 
