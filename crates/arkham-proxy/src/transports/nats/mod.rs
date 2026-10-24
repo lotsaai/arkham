@@ -17,17 +17,13 @@ mod props;
 
 use std::io::{Error as IoError, ErrorKind};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
-use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use arkham_config::grants::{Grant, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, RootCert};
-use arkham_pki::ca::CertAuthority;
 
-use super::{ServeStream, TlsHalves, Transport};
+use super::{ServeStream, TlsCache, TlsHalves, Transport, within};
 use crate::Error;
 use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
@@ -43,41 +39,23 @@ const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 const OPENING_READ: usize = 4096;
 
 /// NATS transport.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct NatsTransport {
-  ca: CertAuthority,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
+  tls: TlsCache,
 }
 
 impl NatsTransport {
-  /// Build both halves over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
-    })
+  /// Share the proxy TLS cache.
+  pub(crate) fn new(tls: TlsCache) -> Self {
+    Self { tls }
   }
 }
 
 impl TlsHalves for NatsTransport {
   type Scope = NatsTrust;
 
-  fn ca(&self) -> &CertAuthority {
-    &self.ca
-  }
-
-  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
-    &self.leaves
-  }
-
-  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
-    &self.roots
+  fn tls(&self) -> &TlsCache {
+    &self.tls
   }
 
   fn tls_label(&self) -> &'static str {
@@ -177,7 +155,12 @@ impl NatsTransport {
       return Ok(());
     };
     if let Some(trust) = trust {
-      let stream = within(open.budget, self.connect_server(trust, &upstream.host, Prefixed::new(rest, tcp))).await?;
+      let stream = within(
+        "nats",
+        open.budget,
+        self.connect_server(trust, &upstream.host, Prefixed::new(rest, tcp)),
+      )
+      .await?;
       let server = ServerLeg {
         stream,
         first: Vec::new(),
@@ -207,8 +190,9 @@ impl NatsTransport {
     };
     let upstream = &open.scope.upstream;
     let tcp = dial_marked(&upstream.host, upstream.port, open.fwmark).await?;
-    let mut server = within(open.budget, self.connect_server(trust, &upstream.host, tcp)).await?;
+    let mut server = within("nats", open.budget, self.connect_server(trust, &upstream.host, tcp)).await?;
     let mut guest = within(
+      "nats",
       open.budget,
       self.accept_guest(&identity, Prefixed::new(hello_buf, guest), open.scope.guest_tls),
     )
@@ -243,6 +227,7 @@ impl NatsTransport {
       return Ok(());
     };
     let guest = within(
+      "nats",
       open.budget,
       self.accept_guest(&identity, Prefixed::new(hello_buf, guest), open.scope.guest_tls),
     )
@@ -255,10 +240,6 @@ impl NatsTransport {
 /// passes `true` on every server leg.
 pub(crate) fn nats_pair(grants: &[Grant], host: &str, port: u16, swap: bool) -> (Nats, Nats) {
   (Nats::downstream(grants, host, port, swap), Nats::upstream(grants, host, port))
-}
-
-async fn within<T>(budget: Duration, step: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
-  tokio::time::timeout(budget, step).await.unwrap_or(Err(Error::NatsHandshakeTimeout))
 }
 
 /// Forward the server's first line, INFO, through `up` to the guest, and
@@ -351,6 +332,7 @@ mod tests {
   use pretty_assertions::assert_eq;
   use tokio::io::{AsyncRead, AsyncReadExt as _, ReadBuf};
 
+  use super::super::TlsCache;
   use super::{NatsTransport, Open, ServerLeg, nats_pair};
 
   use super::fixtures::{mint_user, nats_grants};
@@ -361,7 +343,7 @@ mod tests {
   #[tokio::test]
   async fn mtls_plaintext_guest_forwards_the_real_password() {
     let ca = CertAuthority::generate().expect("ca");
-    let transport = NatsTransport::new(&ca).expect("transport");
+    let transport = NatsTransport::new(TlsCache::new(&ca).expect("tls"));
     let grants = nats_grants(
       "nats://agent:arkham_fake_nats_pass@nats.internal:4222",   // betterleaks:allow
       "tls://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow

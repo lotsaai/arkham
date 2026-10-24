@@ -4,18 +4,14 @@
 pub(crate) mod machine;
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
-use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use arkham_config::grants::{RedisScope, RootCert};
-use arkham_pki::ca::CertAuthority;
 
 use super::PairCtx;
-use super::{ServeStream, TlsHalves, Transport};
+use super::{ServeStream, TlsCache, TlsHalves, Transport};
 use crate::Error;
 use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
@@ -25,41 +21,23 @@ use crate::transports::engine::{Direction, Redis};
 /// Redis transport: each connection string states its own leg, and the
 /// upstream `rediss` leg verifies the chain and the host name — the https
 /// precedent, not libpq's.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RedisTransport {
-  ca: CertAuthority,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
+  tls: TlsCache,
 }
 
 impl RedisTransport {
-  /// Build both halves over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
-    })
+  /// Share the proxy TLS cache.
+  pub(crate) fn new(tls: TlsCache) -> Self {
+    Self { tls }
   }
 }
 
 impl TlsHalves for RedisTransport {
   type Scope = RedisScope;
 
-  fn ca(&self) -> &CertAuthority {
-    &self.ca
-  }
-
-  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
-    &self.leaves
-  }
-
-  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
-    &self.roots
+  fn tls(&self) -> &TlsCache {
+    &self.tls
   }
 
   fn tls_label(&self) -> &'static str {
@@ -125,27 +103,26 @@ impl Transport for RedisTransport {
       host: matched_name.unwrap_or(scope.downstream.host.as_str()),
       port,
       plugins: &state.plugins,
-      mint: Some(state.mint_handle()),
+      mint: Some(state.mint_store()),
     };
     let upstream_name = scope.upstream.host.as_str();
-    let redis = &state.redis;
     match (guest_tls, scope.is_upstream_tls) {
       (None, false) => relay(Prefixed::new(guest_head, guest), upstream, &ctx).await,
       (Some((hello_buf, identity)), false) => {
-        let plain = redis
+        let plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
           .await?;
         relay(plain, upstream, &ctx).await
       }
       (None, true) => {
-        let plain = redis.connect_server(scope, upstream_name, upstream).await?;
+        let plain = self.connect_server(scope, upstream_name, upstream).await?;
         relay(Prefixed::new(guest_head, guest), plain, &ctx).await
       }
       (Some((hello_buf, identity)), true) => {
-        let guest_plain = redis
+        let guest_plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
           .await?;
-        let server_plain = redis.connect_server(scope, upstream_name, upstream).await?;
+        let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
         relay(guest_plain, server_plain, &ctx).await
       }
     }
@@ -184,6 +161,7 @@ mod tests {
   use secrecy::SecretString;
   use tokio::net::TcpListener;
 
+  use super::super::TlsCache;
   use super::RedisTransport;
   use crate::ProxyState;
   use crate::identity::CandidateParams;
@@ -235,7 +213,7 @@ mod tests {
     .unwrap();
     let snapshot = state.snapshot();
     let (guest, _peer) = tokio::io::duplex(64);
-    let transport = RedisTransport::new(&ca).unwrap();
+    let transport = RedisTransport::new(TlsCache::new(&ca).unwrap());
     transport
       .serve(ServeStream {
         guest,

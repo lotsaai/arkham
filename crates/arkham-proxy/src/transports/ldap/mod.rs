@@ -10,18 +10,14 @@ pub(crate) mod machine;
 
 use std::io::{Error as IoError, ErrorKind};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
-use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use arkham_config::grants::{Grant, LdapScope, RootCert};
-use arkham_pki::ca::CertAuthority;
 
 use super::PairCtx;
-use super::{ServeStream, TlsHalves, Transport};
+use super::{ServeStream, TlsCache, TlsHalves, Transport};
 use crate::Error;
 use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
@@ -33,41 +29,23 @@ use machine::starttls_success;
 /// LDAP transport. `ldaps://` settles TLS before the machine runs.
 /// `ldap://` stays plaintext until `StartTLS`, then mints the guest leaf
 /// for the scope host and opens TLS upstream.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct LdapTransport {
-  ca: CertAuthority,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
+  tls: TlsCache,
 }
 
 impl LdapTransport {
-  /// Build both halves over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
-    })
+  /// Share the proxy TLS cache.
+  pub(crate) fn new(tls: TlsCache) -> Self {
+    Self { tls }
   }
 }
 
 impl TlsHalves for LdapTransport {
   type Scope = LdapScope;
 
-  fn ca(&self) -> &CertAuthority {
-    &self.ca
-  }
-
-  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
-    &self.leaves
-  }
-
-  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
-    &self.roots
+  fn tls(&self) -> &TlsCache {
+    &self.tls
   }
 
   fn tls_label(&self) -> &'static str {
@@ -123,7 +101,7 @@ impl Transport for LdapTransport {
       host: matched_name.unwrap_or(scope.downstream.host.as_str()),
       port,
       plugins: &state.plugins,
-      mint: Some(state.mint_handle()),
+      mint: Some(state.mint_store()),
     };
     let upstream_name = scope.upstream.host.as_str();
     let pump = Pump {

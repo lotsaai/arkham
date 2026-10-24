@@ -30,9 +30,9 @@ pub struct MintedPair {
 /// agents reuse tokens across connections.
 // ponytail: process-memory only; restart orphans decoys the agent still
 // holds and forces re-auth. Persist beside the CA if that ceiling bites.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MintStore {
-  pairs: DashMap<String, MintedPair>,
+  pairs: Arc<DashMap<String, MintedPair>>,
 }
 
 impl std::fmt::Debug for MintStore {
@@ -43,12 +43,6 @@ impl std::fmt::Debug for MintStore {
       .field("labels", &labels)
       .finish()
   }
-}
-
-/// A handle to the store handed to each substitution machine.
-#[derive(Debug, Clone)]
-pub struct MintHandle {
-  store: Arc<MintStore>,
 }
 
 impl MintStore {
@@ -96,30 +90,6 @@ impl MintStore {
         (pair.decoy.clone(), SecretString::from(real.clone()), pair.label.clone())
       })
       .collect()
-  }
-}
-
-impl MintHandle {
-  /// A machine's view of the store. Label and decoy pattern come from the
-  /// mint plan the machine derives from its grants.
-  #[must_use]
-  pub fn new(store: Arc<MintStore>) -> Self {
-    Self { store }
-  }
-
-  /// Mint one field value; see [`MintStore::mint`].
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the value is empty.
-  pub fn mint(&self, label: &str, pattern: Option<&str>, field: &str, value: &str, expires_in: Option<u64>) -> Result<String, Error> {
-    self.store.mint(label, pattern, field, value, expires_in)
-  }
-
-  /// Snapshot of every minted pair, (decoy, real, label), for request machines.
-  #[must_use]
-  pub fn pairs(&self) -> Vec<(String, SecretString, String)> {
-    self.store.snapshot_pairs()
   }
 }
 
@@ -242,12 +212,12 @@ mod tests {
   }
 
   #[test]
-  fn handle_mints_through_the_plan_arguments() {
-    let store = Arc::new(MintStore::default());
-    let handle = MintHandle::new(Arc::clone(&store));
-    let decoy = handle.mint("rule", Some("d_{d:8}"), "access_token", "value", None).unwrap();
+  fn clone_shares_the_minted_pair() {
+    let store = MintStore::default();
+    let cloned = store.clone();
+    let decoy = cloned.mint("rule", Some("d_{d:8}"), "access_token", "value", None).unwrap();
     assert!(decoy.starts_with("d_"), "{decoy}");
     assert!(decoy[2..].bytes().all(|b| b.is_ascii_digit()), "{decoy}");
-    assert_eq!(handle.pairs().len(), 1);
+    assert_eq!(store.snapshot_pairs().len(), 1);
   }
 }

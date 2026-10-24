@@ -86,18 +86,18 @@ amq-protocol = { version = "10.6.3", default-features = false }
 async-compat = "0.2.6"
 async-nats = { version = "0.50.0", default-features = false, features = ["aws-lc-rs", "nkeys"] }
 async-trait = "0.1"
-atoi = "2"
+atoi = "3"
 aya = "0.14"
 aya-build = "0.2"
 aya-obj = "0.3"
 base62 = "2.0"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 code-workspace = "0.1.4"
 confique = { version = "0.4", features = ["toml"] }
 dashmap = "6"
-dirs = "6"
+dirs = "7"
 eyre = "0.6"
 fe2o3-amqp = { version = "0.18.3", default-features = false, features = ["acceptor"] }
 fe2o3-amqp-types = "0.18.0"
@@ -105,8 +105,8 @@ fnox-core = "1.33"
 futures = "0.3"
 futures-sink = "0.3"
 futures-util = "0.3.34"
-gix-config = { version = "0.61", features = ["sha1"] }
-gix-discover = { version = "0.56", features = ["sha1"] }
+gix-config = { version = "0.62", features = ["sha1"] }
+gix-discover = { version = "0.57", features = ["sha1"] }
 h2 = "0.4"
 hex = "0.4"
 httlib-hpack = "0.1.3"
@@ -124,22 +124,22 @@ miette = { version = "7", features = ["fancy"] }
 mimalloc = "0.1"
 netlink-packet-core = "0.9"
 netlink-packet-netfilter = "0.4"
-netlink-sys = "0.8"
+netlink-sys = "0.9"
 nkeys = "0.4.5"
-pem = "3.0.6"
+pem = "4"
 percent-encoding = "2.3"
-pgwire = { version = "0.41", default-features = false }
+pgwire = { version = "0.42", default-features = false }
 pretty_assertions = "1"
 proptest = "1"
 rama = { git = "https://github.com/plabayo/rama", branch = "main", default-features = false }
-rand = "0.8"
+rand = "0.10"
 rasn = { version = "0.29.0", default-features = false, features = ["std"] }
 rasn-ldap = "0.29.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 redis = { version = "1.7.1", default-features = false, features = ["tokio-comp"] }
 regex = "1"
 rtnetlink = "0.23.0"
-russh = { version = "0.56", default-features = false, features = ["aws-lc-rs"] }
+russh = { version = "0.64", default-features = false, features = ["aws-lc-rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 rustls-native-certs = "0.8"
 secrecy = { version = "0.10", features = ["serde"] }
@@ -147,7 +147,7 @@ serde = { version = "1", features = ["derive"] }
 serde_amqp = "0.18.0"
 serde_json = "1"
 serde_yaml = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 shellexpand = "3"
 smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-dns", "socket-icmp", "socket-tcp", "socket-udp", "std"] }
 smtp-proto = "0.2.5"
@@ -160,15 +160,15 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "parking_lot", 
 tokio-postgres = "0.7"
 tokio-rustls = "0.26"
 tokio-util = "0.7"
-toml = "0.8"
+toml = "1"
 toml_edit = { version = "0.25", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tun = { version = "0.7", features = ["async"] }
+tun = { version = "0.8", features = ["async"] }
 url = "2"
-validator = { version = "0.20", features = ["derive"] }
-wasmtime = { version = "48", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
-wasmtime-wasi = "48"
+validator = { version = "0.21", features = ["derive"] }
+wasmtime = { version = "50", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
+wasmtime-wasi = "50"
 xpanda = "0.2"
 
 [dependencies]
