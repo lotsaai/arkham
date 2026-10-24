@@ -271,12 +271,12 @@ pub enum Error {
     #[source]
     source: Box<dyn StdError + Send + Sync>,
   },
-  /// A NATS TLS handshake exceeded the configured budget.
-  #[error("nats handshake timed out")]
-  NatsHandshakeTimeout,
-  /// An AMQP TLS handshake exceeded the configured budget.
-  #[error("amqp handshake timed out")]
-  AmqpHandshakeTimeout,
+  /// A protocol handshake exceeded its budget.
+  #[error("{protocol} handshake timed out")]
+  HandshakeTimeout {
+    /// Protocol that ran the handshake.
+    protocol: &'static str,
+  },
   /// A secret does not fit the smallest frame either peer can negotiate.
   #[error("amqp secret of {len} bytes exceeds the minimum frame")]
   AmqpSecretTooLong {
@@ -302,9 +302,6 @@ pub enum Error {
     /// Carry-map entries.
     entries: usize,
   },
-  /// An SMTP TLS handshake exceeded the configured budget.
-  #[error("smtp handshake timed out")]
-  SmtpHandshakeTimeout,
   /// An SMTP leg was asked to start TLS when it was already in TLS.
   #[error("smtp leg is already TLS")]
   SmtpLegAlreadyTls,

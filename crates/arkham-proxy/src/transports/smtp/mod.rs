@@ -18,14 +18,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
-use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use arkham_config::grants::{RootCert, SmtpScope};
-use arkham_pki::ca::CertAuthority;
 
-use super::{PairCtx, ServeStream, TlsHalves, Transport};
+use super::{PairCtx, ServeStream, TlsCache, TlsHalves, Transport, within};
 use crate::Error;
 use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
@@ -33,39 +30,21 @@ use crate::identity::CandidateParams;
 /// SMTP transport. Each connection string states its own leg.
 #[derive(Debug)]
 pub(crate) struct SmtpTransport {
-  ca: CertAuthority,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
+  tls: Arc<TlsCache>,
 }
 
 impl SmtpTransport {
-  /// Build both halves over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
-    })
+  /// Share the proxy TLS cache.
+  pub(crate) fn new(tls: Arc<TlsCache>) -> Self {
+    Self { tls }
   }
 }
 
 impl TlsHalves for SmtpTransport {
   type Scope = SmtpScope;
 
-  fn ca(&self) -> &CertAuthority {
-    &self.ca
-  }
-
-  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
-    &self.leaves
-  }
-
-  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
-    &self.roots
+  fn tls(&self) -> &TlsCache {
+    &self.tls
   }
 
   fn tls_label(&self) -> &'static str {
@@ -131,6 +110,7 @@ impl Transport for SmtpTransport {
     let guest_leg = match guest_tls {
       Some((hello_buf, identity)) => {
         let tls = within(
+          "smtp",
           budget,
           self.accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls),
         )
@@ -140,7 +120,7 @@ impl Transport for SmtpTransport {
       None => session::plain_guest(Prefixed::new(guest_head, guest)),
     };
     let server_leg = if scope.is_upstream_tls {
-      let tls = within(budget, self.connect_server(scope, upstream_name, upstream)).await?;
+      let tls = within("smtp", budget, self.connect_server(scope, upstream_name, upstream)).await?;
       session::tls_server(tls)
     } else {
       session::plain_server(upstream)
@@ -156,12 +136,5 @@ impl Transport for SmtpTransport {
       budget,
     })
     .await
-  }
-}
-
-async fn within<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
-  match tokio::time::timeout(budget, handshake).await {
-    Ok(result) => result,
-    Err(_elapsed) => Err(Error::SmtpHandshakeTimeout),
   }
 }

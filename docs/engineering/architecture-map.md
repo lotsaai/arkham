@@ -31,12 +31,12 @@ Nothing on main is split into one crate per protocol. Each protocol is spread ac
 |---|---|---|
 | `ServeStream<'a,G,S>` | 44 | `{ guest: G, params: CandidateParams<'a>, scope: &'a S }` |
 | `Transport` | 54 | `type Scope: Sync; fn serve<G: AsyncRead+AsyncWrite+Unpin+Send+'static>(&self, ServeStream<'_,G,Self::Scope>) -> impl Future<Output=Result<(),Error>>` |
-| `TlsHalves` | 74 | `type Scope; fn accept_guest` and `fn connect_server` have default bodies (tokio-rustls). A protocol implements `ca`, `leaves`, `roots`, `tls_label`, `root_cert`, `client_paths`. Defaults: `guest_alpn` and `server_alpn` offer nothing; `client_builder` verifies chain and name against the named root, or the platform store when the scope names none. |
+| `TlsHalves` | 74 | `type Scope; fn accept_guest` and `fn connect_server` have default bodies (tokio-rustls). A protocol implements `tls`, `tls_label`, `root_cert`, `client_paths`. Defaults: `guest_alpn` and `server_alpn` offer nothing; `client_builder` verifies chain and name against the named root, or the platform store when the scope names none. |
 | `PairCtx<'a>` | 204 | `{ grants:&[Grant], host:&str, port:u16, plugins:&arkham_plugin::Registry, mint:Option<MintHandle> }` |
 
 **How a new protocol plugs in:**
 1. Implement `Transport::serve`.
-2. Implement `TlsHalves` if it has TLS legs. Supply the accessors. Override `guest_alpn`, `server_alpn`, or `client_builder` only when the wire law differs.
+2. Implement `TlsHalves` if it has TLS legs. Supply `tls`. Override `guest_alpn`, `server_alpn`, or `client_builder` only when the wire law differs.
 3. Build its `(down, up)` wire pair from `PairCtx`.
 
 `accept_guest` and `connect_server` are default methods. Postgres overrides ALPN (`postgresql`) and `client_builder` (libpq `EgressCertVerifier`). Redis, SMTP, LDAP, NATS, and AMQP use the defaults.
@@ -48,7 +48,7 @@ Nothing on main is split into one crate per protocol. Each protocol is spread ac
 | `cached_leaf_mtls` | 52 | same args; cache key `"{sni}\|mtls"`; client verifier on arkham's CA |
 | `cached_roots` | 87 | `(roots:&DashMap<RootCert,Arc<RootCertStore>>, root:&RootCert) -> Result<Arc<RootCertStore>>` (Path or System, fails closed if empty) |
 
-These are free functions, and the caller owns the `DashMap`s. Every transport struct therefore carries its own `ca`, `leaves` and `roots`, which means 6 separate caches and 6 reloads of the CA PEM.
+These are free functions over the one `TlsCache` built in `ProxyState::new`. The leaf key includes the ALPN offer, so a `postgresql` leaf and a leaf with no ALPN do not collide on the same name.
 
 Related helpers in `proxy/connection.rs`:
 | Helper | Line | What it does |
@@ -193,13 +193,10 @@ Per-protocol prod lines below are proxy files plus the matching `grants/` file (
 ### Duplication on main (file:line)
 | What | Copies | Base it should use |
 |---|---|---|
-| Transport struct `{ca, leaves, roots}` plus `new` doing `CertAuthority::load(cert_pem,key_pem)` | redis :34-52, smtp :39-57, ldap :41-59, nats :47-65, amqp :25-38, postgres :35-59 | One shared TLS state in `ProxyState` |
 | `serve` opening (`is_downstream_tls` → `guest_tls_opening`, `dial_marked`, `matched_name`, `PairCtx`) | redis :103-139, smtp :110-137, ldap :112-136, amqp :88-110 | Shared helper |
 | 4-way `(guest_tls, upstream_tls)` leg match | redis :142-159, postgres :195-213, ldap :194-210, amqp :149-171 | Shared helper |
-| `within`/handshake timeout | amqp/mod.rs:176, nats/mod.rs:267, smtp/mod.rs:170, smtp/session.rs:428 | One helper plus one error |
 | `const TLS_RECORD_HANDSHAKE = 0x16` | nats/mod.rs, postgres/machine.rs | One const |
 | Scan-close-hold "guard" (find a full match → close; else hold `needle_prefix_suffix_len`) | amqp/machine.rs:928-947, ldap/machine.rs:828-851, nats/machine.rs:1164-1179 | No engine primitive exists yet; `Raw` replaces but never closes |
-| Per-protocol handshake-timeout errors (`NatsHandshakeTimeout`, `AmqpHandshakeTimeout`, `SmtpHandshakeTimeout`) | proxy/error.rs:276, 293, 321 | One timeout variant |
 | Grant lookups with identical bodies | grants/mod.rs:514-574 (6 copies) | One generic lookup |
 | `XScope::matches` | redis.rs:225, smtp.rs:390, ldap.rs:279, amqp.rs:263, postgres.rs:287, nats.rs:1102 | Same shape |
 | `Leg`/`Scope` structs (`host`, `port`, `password`, `is_*_tls`, `root_cert`, `client_cert`/`key`, `guest_tls`) | redis.rs:16/35, smtp.rs:23/43, ldap.rs:17/35, amqp.rs:13/33 | Shared leg/scope |

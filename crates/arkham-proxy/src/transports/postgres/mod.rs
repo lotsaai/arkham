@@ -8,19 +8,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
 use rustls::client::WantsClientCert;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore, ServerConfig, SignatureScheme};
+use rustls::{ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use arkham_config::grants::{PostgresScope, RootCert, SslMode, SslNegotiation};
-use arkham_pki::ca::CertAuthority;
 
 use super::PairCtx;
-use super::{ServeStream, TlsHalves, Transport};
+use super::{ServeStream, TlsCache, TlsHalves, Transport};
 use crate::Error;
 use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
@@ -33,45 +31,27 @@ use crate::transports::tls::cached_roots;
 /// handshakes under libpq's `sslmode` law.
 #[derive(Debug)]
 pub(crate) struct PostgresTransport {
-  ca: CertAuthority,
+  tls: Arc<TlsCache>,
   provider: Arc<CryptoProvider>,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
 }
 
 impl PostgresTransport {
-  /// Build both halves over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      // An own handle on the same CA: minting needs its signing key, and the
-      // caller's borrow ends with this call.
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
+  /// Share the proxy TLS cache. The crypto provider is the process default.
+  pub(crate) fn new(tls: Arc<TlsCache>) -> Self {
+    Self {
+      tls,
       provider: CryptoProvider::get_default()
         .cloned()
         .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider())),
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
-    })
+    }
   }
 }
 
 impl TlsHalves for PostgresTransport {
   type Scope = PostgresScope;
 
-  fn ca(&self) -> &CertAuthority {
-    &self.ca
-  }
-
-  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
-    &self.leaves
-  }
-
-  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
-    &self.roots
+  fn tls(&self) -> &TlsCache {
+    &self.tls
   }
 
   fn tls_label(&self) -> &'static str {
@@ -100,7 +80,7 @@ impl TlsHalves for PostgresTransport {
 
   fn client_builder(&self, scope: &PostgresScope) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>, Error> {
     let roots = match self.root_cert(scope) {
-      Some(root) => Some(cached_roots(self.roots(), root)?),
+      Some(root) => Some(cached_roots(self.tls().roots(), root)?),
       None => None,
     };
     let verifier = EgressCertVerifier {
@@ -313,6 +293,7 @@ mod tests {
   use tokio::io::AsyncReadExt as _;
   use tokio::net::TcpListener;
 
+  use super::super::TlsCache;
   use super::PostgresTransport;
   use crate::ProxyState;
   use crate::identity::CandidateParams;
@@ -382,7 +363,7 @@ mod tests {
     .unwrap();
     let snapshot = state.snapshot();
     let (guest, _peer) = tokio::io::duplex(64);
-    let transport = PostgresTransport::new(&ca).unwrap();
+    let transport = PostgresTransport::new(Arc::new(TlsCache::new(&ca).unwrap()));
     let result = transport
       .serve(ServeStream {
         guest,

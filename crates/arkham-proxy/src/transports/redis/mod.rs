@@ -7,15 +7,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
-use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use arkham_config::grants::{RedisScope, RootCert};
-use arkham_pki::ca::CertAuthority;
 
 use super::PairCtx;
-use super::{ServeStream, TlsHalves, Transport};
+use super::{ServeStream, TlsCache, TlsHalves, Transport};
 use crate::Error;
 use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
@@ -27,39 +24,21 @@ use crate::transports::engine::{Direction, Redis};
 /// precedent, not libpq's.
 #[derive(Debug)]
 pub(crate) struct RedisTransport {
-  ca: CertAuthority,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
+  tls: Arc<TlsCache>,
 }
 
 impl RedisTransport {
-  /// Build both halves over the CA that signs guest-facing leaves.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the CA cannot be read back from its own PEM.
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
-    })
+  /// Share the proxy TLS cache.
+  pub(crate) fn new(tls: Arc<TlsCache>) -> Self {
+    Self { tls }
   }
 }
 
 impl TlsHalves for RedisTransport {
   type Scope = RedisScope;
 
-  fn ca(&self) -> &CertAuthority {
-    &self.ca
-  }
-
-  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
-    &self.leaves
-  }
-
-  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
-    &self.roots
+  fn tls(&self) -> &TlsCache {
+    &self.tls
   }
 
   fn tls_label(&self) -> &'static str {
@@ -184,6 +163,7 @@ mod tests {
   use secrecy::SecretString;
   use tokio::net::TcpListener;
 
+  use super::super::TlsCache;
   use super::RedisTransport;
   use crate::ProxyState;
   use crate::identity::CandidateParams;
@@ -235,7 +215,7 @@ mod tests {
     .unwrap();
     let snapshot = state.snapshot();
     let (guest, _peer) = tokio::io::duplex(64);
-    let transport = RedisTransport::new(&ca).unwrap();
+    let transport = RedisTransport::new(Arc::new(TlsCache::new(&ca).unwrap()));
     transport
       .serve(ServeStream {
         guest,

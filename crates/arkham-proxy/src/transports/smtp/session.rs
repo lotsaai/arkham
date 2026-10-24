@@ -21,6 +21,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
+use super::super::within;
 use super::SmtpTransport;
 use super::machine::{MAX_COMMAND, Smtp, is_opening_command, is_starttls};
 use crate::Error;
@@ -400,7 +401,7 @@ where
     GuestLeg::Plain(stream) => stream,
     GuestLeg::Tls(_) => return Err(Error::SmtpLegAlreadyTls),
   };
-  let tls = handshake(budget, transport.accept_guest(leaf, plain, scope.guest_tls)).await?;
+  let tls = within("smtp", budget, transport.accept_guest(leaf, plain, scope.guest_tls)).await?;
   Ok(GuestLeg::Tls(Box::new(tls)))
 }
 
@@ -421,15 +422,8 @@ async fn upgrade_server(
     at: 0,
     inner: plain,
   };
-  let tls = handshake(budget, transport.connect_server(scope, name, io)).await?;
+  let tls = within("smtp", budget, transport.connect_server(scope, name, io)).await?;
   Ok(ServerLeg::Upgraded(Box::new(tls)))
-}
-
-async fn handshake<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
-  match tokio::time::timeout(budget, handshake).await {
-    Ok(result) => result,
-    Err(_elapsed) => Err(Error::SmtpHandshakeTimeout),
-  }
 }
 
 async fn write_guest<G>(guest: &mut GuestLeg<G>, bytes: &[u8]) -> Result<(), Error>

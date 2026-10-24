@@ -46,6 +46,7 @@ mod transports;
 mod relay;
 
 use identity::CandidateParams;
+use transports::TlsCache;
 use transports::amqp::AmqpTransport;
 use transports::http::{HttpTransport, HttpsTransport};
 use transports::ldap::LdapTransport;
@@ -173,12 +174,13 @@ impl ProxyState {
       .add_cert(&crt)
       .map_err(|source| Error::MtlsTrustAnchor { source: source.into() })?;
     let mtls_trust = trust.build();
-    let postgres = Arc::new(PostgresTransport::new(ca)?);
-    let redis = Arc::new(RedisTransport::new(ca)?);
-    let smtp = Arc::new(SmtpTransport::new(ca)?);
-    let ldap = Arc::new(LdapTransport::new(ca)?);
-    let nats = Arc::new(NatsTransport::new(ca)?);
-    let amqp = Arc::new(AmqpTransport::new(ca)?);
+    let tls = Arc::new(TlsCache::new(ca)?);
+    let postgres = Arc::new(PostgresTransport::new(Arc::clone(&tls)));
+    let redis = Arc::new(RedisTransport::new(Arc::clone(&tls)));
+    let smtp = Arc::new(SmtpTransport::new(Arc::clone(&tls)));
+    let ldap = Arc::new(LdapTransport::new(Arc::clone(&tls)));
+    let nats = Arc::new(NatsTransport::new(Arc::clone(&tls)));
+    let amqp = Arc::new(AmqpTransport::new(tls));
     Ok(Self {
       config: Arc::new(resolved),
       relay,

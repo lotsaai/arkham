@@ -19,6 +19,7 @@ pub mod tls;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use arkham_config::grants::{Grant, GuestTlsMode, RootCert};
 use arkham_pki::ca::CertAuthority;
@@ -66,6 +67,48 @@ pub(crate) trait Transport: Send + Sync {
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static;
 }
 
+/// Guest leaves and upstream trust anchors shared by every TLS transport.
+///
+/// [`crate::ProxyState::new`] builds one cache. The leaf key includes the
+/// ALPN offer, so a `postgresql` leaf and a leaf that offers nothing stay
+/// distinct for the same name.
+#[derive(Debug)]
+pub(crate) struct TlsCache {
+  ca: CertAuthority,
+  leaves: DashMap<String, Arc<ServerConfig>>,
+  roots: DashMap<RootCert, Arc<RootCertStore>>,
+}
+
+impl TlsCache {
+  /// Read the CA back from its PEM and start empty caches.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the CA cannot be read back from its own PEM.
+  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
+    Ok(Self {
+      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
+      leaves: DashMap::new(),
+      roots: DashMap::new(),
+    })
+  }
+
+  /// CA that signs guest leaves.
+  pub(crate) fn ca(&self) -> &CertAuthority {
+    &self.ca
+  }
+
+  /// Guest leaf cache.
+  pub(crate) fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
+    &self.leaves
+  }
+
+  /// Upstream trust-anchor cache.
+  pub(crate) fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
+    &self.roots
+  }
+}
+
 /// Terminating the guest's TLS and handshaking the real server.
 ///
 /// The handshake bodies are shared. A protocol supplies its cache, the
@@ -75,14 +118,8 @@ pub(crate) trait TlsHalves: Send + Sync {
   /// The typed scope this protocol's grants carry.
   type Scope: Sync;
 
-  /// CA that signs guest leaves.
-  fn ca(&self) -> &CertAuthority;
-
-  /// Guest leaf cache, keyed by name.
-  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>>;
-
-  /// Upstream trust-anchor cache.
-  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>>;
+  /// Shared guest-leaf and upstream-trust cache.
+  fn tls(&self) -> &TlsCache;
 
   /// Protocol word used in the shared TLS errors. `redis` prints `guest redis TLS`.
   fn tls_label(&self) -> &'static str;
@@ -113,7 +150,7 @@ pub(crate) trait TlsHalves: Send + Sync {
   /// Returns an error when the trust anchor cannot be read.
   fn client_builder(&self, scope: &Self::Scope) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>, Error> {
     let root = self.root_cert(scope).cloned().unwrap_or(RootCert::System);
-    let roots = cached_roots(self.roots(), &root)?;
+    let roots = cached_roots(self.tls().roots(), &root)?;
     Ok(ClientConfig::builder().with_root_certificates(roots))
   }
 
@@ -136,9 +173,10 @@ pub(crate) trait TlsHalves: Send + Sync {
     G: AsyncRead + AsyncWrite + Unpin,
   {
     let alpn = self.guest_alpn();
+    let tls = self.tls();
     let config = match guest_tls {
-      GuestTlsMode::Tls => cached_leaf(self.ca(), self.leaves(), name, alpn)?,
-      GuestTlsMode::Mtls => cached_leaf_mtls(self.ca(), self.leaves(), name, alpn)?,
+      GuestTlsMode::Tls => cached_leaf(tls.ca(), tls.leaves(), name, alpn)?,
+      GuestTlsMode::Mtls => cached_leaf_mtls(tls.ca(), tls.leaves(), name, alpn)?,
     };
     TlsAcceptor::from(config).accept(guest).await.map_err(|source| Error::GuestTls {
       protocol: self.tls_label(),
@@ -171,6 +209,19 @@ pub(crate) trait TlsHalves: Send + Sync {
         protocol: self.tls_label(),
         source,
       })
+  }
+}
+
+/// Bound one handshake. `protocol` is the word in [`Error::HandshakeTimeout`].
+///
+/// # Errors
+///
+/// Returns [`Error::HandshakeTimeout`] when `budget` elapses. Returns the
+/// error from `step` when the handshake fails first.
+pub(crate) async fn within<T>(protocol: &'static str, budget: Duration, step: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+  match tokio::time::timeout(budget, step).await {
+    Ok(result) => result,
+    Err(_elapsed) => Err(Error::HandshakeTimeout { protocol }),
   }
 }
 
@@ -222,14 +273,13 @@ mod tests {
 
   use arkham_config::grants::{GuestTlsMode, RootCert};
   use arkham_pki::ca::{CertAuthority, generate_domain_pair, install_crypto_provider, load_or_generate_client_pair};
-  use dashmap::DashMap;
   use rustls::pki_types::ServerName;
   use rustls::{ClientConfig, RootCertStore, ServerConfig};
   use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
   use tokio::net::{TcpListener, TcpStream};
   use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-  use super::TlsHalves;
+  use super::{TlsCache, TlsHalves};
   use crate::Error;
 
   struct Material {
@@ -239,25 +289,15 @@ mod tests {
   }
 
   struct Halves {
-    ca: CertAuthority,
-    leaves: DashMap<String, Arc<ServerConfig>>,
-    roots: DashMap<RootCert, Arc<RootCertStore>>,
+    tls: Arc<TlsCache>,
     alpn: Option<&'static [u8]>,
   }
 
   impl TlsHalves for Halves {
     type Scope = Material;
 
-    fn ca(&self) -> &CertAuthority {
-      &self.ca
-    }
-
-    fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
-      &self.leaves
-    }
-
-    fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
-      &self.roots
+    fn tls(&self) -> &TlsCache {
+      &self.tls
     }
 
     fn tls_label(&self) -> &'static str {
@@ -299,9 +339,7 @@ mod tests {
       std::fs::write(&path, ca.cert_pem()).expect("ca pem");
       Self {
         halves: Halves {
-          ca,
-          leaves: DashMap::new(),
-          roots: DashMap::new(),
+          tls: Arc::new(TlsCache::new(&ca).expect("tls")),
           alpn,
         },
         root: RootCert::Path(path),
@@ -311,7 +349,7 @@ mod tests {
 
     fn material(&self, identity: bool) -> Material {
       let (cert, key) = if identity {
-        let (cert, key) = load_or_generate_client_pair(self.halves.ca(), self.dir.path(), "proxy").expect("client pair");
+        let (cert, key) = load_or_generate_client_pair(self.halves.tls().ca(), self.dir.path(), "proxy").expect("client pair");
         (Some(cert), Some(key))
       } else {
         (None, None)
@@ -368,7 +406,7 @@ mod tests {
     ] {
       let fixture = Fixture::new(alpn);
       let (client, server) = pair().await;
-      let connector = trusting_client(fixture.halves.ca(), offered);
+      let connector = trusting_client(fixture.halves.tls().ca(), offered);
       let name = ServerName::try_from("db.example".to_string()).expect("name");
       let accepted = fixture.halves.accept_guest("db.example", server, GuestTlsMode::Tls);
       let connected = connector.connect(name, client);
@@ -390,6 +428,7 @@ mod tests {
     let scope = fixture.material(false);
     let server_config = fixture
       .halves
+      .tls()
       .ca()
       .generate_domain_cert("upstream.example")
       .expect("leaf")
@@ -421,7 +460,7 @@ mod tests {
   async fn shared_halves_connect_presents_the_scope_client_certificate() {
     let fixture = Fixture::new(None);
     let scope = fixture.material(true);
-    let server_config = demanding_server(fixture.halves.ca(), "upstream.example");
+    let server_config = demanding_server(fixture.halves.tls().ca(), "upstream.example");
     let (client, server) = pair().await;
     let connected = fixture.halves.connect_server(&scope, "upstream.example", client);
     let accepted = TlsAcceptor::from(server_config).accept(server);
@@ -431,7 +470,7 @@ mod tests {
     assert!(accepted.get_ref().1.peer_certificates().is_some());
 
     let bare = fixture.material(false);
-    let server_config = demanding_server(fixture.halves.ca(), "upstream.example");
+    let server_config = demanding_server(fixture.halves.tls().ca(), "upstream.example");
     let (client, server) = pair().await;
     let connected = fixture.halves.connect_server(&bare, "upstream.example", client);
     let accepted = TlsAcceptor::from(server_config).accept(server);
@@ -455,10 +494,49 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn shared_leaf_cache_negotiates_each_alpn_on_one_sni() {
+    install_crypto_provider();
+    let ca = CertAuthority::generate().expect("ca");
+    for postgres_first in [true, false] {
+      let tls = Arc::new(TlsCache::new(&ca).expect("tls"));
+      let postgres = Halves {
+        tls: Arc::clone(&tls),
+        alpn: Some(b"postgresql"),
+      };
+      let plain = Halves { tls, alpn: None };
+      let (first, second) = if postgres_first { (&postgres, &plain) } else { (&plain, &postgres) };
+      let first_agreed = negotiated_alpn(first).await;
+      let second_agreed = negotiated_alpn(second).await;
+      assert_eq!(
+        first_agreed.as_deref(),
+        first.guest_alpn(),
+        "first handshake postgres_first={postgres_first}"
+      );
+      assert_eq!(
+        second_agreed.as_deref(),
+        second.guest_alpn(),
+        "second handshake postgres_first={postgres_first}"
+      );
+    }
+  }
+
+  async fn negotiated_alpn(halves: &Halves) -> Option<Vec<u8>> {
+    let (client, server) = pair().await;
+    let connector = trusting_client(halves.tls().ca(), Some(b"postgresql"));
+    let name = ServerName::try_from("db.example".to_string()).expect("name");
+    let accepted = halves.accept_guest("db.example", server, GuestTlsMode::Tls);
+    let connected = connector.connect(name, client);
+    let (accepted, connected) = within(async { tokio::join!(accepted, connected) }).await;
+    let accepted = accepted.expect("guest accept");
+    connected.expect("guest client");
+    accepted.get_ref().1.alpn_protocol().map(<[u8]>::to_vec)
+  }
+
+  #[tokio::test]
   async fn shared_halves_mtls_accept_rejects_a_guest_without_a_certificate() {
     let fixture = Fixture::new(None);
     let (client, server) = pair().await;
-    let connector = trusting_client(fixture.halves.ca(), None);
+    let connector = trusting_client(fixture.halves.tls().ca(), None);
     let name = ServerName::try_from("db.example".to_string()).expect("name");
     let accepted = fixture.halves.accept_guest("db.example", server, GuestTlsMode::Mtls);
     let connected = connector.connect(name, client);

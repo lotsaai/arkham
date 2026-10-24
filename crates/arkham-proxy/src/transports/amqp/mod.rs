@@ -4,15 +4,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dashmap::DashMap;
-use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use arkham_config::grants::{AmqpScope, RootCert};
-use arkham_pki::ca::CertAuthority;
 
 use super::PairCtx;
-use super::{ServeStream, TlsHalves, Transport};
+use super::{ServeStream, TlsCache, TlsHalves, Transport, within};
 use crate::Error;
 use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
@@ -21,34 +18,21 @@ use crate::transports::engine::{Amqp, Direction};
 
 #[derive(Debug)]
 pub(crate) struct AmqpTransport {
-  ca: CertAuthority,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
+  tls: Arc<TlsCache>,
 }
 
 impl AmqpTransport {
-  pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
-    Ok(Self {
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
-    })
+  /// Share the proxy TLS cache.
+  pub(crate) fn new(tls: Arc<TlsCache>) -> Self {
+    Self { tls }
   }
 }
 
 impl TlsHalves for AmqpTransport {
   type Scope = AmqpScope;
 
-  fn ca(&self) -> &CertAuthority {
-    &self.ca
-  }
-
-  fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
-    &self.leaves
-  }
-
-  fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
-    &self.roots
+  fn tls(&self) -> &TlsCache {
+    &self.tls
   }
 
   fn tls_label(&self) -> &'static str {
@@ -145,6 +129,7 @@ impl AmqpTransport {
       (None, false) => relay(Prefixed::new(head, stream), upstream, ctx, swap).await,
       (Some((hello_buf, identity)), false) => {
         let plain = within(
+          "amqp",
           budget,
           self.accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls),
         )
@@ -152,26 +137,20 @@ impl AmqpTransport {
         relay(plain, upstream, ctx, swap).await
       }
       (None, true) => {
-        let plain = within(budget, self.connect_server(scope, upstream_name, upstream)).await?;
+        let plain = within("amqp", budget, self.connect_server(scope, upstream_name, upstream)).await?;
         relay(Prefixed::new(head, stream), plain, ctx, swap).await
       }
       (Some((hello_buf, identity)), true) => {
         let guest_plain = within(
+          "amqp",
           budget,
           self.accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls),
         )
         .await?;
-        let server_plain = within(budget, self.connect_server(scope, upstream_name, upstream)).await?;
+        let server_plain = within("amqp", budget, self.connect_server(scope, upstream_name, upstream)).await?;
         relay(guest_plain, server_plain, ctx, swap).await
       }
     }
-  }
-}
-
-async fn within<T>(budget: Duration, handshake: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
-  match tokio::time::timeout(budget, handshake).await {
-    Ok(result) => result,
-    Err(_elapsed) => Err(Error::AmqpHandshakeTimeout),
   }
 }
 
