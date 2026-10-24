@@ -8,15 +8,6 @@ ignore = [
   # incompatible. Unblock when the aws-sdk releases on h2 0.4.
   "RUSTSEC-2026-0258",
 
-  # russh is pinned to 0.56.x for the rama-quic/fnox-core conflict; 0.56
-  # pulls libcrux 0.0.4. Unblock with russh >=0.60.3.
-  "RUSTSEC-2026-0154",
-  "RUSTSEC-2026-0153",
-  "RUSTSEC-2026-0212",
-  "RUSTSEC-2026-0208",
-  "RUSTSEC-2026-0207",
-  "RUSTSEC-2026-0074",
-
   # rustls-webpki 0.101 rides rustls 0.21 under hyper-rustls 0.24 in the
   # aws-sdk egress leg; fixes land in webpki 0.103. Unblock when
   # aws-smithy-http-client drops the hyper 0.14 stack.
@@ -49,7 +40,7 @@ ignore = [
   # when fnox-core stops enabling the aws-sdk legacy rustls default.
   "RUSTSEC-2026-0382",
 
-  # Marvinattack on rsa; no fixed release exists upstream, both locked
-  # versions are affected. Revisit when a fix ships.
+  # Marvin attack on rsa. No fixed release exists upstream.
+  # fnox-core 1.39.0 -> age 0.12.1 -> rsa 0.9.10.
   "RUSTSEC-2023-0071",
 ]
