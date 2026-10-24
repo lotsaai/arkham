@@ -1,10 +1,10 @@
 //! NATS wire format: one [`Framer`] cuts both directions into command lines
 //! and counted payloads.
 //!
-//! Downstream, CONNECT is buffered only while the server leg is TLS, so the
-//! swap can see every field. A cleartext leg forwards CONNECT as it arrives.
+//! Downstream, CONNECT is buffered while swap is on, so the swap can see
+//! every field. With swap off, CONNECT is forwarded as it arrives.
 //! Past [`MAX_COMMAND`] the bytes already held and the rest of that line go
-//! out untouched, and the session stays open. When the server leg is TLS,
+//! out untouched, and the session stays open. While swap is on,
 //! every auth method rewrites the CONNECT fields [`NatsAuth::fields`] lists,
 //! and only when each of those fields holds the decoy. A method that signs
 //! does that after the first INFO nonce is armed and the guest signature
@@ -38,14 +38,13 @@
 //! `lexical-core` 1.0 `parse` and `parse_partial` also need one contiguous
 //! slice and report nothing `atoi` does not already return.
 //!
-//! INFO's `tls_required`, `tls_available`, and `tls_verify` come from actson
-//! 2.1.0. The verb is still the framer's first piece. Object bytes go into
-//! `PushJsonFeeder`, and names and bools are taken at depth 1. That crate
-//! keeps the current token in `current_buffer` until the event, and the
-//! feeder queues at most 1024 bytes, so a token stops at [`MAX_COMMAND`].
-//! A cleartext line whose object does not end, and whose `tls_required`
-//! was not true, closes. The INFO line is not stored. The verdict is ready
-//! when the line piece includes LF.
+//! The INFO nonce comes from actson 2.1.0. The verb is still the framer's
+//! first piece. Object bytes go into `PushJsonFeeder`, and the `nonce`
+//! string is taken at depth 1. That crate keeps the current token in
+//! `current_buffer` until the event, and the feeder queues at most 1024
+//! bytes, so a token stops at [`MAX_COMMAND`]. The INFO line is not stored.
+//! `tls_required` does not close the session. The nonce is ready when the
+//! line piece includes LF.
 //!
 //! Upstream, delimited lines (INFO, -ERR, +OK, PING, PONG) redact the real
 //! value back to the decoy. MSG and HMSG payloads are counted down and never
@@ -449,8 +448,8 @@ pub(crate) enum Nats {
 }
 
 impl Nats {
-  /// Guest-to-server leg. `swap` is true only when the server writer is
-  /// already TLS. A cleartext server leg keeps the decoy.
+  /// Guest-to-server leg. `swap` installs the grant's auth fields. With swap
+  /// off, CONNECT is forwarded unchanged.
   pub(crate) fn downstream(grants: &[Grant], host: &str, port: u16, swap: bool) -> Self {
     let policy = if swap {
       let auths: Vec<SwapGrant> = grants
@@ -495,17 +494,6 @@ impl Nats {
       info: InfoWatch::default(),
     }))
   }
-
-  /// TLS verdict of the INFO line whose LF was just framed, once.
-  ///
-  /// `None` until that LF, and `None` again after the verdict is taken.
-  /// A line that is not INFO does not become ready.
-  pub(crate) fn take_info_tls(&mut self) -> Option<InfoVerdict> {
-    match self {
-      Self::Up(up) => up.info.ready.take(),
-      Self::Down(_) | Self::Closed => None,
-    }
-  }
 }
 
 impl Wire for Nats {
@@ -537,9 +525,9 @@ struct SwapGrant {
 /// Whether CONNECT carries the real values.
 #[derive(Debug)]
 enum Policy {
-  /// The server leg is cleartext: CONNECT keeps the decoy.
+  /// Swap is off, so CONNECT is forwarded unchanged.
   Forward,
-  /// The server leg is TLS. Each grant is tried until one CONNECT matches.
+  /// Each grant is tried until one CONNECT matches.
   Swap { auths: Vec<SwapGrant> },
 }
 
@@ -790,38 +778,9 @@ impl Down {
   }
 }
 
-/// TLS flags from one completed INFO object. Absent fields stay false.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct InfoTls {
-  /// INFO `tls_required`.
-  pub(crate) tls_required: bool,
-  /// INFO `tls_available`.
-  pub(crate) tls_available: bool,
-  /// INFO `tls_verify`.
-  pub(crate) tls_verify: bool,
-}
-
-/// What a finished INFO line says about TLS on a cleartext upstream.
-#[derive(Debug)]
-pub(crate) enum InfoVerdict {
-  /// The object ended, or `tls_required` was already true.
-  Flags(InfoTls),
-  /// The object did not end, and `tls_required` was not true.
-  Unreadable,
-}
-
-/// Which INFO bool a key names.
-#[derive(Clone, Copy)]
-enum TlsKey {
-  Required,
-  Available,
-  Verify,
-}
-
 /// A depth-1 INFO key the parser keeps.
 #[derive(Clone, Copy)]
 enum InfoKey {
-  Tls(TlsKey),
   Nonce,
 }
 
@@ -837,11 +796,9 @@ struct InfoParse {
   mark: usize,
   depth: u32,
   key: Option<InfoKey>,
-  tls: InfoTls,
   nonce: Option<String>,
   /// The first `nonce` field was seen, even when its value was empty.
   nonce_seen: bool,
-  ended: bool,
   failed: bool,
 }
 
@@ -853,10 +810,8 @@ impl InfoParse {
       mark: 0,
       depth: 0,
       key: None,
-      tls: InfoTls::default(),
       nonce: None,
       nonce_seen: false,
-      ended: false,
       failed: false,
     }
   }
@@ -904,7 +859,7 @@ impl InfoParse {
     }
   }
 
-  fn finish(mut self) -> (InfoVerdict, Option<String>) {
+  fn finish(mut self) -> Option<String> {
     if !self.failed {
       self.parser.feeder.done();
       loop {
@@ -924,13 +879,7 @@ impl InfoParse {
         }
       }
     }
-    let verdict = if self.tls.tls_required || self.ended {
-      InfoVerdict::Flags(self.tls)
-    } else {
-      InfoVerdict::Unreadable
-    };
-    let nonce = if self.failed { None } else { self.nonce };
-    (verdict, nonce)
+    if self.failed { None } else { self.nonce }
   }
 
   /// Parsed bytes of the open token, plus bytes still sitting in the feeder.
@@ -947,14 +896,10 @@ impl InfoParse {
       }
       JsonEvent::EndObject | JsonEvent::EndArray => {
         self.depth = self.depth.saturating_sub(1);
-        if self.depth == 0 && matches!(event, JsonEvent::EndObject) {
-          self.ended = true;
-        }
       }
       JsonEvent::FieldName => self.note_name(),
-      JsonEvent::ValueTrue | JsonEvent::ValueFalse => self.note_bool(matches!(event, JsonEvent::ValueTrue)),
       JsonEvent::ValueString => self.note_string(),
-      JsonEvent::ValueInt | JsonEvent::ValueFloat | JsonEvent::ValueNull => self.key = None,
+      JsonEvent::ValueTrue | JsonEvent::ValueFalse | JsonEvent::ValueInt | JsonEvent::ValueFloat | JsonEvent::ValueNull => self.key = None,
       JsonEvent::NeedMoreInput => {}
     }
   }
@@ -975,19 +920,6 @@ impl InfoParse {
         self.key = None;
       }
     }
-  }
-
-  fn note_bool(&mut self, value: bool) {
-    if self.depth == 1
-      && let Some(InfoKey::Tls(key)) = self.key
-    {
-      match key {
-        TlsKey::Required => self.tls.tls_required = value,
-        TlsKey::Available => self.tls.tls_available = value,
-        TlsKey::Verify => self.tls.tls_verify = value,
-      }
-    }
-    self.key = None;
   }
 
   fn note_string(&mut self) {
@@ -1016,22 +948,17 @@ impl InfoParse {
 
 fn info_key(raw: &[u8]) -> Option<InfoKey> {
   match raw {
-    b"tls_required" => Some(InfoKey::Tls(TlsKey::Required)),
-    b"tls_available" => Some(InfoKey::Tls(TlsKey::Available)),
-    b"tls_verify" => Some(InfoKey::Tls(TlsKey::Verify)),
     b"nonce" => Some(InfoKey::Nonce),
     _ => None,
   }
 }
 
-/// Server verb plus the TLS verdict of an INFO line in progress.
+/// Server verb plus the nonce of an INFO line in progress.
 struct InfoWatch {
   /// The next line piece is a verb.
   expect_verb: bool,
   /// This command is INFO and its LF has not arrived.
   active: bool,
-  /// Set when an INFO line reaches LF. Taken once.
-  ready: Option<InfoVerdict>,
   parse: Option<InfoParse>,
   nonce: Option<String>,
   opening_done: bool,
@@ -1042,7 +969,6 @@ impl Default for InfoWatch {
     Self {
       expect_verb: true,
       active: false,
-      ready: None,
       parse: None,
       nonce: None,
       opening_done: false,
@@ -1064,16 +990,9 @@ impl InfoWatch {
       parse.push(bytes);
     }
     if end {
-      if self.active && self.ready.is_none() {
-        let (verdict, nonce) = match self.parse.take() {
-          Some(parse) => parse.finish(),
-          None => (InfoVerdict::Unreadable, None),
-        };
-        self.ready = Some(verdict);
-        if !self.opening_done {
-          self.nonce = nonce;
-          self.opening_done = true;
-        }
+      if self.active && !self.opening_done {
+        self.nonce = self.parse.take().and_then(InfoParse::finish);
+        self.opening_done = true;
       }
       self.active = false;
       self.parse = None;
@@ -1096,7 +1015,7 @@ pub(crate) struct Up {
   lines: Raw,
   /// Counted heads and payloads.
   guard: Guard,
-  /// TLS flags from the INFO line, filled as its pieces arrive.
+  /// Nonce from the INFO line, filled as its pieces arrive.
   info: InfoWatch,
 }
 
@@ -1268,7 +1187,7 @@ mod tests {
     let swapped_pass = format!("CONNECT {{\"name\":\"agent-app\",\"pass\":\"{REAL_PASS}\",\"user\":\"agent\",\"verbose\":false}}\r\n");
     let cases = [
       (
-        "cleartext forwards the decoy",
+        "swap off forwards CONNECT unchanged",
         false,
         &pass,
         user_connect("agent", FAKE_PASS),
@@ -1484,7 +1403,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn cleartext_connect_streams_without_buffering() {
+  async fn swap_off_connect_streams_without_buffering() {
     let grants = user_pass();
     let mut machine = down(&grants, false);
     let partial = format!("CONNECT {{\"pass\":\"{FAKE_PASS}\"");
@@ -1815,7 +1734,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn cleartext_forwards_the_guest_nkey_line() {
+  async fn swap_off_forwards_the_guest_nkey_line() {
     let fake = minted();
     let real = minted();
     let grants = nkey_grants(&fake, &real);

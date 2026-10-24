@@ -212,7 +212,7 @@ fn guest_tls(ca: &CertAuthority, sni: bool) -> TlsConnector {
 }
 
 #[tokio::test]
-async fn plaintext_guest_with_mtls_does_not_get_the_real_password() {
+async fn plaintext_guest_with_mtls_gets_the_real_password() {
   install_crypto_provider();
   let ca = CertAuthority::generate().unwrap();
   let stub_cert = ca.generate_domain_cert("localhost").unwrap();
@@ -222,42 +222,31 @@ async fn plaintext_guest_with_mtls_does_not_get_the_real_password() {
   let (_bundle_dir, bundle) = ca_bundle(&ca);
   let fake = format!("amqp://agent:{FAKE}@localhost:{stub_port}");
   let real = format!("amqps://svc:{VALUE}@localhost:{stub_port}?sslrootcert={}", bundle.display());
-  match mtls_grants(&fake, &real) {
-    Err(err) => {
-      assert!(matches!(err.as_ref(), arkham_config::Error::AmqpCleartextMtls { .. }), "{err}");
-      let text = err.to_string();
-      assert!(!text.contains(FAKE), "{text}");
-      assert!(!text.contains(VALUE), "{text}");
-    }
-    Ok(grants) => {
-      let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
-      let stub_task = tokio::spawn(async move {
-        let (conn, _) = stub.accept().await.unwrap();
-        let mut tls = acceptor.accept(conn).await.unwrap();
-        assert_eq!(read_header(&mut tls).await, HEADER_091);
-        tls.write_all(&start()).await.unwrap();
-        let response = start_ok_response(read_frame(&mut tls).await);
-        assert_eq!(
-          response,
-          plain("agent", FAKE),
-          "plaintext guest received the real password: {response:?}"
-        );
-        tls.write_all(&close("ACCESS_REFUSED")).await.unwrap();
-      });
-      let stream = connect_through_proxy(proxy_addr, stub_port).await;
-      let guest = tokio::spawn(guest_lapin(stream));
-      tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
-      let err = tokio::time::timeout(Duration::from_secs(10), guest)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap_err();
-      let text = err.to_string();
-      assert!(text.contains("ACCESS_REFUSED"), "{text}");
-      assert!(!text.contains(VALUE), "{text}");
-      proxy.abort();
-    }
-  }
+  let grants = mtls_grants(&fake, &real).expect("mtls on a cleartext amqp fake loads");
+  let scope = grants.first().and_then(|grant| grant.amqp(None, stub_port)).expect("scope");
+  assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+  assert!(!scope.is_downstream_tls);
+  let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
+  let stub_task = tokio::spawn(async move {
+    let (conn, _) = stub.accept().await.unwrap();
+    let mut tls = acceptor.accept(conn).await.unwrap();
+    assert_eq!(read_header(&mut tls).await, HEADER_091);
+    tls.write_all(&start()).await.unwrap();
+    assert_eq!(start_ok_response(read_frame(&mut tls).await), plain("svc", VALUE));
+    tls.write_all(&close("ACCESS_REFUSED")).await.unwrap();
+  });
+  let stream = connect_through_proxy(proxy_addr, stub_port).await;
+  let guest = tokio::spawn(guest_lapin(stream));
+  tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  let err = tokio::time::timeout(Duration::from_secs(10), guest)
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap_err();
+  let text = err.to_string();
+  assert!(text.contains("ACCESS_REFUSED"), "{text}");
+  assert!(!text.contains(VALUE), "{text}");
+  proxy.abort();
 }
 
 fn mtls_grants(fake: &str, real: &str) -> Result<Vec<Grant>, Box<arkham_config::Error>> {
@@ -315,7 +304,7 @@ fn mtls_grants(fake: &str, real: &str) -> Result<Vec<Grant>, Box<arkham_config::
 }
 
 #[tokio::test]
-async fn amqp_cleartext_start_ok_forwards_the_decoy() {
+async fn amqp_cleartext_start_ok_swaps_the_password() {
   let fx = mitm_fixture(|port| {
     vec![amqp_grant(
       &format!("amqp://agent:{FAKE}@localhost:{port}"),
@@ -327,7 +316,7 @@ async fn amqp_cleartext_start_ok_forwards_the_decoy() {
     let (mut conn, _) = fx.stub.accept().await.unwrap();
     assert_eq!(read_header(&mut conn).await, HEADER_091);
     conn.write_all(&start()).await.unwrap();
-    assert_eq!(start_ok_response(read_frame(&mut conn).await), plain("agent", FAKE));
+    assert_eq!(start_ok_response(read_frame(&mut conn).await), plain("svc", VALUE));
     conn.write_all(&close("ACCESS_REFUSED")).await.unwrap();
   });
   let stream = connect_through_proxy(fx.proxy_addr, fx.stub_port).await;

@@ -423,7 +423,7 @@ pub enum Grant {
   },
   /// One SMTP connection-string mapping: fake string to real, 1:1. Each
   /// string states its own leg's transport in its scheme. `starttls=required`
-  /// on the real `smtp://` string withholds the password until the upgrade.
+  /// on the real `smtp://` string upgrades that leg; AUTH swaps either way.
   Smtp {
     /// The wire needles: the fake password and the real password.
     credential: Credential,
@@ -939,17 +939,18 @@ mod tests {
     cfg.rules.get_mut("t").unwrap().tls = tls;
   }
 
-  fn assert_mtls_rejected(fake: &str, real: &str, secrets: &[&str], pred: impl Fn(&crate::Error) -> bool) {
+  fn assert_mtls_loads(fake: &str, real: &str) {
     let mut cfg = cfg_with_db(fake, real);
     mtls_on(&mut cfg);
-    let Err(err) = resolve(&cfg) else {
-      panic!("mtls on a cleartext fake must be rejected");
+    let resolved = resolve(&cfg).expect("mtls on a cleartext fake loads");
+    let mode = match resolved.grants.first() {
+      Some(Grant::Redis { scope, .. }) => scope.guest_tls,
+      Some(Grant::Smtp { scope, .. }) => scope.guest_tls,
+      Some(Grant::Ldap { scope, .. }) => scope.guest_tls,
+      Some(Grant::Amqp { scope, .. }) => scope.guest_tls,
+      other => panic!("mtls grant: {other:?}"),
     };
-    assert!(pred(&err), "{err}");
-    let text = err.to_string();
-    for secret in secrets {
-      assert!(!text.contains(secret), "mtls rejection included a credential");
-    }
+    assert_eq!(mode, GuestTlsMode::Mtls);
   }
 
   /// A resolved postgres scope, through [`resolve`] exactly as serve does.
@@ -1079,23 +1080,31 @@ mod tests {
   }
 
   #[test]
-  fn redis_mtls_on_a_cleartext_fake_is_rejected() {
-    assert_mtls_rejected(
-      "redis://app:arkham_fake_redis_pass@db.internal:6379/0",         // betterleaks:allow
-      "rediss://app:arkham_real_redis_pass_01@db.internal:6379/0",     // betterleaks:allow
-      &["arkham_fake_redis_pass", "arkham_real_redis_pass_01", "app"], // betterleaks:allow
-      |err| matches!(err, crate::Error::RedisCleartextMtls { .. }),
+  fn redis_mtls_on_a_cleartext_fake_loads() {
+    assert_mtls_loads(
+      "redis://app:arkham_fake_redis_pass@db.internal:6379/0",     // betterleaks:allow
+      "rediss://app:arkham_real_redis_pass_01@db.internal:6379/0", // betterleaks:allow
     );
   }
 
   #[test]
-  fn redis_mtls_on_a_cleartext_upstream_is_rejected() {
-    assert_mtls_rejected(
-      "redis://app:arkham_fake_redis_pass@db.internal:6379/0",         // betterleaks:allow
-      "redis://app:arkham_real_redis_pass_01@db.internal:6379/0",      // betterleaks:allow
-      &["arkham_fake_redis_pass", "arkham_real_redis_pass_01", "app"], // betterleaks:allow
-      |err| matches!(err, crate::Error::RedisCleartextMtls { .. }),
+  fn redis_mtls_on_a_cleartext_upstream_loads() {
+    assert_mtls_loads(
+      "redis://app:arkham_fake_redis_pass@db.internal:6379/0",    // betterleaks:allow
+      "redis://app:arkham_real_redis_pass_01@db.internal:6379/0", // betterleaks:allow
     );
+  }
+
+  #[test]
+  fn redis_cleartext_grant_loads_client_cert_and_trust() {
+    let scope = redis_scope(
+      "redis://app:fake@db.internal:6379/0", // betterleaks:allow
+      "redis://app:real@db.internal:6379/0?sslrootcert=/ca.pem&sslcert=/c.pem&sslkey=/c.key", // betterleaks:allow
+    );
+    assert!(!scope.is_upstream_tls);
+    assert_eq!(scope.root_cert, Some(RootCert::Path(PathBuf::from("/ca.pem"))));
+    assert_eq!(scope.client_cert, Some(PathBuf::from("/c.pem")));
+    assert_eq!(scope.client_key, Some(PathBuf::from("/c.key")));
   }
 
   #[test]
@@ -1186,12 +1195,10 @@ mod tests {
   }
 
   #[test]
-  fn ldap_mtls_on_a_cleartext_fake_is_rejected() {
-    assert_mtls_rejected(
+  fn ldap_mtls_on_a_cleartext_fake_loads() {
+    assert_mtls_loads(
       "ldap://cn%3Ddir:arkham_fake_ldap_pass@ldap.internal:389",     // betterleaks:allow
       "ldaps://cn%3Ddir:arkham_real_ldap_pass_01@ldap.internal:636", // betterleaks:allow
-      &["arkham_fake_ldap_pass", "arkham_real_ldap_pass_01", "cn=dir"], // betterleaks:allow
-      |err| matches!(err, crate::Error::LdapCleartextMtls { .. }),
     );
   }
 
@@ -1477,7 +1484,7 @@ mod tests {
   }
 
   #[test]
-  fn amqp_mtls_rejects_a_cleartext_fake() {
+  fn amqp_mtls_on_a_cleartext_fake_loads() {
     let mut cfg = cfg_with_db(
       "amqp://agent:arkham_fake_amqp_pass@mq.internal",        // betterleaks:allow
       "amqps://svc:arkham_real_amqp_pass_01@mq.internal:5671", // betterleaks:allow
@@ -1495,13 +1502,12 @@ mod tests {
       },
     );
     cfg.rules.get_mut("t").unwrap().tls = tls;
-    let err = resolve(&cfg).expect_err("mtls on a cleartext fake");
-    assert!(matches!(err, crate::Error::AmqpCleartextMtls { .. }), "{err}");
-    let text = err.to_string();
-    assert!(text.contains("amqps://"), "{text}");
-    for secret in ["arkham_fake_amqp_pass", "arkham_real_amqp_pass_01", "agent", "svc"] {
-      assert!(!text.contains(secret), "{text} contains {secret}");
-    }
+    let resolved = resolve(&cfg).expect("mtls on a cleartext amqp fake loads");
+    let Some(Grant::Amqp { scope, .. }) = resolved.grants.first() else {
+      panic!("an amqp rule");
+    };
+    assert_eq!(scope.guest_tls, GuestTlsMode::Mtls);
+    assert!(!scope.is_downstream_tls);
   }
 
   #[test]
@@ -1744,12 +1750,10 @@ mod tests {
   }
 
   #[test]
-  fn smtp_mtls_on_a_cleartext_fake_is_rejected() {
-    assert_mtls_rejected(
-      "smtp://agent:arkham_fake_smtp_pass@mail.internal:587",          // betterleaks:allow
-      "smtps://agent:arkham_real_smtp_pass_01@mail.internal:465",      // betterleaks:allow
-      &["arkham_fake_smtp_pass", "arkham_real_smtp_pass_01", "agent"], // betterleaks:allow
-      |err| matches!(err, crate::Error::SmtpCleartextMtls { .. }),
+  fn smtp_mtls_on_a_cleartext_fake_loads() {
+    assert_mtls_loads(
+      "smtp://agent:arkham_fake_smtp_pass@mail.internal:587",     // betterleaks:allow
+      "smtps://agent:arkham_real_smtp_pass_01@mail.internal:465", // betterleaks:allow
     );
   }
 

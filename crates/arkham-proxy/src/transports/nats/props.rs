@@ -354,38 +354,11 @@ async fn prop_nats_info_cut_leaves_the_rest_unread() {
       let mut cuts: Vec<usize> = cuts.iter().map(|cut| cut % stream.len()).collect();
       cuts.push(info.len().saturating_add(past_newline));
       let expected = run_nats(NatsLeg::Up, &info, &[]).await.out;
-      let mut clear_reader = CutPend::new(stream.clone(), &cuts);
-      let mut clear_up = nats_leg(NatsLeg::Up);
-      let mut clear_down = nats_leg(NatsLeg::DownSwap);
-      let mut clear_guest = Vec::new();
-      let err = server_info(&mut clear_reader, &mut clear_up, &mut clear_down, &mut clear_guest, true)
-        .await
-        .expect_err("cleartext INFO with tls_required must close");
-      prop_assert!(
-        matches!(
-          err,
-          crate::Error::NatsTlsRequired {
-            tls_available: false,
-            tls_verify: false
-          }
-        ),
-        "cleartext close was {err}"
-      );
-      prop_assert!(
-        !clear_guest.contains(&b'\n'),
-        "the read that held LF was written on a cleartext close"
-      );
-      prop_assert!(
-        !contains_bytes(&clear_guest, NATS_REAL.as_bytes()),
-        "INFO carried the real password to the guest"
-      );
       let mut reader = CutPend::new(stream, &cuts);
       let mut up = nats_leg(NatsLeg::Up);
       let mut down = nats_leg(NatsLeg::DownSwap);
       let mut guest = Vec::new();
-      let opened = server_info(&mut reader, &mut up, &mut down, &mut guest, false)
-        .await
-        .expect("info read");
+      let opened = server_info(&mut reader, &mut up, &mut down, &mut guest).await.expect("info read");
       let Some(mut rest) = opened else {
         return Err(TestCaseError::fail("the INFO reader closed"));
       };
@@ -493,7 +466,7 @@ async fn prop_nats_arbitrary_no_panic() {
       let mut up = nats_leg(NatsLeg::Up);
       let mut down = nats_leg(NatsLeg::DownSwap);
       let mut guest = Vec::new();
-      let _ = server_info(&mut reader, &mut up, &mut down, &mut guest, false).await;
+      let _ = server_info(&mut reader, &mut up, &mut down, &mut guest).await;
       Ok(())
     },
   )

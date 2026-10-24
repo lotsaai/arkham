@@ -22,11 +22,6 @@ use crate::identity::CandidateParams;
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Direction, Redis};
 
-/// First byte of a TLS record carrying a handshake: the only shape a
-/// `rediss` guest leg opens with, and a shape a cleartext `redis` scope
-/// never serves.
-const TLS_RECORD_HANDSHAKE: u8 = 0x16;
-
 /// Redis transport: each connection string states its own leg, and the
 /// upstream `rediss` leg verifies the chain and the host name — the https
 /// precedent, not libpq's.
@@ -113,11 +108,6 @@ impl Transport for RedisTransport {
       };
       server_name = Some(sni_name);
       guest_tls = Some((hello_buf, identity));
-    } else if initial.first() == Some(&TLS_RECORD_HANDSHAKE) {
-      // The scope says cleartext; a TLS hello is a different protocol on a
-      // port this scope owns, and the arm never guesses another one.
-      tracing::debug!("TLS opening on a cleartext redis scope; closing");
-      return Ok(());
     }
 
     // The real string states the far end: the dial follows its host and
@@ -180,4 +170,89 @@ pub(crate) fn redis_pair(ctx: &PairCtx<'_>) -> (Redis, Redis) {
     Redis::new(ctx.grants, ctx.host, ctx.port, Direction::Downstream),
     Redis::new(ctx.grants, ctx.host, ctx.port, Direction::Upstream),
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Arc;
+  use std::sync::atomic::{AtomicBool, Ordering};
+  use std::time::Duration;
+
+  use arkham_config::config::ProxyCfg;
+  use arkham_config::grants::{Credential, Grant, RedisScope, ResolvedConfig};
+  use arkham_pki::ca::{CertAuthority, install_crypto_provider};
+  use secrecy::SecretString;
+  use tokio::net::TcpListener;
+
+  use super::RedisTransport;
+  use crate::ProxyState;
+  use crate::identity::CandidateParams;
+  use crate::transports::{ServeStream, Transport as _};
+
+  const FAKE: &str = "arkham_fake_redis_pass"; // betterleaks:allow
+  const VALUE: &str = "arkham_real_redis_pass_01"; // betterleaks:allow
+
+  #[tokio::test]
+  async fn cleartext_redis_tls_record_still_dials() {
+    install_crypto_provider();
+    let ca = CertAuthority::generate().unwrap();
+    let spy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = spy.local_addr().unwrap().port();
+    let dialed = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&dialed);
+    let spy_task = tokio::spawn(async move {
+      if tokio::time::timeout(Duration::from_secs(2), spy.accept()).await.is_ok() {
+        seen.store(true, Ordering::Relaxed);
+      }
+    });
+    let scope = RedisScope::from_strings(
+      &format!("redis://app:{FAKE}@localhost:{port}/0"),
+      &format!("redis://app:{VALUE}@localhost:{port}/0"),
+    )
+    .unwrap();
+    let state = ProxyState::new(
+      ResolvedConfig {
+        proxy: ProxyCfg {
+          listen: "127.0.0.1:0".parse().unwrap(),
+          ca_file: None,
+          ssh_host_key: None,
+          ssh_known_hosts: None,
+          root_certs: Vec::new(),
+          handshake_timeout_secs: 1,
+        },
+        grants: vec![Grant::Redis {
+          credential: Credential {
+            label: "redis".into(),
+            fake: FAKE.into(),
+            value: SecretString::from(VALUE),
+          },
+          scope: Box::new(scope.clone()),
+        }],
+        plugins: Vec::new(),
+      },
+      &ca,
+    )
+    .unwrap();
+    let snapshot = state.snapshot();
+    let (guest, _peer) = tokio::io::duplex(64);
+    let transport = RedisTransport::new(&ca).unwrap();
+    transport
+      .serve(ServeStream {
+        guest,
+        params: CandidateParams {
+          state: &state,
+          snapshot: snapshot.as_ref(),
+          dial_host: "127.0.0.1",
+          port,
+          host: Some("localhost"),
+          raw_host: "localhost",
+          initial: &[0x16, 0x03, 0x01],
+        },
+        scope: &scope,
+      })
+      .await
+      .expect("cleartext redis with a tls record still serves");
+    let _ = tokio::time::timeout(Duration::from_secs(2), spy_task).await;
+    assert!(dialed.load(Ordering::Relaxed), "cleartext redis tls record did not dial");
+  }
 }

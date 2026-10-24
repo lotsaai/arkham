@@ -16,7 +16,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore, ServerConfig, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use arkham_config::grants::{GuestTlsMode, PostgresScope, RootCert, SslMode, SslNegotiation};
+use arkham_config::grants::{PostgresScope, RootCert, SslMode, SslNegotiation};
 use arkham_pki::ca::CertAuthority;
 
 use super::PairCtx;
@@ -153,10 +153,6 @@ impl Transport for PostgresTransport {
       guest_tls = Some((hello_buf, identity));
     } else if let GuestOpening::Cleartext(buf) = opening {
       guest_head = buf;
-    }
-
-    if guest_tls.is_none() && scope.guest_tls == GuestTlsMode::Mtls {
-      return Err(Error::PostgresGuestPlaintext);
     }
 
     // The real string states the far end: the dial follows its host and
@@ -339,7 +335,7 @@ mod tests {
     buf.to_vec()
   }
 
-  async fn assert_opening_sends_nothing(initial: Vec<u8>, close: OpeningClose) {
+  async fn assert_mtls_opening(initial: Vec<u8>, close: OpeningClose) {
     install_crypto_provider();
     let ca = CertAuthority::generate().unwrap();
     let spy = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -405,14 +401,13 @@ mod tests {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let sent = bytes.load(Ordering::Relaxed);
     spy_task.abort();
-    assert_eq!(sent, 0, "plaintext mtls guest sent bytes upstream");
     match close {
       OpeningClose::Plaintext => {
-        let err = result.expect_err("plaintext mtls guest");
-        assert!(matches!(err, crate::Error::PostgresGuestPlaintext), "{err}");
+        assert!(sent > 0, "plaintext mtls guest sent nothing upstream: {result:?}");
       }
       OpeningClose::Quiet => {
         result.expect("sslrequest then non-tls bytes closes before the dial");
+        assert_eq!(sent, 0, "a bad hello reached the upstream");
       }
     }
   }
@@ -423,27 +418,27 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn postgres_mtls_plaintext_guest_sends_nothing_upstream() {
-    assert_opening_sends_nothing(startup(), OpeningClose::Plaintext).await;
+  async fn postgres_mtls_plaintext_guest_reaches_the_upstream() {
+    assert_mtls_opening(startup(), OpeningClose::Plaintext).await;
   }
 
   #[tokio::test]
-  async fn postgres_mtls_gssenc_then_startup_sends_nothing_upstream() {
+  async fn postgres_mtls_gssenc_then_startup_reaches_the_upstream() {
     let mut opening = wire(&pgwire::messages::startup::GssEncRequest::new());
     opening.extend(startup());
-    assert_opening_sends_nothing(opening, OpeningClose::Plaintext).await;
+    assert_mtls_opening(opening, OpeningClose::Plaintext).await;
   }
 
   #[tokio::test]
-  async fn postgres_mtls_cancel_request_sends_nothing_upstream() {
+  async fn postgres_mtls_cancel_request_reaches_the_upstream() {
     let cancel = pgwire::messages::cancel::CancelRequest::new(7, pgwire::messages::startup::SecretKey::I32(11));
-    assert_opening_sends_nothing(wire(&cancel), OpeningClose::Plaintext).await;
+    assert_mtls_opening(wire(&cancel), OpeningClose::Plaintext).await;
   }
 
   #[tokio::test]
   async fn postgres_mtls_sslrequest_then_plaintext_sends_nothing_upstream() {
     let mut opening = wire(&pgwire::messages::startup::SslRequest::new());
     opening.extend(startup());
-    assert_opening_sends_nothing(opening, OpeningClose::Quiet).await;
+    assert_mtls_opening(opening, OpeningClose::Quiet).await;
   }
 }

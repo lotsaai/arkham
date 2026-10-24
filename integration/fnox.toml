@@ -20,7 +20,7 @@ value = "redis://arkham_user:arkham_real_redis_pass@redis:6379/0"
 provider = "plain"
 value = "rediss://arkham_user:arkham_real_redis_pass@redis:6380/0?sslrootcert=/certs/ca.crt"
 
-# `starttls=required` withholds the password until STARTTLS completes.
+# AUTH swaps on cleartext the same way as after STARTTLS.
 # `sslrootcert` is parsed off the string before the dial.
 [secrets.SMTP_URL]
 provider = "plain"
@@ -68,9 +68,11 @@ value = "tls://nkey:SU_REAL_USER_SEED@nats:4222?sslrootcert=/certs/ca.crt"
 provider = "plain"
 value = "tls://creds:SU_REAL_JWT_SEED:REAL_USER_JWT@nats-jwt:4223?sslrootcert=/certs/ca.crt"
 
+# Cleartext upstream. The demo client dials 5672, and this real string is
+# the same port, so the swap is what the broker accepts.
 [secrets.AMQP_URL]
 provider = "plain"
-value = "amqps://svc:arkham_real_amqp_pass_longer_01@amqp:5671?sslrootcert=/certs/ca.crt"
+value = "amqp://svc:arkham_real_amqp_pass_longer_01@amqp:5672"
 
 [secrets.AMQP_TLS_URL]
 provider = "plain"

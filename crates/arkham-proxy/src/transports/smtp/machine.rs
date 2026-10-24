@@ -63,8 +63,7 @@ struct Down {
   /// Suffix of a `DATA` body that may still grow into [`DATA_END`].
   tail: Vec<u8>,
   phase: Phase,
-  /// AUTH payloads are rewritten only when the upstream writer is TLS.
-  /// A cleartext upstream forwards the decoy.
+  /// AUTH payloads are rewritten when this is set. Cleartext and TLS both set it.
   protected: bool,
   creds: Option<Creds>,
   /// Guest-bound bytes queued for [`Wire::take_reply`].
@@ -235,8 +234,7 @@ impl Smtp {
     upstream.gate = Arc::clone(&downstream.gate);
   }
 
-  /// Allow AUTH rewriting. True only while the upstream leg is TLS. A
-  /// cleartext upstream forwards the decoy.
+  /// Allow AUTH rewriting for the rest of the session.
   pub(crate) fn set_protected(&mut self, protected: bool) {
     if let Some(down) = self.down.as_mut() {
       down.protected = protected;

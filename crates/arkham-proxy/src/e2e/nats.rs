@@ -1,6 +1,6 @@
-//! NATS through the MITM: a `nats://` server leg keeps the decoy, a `tls://`
-//! server leg carries the real password, nkey, or user JWT only after its
-//! upgrade, and a guest hello without SNI mints for the grant host.
+//! NATS through the MITM: a `nats://` server leg swaps CONNECT the same way
+//! a `tls://` server leg does, nkey and user JWT still need the INFO nonce,
+//! and a guest hello without SNI mints for the grant host.
 
 use std::path::PathBuf;
 
@@ -145,7 +145,7 @@ fn guest_url(addr: SocketAddr) -> String {
 }
 
 #[tokio::test]
-async fn nats_cleartext_server_leg_receives_the_decoy() {
+async fn nats_cleartext_server_leg_receives_the_real_password() {
   let stub = nats_stub().await;
   let (proxy_addr, proxy) = run_proxy_with(test_state_with(stub.grants(ServerLeg::Cleartext), &stub.ca)).await;
   let port = stub.port;
@@ -156,7 +156,7 @@ async fn nats_cleartext_server_leg_receives_the_decoy() {
     opening.extend_from_slice(b"PING\r\n");
     conn.write_all(&opening).await.unwrap();
     conn.flush().await.unwrap();
-    expect_connect(&mut conn, FAKE, VALUE).await;
+    expect_connect(&mut conn, VALUE, FAKE).await;
   });
   let upstream = connect_through_proxy(proxy_addr, port).await;
   let splice = splice_guest(upstream).await;
@@ -481,34 +481,30 @@ async fn nats_handshake_first_swaps_a_verifying_user_jwt() {
   signed_round_trip(true, true).await;
 }
 
-/// `guest_tls_mode = mtls` and a cleartext guest after INFO: the proxy
-/// returns [`crate::Error::NatsGuestPlaintext`] and the stub sees no CONNECT.
+/// `guest_tls_mode = mtls` and a cleartext guest after INFO: CONNECT still
+/// reaches the TLS upstream with the real password.
 #[tokio::test]
-async fn nats_mtls_plaintext_guest_writes_nothing_upstream() {
+async fn nats_mtls_plaintext_guest_swaps_the_password() {
   let stub = nats_stub().await;
   let port = stub.port;
   let root = stub.bundle.display().to_string();
   let fake = format!("nats://agent:{FAKE}@localhost:{port}");
   let real = format!("tls://agent:{VALUE}@localhost:{port}?sslrootcert={root}");
   let grants = super::resolve_mtls_grants("NATS_URL", &fake, &real).expect("nats mtls on a cleartext fake still loads");
+  let scope = grants.first().and_then(|grant| grant.nats(None, port)).expect("scope");
+  assert_eq!(scope.guest_tls, arkham_config::grants::GuestTlsMode::Mtls);
+  assert!(matches!(scope.upstream_tls, arkham_config::grants::NatsUpstream::Tls { .. }));
   let state = test_state_with(grants, &stub.ca);
   let snapshot = state.snapshot();
   let NatsStub { listener, acceptor, .. } = stub;
   let stub_task = tokio::spawn(async move {
     let (mut conn, _) = listener.accept().await.unwrap();
-    // async-nats upgrades when INFO says tls_required, so this INFO stays
-    // false and the CONNECT that follows is cleartext.
+    // async-nats stays cleartext when INFO says tls_required is false.
+    // The real string is tls://, so the proxy still upgrades this leg.
     conn.write_all(CLEAR_INFO).await.unwrap();
     conn.flush().await.unwrap();
     let mut tls = acceptor.accept(conn).await.unwrap();
-    let mut buf = [0u8; 64];
-    let upstream = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf))
-      .await
-      .expect("upstream closes");
-    match upstream {
-      Ok(0) | Err(_) => {}
-      Ok(n) => panic!("plaintext mtls guest wrote {n} bytes upstream"),
-    }
+    expect_connect(&mut tls, VALUE, FAKE).await;
   });
   let (guest, client) = tokio::io::duplex(64 * 1024);
   let serve = tokio::spawn(async move { serve_connect_stream(guest, &state, snapshot.as_ref(), "localhost", port, &[]).await });
@@ -516,12 +512,7 @@ async fn nats_mtls_plaintext_guest_writes_nothing_upstream() {
   let connected = async_nats::ConnectOptions::with_user_and_password("agent".to_string(), FAKE.to_string())
     .connect(guest_url(splice))
     .await;
-  assert!(connected.is_err(), "plaintext mtls guest");
-  let err = tokio::time::timeout(Duration::from_secs(10), serve)
-    .await
-    .expect("serve finishes")
-    .expect("serve task");
-  let err = err.expect_err("plaintext mtls guest");
-  assert!(matches!(err, crate::Error::NatsGuestPlaintext), "{err}");
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
+  drop(connected);
+  let _ = tokio::time::timeout(Duration::from_secs(10), serve).await;
 }

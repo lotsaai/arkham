@@ -17,10 +17,10 @@ Underneath sits a grant-scoped proxy. A workload can also point its proxy settin
 | SSH | Terminates on decoy keys, presents the real identity upstream, never opens forwarding. |
 | PostgreSQL | Negotiation answered here, startup identity swapped, steady state equal-length relay. |
 | Redis | RESP `AUTH` and `HELLO` passwords swapped. A TLS leaf is minted for the scope host when the client sends no SNI. |
-| SMTP | `AUTH PLAIN`, `AUTH LOGIN`, `AUTH XOAUTH2`, and `AUTH OAUTHBEARER` credentials swapped once the upstream leg is TLS. A cleartext upstream forwards the decoy. `STARTTLS` upgrades the same sockets; `smtps://` is TLS from the first byte. |
+| SMTP | `AUTH PLAIN`, `AUTH LOGIN`, `AUTH XOAUTH2`, and `AUTH OAUTHBEARER` credentials swapped on cleartext the same way as on TLS. `STARTTLS` upgrades the same sockets; `smtps://` is TLS from the first byte. |
 | LDAP | Simple-bind password swapped. StartTLS and LDAPS mint a leaf for the scope host when the client sends no SNI. |
-| NATS | CONNECT `user`/`pass`, `auth_token`, nkey public key, or user JWT swapped once the upstream leg is TLS. Nkey and user JWT also need the server INFO nonce and a signature that verifies under the decoy. A cleartext `nats://` upstream forwards the decoy. `tls://` upgrades after the server's INFO line; `handshake_first` is TLS from the first byte. Message payloads are never rewritten. |
-| AMQP | SASL `PLAIN` user and password swapped in the 0-9-1 `connection.start-ok` and the 1.0 `sasl-init`, once the upstream leg is TLS. A cleartext upstream forwards the decoy. Other mechanisms pass through. Close and error texts that carry the real password reach the client as the decoy. |
+| NATS | CONNECT `user`/`pass`, `auth_token`, nkey public key, or user JWT swapped on cleartext the same way as on TLS. Nkey and user JWT also need the server INFO nonce and a signature that verifies under the decoy. `tls://` upgrades after the server's INFO line; `handshake_first` is TLS from the first byte. Message payloads are never rewritten. |
+| AMQP | SASL `PLAIN` user and password swapped in the 0-9-1 `connection.start-ok` and the 1.0 `sasl-init` on cleartext the same way as on TLS. Other mechanisms pass through. Close and error texts that carry the real password reach the client as the decoy. |
 | Raw TCP | Equal-length byte swap that never reframes; everything else splices untouched. |
 
 ## Install

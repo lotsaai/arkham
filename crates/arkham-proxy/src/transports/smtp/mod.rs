@@ -30,10 +30,6 @@ use crate::Error;
 use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 
-/// First byte of a TLS record carrying a handshake. A cleartext `smtp`
-/// scope never serves one; implicit TLS is `smtps`.
-const TLS_RECORD_HANDSHAKE: u8 = 0x16;
-
 /// SMTP transport. Each connection string states its own leg.
 #[derive(Debug)]
 pub(crate) struct SmtpTransport {
@@ -116,9 +112,6 @@ impl Transport for SmtpTransport {
       };
       server_name = Some(sni_name);
       guest_tls = Some((hello_buf, identity));
-    } else if initial.first() == Some(&TLS_RECORD_HANDSHAKE) {
-      tracing::debug!("TLS opening on a cleartext smtp scope; closing");
-      return Ok(());
     }
 
     let upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;

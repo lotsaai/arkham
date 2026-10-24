@@ -7,8 +7,8 @@
 //! bytes to the next server reader. A non-`220` answer to `STARTTLS`
 //! returns to that loop. After the upgrade, or when the guest sends anything
 //! else, both sockets go to [`relay_guarded`]. Implicit TLS skips the
-//! opening. A session that never upgrades relays with swapping off, and the
-//! decoy passes through.
+//! opening. A session that never upgrades relays with swapping on, because
+//! cleartext swaps the real credential the same way TLS does.
 
 use std::io::ErrorKind;
 use std::pin::Pin;
@@ -224,9 +224,9 @@ where
     budget,
   } = dialogue;
   let mut down = Smtp::new(grants, host, port, Direction::Downstream);
-  // Swap only when the upstream writer is already TLS (`smtps://`). A
-  // cleartext `smtp://` session forwards the decoy until STARTTLS completes.
-  down.set_protected(scope.is_upstream_tls);
+  // Cleartext swaps the real credential the same way TLS does, including
+  // AUTH before STARTTLS and a session that never upgrades.
+  down.set_protected(true);
   let mut up = Smtp::new(grants, host, port, Direction::Upstream);
   Smtp::share_data_gate(&down, &mut up);
   if !guest.is_plain() {

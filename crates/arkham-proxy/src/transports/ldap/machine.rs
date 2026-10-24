@@ -8,7 +8,7 @@
 //! huge length. A message id outside the RFC 4511 range closes the
 //! downstream leg and is forwarded upstream; its body is not peeked. The
 //! upstream needle suffix is released when the message ends, because that
-//! frame cannot grow. A cleartext upstream keeps the decoy. A diagnostic
+//! frame cannot grow. A diagnostic
 //! that still carries the real password closes the leg.
 
 use std::borrow::Cow;
@@ -224,8 +224,7 @@ struct ResultCut {
 
 impl Ldap {
   /// Fresh leg. `swap` is downstream only: a simple bind is rewritten when
-  /// the upstream writer is already TLS. A cleartext upstream keeps the decoy.
-  /// Upstream always redacts a diagnostic that carries the real password.
+  /// it is set. Upstream always redacts a diagnostic that carries the real password.
   pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction, swap: bool) -> Self {
     let down = if dir == Direction::Downstream {
       grants.iter().find_map(|grant| {
@@ -1520,7 +1519,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn cleartext_bind_forwards_the_decoy() {
+  async fn bind_is_unchanged_when_swap_is_off() {
     let frame = bind_frame(1, DN, FAKE_PW);
     let mut machine = Ldap::new(&grant(DN, DN), "ldap", 389, Direction::Downstream, false);
     let out = emit(&mut machine, &frame).await;
