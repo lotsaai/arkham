@@ -35,11 +35,25 @@ ignore = [
   "RUSTSEC-2026-0349",
 
   # webpki-roots 0.26.11 is a semver shim that re-exports webpki-roots 1.x,
-  # and Cargo.lock resolves that to 1.0.10, which already removes the
+  # and Cargo.lock resolves that to 1.0.11, which already removes the
   # distrusted emSign ECC Root CA - G3. Only the shim's version number
   # matches; no distrusted root ships. Delete if the shim stops resolving
   # to >=1.0.10.
   "RUSTSEC-2026-0381",
+
+  # crypto-bigint 0.5.5 timing side channels. Patched only in >=0.7.6, with
+  # no 0.5 or 0.6 backport. Three parents still select 0.5.5:
+  # fnox-core 1.39.0 -> age 0.12.1 (newest) -> p256 0.13.2 ->
+  # elliptic-curve 0.13.8; fnox-core -> aws-sigv4 1.6.3 (newest) depends on
+  # crypto-bigint ^0.5.4 directly; russh 0.56 ->
+  # internal-russh-forked-ssh-key 0.6.16 -> p256/p384/p521 0.13 (same
+  # elliptic-curve 0.13), also reached by keeper-secrets-manager-core
+  # 17.3.0 under fnox-core. fnox-core >=1.40 does not resolve: kube 4's
+  # serde-saphyr caps smallvec at <1.16 and rama-utils requires ^1.16.
+  # russh 0.64 pulls kem 0.3.0, which does not resolve beside age's
+  # ml-kem 0.2.3 (kem =0.3.0-pre.0) and the unified 0.2.1 copy does not
+  # compile. Unblock when age, aws-sigv4, and russh all leave 0.5.
+  "RUSTSEC-2026-0387",
 
   # rustls-webpki 0.101.7 has no 0.101 backport of the emSign intermediate
   # distrust. It rides rustls 0.21 in aws-smithy-http-client's
