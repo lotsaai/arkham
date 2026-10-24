@@ -4,7 +4,6 @@
 pub(crate) mod machine;
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -22,14 +21,14 @@ use crate::transports::engine::{Direction, Redis};
 /// Redis transport: each connection string states its own leg, and the
 /// upstream `rediss` leg verifies the chain and the host name — the https
 /// precedent, not libpq's.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RedisTransport {
-  tls: Arc<TlsCache>,
+  tls: TlsCache,
 }
 
 impl RedisTransport {
   /// Share the proxy TLS cache.
-  pub(crate) fn new(tls: Arc<TlsCache>) -> Self {
+  pub(crate) fn new(tls: TlsCache) -> Self {
     Self { tls }
   }
 }
@@ -104,27 +103,26 @@ impl Transport for RedisTransport {
       host: matched_name.unwrap_or(scope.downstream.host.as_str()),
       port,
       plugins: &state.plugins,
-      mint: Some(state.mint_handle()),
+      mint: Some(state.mint_store()),
     };
     let upstream_name = scope.upstream.host.as_str();
-    let redis = &state.redis;
     match (guest_tls, scope.is_upstream_tls) {
       (None, false) => relay(Prefixed::new(guest_head, guest), upstream, &ctx).await,
       (Some((hello_buf, identity)), false) => {
-        let plain = redis
+        let plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
           .await?;
         relay(plain, upstream, &ctx).await
       }
       (None, true) => {
-        let plain = redis.connect_server(scope, upstream_name, upstream).await?;
+        let plain = self.connect_server(scope, upstream_name, upstream).await?;
         relay(Prefixed::new(guest_head, guest), plain, &ctx).await
       }
       (Some((hello_buf, identity)), true) => {
-        let guest_plain = redis
+        let guest_plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
           .await?;
-        let server_plain = redis.connect_server(scope, upstream_name, upstream).await?;
+        let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
         relay(guest_plain, server_plain, &ctx).await
       }
     }
@@ -215,7 +213,7 @@ mod tests {
     .unwrap();
     let snapshot = state.snapshot();
     let (guest, _peer) = tokio::io::duplex(64);
-    let transport = RedisTransport::new(Arc::new(TlsCache::new(&ca).unwrap()));
+    let transport = RedisTransport::new(TlsCache::new(&ca).unwrap());
     transport
       .serve(ServeStream {
         guest,

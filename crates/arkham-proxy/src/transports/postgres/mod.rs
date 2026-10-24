@@ -29,15 +29,15 @@ use crate::transports::tls::cached_roots;
 
 /// Postgres transport: guest leaves under the `postgresql` ALPN, upstream
 /// handshakes under libpq's `sslmode` law.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PostgresTransport {
-  tls: Arc<TlsCache>,
+  tls: TlsCache,
   provider: Arc<CryptoProvider>,
 }
 
 impl PostgresTransport {
   /// Share the proxy TLS cache. The crypto provider is the process default.
-  pub(crate) fn new(tls: Arc<TlsCache>) -> Self {
+  pub(crate) fn new(tls: TlsCache) -> Self {
     Self {
       tls,
       provider: CryptoProvider::get_default()
@@ -164,29 +164,28 @@ impl Transport for PostgresTransport {
       host: server_name.as_deref().unwrap_or(raw_host),
       port,
       plugins: &state.plugins,
-      mint: Some(state.mint_handle()),
+      mint: Some(state.mint_store()),
     };
     // The upstream leg verifies against the real string's host, which its
     // certificate must carry.
     let upstream_name = scope.upstream.host.as_str();
-    let postgres = &state.postgres;
     match (guest_tls, accepted) {
       (None, false) => relay(Prefixed::new(guest_head, guest), upstream, &ctx, scope, budget).await,
       (Some((hello_buf, identity)), false) => {
-        let plain = postgres
+        let plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
           .await?;
         relay(plain, upstream, &ctx, scope, budget).await
       }
       (None, true) => {
-        let plain = postgres.connect_server(scope, upstream_name, upstream).await?;
+        let plain = self.connect_server(scope, upstream_name, upstream).await?;
         relay(Prefixed::new(guest_head, guest), plain, &ctx, scope, budget).await
       }
       (Some((hello_buf, identity)), true) => {
-        let guest_plain = postgres
+        let guest_plain = self
           .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
           .await?;
-        let server_plain = postgres.connect_server(scope, upstream_name, upstream).await?;
+        let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
         relay(guest_plain, server_plain, &ctx, scope, budget).await
       }
     }
@@ -363,7 +362,7 @@ mod tests {
     .unwrap();
     let snapshot = state.snapshot();
     let (guest, _peer) = tokio::io::duplex(64);
-    let transport = PostgresTransport::new(Arc::new(TlsCache::new(&ca).unwrap()));
+    let transport = PostgresTransport::new(TlsCache::new(&ca).unwrap());
     let result = transport
       .serve(ServeStream {
         guest,

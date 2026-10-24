@@ -1,7 +1,6 @@
 pub(crate) mod machine;
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -16,14 +15,14 @@ use crate::identity::CandidateParams;
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Amqp, Direction};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct AmqpTransport {
-  tls: Arc<TlsCache>,
+  tls: TlsCache,
 }
 
 impl AmqpTransport {
   /// Share the proxy TLS cache.
-  pub(crate) fn new(tls: Arc<TlsCache>) -> Self {
+  pub(crate) fn new(tls: TlsCache) -> Self {
     Self { tls }
   }
 }
@@ -85,7 +84,7 @@ impl Transport for AmqpTransport {
       host: matched_name.unwrap_or(scope.downstream.host.as_str()),
       port,
       plugins: &state.plugins,
-      mint: Some(state.mint_handle()),
+      mint: Some(state.mint_store()),
     };
     self
       .relay_settled(

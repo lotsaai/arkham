@@ -35,7 +35,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use crate::Error;
 use crate::connection::client_identity;
 use crate::identity::CandidateParams;
-use crate::mint::MintHandle;
+use crate::mint::MintStore;
 use rama::tls::client::ClientAuth;
 
 use self::tls::{cached_leaf, cached_leaf_mtls, cached_roots};
@@ -72,11 +72,11 @@ pub(crate) trait Transport: Send + Sync {
 /// [`crate::ProxyState::new`] builds one cache. The leaf key includes the
 /// ALPN offer, so a `postgresql` leaf and a leaf that offers nothing stay
 /// distinct for the same name.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct TlsCache {
-  ca: CertAuthority,
-  leaves: DashMap<String, Arc<ServerConfig>>,
-  roots: DashMap<RootCert, Arc<RootCertStore>>,
+  ca: Arc<CertAuthority>,
+  leaves: Arc<DashMap<String, Arc<ServerConfig>>>,
+  roots: Arc<DashMap<RootCert, Arc<RootCertStore>>>,
 }
 
 impl TlsCache {
@@ -87,25 +87,25 @@ impl TlsCache {
   /// Returns an error when the CA cannot be read back from its own PEM.
   pub(crate) fn new(ca: &CertAuthority) -> Result<Self, Error> {
     Ok(Self {
-      ca: CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?,
-      leaves: DashMap::new(),
-      roots: DashMap::new(),
+      ca: Arc::new(CertAuthority::load(&ca.cert_pem(), &ca.key_pem())?),
+      leaves: Arc::new(DashMap::new()),
+      roots: Arc::new(DashMap::new()),
     })
   }
 
   /// CA that signs guest leaves.
   pub(crate) fn ca(&self) -> &CertAuthority {
-    &self.ca
+    self.ca.as_ref()
   }
 
   /// Guest leaf cache.
   pub(crate) fn leaves(&self) -> &DashMap<String, Arc<ServerConfig>> {
-    &self.leaves
+    self.leaves.as_ref()
   }
 
   /// Upstream trust-anchor cache.
   pub(crate) fn roots(&self) -> &DashMap<RootCert, Arc<RootCertStore>> {
-    &self.roots
+    self.roots.as_ref()
   }
 }
 
@@ -261,8 +261,8 @@ pub(crate) struct PairCtx<'a> {
   pub(crate) port: u16,
   /// Per-connection plugin registry.
   pub(crate) plugins: &'a arkham_plugin::Registry,
-  /// Runtime token-mint handle; `None` keeps value-swap-only behavior.
-  pub(crate) mint: Option<MintHandle>,
+  /// Runtime token-mint store; `None` keeps value-swap-only behavior.
+  pub(crate) mint: Option<MintStore>,
 }
 
 #[cfg(test)]
@@ -288,8 +288,9 @@ mod tests {
     key: Option<PathBuf>,
   }
 
+  #[derive(Debug, Clone)]
   struct Halves {
-    tls: Arc<TlsCache>,
+    tls: TlsCache,
     alpn: Option<&'static [u8]>,
   }
 
@@ -339,7 +340,7 @@ mod tests {
       std::fs::write(&path, ca.cert_pem()).expect("ca pem");
       Self {
         halves: Halves {
-          tls: Arc::new(TlsCache::new(&ca).expect("tls")),
+          tls: TlsCache::new(&ca).expect("tls"),
           alpn,
         },
         root: RootCert::Path(path),
@@ -498,9 +499,9 @@ mod tests {
     install_crypto_provider();
     let ca = CertAuthority::generate().expect("ca");
     for postgres_first in [true, false] {
-      let tls = Arc::new(TlsCache::new(&ca).expect("tls"));
+      let tls = TlsCache::new(&ca).expect("tls");
       let postgres = Halves {
-        tls: Arc::clone(&tls),
+        tls: tls.clone(),
         alpn: Some(b"postgresql"),
       };
       let plain = Halves { tls, alpn: None };

@@ -26,7 +26,7 @@ use tokio::net::TcpStream;
 
 use crate::connection::{dial_marked, trust_anchors};
 use crate::identity::{Expect, expect};
-use crate::mint::{MintBucket, MintHandle, MintStore};
+use crate::mint::{MintBucket, MintStore};
 use crate::transports::PairCtx;
 use crate::transports::http::{MAX_HEAD, http_pair};
 use arkham_config::grants::{Grant, ResolvedConfig, Scheme};
@@ -75,19 +75,19 @@ pub struct ProxyState {
   relay: HttpsRelay,
   extra_relays: HashMap<PathBuf, HttpsRelay>,
   mtls_trust: X509Store,
-  http: Arc<HttpTransport>,
-  https: Arc<HttpsTransport>,
-  tcp: Arc<TcpTransport>,
-  ssh: Arc<SshTransport>,
-  postgres: Arc<PostgresTransport>,
-  redis: Arc<RedisTransport>,
-  smtp: Arc<SmtpTransport>,
-  ldap: Arc<LdapTransport>,
-  nats: Arc<NatsTransport>,
-  amqp: Arc<AmqpTransport>,
+  http: HttpTransport,
+  https: HttpsTransport,
+  tcp: TcpTransport,
+  ssh: SshTransport,
+  postgres: PostgresTransport,
+  redis: RedisTransport,
+  smtp: SmtpTransport,
+  ldap: LdapTransport,
+  nats: NatsTransport,
+  amqp: AmqpTransport,
   mint: MintBucket,
-  /// Runtime token-mint store, shared across connections.
-  mint_store: Arc<crate::mint::MintStore>,
+  /// Runtime token-mint store. Clones share the pair map.
+  mint_store: MintStore,
   fwmark: Option<u32>,
   plugins: Arc<arkham_plugin::Registry>,
 }
@@ -174,30 +174,24 @@ impl ProxyState {
       .add_cert(&crt)
       .map_err(|source| Error::MtlsTrustAnchor { source: source.into() })?;
     let mtls_trust = trust.build();
-    let tls = Arc::new(TlsCache::new(ca)?);
-    let postgres = Arc::new(PostgresTransport::new(Arc::clone(&tls)));
-    let redis = Arc::new(RedisTransport::new(Arc::clone(&tls)));
-    let smtp = Arc::new(SmtpTransport::new(Arc::clone(&tls)));
-    let ldap = Arc::new(LdapTransport::new(Arc::clone(&tls)));
-    let nats = Arc::new(NatsTransport::new(Arc::clone(&tls)));
-    let amqp = Arc::new(AmqpTransport::new(tls));
+    let tls = TlsCache::new(ca)?;
     Ok(Self {
       config: Arc::new(resolved),
       relay,
       extra_relays,
       mtls_trust,
-      http: Arc::new(HttpTransport),
-      https: Arc::new(HttpsTransport),
-      tcp: Arc::new(TcpTransport),
-      ssh: Arc::new(SshTransport::default()),
-      postgres,
-      redis,
-      smtp,
-      ldap,
-      nats,
-      amqp,
+      http: HttpTransport,
+      https: HttpsTransport,
+      tcp: TcpTransport,
+      ssh: SshTransport::default(),
+      postgres: PostgresTransport::new(tls.clone()),
+      redis: RedisTransport::new(tls.clone()),
+      smtp: SmtpTransport::new(tls.clone()),
+      ldap: LdapTransport::new(tls.clone()),
+      nats: NatsTransport::new(tls.clone()),
+      amqp: AmqpTransport::new(tls),
       mint: MintBucket::new(),
-      mint_store: Arc::new(MintStore::default()),
+      mint_store: MintStore::default(),
       fwmark: None,
       plugins,
     })
@@ -218,10 +212,10 @@ impl ProxyState {
     Arc::clone(&self.config)
   }
 
-  /// Handle to the runtime token-mint store for new connections.
+  /// Clone of the runtime token-mint store. Clones share the pair map.
   #[must_use]
-  pub(crate) fn mint_handle(&self) -> MintHandle {
-    MintHandle::new(Arc::clone(&self.mint_store))
+  pub(crate) fn mint_store(&self) -> MintStore {
+    self.mint_store.clone()
   }
 
   /// `SO_MARK` for upstream sockets (`None` = unmarked).
@@ -417,7 +411,7 @@ async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &P
     host: &host,
     port,
     plugins: &state.plugins,
-    mint: Some(state.mint_handle()),
+    mint: Some(state.mint_store()),
   };
   let (mut downstream_machine, mut upstream_machine) = http_pair(&ctx);
   relay_guarded(client, upstream, &mut downstream_machine, &mut upstream_machine, head, &[]).await

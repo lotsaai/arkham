@@ -32,7 +32,7 @@ Nothing on main is split into one crate per protocol. Each protocol is spread ac
 | `ServeStream<'a,G,S>` | 44 | `{ guest: G, params: CandidateParams<'a>, scope: &'a S }` |
 | `Transport` | 54 | `type Scope: Sync; fn serve<G: AsyncRead+AsyncWrite+Unpin+Send+'static>(&self, ServeStream<'_,G,Self::Scope>) -> impl Future<Output=Result<(),Error>>` |
 | `TlsHalves` | 74 | `type Scope; fn accept_guest` and `fn connect_server` have default bodies (tokio-rustls). A protocol implements `tls`, `tls_label`, `root_cert`, `client_paths`. Defaults: `guest_alpn` and `server_alpn` offer nothing; `client_builder` verifies chain and name against the named root, or the platform store when the scope names none. |
-| `PairCtx<'a>` | 204 | `{ grants:&[Grant], host:&str, port:u16, plugins:&arkham_plugin::Registry, mint:Option<MintHandle> }` |
+| `PairCtx<'a>` | 204 | `{ grants:&[Grant], host:&str, port:u16, plugins:&arkham_plugin::Registry, mint:Option<MintStore> }` |
 
 **How a new protocol plugs in:**
 1. Implement `Transport::serve`.
@@ -45,7 +45,7 @@ Nothing on main is split into one crate per protocol. Each protocol is spread ac
 | Fn | Line | Signature |
 |---|---|---|
 | `cached_leaf` | 27 | `(ca:&CertAuthority, leaves:&DashMap<String,Arc<ServerConfig>>, sni:&str, alpn:Option<&[u8]>) -> Result<Arc<ServerConfig>>` |
-| `cached_leaf_mtls` | 52 | same args; cache key `"{sni}\|mtls"`; client verifier on arkham's CA |
+| `cached_leaf_mtls` | 52 | same args; cache key is mode, ALPN offer, and server name; client verifier on arkham's CA |
 | `cached_roots` | 87 | `(roots:&DashMap<RootCert,Arc<RootCertStore>>, root:&RootCert) -> Result<Arc<RootCertStore>>` (Path or System, fails closed if empty) |
 
 These are free functions over the one `TlsCache` built in `ProxyState::new`. The leaf key includes the ALPN offer, so a `postgresql` leaf and a leaf with no ALPN do not collide on the same name.
@@ -103,7 +103,7 @@ Related helpers in `proxy/connection.rs`:
   - `mint_and_redact` :268
 - **Store:**
   - `MintStore::mint` (mint.rs:66) renders a decoy with `fake_for(real_value, pattern)`.
-  - `MintHandle` (mint.rs:50) is what `PairCtx.mint` carries.
+  - `MintStore` is what `PairCtx.mint` carries. A clone shares the pair map.
 - **Users:** only the HTTP h1 and h2 machines (`http/machine.rs`, `http/h2.rs`). Other protocols get `PairCtx.mint` but never read it.
 - **Name clash:** `MintBucket` (mint.rs:135, `ProxyState.mint`) is the *leaf-issuance burst guard*, not OAuth.
 

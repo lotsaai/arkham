@@ -10,7 +10,6 @@ pub(crate) mod machine;
 
 use std::io::{Error as IoError, ErrorKind};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -30,14 +29,14 @@ use machine::starttls_success;
 /// LDAP transport. `ldaps://` settles TLS before the machine runs.
 /// `ldap://` stays plaintext until `StartTLS`, then mints the guest leaf
 /// for the scope host and opens TLS upstream.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct LdapTransport {
-  tls: Arc<TlsCache>,
+  tls: TlsCache,
 }
 
 impl LdapTransport {
   /// Share the proxy TLS cache.
-  pub(crate) fn new(tls: Arc<TlsCache>) -> Self {
+  pub(crate) fn new(tls: TlsCache) -> Self {
     Self { tls }
   }
 }
@@ -102,7 +101,7 @@ impl Transport for LdapTransport {
       host: matched_name.unwrap_or(scope.downstream.host.as_str()),
       port,
       plugins: &state.plugins,
-      mint: Some(state.mint_handle()),
+      mint: Some(state.mint_store()),
     };
     let upstream_name = scope.upstream.host.as_str();
     let pump = Pump {

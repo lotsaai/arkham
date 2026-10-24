@@ -118,8 +118,8 @@ pub(crate) struct H2 {
   /// Static grant pairs from construction; `pairs` rebuilds from these
   /// whenever minted pairs refresh.
   static_pairs: Vec<CredentialPair>,
-  /// Runtime mint handle; `None` keeps value-swap-only behavior.
-  mint: Option<crate::mint::MintHandle>,
+  /// Runtime mint store; `None` keeps value-swap-only behavior.
+  mint: Option<crate::mint::MintStore>,
   /// Response side: the flow-granted grant's expectations, when this
   /// endpoint is a token issuer and this machine mints.
   mint_plan: Option<MintPlan>,
@@ -139,7 +139,7 @@ impl H2 {
     port: u16,
     dir: Direction,
     hook: Option<Box<dyn RewriteHook>>,
-    mint: Option<crate::mint::MintHandle>,
+    mint: Option<crate::mint::MintStore>,
   ) -> Self {
     let static_pairs = eligible_pairs(grants, scheme, host, port, dir);
     let tail_size = max_tail_size(&static_pairs);
@@ -934,7 +934,7 @@ mod h2_tests {
     H2::new(&grants(), Scheme::Https, "api.github.com", 443, Direction::Upstream, None, None)
   }
 
-  fn mint_resp_machine(store: std::sync::Arc<crate::mint::MintStore>) -> H2 {
+  fn mint_resp_machine(store: crate::mint::MintStore) -> H2 {
     H2::new(
       &flow_grants(),
       Scheme::Https,
@@ -942,7 +942,7 @@ mod h2_tests {
       443,
       Direction::Upstream,
       None,
-      Some(crate::mint::MintHandle::new(store)),
+      Some(store),
     )
   }
 
@@ -1369,8 +1369,8 @@ mod h2_tests {
 
   #[tokio::test]
   async fn h2_token_response_mints_and_reframes() {
-    let store = std::sync::Arc::new(crate::mint::MintStore::default());
-    let mut resp = mint_resp_machine(std::sync::Arc::clone(&store));
+    let store = crate::mint::MintStore::default();
+    let mut resp = mint_resp_machine(store.clone());
     let block = encode_headers(&[(":status", "200")]);
     let mut input = frame(F_HEADERS, FLAG_END_HEADERS, 1, &block);
     let body = r#"{"access_token":"real-token-value","token_type":"Bearer"}"#;
@@ -1386,8 +1386,8 @@ mod h2_tests {
 
   #[tokio::test]
   async fn h2_split_data_frames_mint_at_end_stream() {
-    let store = std::sync::Arc::new(crate::mint::MintStore::default());
-    let mut resp = mint_resp_machine(std::sync::Arc::clone(&store));
+    let store = crate::mint::MintStore::default();
+    let mut resp = mint_resp_machine(store.clone());
     let block = encode_headers(&[(":status", "200")]);
     let mut input = frame(F_HEADERS, FLAG_END_HEADERS, 1, &block);
     let (a, b) = r#"{"access_token":"real-token-value"}"#.split_at(20);
@@ -1404,8 +1404,8 @@ mod h2_tests {
 
   #[tokio::test]
   async fn h2_minted_decoy_substitutes_on_a_later_request_connection() {
-    let store = std::sync::Arc::new(crate::mint::MintStore::default());
-    let mut resp = mint_resp_machine(std::sync::Arc::clone(&store));
+    let store = crate::mint::MintStore::default();
+    let mut resp = mint_resp_machine(store.clone());
     let block = encode_headers(&[(":status", "200")]);
     let mut input = frame(F_HEADERS, FLAG_END_HEADERS, 1, &block);
     let body = r#"{"access_token":"real-token-value"}"#;
@@ -1420,7 +1420,7 @@ mod h2_tests {
       443,
       Direction::Downstream,
       None,
-      Some(crate::mint::MintHandle::new(std::sync::Arc::clone(&store))),
+      Some(store.clone()),
     );
     let block = encode_headers(&[
       (":method", "GET"),

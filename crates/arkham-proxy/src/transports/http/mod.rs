@@ -29,7 +29,7 @@ use crate::Error;
 use crate::connection::{GuestIo, Prefixed, client_auth_policy, dial_marked};
 use crate::identity::{CandidateParams, Hello, read_client_hello, read_http_head};
 use crate::into_box_error;
-use crate::mint::MintHandle;
+use crate::mint::MintStore;
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Direction, H2, Http, Raw};
 use crate::transports::tcp;
@@ -108,7 +108,7 @@ impl Transport for HttpsTransport {
       identity,
       port,
       plugins: Arc::clone(&state.plugins),
-      mint: Some(state.mint_handle()),
+      mint: Some(state.mint_store()),
     };
     // Entries naming `root_cert` ride their own relay extending the global
     // egress trust; the map was built from this same config, so a miss is
@@ -172,7 +172,7 @@ impl Transport for HttpTransport {
       host: if named { &head_host } else { raw_host },
       port: if named { head_port } else { port },
       plugins: &state.plugins,
-      mint: Some(state.mint_handle()),
+      mint: Some(state.mint_store()),
     };
     if named {
       let (mut downstream_machine, mut upstream_machine) = http_pair(&ctx);
@@ -198,7 +198,7 @@ pub(crate) struct SubstitutionService {
   identity: String,
   port: u16,
   plugins: Arc<arkham_plugin::Registry>,
-  mint: Option<MintHandle>,
+  mint: Option<MintStore>,
 }
 
 impl<GI, GE> Service<BridgeIo<TlsStream<GI>, TlsStream<GE>>> for SubstitutionService

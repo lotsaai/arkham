@@ -15,7 +15,6 @@ pub(crate) use machine::{MAX_COMMAND, Smtp};
 pub(crate) use session::{GuestLeg, acceptance_reply, plain_guest};
 
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -28,14 +27,14 @@ use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 
 /// SMTP transport. Each connection string states its own leg.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SmtpTransport {
-  tls: Arc<TlsCache>,
+  tls: TlsCache,
 }
 
 impl SmtpTransport {
   /// Share the proxy TLS cache.
-  pub(crate) fn new(tls: Arc<TlsCache>) -> Self {
+  pub(crate) fn new(tls: TlsCache) -> Self {
     Self { tls }
   }
 }
@@ -104,7 +103,7 @@ impl Transport for SmtpTransport {
       host: matched_name.unwrap_or(scope.downstream.host.as_str()),
       port,
       plugins: &state.plugins,
-      mint: Some(state.mint_handle()),
+      mint: Some(state.mint_store()),
     };
     let upstream_name = scope.upstream.host.as_str();
     let guest_leg = match guest_tls {

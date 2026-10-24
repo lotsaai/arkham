@@ -42,7 +42,7 @@ impl Transport for TcpTransport {
       host: raw_host,
       port,
       plugins: &state.plugins,
-      mint: Some(state.mint_handle()),
+      mint: Some(state.mint_store()),
     };
     let (mut downstream_machine, mut upstream_machine) = raw_tcp_pair(&ctx);
     relay_guarded(guest, upstream, &mut downstream_machine, &mut upstream_machine, initial, &[]).await

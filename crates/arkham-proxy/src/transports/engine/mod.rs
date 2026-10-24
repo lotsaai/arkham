@@ -239,10 +239,10 @@ fn grant_pattern(grant: &Grant) -> Option<String> {
 /// Minted pairs as needle→replacement pairs for one direction: downstream
 /// swaps minted decoys back to real values, upstream redacts real minted
 /// values back to their decoys.
-pub(crate) fn minted_pairs(mint: &crate::mint::MintHandle, dir: Direction) -> Vec<CredentialPair> {
+pub(crate) fn minted_pairs(mint: &crate::mint::MintStore, dir: Direction) -> Vec<CredentialPair> {
   use secrecy::ExposeSecret as _;
   mint
-    .pairs()
+    .snapshot_pairs()
     .into_iter()
     .filter_map(|(decoy, real, label)| {
       let real = real.expose_secret();
@@ -267,7 +267,7 @@ pub(crate) fn minted_pairs(mint: &crate::mint::MintHandle, dir: Direction) -> Ve
 /// redaction: minting fires only on what it can positively identify.
 pub(crate) fn mint_and_redact(
   plan: &MintPlan,
-  mint: &crate::mint::MintHandle,
+  mint: &crate::mint::MintStore,
   body: &[u8],
   pairs: &[CredentialPair],
 ) -> (Vec<u8>, Vec<Hit>) {

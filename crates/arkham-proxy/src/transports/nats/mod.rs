@@ -17,7 +17,6 @@ mod props;
 
 use std::io::{Error as IoError, ErrorKind};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -40,14 +39,14 @@ const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 const OPENING_READ: usize = 4096;
 
 /// NATS transport.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct NatsTransport {
-  tls: Arc<TlsCache>,
+  tls: TlsCache,
 }
 
 impl NatsTransport {
   /// Share the proxy TLS cache.
-  pub(crate) fn new(tls: Arc<TlsCache>) -> Self {
+  pub(crate) fn new(tls: TlsCache) -> Self {
     Self { tls }
   }
 }
@@ -324,7 +323,6 @@ where
 mod tests {
   use std::io::Cursor;
   use std::pin::Pin;
-  use std::sync::Arc;
   use std::task::{Context, Poll};
   use std::time::Duration;
 
@@ -345,7 +343,7 @@ mod tests {
   #[tokio::test]
   async fn mtls_plaintext_guest_forwards_the_real_password() {
     let ca = CertAuthority::generate().expect("ca");
-    let transport = NatsTransport::new(Arc::new(TlsCache::new(&ca).expect("tls")));
+    let transport = NatsTransport::new(TlsCache::new(&ca).expect("tls"));
     let grants = nats_grants(
       "nats://agent:arkham_fake_nats_pass@nats.internal:4222",   // betterleaks:allow
       "tls://agent:real-nats-pass-is-longer@nats.upstream:4222", // betterleaks:allow
