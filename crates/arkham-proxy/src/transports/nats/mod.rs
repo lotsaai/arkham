@@ -373,38 +373,46 @@ mod tests {
     let (guest_peer, guest) = tokio::io::duplex(64);
     drop(guest_peer);
     let mint = crate::mint::MintBucket::new();
-    let open = Open {
-      scope: &scope,
-      grants: &grants,
-      port: 4222,
-      budget: Duration::from_secs(10),
-      mint: &mint,
-      authority: "nats.internal",
-      fwmark: None,
-    };
     let connect = b"CONNECT {\"user\":\"agent\",\"pass\":\"arkham_fake_nats_pass\"}\r\n"; // betterleaks:allow
-    let finished = tokio::time::timeout(
-      Duration::from_millis(200),
-      transport.relay_guest(
-        guest,
-        connect,
-        ServerLeg {
-          stream: server,
-          first: Vec::new(),
-          down,
-          up,
-        },
-        &open,
-      ),
-    )
-    .await
-    .expect("plaintext mtls guest reaches the upstream");
-    finished.expect("plaintext mtls guest relay");
-    let mut forwarded = Vec::new();
-    upstream.read_to_end(&mut forwarded).await.expect("upstream read");
-    let text = String::from_utf8_lossy(&forwarded);
+    let relay = tokio::spawn(async move {
+      let open = Open {
+        scope: &scope,
+        grants: &grants,
+        port: 4222,
+        budget: Duration::from_secs(10),
+        mint: &mint,
+        authority: "nats.internal",
+        fwmark: None,
+      };
+      transport
+        .relay_guest(
+          guest,
+          connect,
+          ServerLeg {
+            stream: server,
+            first: Vec::new(),
+            down,
+            up,
+          },
+          &open,
+        )
+        .await
+    });
+    let mut buf = [0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(2), upstream.read(&mut buf))
+      .await
+      .expect("upstream receives CONNECT")
+      .expect("upstream read");
+    assert!(n > 0, "upstream received nothing");
+    let text = String::from_utf8_lossy(&buf[..n]);
     assert!(text.contains("real-nats-pass-is-longer"), "{text}");
     assert!(!text.contains("arkham_fake_nats_pass"), "{text}");
+    drop(upstream);
+    let finished = tokio::time::timeout(Duration::from_secs(2), relay)
+      .await
+      .expect("relay ends")
+      .expect("relay task");
+    finished.expect("plaintext mtls guest relay");
   }
 
   #[tokio::test]
