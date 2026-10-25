@@ -1,8 +1,22 @@
+## [0.3.33] - 2026-10-25
+
+### 🐛 Bug Fixes
+
+- *(proxy)* Swap real credentials on cleartext (#134)
+
+### 🚜 Refactor
+
+- *(proxy)* Share one TLS cache and handshake timeout (#136)
 ## [0.3.32] - 2026-10-23
 
 ### 🚜 Refactor
 
 - *(proxy)* Share TlsHalves accept and connect (#132)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.32 [ci skip]
+- Release
 ## [0.3.31] - 2026-10-21
 
 ### ⚙️ Miscellaneous Tasks

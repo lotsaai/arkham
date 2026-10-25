@@ -386,7 +386,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-compose"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "arkham-config",
  "arkham-fnox",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-config"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "base62",
  "base64 0.23.1",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-ebpf"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -468,14 +468,14 @@ dependencies = [
 
 [[package]]
 name = "arkham-ebpf-programs"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "aya-ebpf",
 ]
 
 [[package]]
 name = "arkham-fnox"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "arkham-config",
  "fnox-core",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-pki"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "rama",
  "rand 0.8.8",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-plugin"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "arkham-config",
  "thiserror 2.0.21",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-proxy"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "actson",
  "amq-protocol",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tproxy"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tun"
-version = "0.3.32"
+version = "0.3.33"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -2621,9 +2621,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.6"
+version = "0.7.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bb08299a6046833a879ace115697f12fd2bd6c8d3e93c909ffc9e0738e7cae0"
+checksum = "d811ea23fdfbcce2e2d5132344d471abdb8f901ac496a0893a3df92e70525e52"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -2664,7 +2664,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
 dependencies = [
- "crypto-bigint 0.7.6",
+ "crypto-bigint 0.7.9",
  "rand_core 0.10.1",
 ]
 
@@ -2843,9 +2843,9 @@ dependencies = [
  "cfg-if",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "lock_api",
+ "lock_api 0.4.14",
  "once_cell",
- "parking_lot_core",
+ "parking_lot_core 0.9.12",
 ]
 
 [[package]]
@@ -3155,7 +3155,7 @@ checksum = "c0681a4fc24c767085329728d8dfba959af91228aa4610cca4f8ce317ba46ae0"
 dependencies = [
  "der 0.8.2",
  "digest 0.11.3",
- "elliptic-curve 0.14.1",
+ "elliptic-curve 0.14.3",
  "rfc6979 0.6.0",
  "signature 3.0.0",
  "spki 0.8.1",
@@ -3217,12 +3217,12 @@ dependencies = [
 
 [[package]]
 name = "elliptic-curve"
-version = "0.14.1"
+version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d65aa39b3a5c1c9c1b745c9a019234bb7a21b77abcb4f4d266d706e2d577d65"
+checksum = "900f37e7e18d74a2347389af6cd69e3a30d5cc9e697f40004865679aa75e9c7c"
 dependencies = [
  "base16ct 1.0.0",
- "crypto-bigint 0.7.6",
+ "crypto-bigint 0.7.9",
  "crypto-common 0.2.2",
  "digest 0.11.3",
  "ff 0.14.0",
@@ -3400,7 +3400,7 @@ dependencies = [
  "fe2o3-amqp-types",
  "futures-util",
  "getrandom 0.4.3",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "serde",
  "serde_amqp",
@@ -3983,9 +3983,9 @@ dependencies = [
 
 [[package]]
 name = "gix-config"
-version = "0.62.1"
+version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d8de82251a43c9f845458cd64e565f7350ce446bb786348f79d80dc5089806e"
+checksum = "3e11ccf82e9630c4e7befbae07cbe90e79de61dc73a34448c2dec70a13da9ebf"
 dependencies = [
  "bstr",
  "gix-config-value",
@@ -4094,13 +4094,13 @@ dependencies = [
 
 [[package]]
 name = "gix-hashtable"
-version = "0.18.0"
+version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "916cb6b2ec42ffaca624e7867bb382a4673015cb4ffcd7330b48085d02e4c615"
+checksum = "2f66822aee11ccb28d6a2e63b587254e578fb52a138bd5806b58d8560125592b"
 dependencies = [
  "gix-hash",
  "hashbrown 0.17.1",
- "parking_lot",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -4135,9 +4135,9 @@ dependencies = [
 
 [[package]]
 name = "gix-parallel"
-version = "0.50.0"
+version = "0.50.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e994cf1eec247ba4be7f9e7c0d58cc73f83eecb5fcb9feb595df5ba3d2078546"
+checksum = "58e7e10f8343e05f6ad8651f97dffa1caca1531bb274bfc8e3050e80e3ed5946"
 dependencies = [
  "gix-trace",
 ]
@@ -4176,9 +4176,9 @@ dependencies = [
 
 [[package]]
 name = "gix-sec"
-version = "0.16.0"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5640f642a1b471616d48230b1def7ca743cb30903441ff84800cafbab3c0fddf"
+checksum = "9598d1f35baec7038c2d278bfcc18f1d8951f41dcc3f51ab6175661dfe5a6137"
 dependencies = [
  "bitflags 2.13.2",
  "gix-path",
@@ -4194,7 +4194,7 @@ checksum = "b8fdb135a043d6106b59bc58d59a326b277e495ec26fb9e02a1e2b6354bf4b5a"
 dependencies = [
  "gix-fs",
  "libc",
- "parking_lot",
+ "parking_lot 0.12.5",
  "tempfile",
  "windows-sys 0.61.2",
 ]
@@ -4207,9 +4207,9 @@ checksum = "c477c029518d3f235c26db21ff7cccc1fa13c0c31b05c005a55b7affd4ffbd81"
 
 [[package]]
 name = "gix-utils"
-version = "0.5.1"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8e770b8c34311044d1addc7b18957db0ac27183707e1140dc90e6f674a6354e"
+checksum = "11a9446060447e9ec58f5d333b98bed53389dfa10de5d8dd46fc76d01dfc2954"
 dependencies = [
  "bstr",
  "fastrand",
@@ -4787,7 +4787,7 @@ dependencies = [
  "moka",
  "ndk-context",
  "once_cell",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rand 0.10.3",
  "resolv-conf",
  "smallvec",
@@ -5154,7 +5154,7 @@ dependencies = [
  "i18n-embed-impl",
  "intl-memoizer",
  "log",
- "parking_lot",
+ "parking_lot 0.12.5",
  "rust-embed",
  "thiserror 1.0.69",
  "unic-langid",
@@ -6133,6 +6133,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lock_api"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65d91b22da179613dcf4d6ec8349563f52a363f6849e03b00dd0a185ec4a59af"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6343,7 +6352,7 @@ dependencies = [
  "equivalent",
  "event-listener",
  "futures-util",
- "parking_lot",
+ "parking_lot 0.12.5",
  "portable-atomic",
  "smallvec",
  "tagptr",
@@ -6852,7 +6861,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2c9239b2dbc807adbbe147e8cf72ea7450c3a0aabe62cb8e75ff4ec22e1f72a"
 dependencies = [
  "ecdsa 0.17.0",
- "elliptic-curve 0.14.1",
+ "elliptic-curve 0.14.3",
  "primefield",
  "primeorder 0.14.0",
  "sha2 0.11.1",
@@ -6895,9 +6904,9 @@ dependencies = [
 
 [[package]]
 name = "pageant"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0786409b5aaa884655c9b4065681db0835db0cc185a6fb19fb17a5d38656866"
+checksum = "e0bc922d9aa8cfcf598de27b3c6122cb2eeda9d6fe71527a22ebcb7f633540ff"
 dependencies = [
  "base16ct 1.0.0",
  "byteorder",
@@ -6925,8 +6934,18 @@ version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
 dependencies = [
- "lock_api",
- "parking_lot_core",
+ "lock_api 0.4.14",
+ "parking_lot_core 0.9.12",
+]
+
+[[package]]
+name = "parking_lot"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9cf937ca4e1d0b7578784559063422fc39ae7c5a00f02471f2614d5486fd226"
+dependencies = [
+ "lock_api 0.5.0",
+ "parking_lot_core 0.10.0",
 ]
 
 [[package]]
@@ -6937,7 +6956,19 @@ checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
 dependencies = [
  "cfg-if",
  "libc",
- "redox_syscall",
+ "redox_syscall 0.5.18",
+ "smallvec",
+ "windows-link 0.2.1",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cfff060068cc18aa7815010fcaf80c68c7fb9e85fc7f5c0f9bf142c21d19826"
+dependencies = [
+ "libc",
+ "redox_syscall 0.9.5",
  "smallvec",
  "windows-link 0.2.1",
 ]
@@ -7351,7 +7382,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
 dependencies = [
- "crypto-bigint 0.7.6",
+ "crypto-bigint 0.7.9",
  "crypto-common 0.2.2",
  "ff 0.14.0",
  "rand_core 0.10.1",
@@ -7374,7 +7405,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c9f42978c78a00e3d68f69fc03e57a234debae69da4020a4fb588fcdcd07b06"
 dependencies = [
- "elliptic-curve 0.14.1",
+ "elliptic-curve 0.14.3",
  "once_cell",
  "primefield",
  "serdect",
@@ -7461,7 +7492,7 @@ version = "31.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf52d87428247c5aa3760ac8e7d8b13ec7b3579b955a8c3f311668b6860acba5"
 dependencies = [
- "parking_lot",
+ "parking_lot 0.12.5",
 ]
 
 [[package]]
@@ -7667,7 +7698,7 @@ dependencies = [
 [[package]]
 name = "rama"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "base64 0.23.1",
@@ -7730,13 +7761,13 @@ dependencies = [
 [[package]]
 name = "rama-core"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "asynk-strim",
  "bytes",
  "futures",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "rama-error",
  "rama-macros",
@@ -7754,7 +7785,7 @@ dependencies = [
 [[package]]
 name = "rama-crypto"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "base64 0.23.1",
@@ -7780,12 +7811,12 @@ dependencies = [
 [[package]]
 name = "rama-error"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 
 [[package]]
 name = "rama-http"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "base64 0.23.1",
@@ -7797,7 +7828,7 @@ dependencies = [
  "iri-string",
  "jiff",
  "moka",
- "parking_lot",
+ "parking_lot 0.13.0",
  "percent-encoding",
  "pin-project-lite",
  "rama-core",
@@ -7818,9 +7849,9 @@ dependencies = [
 [[package]]
 name = "rama-http-backend"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "rama-core",
  "rama-http",
@@ -7841,7 +7872,7 @@ dependencies = [
 [[package]]
 name = "rama-http-core"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "atomic-waker",
@@ -7850,7 +7881,7 @@ dependencies = [
  "httpdate",
  "indexmap 2.14.2",
  "itoa",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "rama-core",
  "rama-http",
@@ -7868,7 +7899,7 @@ dependencies = [
 [[package]]
 name = "rama-http-headers"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "base64 0.23.1",
@@ -7888,7 +7919,7 @@ dependencies = [
 [[package]]
 name = "rama-http-types"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "bytes",
  "const_format",
@@ -7900,7 +7931,7 @@ dependencies = [
  "memchr",
  "mime",
  "mime_guess",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "rama-core",
  "rama-json",
@@ -7919,11 +7950,11 @@ dependencies = [
 [[package]]
 name = "rama-icap"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "httpdate",
  "itoa",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rama-core",
  "rama-net",
  "rama-utils",
@@ -7933,7 +7964,7 @@ dependencies = [
 [[package]]
 name = "rama-json"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "itoa",
  "rama-utils",
@@ -7945,7 +7976,7 @@ dependencies = [
 [[package]]
 name = "rama-macros"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -7956,7 +7987,7 @@ dependencies = [
 [[package]]
 name = "rama-net"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -7975,7 +8006,7 @@ dependencies = [
  "mime",
  "moka",
  "ndk-context",
- "parking_lot",
+ "parking_lot 0.13.0",
  "percent-encoding",
  "pin-project-lite",
  "psl",
@@ -7994,13 +8025,13 @@ dependencies = [
 [[package]]
 name = "rama-quic"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "fastbloom",
  "jiff",
  "lru-slab",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "rama-core",
  "rama-crypto",
@@ -8023,7 +8054,7 @@ dependencies = [
 [[package]]
 name = "rama-quic-proto"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "rama-core",
  "rama-tls",
@@ -8035,10 +8066,10 @@ dependencies = [
 [[package]]
 name = "rama-tcp"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "libc",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "rama-core",
  "rama-net",
@@ -8051,7 +8082,7 @@ dependencies = [
 [[package]]
 name = "rama-tls"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "base64 0.23.1",
@@ -8060,7 +8091,7 @@ dependencies = [
  "jiff",
  "md5 0.8.1",
  "nom 8.0.0",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "rama-core",
  "rama-crypto",
@@ -8075,12 +8106,12 @@ dependencies = [
 [[package]]
 name = "rama-tls-boring"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "itertools 0.15.0",
  "moka",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "rama-boring",
  "rama-boring-tokio",
@@ -8095,7 +8126,7 @@ dependencies = [
 [[package]]
 name = "rama-ua"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "chacha20 0.10.2",
@@ -8115,11 +8146,11 @@ dependencies = [
 [[package]]
 name = "rama-udp"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "ahash",
  "libc",
- "parking_lot",
+ "parking_lot 0.13.0",
  "rama-core",
  "rama-net",
  "rama-utils",
@@ -8131,7 +8162,7 @@ dependencies = [
 [[package]]
 name = "rama-unix"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "libc",
  "pin-project-lite",
@@ -8144,13 +8175,13 @@ dependencies = [
 [[package]]
 name = "rama-utils"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#968e370275735a2e6ef75bc6c5edbf22ca3274c1"
+source = "git+https://github.com/plabayo/rama?branch=main#7249916f3c527369d50073ca51e09058dfb3b090"
 dependencies = [
  "atomic-waker",
  "base64 0.23.1",
  "const_format",
  "memchr",
- "parking_lot",
+ "parking_lot 0.13.0",
  "pin-project-lite",
  "rama-macros",
  "regex",
@@ -8381,6 +8412,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redox_syscall"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "580c875845b41ecb1564ad1ae4703044cef774145e3d7a94dc2b3fa7c97868fd"
+dependencies = [
+ "bitflags 2.13.2",
+]
+
+[[package]]
 name = "redox_users"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8575,7 +8615,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
 dependencies = [
- "crypto-bigint 0.7.6",
+ "crypto-bigint 0.7.9",
  "hmac 0.13.0",
 ]
 
@@ -8631,7 +8671,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33405e321e16ef941ca66e254f6904c3aafd3c7ff001fb88bf11c73eb75c2b85"
 dependencies = [
  "const-oid 0.10.2",
- "crypto-bigint 0.7.6",
+ "crypto-bigint 0.7.9",
  "crypto-primes",
  "digest 0.11.3",
  "pkcs1 0.8.0-rc.5",
@@ -9720,7 +9760,7 @@ version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
- "lock_api",
+ "lock_api 0.4.14",
 ]
 
 [[package]]
@@ -10160,7 +10200,7 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2 0.6.5",
@@ -10215,7 +10255,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "log",
- "parking_lot",
+ "parking_lot 0.12.5",
  "percent-encoding",
  "phf",
  "pin-project-lite",
@@ -10571,7 +10611,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
 dependencies = [
  "crossbeam-channel",
- "parking_lot",
+ "parking_lot 0.12.5",
  "symlink",
  "thiserror 2.0.21",
  "time",
@@ -11456,7 +11496,7 @@ checksum = "1c598d6b99ea013e35844697fc4670d08339d5cda15588f193c6beedd12f644b"
 dependencies = [
  "futures",
  "js-sys",
- "parking_lot",
+ "parking_lot 0.12.5",
  "pin-utils",
  "slab",
  "wasm-bindgen",
