@@ -17,13 +17,11 @@ use russh::client::Handle;
 use russh::client::Msg as ClientMsg;
 use russh::client::connect_stream;
 use russh::keys::PrivateKeyWithHashAlg;
-use russh::keys::PublicKeyOrCertificate;
 use russh::keys::decode_secret_key;
 use russh::keys::parse_public_key_base64;
 use russh::keys::ssh_key::PrivateKey;
 use russh::keys::ssh_key::PublicKey;
 use russh::server::Auth;
-use russh::server::ChannelOpenHandle;
 use russh::server::Config as ServerConfig;
 use russh::server::Msg as ServerMsg;
 use russh::server::Session;
@@ -223,23 +221,17 @@ impl russh::server::Handler for Guest {
   fn auth_password(&mut self, _user: &str, _password: &str) -> impl Future<Output = Result<Auth, Self::Error>> {
     ready(Ok(Auth::reject()))
   }
-  async fn channel_open_session(
-    &mut self,
-    mut channel: Channel<ServerMsg>,
-    reply: ChannelOpenHandle,
-    session: &mut Session,
-  ) -> Result<(), Self::Error> {
+  async fn channel_open_session(&mut self, mut channel: Channel<ServerMsg>, session: &mut Session) -> Result<bool, Self::Error> {
     if self.upstream.is_none() {
       let handle = self.dial_upstream().await?;
       self.upstream = Some(handle);
     }
     // The slot was filled just above; an empty read still closes the
-    // channel quietly instead of panicking. Dropping `reply` rejects it.
+    // channel quietly instead of panicking.
     let Some(upstream) = self.upstream.as_ref() else {
-      return Ok(());
+      return Ok(false);
     };
     let remote = upstream.channel_open_session().await?;
-    reply.accept().await;
     let (mut read, write) = remote.split();
     let guest_id = channel.id();
     let guest_writer = session.handle();
@@ -295,7 +287,7 @@ impl russh::server::Handler for Guest {
       let _ = guest_writer.close(guest_id).await;
       let _ = pump_writer.close().await;
     });
-    Ok(())
+    Ok(true)
   }
 }
 
@@ -366,8 +358,8 @@ async fn forward_guest_message(upstream: &ChannelWriteHalf<ClientMsg>, message: 
       upstream.window_change(col_width, row_height, pix_width, pix_height).await.is_err(),
     ),
     ChannelMsg::Signal { signal } => (false, upstream.signal(signal).await.is_err()),
-    ChannelMsg::Data { data } => (false, upstream.data_bytes(data).await.is_err()),
-    ChannelMsg::ExtendedData { data, ext } => (false, upstream.extended_data_bytes(ext, data).await.is_err()),
+    ChannelMsg::Data { data } => (false, upstream.data(&*data).await.is_err()),
+    ChannelMsg::ExtendedData { data, ext } => (false, upstream.extended_data(ext, &*data).await.is_err()),
     ChannelMsg::Eof => (false, upstream.eof().await.is_err()),
     ChannelMsg::Close => (true, upstream.close().await.is_err()),
     // Port and agent forwarding, X11: never forwarded.
@@ -394,8 +386,8 @@ struct UpstreamLeg {
 impl russh::client::Handler for UpstreamLeg {
   type Error = RusshError;
 
-  fn check_server_key(&mut self, server_public_key: &PublicKeyOrCertificate) -> impl Future<Output = Result<bool, Self::Error>> {
-    ready(self.verify_server_key(&server_public_key.public_key()))
+  fn check_server_key(&mut self, server_public_key: &PublicKey) -> impl Future<Output = Result<bool, Self::Error>> {
+    ready(self.verify_server_key(server_public_key))
   }
 }
 
@@ -415,7 +407,7 @@ impl UpstreamLeg {
 
 #[cfg(test)]
 mod tests {
-  use bytes::Bytes;
+  use russh::CryptoVec;
 
   use super::*;
   use arkham_pki::ssh::SshKey;
@@ -439,13 +431,11 @@ mod tests {
       ready(Ok(if *public_key == self.admit { Auth::Accept } else { Auth::reject() }))
     }
 
-    async fn channel_open_session(
+    fn channel_open_session(
       &mut self,
       mut channel: Channel<ServerMsg>,
-      reply: ChannelOpenHandle,
       session: &mut Session,
-    ) -> Result<(), Self::Error> {
-      reply.accept().await;
+    ) -> impl Future<Output = Result<bool, Self::Error>> {
       let writer = session.handle();
       let id = channel.id();
       tokio::spawn(async move {
@@ -454,8 +444,8 @@ mod tests {
             // A real sshd answers the request before any output; OpenSSH
             // clients wait for that reply.
             let _ = writer.channel_success(id).await;
-            let echoed = format!("ok:{}", String::from_utf8_lossy(&command));
-            let _ = writer.data(id, Bytes::from(echoed)).await;
+            let reply = format!("ok:{}", String::from_utf8_lossy(&command));
+            let _ = writer.data(id, CryptoVec::from(reply)).await;
             let _ = writer.exit_status_request(id, 0).await;
             let _ = writer.eof(id).await;
             let _ = writer.close(id).await;
@@ -463,7 +453,7 @@ mod tests {
           }
         }
       });
-      Ok(())
+      ready(Ok(true))
     }
   }
 
@@ -473,7 +463,7 @@ mod tests {
   impl russh::client::Handler for Client {
     type Error = RusshError;
 
-    fn check_server_key(&mut self, _server_public_key: &PublicKeyOrCertificate) -> impl Future<Output = Result<bool, Self::Error>> {
+    fn check_server_key(&mut self, _server_public_key: &PublicKey) -> impl Future<Output = Result<bool, Self::Error>> {
       ready(Ok(true))
     }
   }

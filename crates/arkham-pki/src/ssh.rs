@@ -7,11 +7,11 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
-use rand::rng;
+use rand::rngs::OsRng;
 use russh::keys::decode_secret_key;
 use russh::keys::known_hosts::known_host_keys_path;
+use russh::keys::ssh_encoding::LineEnding;
 use russh::keys::ssh_key::Algorithm;
-use russh::keys::ssh_key::LineEnding;
 use russh::keys::ssh_key::PrivateKey;
 use russh::keys::ssh_key::PublicKey;
 
@@ -31,7 +31,7 @@ impl SshKey {
   ///
   /// Returns [`Error::SshKeygen`] when the backend refuses to generate.
   pub fn generate() -> Result<Self, Error> {
-    let key = PrivateKey::random(&mut rng(), Algorithm::Ed25519).map_err(|source| Error::SshKeygen { source })?;
+    let key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).map_err(|source| Error::SshKeygen { source })?;
     Ok(Self { key })
   }
 
