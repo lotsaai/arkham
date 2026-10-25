@@ -3,6 +3,7 @@
 pub(crate) mod legs;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -21,9 +22,9 @@ use crate::transports::tcp;
 /// The `ssh://` transport: the guest leg terminates here against a decoy
 /// key, the upstream leg presents the real key. Disk keys are cached per
 /// file triple; only the dial target assembles per connection.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct SshTransport {
-  keys: DashMap<(PathBuf, PathBuf, PathBuf), LegKeys>,
+  keys: Arc<DashMap<(PathBuf, PathBuf, PathBuf), LegKeys>>,
 }
 
 impl SshTransport {

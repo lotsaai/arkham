@@ -8,8 +8,14 @@ ignore = [
   # incompatible. Unblock when the aws-sdk releases on h2 0.4.
   "RUSTSEC-2026-0258",
 
-  # russh is pinned to 0.56.x for the rama-quic/fnox-core conflict; 0.56
-  # pulls libcrux 0.0.4. Unblock with russh >=0.60.3.
+  # russh 0.56.0 is below the 0.60.3 fix for RUSTSEC-2026-0154, and
+  # russh-cryptovec 0.52.0 is below the 0.60.3 fix for RUSTSEC-2026-0153.
+  # That pin also pulls libcrux-ml-kem 0.0.4, libcrux-secrets 0.0.4, and
+  # libcrux-sha3 0.0.4 (0212, 0208, 0207, 0074). russh 0.59.0 does not
+  # resolve: it requires rand_core =0.10.0-rc-3, and rama-ua's chacha20
+  # requires rand_core ^0.10. russh >=0.60.3 resolves to ml-kem 0.2.1
+  # and kem 0.3.0. ml-kem 0.2.1 does not compile against kem 0.3.0.
+  # ml-kem 0.2.3 pins kem =0.3.0-pre.0 and cannot be selected beside it.
   "RUSTSEC-2026-0154",
   "RUSTSEC-2026-0153",
   "RUSTSEC-2026-0212",
@@ -35,11 +41,16 @@ ignore = [
   "RUSTSEC-2026-0349",
 
   # webpki-roots 0.26.11 is a semver shim that re-exports webpki-roots 1.x,
-  # and Cargo.lock resolves that to 1.0.10, which already removes the
+  # and Cargo.lock resolves that to 1.0.11, which already removes the
   # distrusted emSign ECC Root CA - G3. Only the shim's version number
   # matches; no distrusted root ships. Delete if the shim stops resolving
   # to >=1.0.10.
   "RUSTSEC-2026-0381",
+
+  # crypto-bigint 0.5.5 timing side channels. Patched only in >=0.7.6.
+  # fnox-core 1.39.0 -> age 0.12.1 / aws-sigv4 1.6.3, and
+  # russh 0.56.0 -> internal-russh-forked-ssh-key 0.6.16.
+  "RUSTSEC-2026-0387",
 
   # rustls-webpki 0.101.7 has no 0.101 backport of the emSign intermediate
   # distrust. It rides rustls 0.21 in aws-smithy-http-client's
@@ -49,7 +60,7 @@ ignore = [
   # when fnox-core stops enabling the aws-sdk legacy rustls default.
   "RUSTSEC-2026-0382",
 
-  # Marvinattack on rsa; no fixed release exists upstream, both locked
-  # versions are affected. Revisit when a fix ships.
+  # Marvin attack on rsa. No fixed release exists upstream.
+  # fnox-core 1.39.0 -> age 0.12.1 -> rsa 0.9.10.
   "RUSTSEC-2023-0071",
 ]

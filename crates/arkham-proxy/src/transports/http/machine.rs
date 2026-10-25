@@ -114,8 +114,8 @@ pub(crate) struct Http {
   /// Static grant pairs from construction; `pairs` rebuilds from these
   /// whenever minted pairs refresh.
   static_pairs: Vec<CredentialPair>,
-  /// Runtime mint handle; `None` keeps value-swap-only behavior.
-  mint: Option<crate::mint::MintHandle>,
+  /// Runtime mint store; `None` keeps value-swap-only behavior.
+  mint: Option<crate::mint::MintStore>,
   /// Response side: the flow-granted grant's expectations, when this
   /// endpoint is a token issuer and this machine mints.
   mint_plan: Option<MintPlan>,
@@ -139,7 +139,7 @@ impl Http {
     port: u16,
     dir: Direction,
     hook: Option<Box<dyn RewriteHook>>,
-    mint: Option<crate::mint::MintHandle>,
+    mint: Option<crate::mint::MintStore>,
   ) -> Self {
     let static_pairs = eligible_pairs(grants, scheme, host, port, dir);
     let tail_size = max_tail_size(&static_pairs);
@@ -1509,7 +1509,7 @@ mod tests {
     }]
   }
 
-  fn mint_machine(store: std::sync::Arc<crate::mint::MintStore>) -> Http {
+  fn mint_machine(store: crate::mint::MintStore) -> Http {
     Http::new(
       &flow_grants(),
       Scheme::Https,
@@ -1517,7 +1517,7 @@ mod tests {
       443,
       Direction::Upstream,
       None,
-      Some(crate::mint::MintHandle::new(store)),
+      Some(store),
     )
   }
 
@@ -2154,8 +2154,8 @@ mod tests {
 
   #[tokio::test]
   async fn token_response_mints_decoy_and_rewrites_length() {
-    let store = std::sync::Arc::new(crate::mint::MintStore::default());
-    let mut resp = mint_machine(std::sync::Arc::clone(&store));
+    let store = crate::mint::MintStore::default();
+    let mut resp = mint_machine(store.clone());
     let body = r#"{"access_token":"real-token-value","token_type":"Bearer","expires_in":3600}"#;
     let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
     let (out, hits) = resp.substitute(input.as_bytes()).await;
@@ -2178,8 +2178,8 @@ mod tests {
 
   #[tokio::test]
   async fn minted_decoy_substitutes_on_a_later_connection() {
-    let store = std::sync::Arc::new(crate::mint::MintStore::default());
-    let mut resp = mint_machine(std::sync::Arc::clone(&store));
+    let store = crate::mint::MintStore::default();
+    let mut resp = mint_machine(store.clone());
     let body = r#"{"access_token":"real-token-value","token_type":"Bearer"}"#;
     let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
     resp.substitute(input.as_bytes()).await;
@@ -2192,7 +2192,7 @@ mod tests {
       443,
       Direction::Downstream,
       None,
-      Some(crate::mint::MintHandle::new(std::sync::Arc::clone(&store))),
+      Some(store.clone()),
     );
     let input = format!("GET /x HTTP/1.1\r\nHost: a\r\nAuthorization: Bearer {decoy}\r\n\r\n");
     let (out, hits) = req.substitute(input.as_bytes()).await;
@@ -2212,8 +2212,8 @@ mod tests {
   async fn keepalive_request_sees_fresh_mint_at_next_head() {
     // The request machine is constructed before anything mints; the decoy
     // minted on the response leg must go live at the next request head.
-    let store = std::sync::Arc::new(crate::mint::MintStore::default());
-    let mut resp = mint_machine(std::sync::Arc::clone(&store));
+    let store = crate::mint::MintStore::default();
+    let mut resp = mint_machine(store.clone());
     let body = r#"{"access_token":"real-token-value"}"#;
     let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
     resp.substitute(input.as_bytes()).await;
@@ -2225,7 +2225,7 @@ mod tests {
       443,
       Direction::Downstream,
       None,
-      Some(crate::mint::MintHandle::new(std::sync::Arc::clone(&store))),
+      Some(store.clone()),
     );
     let first = "GET /a HTTP/1.1\r\nHost: a\r\n\r\n";
     let _ = req.substitute(first.as_bytes()).await;
@@ -2239,8 +2239,8 @@ mod tests {
 
   #[tokio::test]
   async fn chunked_token_response_mints_and_rechunks() {
-    let store = std::sync::Arc::new(crate::mint::MintStore::default());
-    let mut resp = mint_machine(std::sync::Arc::clone(&store));
+    let store = crate::mint::MintStore::default();
+    let mut resp = mint_machine(store.clone());
     let input = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n23\r\n{\"access_token\":\"real-token-value\"}\r\n0\r\n\r\n";
     let (out, _hits) = resp.substitute(input.as_bytes()).await;
     let out = String::from_utf8(out.into_owned()).unwrap();
@@ -2252,8 +2252,8 @@ mod tests {
 
   #[tokio::test]
   async fn non_json_token_response_passes_through() {
-    let store = std::sync::Arc::new(crate::mint::MintStore::default());
-    let mut resp = mint_machine(std::sync::Arc::clone(&store));
+    let store = crate::mint::MintStore::default();
+    let mut resp = mint_machine(store.clone());
     let body = "not json at all";
     let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
     let (out, hits) = resp.substitute(input.as_bytes()).await;
@@ -2265,7 +2265,7 @@ mod tests {
 
   #[tokio::test]
   async fn rotation_mints_a_pair_per_value() {
-    let store = std::sync::Arc::new(crate::mint::MintStore::default());
+    let store = crate::mint::MintStore::default();
     let mut grants = flow_grants();
     let Grant::Token { oauth2: Some(flow), .. } = &mut grants[0] else {
       panic!("a flow grant");
@@ -2278,7 +2278,7 @@ mod tests {
       443,
       Direction::Upstream,
       None,
-      Some(crate::mint::MintHandle::new(std::sync::Arc::clone(&store))),
+      Some(store.clone()),
     );
     let first = r#"{"access_token":"token-one","refresh_token":"refresh-one"}"#;
     let input = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{first}", first.len());

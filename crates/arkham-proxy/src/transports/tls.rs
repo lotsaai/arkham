@@ -1,8 +1,9 @@
-//! Cached guest leaves and upstream trust anchors shared by the TLS transports.
+//! Cached guest leaves and upstream trust anchors.
 //!
-//! Redis, Postgres, and LDAP each keep their own cache. The mint and the
-//! PEM read are the same work, so they live here. A protocol that offers an
-//! ALPN identifier passes it in; one that does not passes `None`.
+//! Every TLS transport shares one [`super::TlsCache`]. The leaf key is the
+//! server name, the ALPN offer, and whether the leaf demands a client
+//! certificate, so a `postgresql` leaf and a leaf that offers nothing stay
+//! distinct for the same name.
 
 use std::sync::Arc;
 
@@ -17,9 +18,7 @@ use arkham_pki::ca::generate_domain_pair;
 
 use crate::Error;
 
-/// Leaf for one name, cached. Minted before insert so two guests naming the
-/// same host keygen at most twice. `alpn` is offered when the protocol's
-/// clients look for an identifier.
+/// Leaf for one name and one ALPN offer.
 ///
 /// # Errors
 ///
@@ -30,7 +29,9 @@ pub(crate) fn cached_leaf(
   sni: &str,
   alpn: Option<&[u8]>,
 ) -> Result<Arc<ServerConfig>, Error> {
-  if let Some(config) = leaves.get(sni) {
+  let offered = alpn.map(|bytes| bytes.escape_ascii().to_string()).unwrap_or_default();
+  let key = format!("t\0{offered}\0{sni}");
+  if let Some(config) = leaves.get(&key) {
     return Ok(config.clone());
   }
   let mut config = (*ca.generate_domain_cert(sni)?.server_config).clone();
@@ -38,7 +39,7 @@ pub(crate) fn cached_leaf(
     config.alpn_protocols = vec![alpn.to_vec()];
   }
   let config = Arc::new(config);
-  leaves.insert(sni.to_string(), Arc::clone(&config));
+  leaves.insert(key, Arc::clone(&config));
   Ok(config)
 }
 
@@ -55,8 +56,9 @@ pub(crate) fn cached_leaf_mtls(
   sni: &str,
   alpn: Option<&[u8]>,
 ) -> Result<Arc<ServerConfig>, Error> {
-  let cache_key = format!("{sni}|mtls");
-  if let Some(config) = leaves.get(&cache_key) {
+  let offered = alpn.map(|bytes| bytes.escape_ascii().to_string()).unwrap_or_default();
+  let key = format!("m\0{offered}\0{sni}");
+  if let Some(config) = leaves.get(&key) {
     return Ok(config.clone());
   }
   let (chain, key_der) = generate_domain_pair(ca, sni)?;
@@ -75,7 +77,7 @@ pub(crate) fn cached_leaf_mtls(
     config.alpn_protocols = vec![alpn.to_vec()];
   }
   let config = Arc::new(config);
-  leaves.insert(cache_key, Arc::clone(&config));
+  leaves.insert(key, Arc::clone(&config));
   Ok(config)
 }
 
