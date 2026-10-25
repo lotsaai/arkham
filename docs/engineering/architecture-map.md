@@ -193,16 +193,7 @@ Per-protocol prod lines below are proxy files plus the matching `grants/` file (
 ### Duplication on main (file:line)
 | What | Copies | Base it should use |
 |---|---|---|
-| `serve` opening (`is_downstream_tls` → `guest_tls_opening`, `dial_marked`, `matched_name`, `PairCtx`) | redis :103-139, smtp :110-137, ldap :112-136, amqp :88-110 | Shared helper |
-| 4-way `(guest_tls, upstream_tls)` leg match | redis :142-159, postgres :195-213, ldap :194-210, amqp :149-171 | Shared helper |
-| `const TLS_RECORD_HANDSHAKE = 0x16` | nats/mod.rs, postgres/machine.rs | One const |
-| Scan-close-hold "guard" (find a full match → close; else hold `needle_prefix_suffix_len`) | amqp/machine.rs:928-947, ldap/machine.rs:828-851, nats/machine.rs:1164-1179 | No engine primitive exists yet; `Raw` replaces but never closes |
-| Grant lookups with identical bodies | grants/mod.rs:514-574 (6 copies) | One generic lookup |
-| `XScope::matches` | redis.rs:225, smtp.rs:390, ldap.rs:279, amqp.rs:263, postgres.rs:287, nats.rs:1102 | Same shape |
 | `Leg`/`Scope` structs (`host`, `port`, `password`, `is_*_tls`, `root_cert`, `client_cert`/`key`, `guest_tls`) | redis.rs:16/35, smtp.rs:23/43, ldap.rs:17/35, amqp.rs:13/33 | Shared leg/scope |
-| `grant()` `rule.tls` loop (`TlsEnvMismatch` / Identity / Trust) | redis.rs:240-282, ldap.rs:292-330, smtp.rs:403+, amqp.rs:268+ (I read the first two in full and saw the same error variants in the other two) | Shared |
-| Guest-CA load-or-generate | stack.rs:190-203, rewrites.rs:257-278, ambient.rs:311-326 | One loader |
-| `HostTlsCfg` + client cert/key/ca blob naming | kube.rs:370-383, talos.rs:383-398 | Shared |
 
 ### Protocol knowledge sitting in shared files
 These are the places a new protocol has to edit today:
@@ -262,14 +253,13 @@ flowchart TD
   C3 --> C4[ambient :213 → derive_sources ambient.rs:67<br/>git/jj/ssh/nats/kube/talos adapters]
   C4 --> C5[grants :238 → adapt::write_state adapt.rs:229<br/>state/grants/arkham.toml + rules.d blobs]
   C5 --> C6[profiles / guest_identities / stack → Stack::render :500]
-  C6 --> D[compose.yml written confine.rs:454]
+  C6 --> D[compose.yml written when the render differs]
   A --> E[up_workspace confine.rs:622] --> F[exec_agent confine.rs:676]
 ```
 
 - **Agent container:** gets decoy env vars (stack.rs:730-731) and decoy twin files, mounted read-only at the tool's default path through `RewriteCollector::twin`.
-- **arkham container:** mounts `state/grants` at `/arkham/grants` read-only, and mounts `grants/arkham.toml` as `/root/.config/arkham/config.toml` (stack.rs:602-612).
+- **arkham container:** mounts `state/grants` at `/arkham/grants` read-only, and mounts `grants/arkham.toml` as `/root/.config/arkham/config.toml`. Config discovery derives `rules.d` from that file's directory, so the service does not set `ARKHAM_CONFIG`.
   - At start the arkham service runs `fnox::resolve`, then `grants::resolve`, then `ProxyState::new` (main.rs:176-207).
-  - The comment at adapt.rs:240 says `ARKHAM_CONFIG` points at the grants file. That comment is stale: stack.rs:604-607 deliberately mounts it at the standard path instead.
 - **Adapter output contract:** a `GrantFragment` with the real value goes to arkham only. The decoy document goes to the agent. Materialized blobs (client cert, key, CA, ssh identity) are named `/arkham/grants/rules.d/<prefix><label>.*` (adapt.rs:200-216).
 
 ## Not checked / unsure

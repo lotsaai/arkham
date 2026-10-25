@@ -64,7 +64,7 @@ Curate an `oauth2` registry fragment from a saved discovery or OpenAPI document.
 
 ## `arkham init [--backend <BACKEND>] [WORKSPACE]`
 
-Generate the workspace stack as editable files: the CA and the agent entrypoint when they are missing, and `<state-dir>/arkham/ws/<slug>/compose.yml`. Rules are not written anywhere: they derive at serve time from fnox declarations the registry knows, and config holds overrides only. Nothing existing is overwritten; the stack is regenerated when the workspace config or the generator's stack shape changed since it was generated. `--backend` picks the capture backend (`ebpf` by default, Linux only) and only applies to a stack that does not exist yet — a regeneration keeps the backend the stack already runs. Prints a warning when no rule is in play, since then nothing would be substituted.
+Generate the workspace stack: the CA and the agent entrypoint when they are missing, and `<state-dir>/arkham/ws/<slug>/compose.yml`. That compose file is generated state. Overrides go in `~/.config/arkham/compose.yaml` or `<workspace>/.config/arkham/compose.yaml`. Rules are not written anywhere: they derive at serve time from fnox declarations the registry knows, and config holds overrides only. An existing stack is rewritten when the rendered file would change and left untouched when it matches. `--backend` picks the capture backend (`ebpf` by default, Linux only). A named backend is part of the render and replaces the file when the output differs. An unnamed backend keeps the one already rendered. Prints a warning when no rule is in play, since then nothing would be substituted.
 
 ## `arkham agent [WORKSPACE] [--rm] [-- <COMMAND>...]`
 

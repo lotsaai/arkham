@@ -6,6 +6,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::adapt::load_guest_ca;
 use crate::decoys::Decoy;
 use crate::error::Error;
 use crate::expand::expand_path;
@@ -17,9 +18,9 @@ use crate::paths::{Mount, expand};
 use crate::rewrites::{RewriteCollector, RewriteOutputs};
 use crate::ssh;
 use crate::talos;
-use arkham_config::config::{FileRewrite, config_dir};
+use arkham_config::config::FileRewrite;
 use arkham_config::registry::Registry;
-use arkham_pki::ca::{CertAuthority, load_or_generate};
+use arkham_pki::ca::CertAuthority;
 use dirs::config_dir as dirs_config_dir;
 use xpanda::Xpanda;
 
@@ -310,19 +311,13 @@ impl AmbientDeriver<'_> {
   /// loaded.
   fn ca(&mut self) -> Result<&CertAuthority, Error> {
     if self.ca.is_none() {
-      let ca_path = config_dir()
-        .ok_or_else(|| Error::ConfigDir {
-          detail: "ambient kubeconfig derivation needs the arkham config directory to load the CA from".to_string(),
-        })?
-        .join("ca.pem");
-      self.ca = Some(load_or_generate(&ca_path).map_err(|source| Error::GuestCa { path: ca_path, source })?);
+      self.ca = Some(load_guest_ca(
+        "ambient kubeconfig derivation needs the arkham config directory to load the CA from",
+      )?);
     }
-    match self.ca.as_ref() {
-      Some(ca) => Ok(ca),
-      None => Err(Error::ConfigDir {
-        detail: "the ambient guest CA slot is empty after loading it".to_string(),
-      }),
-    }
+    self.ca.as_ref().ok_or_else(|| Error::ConfigDir {
+      detail: "the ambient guest CA slot is empty after loading it".to_string(),
+    })
   }
 }
 

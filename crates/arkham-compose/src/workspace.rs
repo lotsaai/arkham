@@ -5,7 +5,9 @@
 use std::path::{Component, Path, PathBuf};
 
 use arkham_config::cli::Cli;
-use arkham_config::config::{AppConfig, load, project_config_file, project_config_write_path, project_rules_dir, rules_dir};
+use arkham_config::config::{
+  AppConfig, load, project_config_dir, project_config_file, project_config_write_path, project_rules_dir, rules_dir,
+};
 use arkham_config::registry::Registry;
 use dirs::state_dir;
 
@@ -87,13 +89,24 @@ impl Workspace {
       .join(self.slug())
   }
 
-  /// The workspace's override file: `arkham.compose.yaml` first, then `.yml`.
+  /// The workspace's override file. Unified `.config/arkham/compose.yaml`
+  /// wins, then `.yml`, then the legacy flat names. Absent files still
+  /// report the canonical unified path.
   pub(crate) fn file(&self) -> PathBuf {
-    let yaml = self.root.join(".config").join("arkham.compose.yaml");
-    if yaml.is_file() {
-      return yaml;
+    let dir = project_config_dir(&self.root);
+    for name in ["compose.yaml", "compose.yml"] {
+      let path = dir.join(name);
+      if path.is_file() {
+        return path;
+      }
     }
-    self.root.join(".config").join("arkham.compose.yml")
+    for name in ["arkham.compose.yaml", "arkham.compose.yml"] {
+      let path = self.root.join(".config").join(name);
+      if path.is_file() {
+        return path;
+      }
+    }
+    dir.join("compose.yaml")
   }
 
   /// The workspace's own config, as generation and support-file setup read
@@ -124,6 +137,34 @@ mod moved_suite {
   use tempfile::tempdir;
 
   use crate::confine::*;
+  use crate::workspace::Workspace;
+
+  /// Unified compose files win over the legacy flat names. Absent files report the canonical path.
+  #[test]
+  fn workspace_override_file_prefers_unified_compose_then_legacy() {
+    let root = tempfile::tempdir().unwrap();
+    let ws = Workspace::new(root.path());
+    let unified = root.path().join(".config").join("arkham");
+    let canonical = unified.join("compose.yaml");
+    assert_eq!(ws.file(), canonical, "no override yet names the canonical path");
+
+    fs::create_dir_all(root.path().join(".config")).unwrap();
+    let older_short = root.path().join(".config").join("arkham.compose.yml");
+    fs::write(&older_short, "legacy: yml\n").unwrap();
+    assert_eq!(ws.file(), older_short);
+
+    let older_long = root.path().join(".config").join("arkham.compose.yaml");
+    fs::write(&older_long, "legacy: yaml\n").unwrap();
+    assert_eq!(ws.file(), older_long);
+
+    fs::create_dir_all(&unified).unwrap();
+    let nested_short = unified.join("compose.yml");
+    fs::write(&nested_short, "unified: yml\n").unwrap();
+    assert_eq!(ws.file(), nested_short);
+
+    fs::write(&canonical, "unified: yaml\n").unwrap();
+    assert_eq!(ws.file(), canonical);
+  }
 
   /// Home prefixes move to the container home; URLs, relative paths, and
   /// off-home absolutes stay intact.
