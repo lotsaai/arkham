@@ -507,70 +507,46 @@ impl Grant {
       .find(|entry| entry.scheme == scheme && entry.port == port && host.is_none_or(|host| entry.host.matches(host)))
   }
 
-  /// The postgres scope whose downstream (guest-side) port and host cover
-  /// a destination, `host` optional as above: transparent capture knows the
-  /// port before it knows the host.
+  /// Postgres scope covering this downstream destination.
   #[must_use]
   pub fn postgres(&self, host: Option<&str>, port: u16) -> Option<&PostgresScope> {
-    let Grant::Postgres { scope, .. } = self else {
-      return None;
-    };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    let Grant::Postgres { scope, .. } = self else { return None };
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
-  /// The redis scope whose downstream (guest-side) port and host cover a
-  /// destination, `host` optional as above: transparent capture knows the
-  /// port before it knows the host.
+  /// Redis scope covering this downstream destination.
   #[must_use]
   pub fn redis(&self, host: Option<&str>, port: u16) -> Option<&RedisScope> {
-    let Grant::Redis { scope, .. } = self else {
-      return None;
-    };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    let Grant::Redis { scope, .. } = self else { return None };
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
-  /// The SMTP scope whose downstream (guest-side) port and host cover a
-  /// destination, `host` optional as above: transparent capture knows the
-  /// port before it knows the host.
+  /// SMTP scope covering this downstream destination.
   #[must_use]
   pub fn smtp(&self, host: Option<&str>, port: u16) -> Option<&SmtpScope> {
-    let Grant::Smtp { scope, .. } = self else {
-      return None;
-    };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    let Grant::Smtp { scope, .. } = self else { return None };
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
-  /// The LDAP scope whose downstream (guest-side) port and host cover a
-  /// destination, `host` optional as above: transparent capture knows the
-  /// port before it knows the host.
+  /// LDAP scope covering this downstream destination.
   #[must_use]
   pub fn ldap(&self, host: Option<&str>, port: u16) -> Option<&LdapScope> {
-    let Grant::Ldap { scope, .. } = self else {
-      return None;
-    };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    let Grant::Ldap { scope, .. } = self else { return None };
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
-  /// The NATS scope whose downstream (guest-side) port and host cover a
-  /// destination, `host` optional as above: transparent capture knows the
-  /// port before it knows the host.
+  /// NATS scope covering this downstream destination.
   #[must_use]
   pub fn nats(&self, host: Option<&str>, port: u16) -> Option<&NatsScope> {
-    let Grant::Nats { scope, .. } = self else {
-      return None;
-    };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    let Grant::Nats { scope, .. } = self else { return None };
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
-  /// The AMQP scope whose downstream (guest-side) port and host cover a
-  /// destination, `host` optional as above: transparent capture knows the
-  /// port before it knows the host.
+  /// AMQP scope covering this downstream destination.
   #[must_use]
   pub fn amqp(&self, host: Option<&str>, port: u16) -> Option<&AmqpScope> {
-    let Grant::Amqp { scope, .. } = self else {
-      return None;
-    };
-    (scope.downstream.port == port && host.is_none_or(|host| scope.downstream.host.eq_ignore_ascii_case(host))).then(|| scope.as_ref())
+    let Grant::Amqp { scope, .. } = self else { return None };
+    downstream_covers(&scope.downstream.host, scope.downstream.port, host, port).then(|| scope.as_ref())
   }
 
   /// The ssh scope whose port and host cover a destination, `host` optional
@@ -584,6 +560,78 @@ impl Grant {
       .iter()
       .find(|entry| entry.port == port && host.is_none_or(|host| entry.host.matches(host)))
   }
+}
+
+/// Downstream `(host, port)` cover. `host` none matches any host on the port.
+#[must_use]
+pub(crate) fn downstream_covers(downstream_host: &str, downstream_port: u16, host: Option<&str>, port: u16) -> bool {
+  downstream_port == port && host.is_none_or(|host| downstream_host.eq_ignore_ascii_case(host))
+}
+
+/// Why a rule `tls` row cannot state the guest leg.
+pub(crate) enum TlsRow {
+  /// The row key is not the rule's env name.
+  Mismatch { key: String, env: String },
+  /// The row names a client certificate or key.
+  Identity,
+  /// The row names a root certificate.
+  Trust,
+}
+
+/// Guest TLS mode from the rule table. The last matching row wins.
+///
+/// # Errors
+///
+/// Returns a row that names the wrong env, a client identity, or a root.
+pub(crate) fn apply_guest_tls(rule: &RuleCfg) -> Result<GuestTlsMode, TlsRow> {
+  let mut mode = GuestTlsMode::default();
+  for (key, tls) in &rule.tls {
+    if key != &rule.env {
+      return Err(TlsRow::Mismatch {
+        key: key.clone(),
+        env: rule.env.clone(),
+      });
+    }
+    if tls.client_cert.is_some() || tls.client_key.is_some() {
+      return Err(TlsRow::Identity);
+    }
+    if tls.root_cert.is_some() {
+      return Err(TlsRow::Trust);
+    }
+    mode = tls.guest_tls_mode;
+  }
+  Ok(mode)
+}
+
+/// Map a [`TlsRow`] onto the protocol's identity and trust errors.
+pub(crate) fn map_tls_row(label: &str, row: TlsRow, identity: Error, trust: Error) -> Error {
+  match row {
+    TlsRow::Mismatch { key, env } => Error::TlsEnvMismatch {
+      label: label.to_string(),
+      key,
+      env,
+    },
+    TlsRow::Identity => identity,
+    TlsRow::Trust => trust,
+  }
+}
+
+/// Password credential. The downstream password is the decoy and the upstream password is the real value.
+pub(crate) fn password_credential(label: &str, fake: &SecretString, value: SecretString) -> Credential {
+  Credential {
+    label: label.to_string(),
+    fake: fake.expose_secret().to_string(),
+    value,
+  }
+}
+
+/// The fake connection string a rule states, or empty when it states none.
+pub(crate) fn stated_fake(rule: &RuleCfg) -> String {
+  rule
+    .value
+    .as_ref()
+    .map(|value| value.expose_secret().to_string())
+    .unwrap_or_default()
 }
 
 fn endpoint_match(entry: &EndpointScope, scheme: Scheme, host: &str, port: u16) -> bool {

@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use secrecy::{ExposeSecret as _, SecretString};
+use secrecy::SecretString;
 use url::{Host, Url};
 
-use super::{Credential, Grant, GuestTlsMode, RootCert, Scheme};
+use super::{Grant, GuestTlsMode, RootCert, Scheme, apply_guest_tls, downstream_covers, map_tls_row, password_credential, stated_fake};
 use crate::config::RuleCfg;
 use crate::error::Error;
 
@@ -261,41 +261,24 @@ impl AmqpScope {
   }
 
   pub(super) fn matches(scope: &Self, scheme: Scheme, host: &str, port: u16) -> bool {
-    matches!(scheme, Scheme::Amqp | Scheme::Amqps) && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
+    matches!(scheme, Scheme::Amqp | Scheme::Amqps) && downstream_covers(&scope.downstream.host, scope.downstream.port, Some(host), port)
   }
 }
 
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
-  let fake = rule
-    .value
-    .as_ref()
-    .map(|value| value.expose_secret().to_string())
-    .unwrap_or_default();
-  let mut scope = AmqpScope::from_strings(&fake, real).map_err(|source| Error::AmqpScope {
+  let mut scope = AmqpScope::from_strings(&stated_fake(rule), real).map_err(|source| Error::AmqpScope {
     label: label.to_string(),
     source,
   })?;
-  for (key, tls) in &rule.tls {
-    if key != &rule.env {
-      return Err(Error::TlsEnvMismatch {
-        label: label.to_string(),
-        key: key.clone(),
-        env: rule.env.clone(),
-      });
-    }
-    if tls.client_cert.is_some() || tls.client_key.is_some() {
-      return Err(Error::AmqpIdentity { label: label.to_string() });
-    }
-    if tls.root_cert.is_some() {
-      return Err(Error::AmqpTrust { label: label.to_string() });
-    }
-    scope.guest_tls = tls.guest_tls_mode;
-  }
-  let credential = Credential {
-    label: label.to_string(),
-    fake: scope.downstream.password.expose_secret().to_string(),
-    value: scope.upstream.password.clone(),
-  };
+  scope.guest_tls = apply_guest_tls(rule).map_err(|row| {
+    map_tls_row(
+      label,
+      row,
+      Error::AmqpIdentity { label: label.to_string() },
+      Error::AmqpTrust { label: label.to_string() },
+    )
+  })?;
+  let credential = password_credential(label, &scope.downstream.password, scope.upstream.password.clone());
   Ok(Grant::Amqp {
     credential,
     scope: Box::new(scope),

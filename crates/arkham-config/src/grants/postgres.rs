@@ -3,10 +3,10 @@
 
 use std::path::PathBuf;
 
-use secrecy::{ExposeSecret as _, SecretString};
+use secrecy::SecretString;
 use url::Url;
 
-use super::{Credential, Grant, GuestTlsMode, RootCert, Scheme};
+use super::{Grant, GuestTlsMode, RootCert, Scheme, apply_guest_tls, downstream_covers, map_tls_row, password_credential, stated_fake};
 use crate::config::RuleCfg;
 use crate::error::Error;
 
@@ -285,7 +285,7 @@ impl PostgresScope {
 
   /// Grant-level match for a concrete request: scheme + port + host.
   pub(super) fn matches(scope: &Self, scheme: Scheme, host: &str, port: u16) -> bool {
-    scheme == Scheme::Postgres && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
+    scheme == Scheme::Postgres && downstream_covers(&scope.downstream.host, scope.downstream.port, Some(host), port)
   }
 }
 
@@ -297,41 +297,19 @@ impl PostgresScope {
 /// Returns an error when either string fails the postgres law above, or
 /// when a `tls` row tries to state what only the real string may state.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
-  let fake = rule
-    .value
-    .as_ref()
-    .map(|value| value.expose_secret().to_string())
-    .unwrap_or_default();
-  let mut scope = PostgresScope::from_strings(&fake, real).map_err(|err| Error::PostgresScope {
+  let mut scope = PostgresScope::from_strings(&stated_fake(rule), real).map_err(|err| Error::PostgresScope {
     label: label.to_string(),
     detail: err,
   })?;
-  // The rule table states the guest leg only; the upstream identity
-  // lives in the real string's libpq URL.
-  for (key, tls) in &rule.tls {
-    if key != &rule.env {
-      return Err(Error::TlsEnvMismatch {
-        label: label.to_string(),
-        key: key.clone(),
-        env: rule.env.clone(),
-      });
-    }
-    if tls.client_cert.is_some() || tls.client_key.is_some() {
-      return Err(Error::PostgresIdentity { label: label.to_string() });
-    }
-    if tls.root_cert.is_some() {
-      return Err(Error::PostgresTrust { label: label.to_string() });
-    }
-    scope.guest_tls = tls.guest_tls_mode;
-  }
-  // The wire needles are the credentials: fake password in, real
-  // password out; the legs' users swap when they differ (the wire
-  // machine rewrites the startup's `user` parameter).
-  let credential = Credential {
-    label: label.to_string(),
-    fake: scope.downstream.password.expose_secret().to_string(),
-    value: scope.upstream.password.clone(),
-  };
+  scope.guest_tls = apply_guest_tls(rule).map_err(|row| {
+    map_tls_row(
+      label,
+      row,
+      Error::PostgresIdentity { label: label.to_string() },
+      Error::PostgresTrust { label: label.to_string() },
+    )
+  })?;
+  let credential = password_credential(label, &scope.downstream.password, scope.upstream.password.clone());
   Ok(Grant::Postgres {
     credential,
     scope: Box::new(scope),
