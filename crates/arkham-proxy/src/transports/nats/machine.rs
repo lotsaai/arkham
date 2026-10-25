@@ -63,9 +63,7 @@ use secrecy::ExposeSecret as _;
 use serde_json::{Map, Value};
 use strum::{EnumIter, EnumString, IntoEnumIterator as _, IntoStaticStr};
 
-use crate::transports::engine::{
-  CredentialPair, Hit, Location, Raw, Rewritten, Wire, find_new_match, max_tail_size, needle_prefix_suffix_len,
-};
+use crate::transports::engine::{CredentialPair, Hit, Location, Raw, Rewritten, Wire, max_tail_size, scan_close_hold};
 
 /// Longest CONNECT line a TLS downstream leg buffers before forwarding the
 /// rest of that line unchanged.
@@ -1085,16 +1083,7 @@ impl Guard {
     if data.is_empty() {
       return Ok(());
     }
-    let mut combined = std::mem::take(&mut self.held);
-    combined.extend_from_slice(data);
-    if self.pairs.iter().any(|pair| find_new_match(&combined, &pair.needle, 0)) {
-      return Err(CloseLeg);
-    }
-    let hold = needle_prefix_suffix_len(&combined, &self.pairs, self.bound);
-    let emit = combined.len().saturating_sub(hold);
-    self.held = combined.split_off(emit);
-    out.append(&mut combined);
-    Ok(())
+    scan_close_hold(&mut self.held, data, out, &self.pairs, self.bound).map_err(|()| CloseLeg)
   }
 
   /// The frame ended, so its held suffix cannot grow.

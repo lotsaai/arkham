@@ -18,9 +18,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use arkham_config::grants::{PostgresScope, RootCert, SslMode, SslNegotiation};
 
 use super::PairCtx;
-use super::{ServeStream, TlsCache, TlsHalves, Transport};
+use super::{ServeStream, TlsCache, TlsHalves, Transport, pair_ctx, settle_legs};
 use crate::Error;
-use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
+use crate::connection::{dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Direction, Postgres};
@@ -159,36 +159,27 @@ impl Transport for PostgresTransport {
       return Ok(());
     }
 
-    let ctx = PairCtx {
-      grants: &snapshot.grants,
-      host: server_name.as_deref().unwrap_or(raw_host),
+    let ctx = pair_ctx(
+      &snapshot.grants,
+      server_name.as_deref().unwrap_or(raw_host),
       port,
-      plugins: &state.plugins,
-      mint: Some(state.mint_store()),
-    };
+      &state.plugins,
+      state.mint_store(),
+    );
     // The upstream leg verifies against the real string's host, which its
     // certificate must carry.
     let upstream_name = scope.upstream.host.as_str();
-    match (guest_tls, accepted) {
-      (None, false) => relay(Prefixed::new(guest_head, guest), upstream, &ctx, scope, budget).await,
-      (Some((hello_buf, identity)), false) => {
-        let plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
-          .await?;
-        relay(plain, upstream, &ctx, scope, budget).await
-      }
-      (None, true) => {
-        let plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(Prefixed::new(guest_head, guest), plain, &ctx, scope, budget).await
-      }
-      (Some((hello_buf, identity)), true) => {
-        let guest_plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
-          .await?;
-        let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(guest_plain, server_plain, &ctx, scope, budget).await
-      }
-    }
+    let settled = settle_legs(
+      self,
+      guest_tls,
+      accepted,
+      (guest, guest_head),
+      upstream,
+      scope,
+      (scope.guest_tls, upstream_name, None),
+    )
+    .await?;
+    super::relay_settled!(settled, relay, &ctx, scope, budget)
   }
 }
 

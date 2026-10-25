@@ -424,6 +424,31 @@ pub(crate) fn response_has_no_body(status: Option<u16>) -> bool {
   (100..200).contains(&code) || code == 204 || code == 205 || code == 304
 }
 
+/// Hold back a needle suffix and close when a full needle is already present.
+///
+/// # Errors
+///
+/// Returns `Err(())` when `pairs` contains a complete needle in `held` plus `data`.
+pub(crate) fn scan_close_hold(
+  held: &mut Vec<u8>,
+  data: &[u8],
+  out: &mut Vec<u8>,
+  pairs: &[CredentialPair],
+  bound: usize,
+) -> Result<(), ()> {
+  let mut combined = std::mem::take(held);
+  combined.extend_from_slice(data);
+  if pairs.iter().any(|pair| find_new_match(&combined, &pair.needle, 0)) {
+    return Err(());
+  }
+  let keep = needle_prefix_suffix_len(&combined, pairs, bound);
+  let emit = combined.len().saturating_sub(keep);
+  let tail = combined.split_off(emit);
+  out.extend_from_slice(&combined);
+  *held = tail;
+  Ok(())
+}
+
 /// Longest suffix of `data` (bounded by `bound`) that is a proper prefix of
 /// some needle: exactly the bytes that might still grow into a match.
 pub(crate) fn needle_prefix_suffix_len(data: &[u8], pairs: &[CredentialPair], bound: usize) -> usize {

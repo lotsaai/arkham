@@ -22,7 +22,7 @@ use serde_amqp::serde::de::DeserializeOwned;
 use serde_amqp::serde::{Deserialize, Serialize};
 
 use crate::transports::engine::{
-  CredentialPair, Direction, Hit, Location, Rewritten, Wire, find_new_match, needle_prefix_suffix_len, replace_bytes,
+  CredentialPair, Direction, Hit, Location, Rewritten, Wire, find_new_match, needle_prefix_suffix_len, replace_bytes, scan_close_hold,
 };
 
 /// Protocol header length. `parse_protocol_header` does not return a partial version.
@@ -930,20 +930,13 @@ impl Amqp {
       out.extend_from_slice(data);
       return Ok(());
     };
-    let mut combined = std::mem::take(&mut self.tail);
-    combined.extend_from_slice(data);
-    if memchr::memmem::find(&combined, &pair.needle).is_some() {
-      return Err(());
-    }
-    let bound = pair.needle.len().saturating_sub(1);
-    let hold = needle_prefix_suffix_len(&combined, std::slice::from_ref(pair), bound);
-    let emit = combined.len().saturating_sub(hold);
-    let Some(head) = combined.get(..emit) else {
-      return Err(());
-    };
-    out.extend_from_slice(head);
-    self.tail = combined.split_off(emit);
-    Ok(())
+    scan_close_hold(
+      &mut self.tail,
+      data,
+      out,
+      std::slice::from_ref(pair),
+      pair.needle.len().saturating_sub(1),
+    )
   }
 
   fn suffix(&self, data: &[u8]) -> usize {

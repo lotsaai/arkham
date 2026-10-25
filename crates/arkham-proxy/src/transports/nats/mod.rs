@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use arkham_config::grants::{Grant, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, RootCert};
 
-use super::{ServeStream, TlsCache, TlsHalves, Transport, within};
+use super::{ServeStream, TLS_RECORD_HANDSHAKE, TlsCache, TlsHalves, Transport, within};
 use crate::Error;
 use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
@@ -31,9 +31,6 @@ use crate::mint::MintBucket;
 use crate::relay::{log_hits, relay_guarded};
 use crate::transports::engine::{Rewritten, Wire};
 use machine::Nats;
-
-/// First byte of a TLS record carrying a handshake.
-const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 
 /// Read window for INFO and for the guest's first bytes.
 const OPENING_READ: usize = 4096;

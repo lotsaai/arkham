@@ -11,9 +11,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use arkham_config::grants::{RedisScope, RootCert};
 
 use super::PairCtx;
-use super::{ServeStream, TlsCache, TlsHalves, Transport};
+use super::{ServeStream, TlsCache, TlsHalves, Transport, matched_host, open_flagged, pair_ctx, settle_legs};
 use crate::Error;
-use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::relay::relay_guarded;
 use crate::transports::engine::{Direction, Redis};
@@ -59,7 +58,7 @@ impl Transport for RedisTransport {
   /// The `redis://` / `rediss://` arm. Each connection string states its
   /// own leg's transport, so both legs are settled here and the wire
   /// machine then works on plaintext whichever way either arrived.
-  async fn serve<G>(&self, ServeStream { mut guest, params, scope }: ServeStream<'_, G, RedisScope>) -> Result<(), Error>
+  async fn serve<G>(&self, ServeStream { guest, params, scope }: ServeStream<'_, G, RedisScope>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
   {
@@ -72,60 +71,38 @@ impl Transport for RedisTransport {
       ..
     } = params;
     let budget = Duration::from_secs(snapshot.proxy.handshake_timeout_secs);
-    let mut server_name = host.map(ToString::to_string);
-    let guest_head = initial.to_vec();
-    let mut guest_tls: Option<(Vec<u8>, String)> = None;
-    if scope.is_downstream_tls {
-      // Transparent capture has no CONNECT authority. A ClientHello with no
-      // SNI — Bun's Redis client sends none — would otherwise close here.
-      // The scope was already chosen by port, and its downstream host is the
-      // name that client checks the leaf against.
-      let authority = host.or(Some(scope.downstream.host.as_str()));
-      let Some((hello_buf, identity, sni_name)) = guest_tls_opening(&mut guest, initial, budget, authority, &state.mint).await? else {
-        return Ok(());
-      };
-      server_name = Some(sni_name);
-      guest_tls = Some((hello_buf, identity));
-    }
-
-    // The real string states the far end: the dial follows its host and
-    // port, not the destination the guest aimed at.
-    let upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;
-    // Transparent capture knows the destination address, not the name in
-    // the connection string. The scope was already chosen by port; keying
-    // the swap on that address would miss the grant and forward the fake
-    // password unchanged.
-    let matched_name = server_name
-      .as_deref()
-      .filter(|name| scope.downstream.host.eq_ignore_ascii_case(name));
-    let ctx = PairCtx {
-      grants: &snapshot.grants,
-      host: matched_name.unwrap_or(scope.downstream.host.as_str()),
-      port,
-      plugins: &state.plugins,
-      mint: Some(state.mint_store()),
+    // The real string states the far end: the dial follows its host and port.
+    let Some(opened) = open_flagged(
+      guest,
+      initial,
+      budget,
+      host,
+      (scope.downstream.host.as_str(), scope.is_downstream_tls),
+      (scope.upstream.host.as_str(), scope.upstream.port, state.fwmark),
+      &state.mint,
+    )
+    .await?
+    else {
+      return Ok(());
     };
-    let upstream_name = scope.upstream.host.as_str();
-    match (guest_tls, scope.is_upstream_tls) {
-      (None, false) => relay(Prefixed::new(guest_head, guest), upstream, &ctx).await,
-      (Some((hello_buf, identity)), false) => {
-        let plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
-          .await?;
-        relay(plain, upstream, &ctx).await
-      }
-      (None, true) => {
-        let plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(Prefixed::new(guest_head, guest), plain, &ctx).await
-      }
-      (Some((hello_buf, identity)), true) => {
-        let guest_plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, guest), scope.guest_tls)
-          .await?;
-        let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(guest_plain, server_plain, &ctx).await
-      }
-    }
+    let ctx = pair_ctx(
+      &snapshot.grants,
+      matched_host(opened.server_name.as_deref(), scope.downstream.host.as_str()),
+      port,
+      &state.plugins,
+      state.mint_store(),
+    );
+    let settled = settle_legs(
+      self,
+      opened.guest_tls,
+      scope.is_upstream_tls,
+      (opened.guest, opened.guest_head),
+      opened.upstream,
+      scope,
+      (scope.guest_tls, scope.upstream.host.as_str(), None),
+    )
+    .await?;
+    super::relay_settled!(settled, relay, &ctx)
   }
 }
 

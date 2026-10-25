@@ -17,9 +17,9 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use arkham_config::grants::{Grant, LdapScope, RootCert};
 
 use super::PairCtx;
-use super::{ServeStream, TlsCache, TlsHalves, Transport};
+use super::{ServeStream, TlsCache, TlsHalves, Transport, matched_host, open_flagged, pair_ctx, settle_legs};
 use crate::Error;
-use crate::connection::{Prefixed, dial_marked, guest_tls_opening};
+use crate::connection::{Prefixed, guest_tls_opening};
 use crate::identity::CandidateParams;
 use crate::mint::MintBucket;
 use crate::relay::{RelayEnd, log_hits, relay_guarded, relay_stop};
@@ -67,7 +67,7 @@ impl Transport for LdapTransport {
   /// The `ldap://` / `ldaps://` arm. LDAPS settles both legs, then relays.
   /// Cleartext classifies the first message: `StartTLS` is lockstep, and
   /// anything else is [`relay_guarded`] from the bytes already read.
-  async fn serve<G>(&self, ServeStream { mut guest, params, scope }: ServeStream<'_, G, LdapScope>) -> Result<(), Error>
+  async fn serve<G>(&self, ServeStream { guest, params, scope }: ServeStream<'_, G, LdapScope>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
   {
@@ -80,29 +80,26 @@ impl Transport for LdapTransport {
       ..
     } = params;
     let budget = Duration::from_secs(snapshot.proxy.handshake_timeout_secs);
-    let mut server_name = host.map(ToString::to_string);
-    let guest_head = initial.to_vec();
-    let mut guest_tls: Option<(Vec<u8>, String)> = None;
-    if scope.is_downstream_tls {
-      let authority = host.or(Some(scope.downstream.host.as_str()));
-      let Some((hello_buf, identity, sni_name)) = guest_tls_opening(&mut guest, initial, budget, authority, &state.mint).await? else {
-        return Ok(());
-      };
-      server_name = Some(sni_name);
-      guest_tls = Some((hello_buf, identity));
-    }
-
-    let upstream = dial_marked(&scope.upstream.host, scope.upstream.port, state.fwmark).await?;
-    let matched_name = server_name
-      .as_deref()
-      .filter(|name| scope.downstream.host.eq_ignore_ascii_case(name));
-    let ctx = PairCtx {
-      grants: &snapshot.grants,
-      host: matched_name.unwrap_or(scope.downstream.host.as_str()),
-      port,
-      plugins: &state.plugins,
-      mint: Some(state.mint_store()),
+    let Some(opened) = open_flagged(
+      guest,
+      initial,
+      budget,
+      host,
+      (scope.downstream.host.as_str(), scope.is_downstream_tls),
+      (scope.upstream.host.as_str(), scope.upstream.port, state.fwmark),
+      &state.mint,
+    )
+    .await?
+    else {
+      return Ok(());
     };
+    let ctx = pair_ctx(
+      &snapshot.grants,
+      matched_host(opened.server_name.as_deref(), scope.downstream.host.as_str()),
+      port,
+      &state.plugins,
+      state.mint_store(),
+    );
     let upstream_name = scope.upstream.host.as_str();
     let pump = Pump {
       scope,
@@ -114,31 +111,24 @@ impl Transport for LdapTransport {
     if scope.is_downstream_tls {
       return self
         .relay_settled(
-          OpenGuest {
-            stream: guest,
-            head: guest_head,
-            tls: guest_tls,
-          },
-          upstream,
+          opened.guest,
+          opened.guest_head,
+          opened.guest_tls,
+          opened.upstream,
           &pump,
           upstream_name,
         )
         .await;
     }
     if scope.is_upstream_tls {
-      let plain = self.connect_server(scope, upstream_name, upstream).await?;
-      self.opening(Prefixed::new(guest_head, guest), plain, &pump).await
+      let plain = self.connect_server(scope, upstream_name, opened.upstream).await?;
+      self.opening(Prefixed::new(opened.guest_head, opened.guest), plain, &pump).await
     } else {
-      self.opening(Prefixed::new(guest_head, guest), upstream, &pump).await
+      self
+        .opening(Prefixed::new(opened.guest_head, opened.guest), opened.upstream, &pump)
+        .await
     }
   }
-}
-
-/// Guest bytes already read, plus whether that leg opened with TLS.
-struct OpenGuest<G> {
-  stream: G,
-  head: Vec<u8>,
-  tls: Option<(Vec<u8>, String)>,
 }
 
 /// Facts the cleartext opening and the `StartTLS` upgrade share.
@@ -155,34 +145,32 @@ impl LdapTransport {
   /// Both legs already know their transport. The password is swapped on
   /// cleartext the same way it is on TLS. A further `StartTLS` is refused
   /// only when the upstream writer is already TLS.
-  async fn relay_settled<G, S>(&self, guest: OpenGuest<G>, upstream: S, pump: &Pump<'_>, upstream_name: &str) -> Result<(), Error>
+  async fn relay_settled<G, S>(
+    &self,
+    guest: G,
+    head: Vec<u8>,
+    tls: Option<(Vec<u8>, String)>,
+    upstream: S,
+    pump: &Pump<'_>,
+    upstream_name: &str,
+  ) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
     S: AsyncRead + AsyncWrite + Unpin,
   {
-    let OpenGuest { stream, head, tls } = guest;
     let scope = pump.scope;
     let hold_starttls = scope.is_upstream_tls;
-    match (tls, scope.is_upstream_tls) {
-      (None, false) => relay(Prefixed::new(head, stream), upstream, pump.ctx, hold_starttls).await,
-      (Some((hello_buf, identity)), false) => {
-        let plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
-          .await?;
-        relay(plain, upstream, pump.ctx, hold_starttls).await
-      }
-      (None, true) => {
-        let plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(Prefixed::new(head, stream), plain, pump.ctx, hold_starttls).await
-      }
-      (Some((hello_buf, identity)), true) => {
-        let guest_plain = self
-          .accept_guest(&identity, Prefixed::new(hello_buf, stream), scope.guest_tls)
-          .await?;
-        let server_plain = self.connect_server(scope, upstream_name, upstream).await?;
-        relay(guest_plain, server_plain, pump.ctx, hold_starttls).await
-      }
-    }
+    let settled = settle_legs(
+      self,
+      tls,
+      scope.is_upstream_tls,
+      (guest, head),
+      upstream,
+      scope,
+      (scope.guest_tls, upstream_name, None),
+    )
+    .await?;
+    super::relay_settled!(settled, relay, pump.ctx, hold_starttls)
   }
 
   /// Classify the first cleartext message. `StartTLS` stays here; every
