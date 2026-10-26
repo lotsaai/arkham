@@ -20,6 +20,7 @@ use pgwire::messages::startup::{GssEncRequest, SslRequest, Startup};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::Error;
+use crate::transports::TLS_RECORD_HANDSHAKE;
 use crate::transports::engine::{Direction, Hit, Raw, Rewritten, Wire};
 
 /// Cap for one greeting message. Real `StartupMessages` are hundreds of
@@ -359,9 +360,6 @@ fn ssl_request() -> [u8; NEGOTIATION_LEN] {
 
 /// Length of a Postgres negotiation request: a length word and a magic code.
 const NEGOTIATION_LEN: usize = 8;
-/// First byte of a TLS record carrying a handshake message, which is what a
-/// direct-SSL client opens with.
-const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 
 #[cfg(test)]
 mod tests {

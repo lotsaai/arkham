@@ -44,15 +44,15 @@ arkham agent --rm       # the same, stopping both when the shell exits
 arkham down             # stop both
 ```
 
-`init` writes three things. It replaces `agent-entrypoint.sh` when the copy differs from the generated script. `init` replaces the compose file when the workspace config or the stack shape changes. When neither has changed, `init` leaves the compose file in place. `init` leaves an existing `ca.pem` in place.
+`init` writes three things. It replaces `agent-entrypoint.sh` when the copy differs from the generated script. `init` rewrites the compose file when the rendered output differs, and leaves it in place when the render matches. `init` leaves an existing `ca.pem` in place.
 
 | Path | What it is |
 | --- | --- |
-| `<state-dir>/arkham/ws/<slug>/compose.yml` | the generated stack, which is yours to edit (`<state-dir>` is `~/.local/state` on Linux) |
+| `<state-dir>/arkham/ws/<slug>/compose.yml` | the generated stack (`<state-dir>` is `~/.local/state` on Linux). Overrides live in `~/.config/arkham/compose.yaml` or this workspace's `.config/arkham/compose.yaml` |
 | `~/.config/arkham/ca.pem` | arkham's CA, with `ca.crt` and `ca.key` written beside it |
 | `~/.config/arkham/agent-entrypoint.sh` | the agent's entrypoint |
 
-`up` merges three compose layers, later winning: `<config-dir>/arkham/compose.yml`, the generated file above, then this workspace's `.config/arkham.compose.yaml` if you create one.
+`up` merges three compose layers, later winning: `<config-dir>/arkham/compose.yaml` (or `compose.yml`), the generated file above, then this workspace's `.config/arkham/compose.yaml` (or `.yml`).
 
 ## Where the secrets live
 

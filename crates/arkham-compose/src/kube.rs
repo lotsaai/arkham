@@ -13,16 +13,16 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use arkham_config::config::{HostTlsCfg, RewriteFormat, fake_for};
-use arkham_config::grants::{EndpointScope, GuestTlsMode, Scheme, decoy_for_rule};
+use arkham_config::grants::{EndpointScope, Scheme, decoy_for_rule};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value, from_str};
 
-use crate::adapt::{GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, decode, render_decoy, render_fragment, rewrite_label};
+use crate::adapt::{GrantFragment, RewriteAdapted, decode, materialize_client_tls, render_decoy, render_fragment, rewrite_label};
 use crate::error::Error;
 
 /// A kubeconfig document; unknown fields ignored.
@@ -289,7 +289,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
     str::to_string,
   );
   let (decoy_token, _) = decoy_for_rule(&env, None, &[scope], value.len());
-  let blobs = kube_blobs(&label, cert, key, ca_bundle, ca, guests_dir)?;
+  let blobs = kube_blobs(&label, cert.zip(key), ca_bundle, ca, guests_dir)?;
   let fragment = render_fragment(
     source,
     &label,
@@ -339,8 +339,7 @@ struct KubeBlobs {
 /// Returns an error when the guest pair cannot be minted or its files read.
 fn kube_blobs(
   label: &str,
-  cert: Option<Vec<u8>>,
-  key: Option<Vec<u8>>,
+  client_pair: Option<(Vec<u8>, Vec<u8>)>,
   ca_bundle: Option<Vec<u8>>,
   ca: &CertAuthority,
   guests_dir: &Path,
@@ -354,33 +353,11 @@ fn kube_blobs(
     path: guest_key_path.clone(),
     source,
   })?;
-  let mut materialized = Vec::new();
-  let mut tls = HostTlsCfg {
-    client_cert: None,
-    client_key: None,
-    root_cert: None,
-    // A client pair means mutual TLS both ways: the guest presents the
-    // minted pair, the proxy the real one upstream. Token-only users carry
-    // no client certificate, so asking for one fails their handshake with
-    // `certificate required` before any bearer swap can happen.
-    guest_tls_mode: GuestTlsMode::Tls,
-    guest_cert: None,
-    guest_key: None,
-  };
-  if let (Some(cert), Some(key)) = (cert, key) {
-    tls.guest_tls_mode = GuestTlsMode::Mtls;
-    let cert_name = format!("{label}.client.crt");
-    let key_name = format!("{label}.client.key");
-    tls.client_cert = Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}")));
-    tls.client_key = Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{key_name}")));
-    materialized.push((cert_name, cert));
-    materialized.push((key_name, key));
-  }
-  if let Some(ca_bundle) = ca_bundle {
-    let ca_name = format!("{label}.ca.crt");
-    tls.root_cert = Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{ca_name}")));
-    materialized.push((ca_name, ca_bundle));
-  }
+  // A client pair means mutual TLS both ways: the guest presents the
+  // minted pair, the proxy the real one upstream. Token-only users carry
+  // no client certificate, so asking for one fails their handshake with
+  // `certificate required` before any bearer swap can happen.
+  let (tls, materialized) = materialize_client_tls(label, client_pair, ca_bundle);
   Ok(KubeBlobs {
     tls,
     materialized,
@@ -482,11 +459,17 @@ fn entries_mut<'a>(root: &'a mut Value, key: &str) -> Vec<&'a mut Mapping> {
 
 #[cfg(test)]
 mod tests {
-  use arkham_config::config::RuleCfg;
-  use serde::Deserialize;
-
   use super::*;
   use crate::adapt::write_state;
+  use crate::expand::*;
+  use crate::rewrites::*;
+  use crate::test_support::*;
+  use arkham_config::config::FileRewrite;
+  use arkham_config::config::RuleCfg;
+  use arkham_config::grants::GuestTlsMode;
+  use serde::Deserialize;
+  use std::collections::HashMap;
+  use tempfile::tempdir;
 
   const BEARER_DOC: &str = r"apiVersion: v1
 kind: Config
@@ -746,33 +729,16 @@ users:
     write_state(&grants, &[]).unwrap();
     assert!(!stale.exists(), "removed rewrites stop granting");
   }
-}
-
-#[cfg(test)]
-mod moved_suite {
-
-  use std::fs;
-
-  use arkham_config::config::{FileRewrite, RewriteFormat};
-  use tempfile::tempdir;
-
-  use crate::expand::*;
-
-  use crate::rewrites::*;
-
-  use crate::test_support::*;
 
   /// Kubeconfig sources adapt with no `envs`, stated or sniffed.
   #[test]
   fn kube_rewrites_adapt_stated_or_sniffed() {
-    use std::collections::HashMap;
-
-    use arkham_pki::ca::CertAuthority;
-
     let dir = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(home.path(), xdg.path());
     let source = dir.path().join("k3s.yaml");
     fs::write(&source, KUBE_DOC).unwrap();
-    let ca = CertAuthority::generate().unwrap();
     let expander = build_expander(HashMap::new());
     let files = dir.path().join("files");
     let guests = dir.path().join("guests");
@@ -791,7 +757,6 @@ mod moved_suite {
         expander: &expander,
         home: "/home/eng",
         host_home: None,
-        kube_ca: Some(&ca),
         guests_dir: &guests,
       })
       .unwrap();
@@ -811,14 +776,12 @@ mod moved_suite {
   /// A stated kubeconfig format on a foreign file fails closed.
   #[test]
   fn stated_kubeconfig_on_plain_text_is_an_error() {
-    use std::collections::HashMap;
-
-    use arkham_pki::ca::CertAuthority;
-
     let dir = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(home.path(), xdg.path());
     let source = dir.path().join("npmrc");
     fs::write(&source, "//registry.npmjs.org/:_authToken=real-secret-1\n").unwrap();
-    let ca = CertAuthority::generate().unwrap();
     let guests = dir.path().join("guests");
     let expander = build_expander(HashMap::new());
     let error = write_rewrites(&RewriteInputs {
@@ -835,7 +798,6 @@ mod moved_suite {
       expander: &expander,
       home: "/home/eng",
       host_home: None,
-      kube_ca: Some(&ca),
       guests_dir: &guests,
     })
     .unwrap_err()

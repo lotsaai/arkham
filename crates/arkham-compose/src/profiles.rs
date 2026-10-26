@@ -170,13 +170,11 @@ pub(crate) fn profile_mounts(
 }
 
 #[cfg(test)]
-mod moved_suite {
-  use arkham_config::cli::ProxyBackend;
-
-  use crate::profiles::*;
-
+mod tests {
+  use super::*;
   use crate::stack::*;
   use crate::test_support::*;
+  use arkham_config::cli::ProxyBackend;
 
   #[test]
   fn shared_profile_mounts_tools_at_each_tools_default_location() {

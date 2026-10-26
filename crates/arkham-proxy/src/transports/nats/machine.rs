@@ -63,9 +63,7 @@ use secrecy::ExposeSecret as _;
 use serde_json::{Map, Value};
 use strum::{EnumIter, EnumString, IntoEnumIterator as _, IntoStaticStr};
 
-use crate::transports::engine::{
-  CredentialPair, Hit, Location, Raw, Rewritten, Wire, find_new_match, max_tail_size, needle_prefix_suffix_len,
-};
+use crate::transports::engine::{CredentialPair, Hit, Location, Raw, Rewritten, Wire, scan_close_hold};
 
 /// Longest CONNECT line a TLS downstream leg buffers before forwarding the
 /// rest of that line unchanged.
@@ -486,11 +484,7 @@ impl Nats {
     Self::Up(Box::new(Up {
       framer: Framer::new(Side::Server),
       lines: Raw::from_pairs(pairs.clone()),
-      guard: Guard {
-        bound: max_tail_size(&pairs),
-        pairs,
-        held: Vec::new(),
-      },
+      guard: Guard { pairs, held: Vec::new() },
       info: InfoWatch::default(),
     }))
   }
@@ -1075,7 +1069,6 @@ async fn redact(lines: &mut Raw, bytes: &[u8], out: &mut Vec<u8>, hits: &mut Vec
 /// is never rewritten: the real value there closes the leg.
 struct Guard {
   pairs: Vec<CredentialPair>,
-  bound: usize,
   /// Suffix that could still grow into a real value.
   held: Vec<u8>,
 }
@@ -1085,16 +1078,7 @@ impl Guard {
     if data.is_empty() {
       return Ok(());
     }
-    let mut combined = std::mem::take(&mut self.held);
-    combined.extend_from_slice(data);
-    if self.pairs.iter().any(|pair| find_new_match(&combined, &pair.needle, 0)) {
-      return Err(CloseLeg);
-    }
-    let hold = needle_prefix_suffix_len(&combined, &self.pairs, self.bound);
-    let emit = combined.len().saturating_sub(hold);
-    self.held = combined.split_off(emit);
-    out.append(&mut combined);
-    Ok(())
+    scan_close_hold(&mut self.held, data, out, &self.pairs).map_err(|()| CloseLeg)
   }
 
   /// The frame ended, so its held suffix cannot grow.

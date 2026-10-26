@@ -1,7 +1,7 @@
 //! LDAP simple bind through the MITM: a cleartext upstream swaps the real
 //! password the same way TLS does, and LDAPS swaps from the first byte.
 
-use super::*;
+use super::fixture::*;
 use arkham_config::grants::LdapScope;
 use rasn::prelude::OctetString;
 use rasn_ldap::{
@@ -405,7 +405,7 @@ async fn ldap_starttls_with_a_client_cert_swaps_the_password() {
   std::fs::write(&bundle, ca.cert_pem()).unwrap();
   let fake = format!("ldap://{}:{FAKE}@localhost:{stub_port}", user(DN));
   let real = format!("ldap://{}:{VALUE}@localhost:{stub_port}?sslrootcert={}", user(DN), bundle.display());
-  let grants = super::resolve_mtls_grants("LDAP_URL", &fake, &real).expect("ldap starttls with mtls still loads");
+  let grants = resolve_mtls_grants("LDAP_URL", &fake, &real).expect("ldap starttls with mtls still loads");
   let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
   let stub_task = tokio::spawn(async move { serve_flow(stub, acceptor, Flow::StartTlsFirst).await });
   let stream = connect_through_proxy(proxy_addr, stub_port).await;
@@ -435,7 +435,7 @@ async fn ldap_starttls_without_a_client_cert_never_reaches_upstream() {
   std::fs::write(&bundle, ca.cert_pem()).unwrap();
   let fake = format!("ldap://{}:{FAKE}@localhost:{stub_port}", user(DN));
   let real = format!("ldap://{}:{VALUE}@localhost:{stub_port}?sslrootcert={}", user(DN), bundle.display());
-  let grants = super::resolve_mtls_grants("LDAP_URL", &fake, &real).expect("ldap starttls with mtls still loads");
+  let grants = resolve_mtls_grants("LDAP_URL", &fake, &real).expect("ldap starttls with mtls still loads");
   let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
   let stub_task = tokio::spawn(async move { bytes_after_starttls(stub).await });
   let stream = connect_through_proxy(proxy_addr, stub_port).await;
@@ -572,7 +572,7 @@ async fn ldap_tls_without_sni_mints_for_the_grant_host() {
 fn ldap_mtls_on_a_cleartext_fake_loads() {
   let fake = format!("ldap://{}:{FAKE}@localhost:389", user(DN));
   let real = format!("ldaps://{}:{VALUE}@localhost:636", user(DN));
-  let grants = super::resolve_mtls_grants("LDAP_URL", &fake, &real).expect("mtls on an ldap fake loads");
+  let grants = resolve_mtls_grants("LDAP_URL", &fake, &real).expect("mtls on an ldap fake loads");
   let scope = grants.first().and_then(|grant| grant.ldap(None, 389)).expect("scope");
   assert_eq!(scope.guest_tls, arkham_config::grants::GuestTlsMode::Mtls);
   assert!(!scope.is_downstream_tls);

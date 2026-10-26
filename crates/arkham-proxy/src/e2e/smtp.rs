@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
-use super::*;
+use super::fixture::*;
 use base64::Engine as _;
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::transport::smtp::client::{AsyncSmtpConnection, Certificate, CertificateStore, Identity, TlsParameters};
@@ -621,7 +621,7 @@ async fn smtps_without_sni_mints_for_the_grant_host() {
 fn smtp_mtls_on_a_cleartext_fake_loads() {
   let fake = format!("smtp://agent%40demo.test:{FAKE}@localhost:587");
   let real = format!("smtps://agent%40demo.test:{VALUE}@localhost:465");
-  let grants = super::resolve_mtls_grants("SMTP_URL", &fake, &real).expect("mtls on an smtp fake loads");
+  let grants = resolve_mtls_grants("SMTP_URL", &fake, &real).expect("mtls on an smtp fake loads");
   let scope = grants.first().and_then(|grant| grant.smtp(None, 587)).expect("scope");
   assert_eq!(scope.guest_tls, arkham_config::grants::GuestTlsMode::Mtls);
   assert!(!scope.is_downstream_tls);
@@ -766,7 +766,7 @@ async fn smtp_mtls_starttls_without_a_client_certificate_sends_no_auth_upstream(
     "smtp://agent%40demo.test:{VALUE}@localhost:{stub_port}?starttls=required&sslrootcert={}",
     bundle.display()
   );
-  let grants = super::resolve_mtls_grants("SMTP_URL", &fake, &real).expect("smtp starttls with mtls still loads");
+  let grants = resolve_mtls_grants("SMTP_URL", &fake, &real).expect("smtp starttls with mtls still loads");
   let (proxy_addr, proxy) = run_proxy_with(test_state_with(grants, &ca)).await;
   let (tx, mut rx) = tokio::sync::mpsc::channel(2);
   let stub_task = tokio::spawn(async move {

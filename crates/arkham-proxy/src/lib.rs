@@ -28,7 +28,7 @@ use crate::connection::{dial_marked, trust_anchors};
 use crate::identity::{Expect, expect};
 use crate::mint::{MintBucket, MintStore};
 use crate::transports::PairCtx;
-use crate::transports::http::{MAX_HEAD, http_pair};
+use crate::transports::http::transport::{MAX_HEAD, http_pair};
 use arkham_config::grants::{Grant, ResolvedConfig, Scheme};
 use arkham_pki::ca::CertAuthority;
 pub(crate) use relay::relay_guarded;
@@ -47,15 +47,15 @@ mod relay;
 
 use identity::CandidateParams;
 use transports::TlsCache;
-use transports::amqp::AmqpTransport;
-use transports::http::{HttpTransport, HttpsTransport};
-use transports::ldap::LdapTransport;
-use transports::nats::NatsTransport;
-use transports::postgres::PostgresTransport;
-use transports::redis::RedisTransport;
-use transports::smtp::SmtpTransport;
-use transports::ssh::SshTransport;
-use transports::tcp::TcpTransport;
+use transports::amqp::transport::AmqpTransport;
+use transports::http::transport::{HttpTransport, HttpsTransport};
+use transports::ldap::transport::LdapTransport;
+use transports::nats::transport::NatsTransport;
+use transports::postgres::transport::PostgresTransport;
+use transports::redis::transport::RedisTransport;
+use transports::smtp::transport::SmtpTransport;
+use transports::ssh::transport::SshTransport;
+use transports::tcp::transport::TcpTransport;
 /// One HTTPS MITM relay shape: cached in-memory leaf issuer.
 type HttpsRelay = TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCertIssuer>>;
 

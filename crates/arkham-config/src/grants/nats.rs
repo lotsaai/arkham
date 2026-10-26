@@ -18,7 +18,7 @@ use serde::Deserialize;
 use strum::{EnumIter, IntoEnumIterator as _, IntoStaticStr};
 use url::Url;
 
-use super::{Credential, Grant, GuestTlsMode, RootCert, Scheme};
+use super::{Credential, Grant, GuestTlsMode, RootCert, Scheme, apply_guest_tls, downstream_covers, map_tls_row, stated_fake};
 use crate::config::{RuleCfg, fake_for};
 use crate::error::Error;
 
@@ -1101,7 +1101,7 @@ impl NatsScope {
 
   /// Grant-level match for a concrete request: scheme + port + host.
   pub(super) fn matches(scope: &Self, scheme: Scheme, host: &str, port: u16) -> bool {
-    scheme == Scheme::Nats && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
+    scheme == Scheme::Nats && downstream_covers(&scope.downstream.host, scope.downstream.port, Some(host), port)
   }
 }
 
@@ -1112,31 +1112,18 @@ impl NatsScope {
 /// Returns an error when either string fails the law above, or when a
 /// `tls` row tries to state what only the real string may state.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
-  let fake = rule
-    .value
-    .as_ref()
-    .map(|value| value.expose_secret().to_string())
-    .unwrap_or_default();
-  let mut scope = NatsScope::from_strings(&fake, real).map_err(|source| Error::NatsScope {
+  let mut scope = NatsScope::from_strings(&stated_fake(rule), real).map_err(|source| Error::NatsScope {
     label: label.to_string(),
     source,
   })?;
-  for (key, tls) in &rule.tls {
-    if key != &rule.env {
-      return Err(Error::TlsEnvMismatch {
-        label: label.to_string(),
-        key: key.clone(),
-        env: rule.env.clone(),
-      });
-    }
-    if tls.client_cert.is_some() || tls.client_key.is_some() {
-      return Err(Error::NatsIdentity { label: label.to_string() });
-    }
-    if tls.root_cert.is_some() {
-      return Err(Error::NatsTrust { label: label.to_string() });
-    }
-    scope.guest_tls = tls.guest_tls_mode;
-  }
+  scope.guest_tls = apply_guest_tls(rule).map_err(|row| {
+    map_tls_row(
+      label,
+      row,
+      Error::NatsIdentity { label: label.to_string() },
+      Error::NatsTrust { label: label.to_string() },
+    )
+  })?;
   let (fake, value) = scope.auth.credential();
   let (fake, value) = (fake.to_string(), value.clone());
   let credential = Credential {

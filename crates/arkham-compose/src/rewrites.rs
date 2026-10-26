@@ -6,11 +6,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use arkham_config::config::{FileRewrite, RewriteFormat, config_dir};
-use arkham_pki::ca::{CertAuthority, load_or_generate};
+use arkham_config::config::{FileRewrite, RewriteFormat};
+use arkham_pki::ca::CertAuthority;
 use xpanda::Xpanda;
 
-use crate::adapt::{RewriteAdapted, sniff};
+use crate::adapt::{RewriteAdapted, load_guest_ca, sniff};
 use crate::decoys::Decoy;
 use crate::error::Error;
 use crate::expand::{apply_rewrites, expand_path, expand_value, rewrite_file_name};
@@ -65,9 +65,6 @@ pub(crate) struct RewriteInputs<'a> {
   pub(crate) home: &'a str,
   /// Host home relative sources and `~` expand against.
   pub(crate) host_home: Option<&'a Path>,
-  /// Guest-identity CA, preloaded by generation or injected by tests; the
-  /// kube adapter mints the guest pair from it.
-  pub(crate) kube_ca: Option<&'a CertAuthority>,
   /// Guest pairs mint here; the kube adapter reads them back for the decoy.
   pub(crate) guests_dir: &'a Path,
 }
@@ -104,7 +101,6 @@ pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutput
     expander,
     home,
     host_home,
-    kube_ca,
     guests_dir,
   } = *inputs;
   if rewrites.is_empty() {
@@ -119,7 +115,6 @@ pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutput
     guests_dir,
     expander,
     home,
-    preloaded_ca: kube_ca,
     ca: None,
     collector: RewriteCollector::new(files_dir)?,
   };
@@ -238,8 +233,6 @@ struct ExplicitRewrites<'a> {
   expander: &'a Xpanda,
   /// Container home for `{home}` substitution.
   home: &'a str,
-  /// The guest CA preloaded by the caller, when it loaded one.
-  preloaded_ca: Option<&'a CertAuthority>,
   /// The guest CA this pass loaded, on first adapter use.
   ca: Option<CertAuthority>,
   /// Grants and decoy mounts collected along the way.
@@ -247,34 +240,22 @@ struct ExplicitRewrites<'a> {
 }
 
 impl ExplicitRewrites<'_> {
-  /// The guest CA for the format adapters: the caller's preloaded one, or
-  /// one loaded from the config directory on first use.
+  /// The guest CA for the format adapters, loaded from the config directory
+  /// on first use.
   ///
   /// # Errors
   ///
   /// Returns an error when the arkham config directory or the CA cannot be
   /// loaded.
   fn ca(&mut self) -> Result<&CertAuthority, Error> {
-    if let Some(ca) = self.preloaded_ca {
-      return Ok(ca);
-    }
     if self.ca.is_none() {
-      let ca_path = config_dir()
-        .ok_or_else(|| Error::ConfigDir {
-          detail: "an adapted rewrite needs the arkham config directory to load the CA from".to_string(),
-        })?
-        .join("ca.pem");
-      self.ca = Some(load_or_generate(&ca_path).map_err(|source| Error::GuestCa {
-        path: ca_path.clone(),
-        source,
-      })?);
+      self.ca = Some(load_guest_ca(
+        "an adapted rewrite needs the arkham config directory to load the CA from",
+      )?);
     }
-    match self.ca.as_ref() {
-      Some(ca) => Ok(ca),
-      None => Err(Error::ConfigDir {
-        detail: "the adapted-rewrite CA slot is empty after loading it".to_string(),
-      }),
-    }
+    self.ca.as_ref().ok_or_else(|| Error::ConfigDir {
+      detail: "the adapted-rewrite CA slot is empty after loading it".to_string(),
+    })
   }
 
   /// One rewrite's output bytes: the format adapter's decoy document with
@@ -371,22 +352,16 @@ impl ExplicitRewrites<'_> {
 }
 
 #[cfg(test)]
-mod moved_suite {
-
-  use std::slice::from_ref;
-
-  use tempfile::tempdir;
-
+mod tests {
+  use super::*;
   use crate::expand::*;
-
-  use crate::rewrites::*;
+  use std::slice::from_ref;
+  use tempfile::tempdir;
 
   /// Sources rewrite reals to decoys on disk and mount read-only at the
   /// `{home}`-expanded dest; unknown names fail naming the name.
   #[test]
   fn file_rewrites_swap_reals_for_decoys_on_disk() {
-    use std::collections::HashMap;
-
     let dir = tempdir().unwrap();
     let source = dir.path().join("npmrc");
     fs::write(&source, "//registry.npmjs.org/:_authToken=real-secret-1\n").unwrap();
@@ -412,7 +387,6 @@ mod moved_suite {
       expander: &expander,
       home: "/home/eng",
       host_home: None,
-      kube_ca: None,
       guests_dir: dir.path(),
     })
     .unwrap();
@@ -436,7 +410,6 @@ mod moved_suite {
       expander: &expander,
       home: "/home/eng",
       host_home: None,
-      kube_ca: None,
       guests_dir: dir.path(),
     })
     .unwrap_err()

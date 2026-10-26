@@ -40,10 +40,10 @@ mise use -g github:casualjim/arkham
 
 Or download a tarball from [the releases page](https://github.com/casualjim/arkham/releases) and put `arkham` on your `PATH`.
 
-**As a container**: `ghcr.io/casualjim/arkham`. The image is runtime-only, entrypoint `arkham`, default command `serve`.
+**As a container**: `ghcr.io/lotsaai/arkham`. The image is runtime-only, entrypoint `arkham`, default command `serve`.
 
 ```sh
-docker run --rm ghcr.io/casualjim/arkham:latest fake GH_TOKEN
+docker run --rm ghcr.io/lotsaai/arkham:latest fake GH_TOKEN
 ```
 
 **From source**: clone, then build with a recent stable Rust toolchain (the crate uses edition 2024; all three Linux capture backends compile in unconditionally):

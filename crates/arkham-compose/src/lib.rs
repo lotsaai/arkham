@@ -1,6 +1,6 @@
 //! Workspace confinement: `arkham rules` prints env-only rules for the
 //! fnox-declared names the registry knows; `arkham init` generates the
-//! workspace stack once as an editable file; `arkham up`/`down`/`logs` drive
+//! workspace stack as generated state; `arkham up`/`down`/`logs` drive
 //! the layered compose project; `arkham agent` runs that whole sequence
 //! in one go.
 

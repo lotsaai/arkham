@@ -1,5 +1,5 @@
 //! `arkham init` plus the stack commands (`up`, `down`, `logs`):
-//! generate-once-then-edit, then drive the compose project and enter the agent.
+//! regenerate when the render changes, then drive compose and enter the agent.
 
 use std::collections::{BTreeMap, hash_map::DefaultHasher};
 use std::ffi::OsString;
@@ -13,10 +13,10 @@ use tokio::process::Command;
 use crate::error::Error;
 use crate::expose::prune_workspace;
 use crate::paths::{expand, translate};
-use crate::stack::{STACK_SHAPE, current_uid, generate_stack, stack_shape_in};
+use crate::stack::{current_uid, generate_stack};
 use crate::workspace::Workspace;
 use arkham_config::cli::{Cli, CliCommand, ProxyBackend};
-use arkham_config::config::{AppConfig, RuleCfg, WorkspaceBuild, config_dir, project_config_write_path};
+use arkham_config::config::{AppConfig, RuleCfg, WorkspaceBuild, config_dir};
 use arkham_pki::ca::load_or_generate;
 use clap::Args;
 use dirs::home_dir;
@@ -323,71 +323,6 @@ pub(crate) fn rules_warning(rules: &BTreeMap<String, RuleCfg>, derivable: &[Stri
   )
 }
 
-/// Digest of both config layers' bytes — global and workspace — plus the
-/// `rules.d` override trees both sides, so a stack generated from different
-/// settings can be told apart from a current one: generation reads all of
-/// them, so editing any must regenerate. `DefaultHasher`
-/// is enough: this only ever compares digests written by the same binary.
-pub(crate) fn config_digest(root: &Path) -> u64 {
-  use std::hash::{Hash as _, Hasher as _};
-  fn hash_file(path: &Path, hasher: &mut std::collections::hash_map::DefaultHasher) {
-    match std::fs::read(path) {
-      Ok(bytes) => bytes.hash(hasher),
-      Err(_) => "absent".hash(hasher),
-    }
-    path.hash(hasher);
-  }
-  fn hash_rules_dir(dir: &Path, hasher: &mut std::collections::hash_map::DefaultHasher) {
-    let mut files = std::fs::read_dir(dir)
-      .ok()
-      .map(|entries| {
-        entries
-          .flatten()
-          .map(|entry| entry.path())
-          .filter(|path| path.is_file())
-          .collect::<Vec<_>>()
-      })
-      .unwrap_or_default();
-    files.sort();
-    if files.is_empty() {
-      "absent".hash(hasher);
-      dir.hash(hasher);
-      return;
-    }
-    for path in files {
-      hash_file(&path, hasher);
-    }
-  }
-  let mut hasher = std::collections::hash_map::DefaultHasher::new();
-  let global = arkham_config::config::config_dir().map(|dir| dir.join("config.toml"));
-  let legacy = root.join(".config").join("arkham.toml");
-  for path in global.into_iter().chain([project_config_write_path(root), legacy]) {
-    hash_file(&path, &mut hasher);
-  }
-  if let Some(global_rules) = arkham_config::config::rules_dir() {
-    hash_rules_dir(&global_rules, &mut hasher);
-  }
-  hash_rules_dir(&arkham_config::config::project_rules_dir(root), &mut hasher);
-  hasher.finish()
-}
-
-/// Whether the stack on disk was generated from a different workspace config
-/// — which matters because the decoys are derived from the rules: a stack made
-/// before a rule existed hands the agent a decoy that can never be swapped —
-/// or by an older stack shape, which matters because `arkham agent` bundles
-/// generation and must not leave an old wiring behind. A stack with no digest
-/// beside it predates the check and counts as stale.
-pub(crate) fn stack_is_stale(state_ws: &Path, root: &Path) -> bool {
-  let shape_stale = std::fs::read_to_string(state_ws.join("compose.yml")).is_ok_and(|body| stack_shape_in(&body) != Some(STACK_SHAPE));
-  if shape_stale {
-    return true;
-  }
-  match std::fs::read_to_string(state_ws.join("config.digest")) {
-    Ok(stored) => stored.trim() != config_digest(root).to_string(),
-    Err(_) => true,
-  }
-}
-
 /// The capture backend the stack on disk was generated with, when it can be
 /// read back — a regeneration must not silently switch how traffic is
 /// captured just because this run did not name a backend.
@@ -401,9 +336,8 @@ pub(crate) fn generated_backend(compose: &str) -> Option<ProxyBackend> {
   .find_map(|(name, backend)| compose.contains(&format!("\"--proxy-backend\", \"{name}\"")).then_some(backend))
 }
 
-/// Generate the workspace stack when it is absent, and regenerate it when the
-/// workspace config changed since it was generated; a stack whose config is
-/// unchanged is left alone, so hand edits survive until then.
+/// Generate the workspace stack when it is absent, and rewrite it when the
+/// rendered file would differ. An identical render is left untouched.
 pub(crate) async fn init_workspace(
   workspace: &Workspace,
   backend: ProxyBackend,
@@ -435,47 +369,46 @@ pub(crate) async fn init_workspace(
     println!("wrote {}", workspace.root().join("mise.agent.toml").display());
   }
   let existing = tokio::fs::read_to_string(&ws_compose).await.ok();
-  if existing.is_some() {
-    if !stack_is_stale(&state_ws, workspace.root()) {
-      println!("exists, left untouched: {}", ws_compose.display());
-      return Ok(());
-    }
-    println!(
-      "regenerating {}: the workspace config or the stack shape changed since it was generated, so hand edits to it are replaced",
-      ws_compose.display()
-    );
-  }
   // An unnamed backend keeps whatever the stack on disk already runs.
-  let backend = match (explicit_backend, existing.as_deref().and_then(generated_backend)) {
-    (false, Some(existing)) => existing,
-    _ => backend,
+  let backend = if explicit_backend {
+    backend
+  } else {
+    existing.as_deref().and_then(generated_backend).unwrap_or(backend)
   };
   let stack = generate_stack(workspace.root(), backend, arkham_version).await?;
-  tokio::fs::write(&ws_compose, stack).await.map_err(|source| Error::WriteFile {
+  if existing.as_deref() == Some(stack.as_str()) {
+    println!("exists, left untouched: {}", ws_compose.display());
+    return Ok(());
+  }
+  tokio::fs::write(&ws_compose, &stack).await.map_err(|source| Error::WriteFile {
     path: ws_compose.clone(),
     source,
   })?;
-  tokio::fs::write(state_ws.join("config.digest"), config_digest(workspace.root()).to_string())
-    .await
-    .map_err(|source| Error::WriteFile {
-      path: state_ws.join("config.digest"),
-      source,
-    })?;
-  println!("generated: {}", ws_compose.display());
+  if existing.is_some() {
+    println!("regenerated: {}", ws_compose.display());
+  } else {
+    println!("generated: {}", ws_compose.display());
+  }
   Ok(())
 }
 
-/// The compose files on disk, in layer order.
+/// The compose files on disk, in layer order: global `compose.yaml` or
+/// `compose.yml`, the generated stack, then the workspace override.
 fn compose_layers(workspace: &Workspace) -> Vec<PathBuf> {
-  [
-    config_dir().map(|dir| dir.join("compose.yml")),
-    Some(workspace.state_dir().join("compose.yml")),
-    Some(workspace.file()),
-  ]
-  .into_iter()
-  .flatten()
-  .filter(|path| path.is_file())
-  .collect()
+  let global = config_dir().and_then(|dir| {
+    let yaml = dir.join("compose.yaml");
+    if yaml.is_file() {
+      Some(yaml)
+    } else {
+      let dotted = dir.join("compose.yml");
+      dotted.is_file().then_some(dotted)
+    }
+  });
+  [global, Some(workspace.state_dir().join("compose.yml")), Some(workspace.file())]
+    .into_iter()
+    .flatten()
+    .filter(|path| path.is_file())
+    .collect()
 }
 
 /// A `docker compose` command over those layers.
@@ -781,10 +714,10 @@ pub struct AgentArgs {
 /// `arkham init [--backend <backend>] [workspace]`: write the support files, a
 /// stub workspace config when the workspace has none (rules derive at serve
 /// time, so the file holds overrides and `[workspace]` keys only), and the
-/// workspace stack into `<state-dir>/arkham/ws/<slug>/compose.yml` — the one
-/// editable file where generated services and secret mounts live. An existing
-/// stack is regenerated only when the workspace config changed since it was
-/// generated.
+/// workspace stack into `<state-dir>/arkham/ws/<slug>/compose.yml`. That file
+/// is generated state. Overrides live in `~/.config/arkham/compose.yaml` or
+/// `<workspace>/.config/arkham/compose.yaml`. An existing stack is rewritten
+/// when the rendered file would change and left untouched when it matches.
 impl CliCommand for InitArgs {
   type Error = Error;
   /// Runs the init generation.
@@ -911,6 +844,56 @@ impl CliCommand for LogsArgs {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::mounts::*;
+  use crate::stack::*;
+  use crate::test_support::*;
+  use crate::workspace::*;
+
+  /// Global `compose.yaml` beats `compose.yml`, then the generated file, then the workspace override.
+  #[test]
+  fn compose_layers_read_global_yaml_or_yml_then_generated_then_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let xdg = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let previous_config = std::env::var_os("XDG_CONFIG_HOME");
+    let previous_state = std::env::var_os("XDG_STATE_HOME");
+    set_env("XDG_CONFIG_HOME", xdg.path());
+    set_env("XDG_STATE_HOME", state.path());
+    let workspace = Workspace::new(root.path());
+    let global = xdg.path().join("arkham");
+    std::fs::create_dir_all(&global).unwrap();
+    let global_yaml = global.join("compose.yaml");
+    let global_short = global.join("compose.yml");
+    std::fs::write(&global_short, "global: yml\n").unwrap();
+    let generated = workspace.state_dir().join("compose.yml");
+    std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+    std::fs::write(&generated, "generated: true\n").unwrap();
+    let unified = root.path().join(".config").join("arkham");
+    std::fs::create_dir_all(&unified).unwrap();
+    let workspace_yaml = unified.join("compose.yaml");
+    std::fs::write(&workspace_yaml, "workspace: yaml\n").unwrap();
+
+    assert_eq!(
+      compose_layers(&workspace),
+      vec![global_short.clone(), generated.clone(), workspace_yaml.clone()]
+    );
+
+    std::fs::write(&global_yaml, "global: yaml\n").unwrap();
+    assert_eq!(
+      compose_layers(&workspace),
+      vec![global_yaml, generated.clone(), workspace_yaml.clone()],
+      "a global compose.yaml hides compose.yml"
+    );
+
+    match previous_config {
+      Some(value) => set_env("XDG_CONFIG_HOME", value),
+      None => unset_env("XDG_CONFIG_HOME"),
+    }
+    match previous_state {
+      Some(value) => set_env("XDG_STATE_HOME", value),
+      None => unset_env("XDG_STATE_HOME"),
+    }
+  }
 
   #[test]
   fn up_argv_adds_build_only_when_asked() {
@@ -941,18 +924,6 @@ mod tests {
       "same tree is stable"
     );
   }
-}
-
-#[cfg(test)]
-mod moved_suite {
-
-  use crate::confine::*;
-
-  use crate::mounts::*;
-
-  use crate::stack::*;
-  use crate::test_support::*;
-  use crate::workspace::*;
 
   #[test]
   fn the_example_workspace_loads_and_inherits_registry_hosts() {
@@ -1081,7 +1052,6 @@ mod moved_suite {
 
   #[test]
   fn support_files_are_written_when_absent_and_stale_entrypoints_regenerate() {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
     let entrypoint = dir.path().join("agent-entrypoint.sh");
     let storage = dir.path().join("state").join("containers");
@@ -1192,128 +1162,146 @@ mod moved_suite {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "[rules.x]\n");
   }
 
-  /// Regeneration keys off the workspace config: a stack generated before a
-  /// rule existed holds decoys that can never be swapped, and a stack with no
-  /// digest beside it predates the check.
-  #[test]
-  fn the_stack_is_stale_until_its_digest_matches_the_workspace_config() {
-    let root = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
-    let config = root.path().join(".config");
-    std::fs::create_dir_all(config.join("arkham")).unwrap();
-
-    assert!(
-      stack_is_stale(state.path(), root.path()),
-      "no digest means the stack predates the check"
-    );
-    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
-    assert!(!stack_is_stale(state.path(), root.path()), "an untouched config keeps the stack");
-
-    std::fs::write(config.join("arkham").join("config.toml"), "[rules.x]\nenv = \"X\"\n").unwrap();
-    assert!(
-      stack_is_stale(state.path(), root.path()),
-      "a config that appeared after generation is a change"
-    );
-    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
-    assert!(!stack_is_stale(state.path(), root.path()));
+  /// Pin cwd, XDG, and fnox discovery so host config cannot leak into generation.
+  struct GenerationPin {
+    _env: AmbientEnv,
+    previous_cwd: std::path::PathBuf,
+    previous_state: Option<std::ffi::OsString>,
   }
 
-  /// Generation reads the `rules.d` override trees on both layers, so an
-  /// edit there changes the derived decoys and must regenerate the stack.
-  #[test]
-  fn the_stack_is_stale_when_the_rules_overrides_change() {
-    let root = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
-    let global = tempfile::tempdir().unwrap();
-    set_env("XDG_CONFIG_HOME", global.path());
-    let global_rules = global.path().join("arkham").join("rules.d");
-    let project_rules = root.path().join(".config").join("arkham").join("rules.d");
-
-    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
-    assert!(!stack_is_stale(state.path(), root.path()), "absent rules trees are stable");
-
-    std::fs::create_dir_all(&project_rules).unwrap();
-    std::fs::write(
-      project_rules.join("10-late.toml"),
-      "[names.LATE_TOKEN]\nhosts = [\"https://late.example\"]\n",
-    )
-    .unwrap();
-    assert!(
-      stack_is_stale(state.path(), root.path()),
-      "a project rules.d file that appeared after generation is a change"
-    );
-    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
-    assert!(!stack_is_stale(state.path(), root.path()));
-
-    std::fs::create_dir_all(&global_rules).unwrap();
-    std::fs::write(
-      global_rules.join("10-glob.toml"),
-      "[names.GLOB_TOKEN]\nhosts = [\"https://glob.example\"]\n",
-    )
-    .unwrap();
-    assert!(
-      stack_is_stale(state.path(), root.path()),
-      "a global rules.d file that appeared after generation is a change"
-    );
-    unset_env("XDG_CONFIG_HOME");
+  impl GenerationPin {
+    fn enter(root: &std::path::Path, home: &std::path::Path, xdg: &std::path::Path, state: &std::path::Path) -> Self {
+      let previous_state = std::env::var_os("XDG_STATE_HOME");
+      let env = AmbientEnv::isolate(home, xdg);
+      unset_env("FNOX_CONFIG_DIR");
+      unset_env("FNOX_PROFILE");
+      set_env("XDG_STATE_HOME", state);
+      let previous_cwd = std::env::current_dir().unwrap();
+      std::env::set_current_dir(root).unwrap();
+      Self {
+        _env: env,
+        previous_cwd,
+        previous_state,
+      }
+    }
   }
 
-  /// Generation reads the global layer too, so an edit there — where `[workspace]`
-  /// settings like `init` live — must regenerate the stack, not just workspace edits.
-  #[test]
-  fn the_stack_is_stale_when_the_global_config_changes() {
-    let root = tempfile::tempdir().unwrap();
-    let state = tempfile::tempdir().unwrap();
-    let global = tempfile::tempdir().unwrap();
-    set_env("XDG_CONFIG_HOME", global.path());
-    let arkham_dir = global.path().join("arkham");
-    std::fs::create_dir_all(&arkham_dir).unwrap();
-
-    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
-    assert!(!stack_is_stale(state.path(), root.path()), "absent global layer is stable");
-
-    std::fs::write(arkham_dir.join("config.toml"), "[workspace]\ninit = \"/init\"\n").unwrap();
-    assert!(
-      stack_is_stale(state.path(), root.path()),
-      "a global config that appeared after generation is a change"
-    );
-    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
-    assert!(!stack_is_stale(state.path(), root.path()));
-
-    std::fs::write(arkham_dir.join("config.toml"), "[workspace]\ninit = \"/init2\"\n").unwrap();
-    assert!(stack_is_stale(state.path(), root.path()), "a global config edit is a change");
-    unset_env("XDG_CONFIG_HOME");
+  impl Drop for GenerationPin {
+    fn drop(&mut self) {
+      std::env::set_current_dir(&self.previous_cwd).unwrap();
+      match self.previous_state.take() {
+        Some(value) => set_env("XDG_STATE_HOME", value),
+        None => unset_env("XDG_STATE_HOME"),
+      }
+    }
   }
 
-  /// A digest that matches can only be made stale by the shape: an older
-  /// shape — or none at all, which is every stack generated before the
-  /// marker existed — regenerates, so the bundled `arkham agent` cannot leave
-  /// an old wiring behind.
-  #[test]
-  fn a_stack_of_an_older_shape_is_stale() {
-    assert_eq!(stack_shape_in("# stack shape: 2\nservices:\n"), Some(2));
-    assert_eq!(stack_shape_in("services:\n"), None, "a pre-marker stack carries no shape");
-    assert_eq!(stack_shape_in("# stack shape: nope\n"), None);
+  fn compose_path(root: &std::path::Path) -> std::path::PathBuf {
+    Workspace::new(root).state_dir().join("compose.yml")
+  }
 
+  fn write_workspace_config(root: &std::path::Path, body: &str) {
+    let path = root.join(".config").join("arkham").join("config.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+  }
+
+  /// Same rendered bytes leave the file's content and mtime alone, and no digest is written.
+  #[tokio::test]
+  async fn init_workspace_leaves_an_identical_compose_file_untouched() {
     let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let xdg = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
-    std::fs::write(state.path().join("config.digest"), config_digest(root.path()).to_string()).unwrap();
+    let _pin = GenerationPin::enter(root.path(), home.path(), xdg.path(), state.path());
+    write_workspace_config(root.path(), "[workspace]\nname = \"kept\"\n");
+    let workspace = Workspace::new(root.path());
+    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-a").await.unwrap();
+    let compose = compose_path(root.path());
+    let body = std::fs::read_to_string(&compose).unwrap();
+    let file = std::fs::File::options().write(true).open(&compose).unwrap();
+    let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    file.set_modified(stamp).unwrap();
+    drop(file);
+    let config = root.path().join(".config").join("arkham").join("config.toml");
+    std::fs::write(&config, "[workspace]\nname = \"kept\"\n# comment only\n").unwrap();
+    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-a").await.unwrap();
+    assert_eq!(std::fs::read_to_string(&compose).unwrap(), body);
+    assert_eq!(std::fs::metadata(&compose).unwrap().modified().unwrap(), stamp);
+    assert!(!workspace.state_dir().join("config.digest").exists());
+  }
 
+  /// A render change rewrites the file. An unnamed backend stays the one already rendered.
+  #[tokio::test]
+  async fn init_workspace_rewrites_compose_when_the_render_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let xdg = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let _pin = GenerationPin::enter(root.path(), home.path(), xdg.path(), state.path());
     std::fs::write(
-      state.path().join("compose.yml"),
-      format!("# stack shape: {STACK_SHAPE}\nname: arkham\n"),
+      root.path().join("fnox.toml"),
+      "[secrets.GITHUB_TOKEN]\ndefault = \"not-the-decoy\"\n",
     )
     .unwrap();
-    assert!(
-      !stack_is_stale(state.path(), root.path()),
-      "current shape and matching digest keep the stack"
+    std::fs::write(root.path().join("notes.txt"), "plain\n").unwrap();
+    write_workspace_config(root.path(), "[workspace]\nname = \"kept\"\n");
+    let workspace = Workspace::new(root.path());
+    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-a").await.unwrap();
+    let compose = compose_path(root.path());
+    let first = std::fs::read_to_string(&compose).unwrap();
+    assert!(first.contains("ghcr.io/lotsaai/arkham:0.0.0-a"), "{first}");
+    assert!(first.contains("\"--proxy-backend\", \"tun\""), "{first}");
+    assert!(first.contains("name: kept"), "{first}");
+    assert!(first.contains("GITHUB_TOKEN:"), "{first}");
+    assert!(!first.contains("ghp_named_"), "{first}");
+    assert!(!workspace.state_dir().join("config.digest").exists());
+
+    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-b").await.unwrap();
+    let versioned = std::fs::read_to_string(&compose).unwrap();
+    assert_ne!(versioned, first);
+    assert!(versioned.contains("ghcr.io/lotsaai/arkham:0.0.0-b"), "{versioned}");
+    assert!(versioned.contains("\"--proxy-backend\", \"tun\""), "{versioned}");
+
+    write_workspace_config(root.path(), "[workspace]\nname = \"renamed\"\n");
+    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-b").await.unwrap();
+    let renamed = std::fs::read_to_string(&compose).unwrap();
+    assert!(renamed.contains("name: renamed"), "{renamed}");
+    assert!(!renamed.contains("name: kept"), "{renamed}");
+
+    let rules = root.path().join(".config").join("arkham").join("rules.d");
+    std::fs::create_dir_all(&rules).unwrap();
+    std::fs::write(
+      rules.join("10-github.toml"),
+      "[names.GITHUB_TOKEN]\npattern = \"ghp_named_{hex:32}\"\n",
+    )
+    .unwrap();
+    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-b").await.unwrap();
+    let patterned = std::fs::read_to_string(&compose).unwrap();
+    assert!(patterned.contains("ghp_named_"), "{patterned}");
+
+    write_workspace_config(
+      root.path(),
+      "[workspace]\nname = \"renamed\"\n\n[[workspace.file_rewrite]]\nsource = \"notes.txt\"\ndest = \"/opt/rewritten.txt\"\n",
     );
+    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-b").await.unwrap();
+    let rewritten = std::fs::read_to_string(&compose).unwrap();
+    assert!(rewritten.contains("/opt/rewritten.txt"), "{rewritten}");
 
-    std::fs::write(state.path().join("compose.yml"), "# stack shape: 1\nname: arkham\n").unwrap();
-    assert!(stack_is_stale(state.path(), root.path()), "an older shape regenerates");
+    init_workspace(&workspace, ProxyBackend::Ebpf, true, "0.0.0-b").await.unwrap();
+    let ebpf = std::fs::read_to_string(&compose).unwrap();
+    assert!(ebpf.contains("\"--proxy-backend\", \"ebpf\""), "{ebpf}");
+    assert!(!ebpf.contains("\"--proxy-backend\", \"tun\""), "{ebpf}");
 
-    std::fs::write(state.path().join("compose.yml"), "name: arkham\n").unwrap();
-    assert!(stack_is_stale(state.path(), root.path()), "a pre-marker stack regenerates");
+    write_workspace_config(
+      root.path(),
+      "[workspace]\nname = \"renamed\"\ninit = \"/bin/from-config\"\n\n[[workspace.file_rewrite]]\nsource = \"notes.txt\"\ndest = \"/opt/rewritten.txt\"\n",
+    );
+    init_workspace(&workspace, ProxyBackend::Tproxy, false, "0.0.0-b").await.unwrap();
+    let preserved = std::fs::read_to_string(&compose).unwrap();
+    assert!(preserved.contains("ARKHAM_INIT: \"/bin/from-config\""), "{preserved}");
+    assert!(preserved.contains("\"--proxy-backend\", \"ebpf\""), "{preserved}");
+    assert!(!preserved.contains("\"--proxy-backend\", \"tproxy\""), "{preserved}");
   }
 
   /// A regeneration must not switch how traffic is captured: the backend is

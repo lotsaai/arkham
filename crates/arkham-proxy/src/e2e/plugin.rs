@@ -1,4 +1,4 @@
-use super::*;
+use super::fixture::*;
 
 /// Hook that votes `Close` on every call.
 struct CloseHook;

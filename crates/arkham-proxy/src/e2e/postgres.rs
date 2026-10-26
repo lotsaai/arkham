@@ -1,4 +1,4 @@
-use super::*;
+use super::fixture::*;
 
 use std::pin::Pin;
 use std::task::{Context, Poll};

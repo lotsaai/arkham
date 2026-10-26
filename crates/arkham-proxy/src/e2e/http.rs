@@ -1,4 +1,4 @@
-use super::*;
+use super::fixture::*;
 
 #[test]
 fn parse_authority_bracketed_v6_default_port() {

@@ -1,4 +1,4 @@
-use super::*;
+use super::fixture::*;
 
 fn localhost_tcp_grant(port: u16, fake: &str, value: &str) -> Vec<Grant> {
   vec![Grant::Token {

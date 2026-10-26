@@ -276,10 +276,8 @@ impl Layout {
 }
 
 #[cfg(test)]
-mod moved_suite {
-
-  use crate::mounts::*;
-
+mod tests {
+  use super::*;
   use crate::test_support::*;
 
   #[test]

@@ -25,8 +25,8 @@ use rasn_ldap::{
 use secrecy::ExposeSecret as _;
 
 use crate::transports::engine::{
-  CredentialPair, Direction, Hit, LocalUpgrade, Location, PeerFact, Raw, Rewritten, UpgradeNote, Wire, find_new_match,
-  needle_prefix_suffix_len, replace_bytes,
+  CredentialPair, Direction, Hit, LocalUpgrade, Location, PeerFact, Raw, Rewritten, UpgradeNote, Wire, find_new_match, replace_bytes,
+  scan_close_hold,
 };
 
 /// `StartTLS` extended operation OID (RFC 4511).
@@ -833,20 +833,7 @@ impl Ldap {
       out.extend_from_slice(data);
       return Ok(());
     }
-    let mut combined = std::mem::take(&mut self.held);
-    combined.extend_from_slice(data);
-    if find_new_match(&combined, &up.pair.needle, 0) {
-      return Err(());
-    }
-    let tail = up.pair.needle.len().saturating_sub(1);
-    let hold = needle_prefix_suffix_len(&combined, std::slice::from_ref(&up.pair), tail);
-    let emit = combined.len().saturating_sub(hold);
-    let Some(head) = combined.get(..emit) else {
-      return Err(());
-    };
-    out.extend_from_slice(head);
-    self.held = combined.split_off(emit);
-    Ok(())
+    scan_close_hold(&mut self.held, data, out, std::slice::from_ref(&up.pair))
   }
 }
 

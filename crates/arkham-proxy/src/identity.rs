@@ -21,8 +21,8 @@ use crate::Error;
 use crate::ProxyState;
 use crate::transports::ServeStream;
 use crate::transports::Transport;
-use crate::transports::http::MAX_HEAD;
-use crate::transports::tcp::splice;
+use crate::transports::http::transport::MAX_HEAD;
+use crate::transports::tcp::transport::splice;
 
 /// Hard cap for a single `ClientHello` (RFC 8446 §5.1: a record payload is at
 /// most 2^14 bytes, plus the 5-byte record header).

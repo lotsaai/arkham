@@ -4,10 +4,10 @@
 
 use std::path::PathBuf;
 
-use secrecy::{ExposeSecret as _, SecretString};
+use secrecy::SecretString;
 use url::Url;
 
-use super::{Credential, Grant, GuestTlsMode, RootCert, Scheme};
+use super::{Grant, GuestTlsMode, RootCert, Scheme, apply_guest_tls, downstream_covers, map_tls_row, password_credential, stated_fake};
 use crate::config::RuleCfg;
 use crate::error::Error;
 
@@ -213,7 +213,7 @@ impl RedisScope {
 
   /// Grant-level match for a concrete request: scheme + port + host.
   pub(super) fn matches(scope: &Self, scheme: Scheme, host: &str, port: u16) -> bool {
-    matches!(scheme, Scheme::Redis | Scheme::Rediss) && port == scope.downstream.port && scope.downstream.host.eq_ignore_ascii_case(host)
+    matches!(scheme, Scheme::Redis | Scheme::Rediss) && downstream_covers(&scope.downstream.host, scope.downstream.port, Some(host), port)
   }
 }
 
@@ -225,40 +225,19 @@ impl RedisScope {
 /// Returns an error when either string fails the redis law above, or when a
 /// `tls` row tries to state what only the real string may state.
 pub(super) fn grant(label: &str, rule: &RuleCfg, real: &str) -> Result<Grant, Error> {
-  let fake = rule
-    .value
-    .as_ref()
-    .map(|value| value.expose_secret().to_string())
-    .unwrap_or_default();
-  let mut scope = RedisScope::from_strings(&fake, real).map_err(|err| Error::RedisScope {
+  let mut scope = RedisScope::from_strings(&stated_fake(rule), real).map_err(|err| Error::RedisScope {
     label: label.to_string(),
     detail: err,
   })?;
-  // The rule table states the guest leg only; the upstream identity and
-  // trust live in the real string's query.
-  for (key, tls) in &rule.tls {
-    if key != &rule.env {
-      return Err(Error::TlsEnvMismatch {
-        label: label.to_string(),
-        key: key.clone(),
-        env: rule.env.clone(),
-      });
-    }
-    if tls.client_cert.is_some() || tls.client_key.is_some() {
-      return Err(Error::RedisIdentity { label: label.to_string() });
-    }
-    if tls.root_cert.is_some() {
-      return Err(Error::RedisTrust { label: label.to_string() });
-    }
-    scope.guest_tls = tls.guest_tls_mode;
-  }
-  // The wire needles are the credentials: fake password in, real
-  // password out; the legs' users swap when they differ.
-  let credential = Credential {
-    label: label.to_string(),
-    fake: scope.downstream.password.expose_secret().to_string(),
-    value: scope.upstream.password.clone(),
-  };
+  scope.guest_tls = apply_guest_tls(rule).map_err(|row| {
+    map_tls_row(
+      label,
+      row,
+      Error::RedisIdentity { label: label.to_string() },
+      Error::RedisTrust { label: label.to_string() },
+    )
+  })?;
+  let credential = password_credential(label, &scope.downstream.password, scope.upstream.password.clone());
   Ok(Grant::Redis {
     credential,
     scope: Box::new(scope),

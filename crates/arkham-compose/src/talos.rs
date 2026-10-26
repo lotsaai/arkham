@@ -13,17 +13,17 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use arkham_config::config::{HostTlsCfg, RewriteFormat};
+use arkham_config::config::RewriteFormat;
 use arkham_config::context::{AmbientProtocol, ContextRef, Presented, identities, require_distinct};
-use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
+use arkham_config::grants::{EndpointScope, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value, from_str};
 
-use crate::adapt::{GRANTS_STATE_DIR, GrantFragment, RewriteAdapted, decode, render_decoy, render_fragment};
+use crate::adapt::{GrantFragment, RewriteAdapted, decode, materialize_client_tls, render_decoy, render_fragment};
 use crate::error::Error;
 
 /// Why one context did not become a grant. The active context turns a skip
@@ -380,22 +380,7 @@ fn client_key_pem(raw: &[u8]) -> Vec<u8> {
 fn one_grant(source: &Path, item: &Prepared, id: &arkham_config::context::ContextIdentity, decoy: &str) -> Result<RewriteAdapted, Error> {
   let label = &id.label;
   let value = String::from_utf8_lossy(&item.crt).into_owned();
-  let cert_name = format!("{label}.client.crt");
-  let key_name = format!("{label}.client.key");
-  let ca_name = format!("{label}.ca.crt");
-  let materialized = vec![
-    (cert_name.clone(), item.crt.clone()),
-    (key_name.clone(), client_key_pem(&item.key)),
-    (ca_name.clone(), item.ca.clone()),
-  ];
-  let tls = HostTlsCfg {
-    client_cert: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{cert_name}"))),
-    client_key: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{key_name}"))),
-    root_cert: Some(PathBuf::from(format!("{GRANTS_STATE_DIR}/rules.d/{ca_name}"))),
-    guest_tls_mode: GuestTlsMode::Mtls,
-    guest_cert: None,
-    guest_key: None,
-  };
+  let (tls, materialized) = materialize_client_tls(label, Some((item.crt.clone(), client_key_pem(&item.key))), Some(item.ca.clone()));
   let allows = item.allows.iter().map(|allow| allow.entry.clone()).collect::<Vec<_>>();
   let fragment = render_fragment(
     source,
@@ -423,6 +408,16 @@ fn one_grant(source: &Path, item: &Prepared, id: &arkham_config::context::Contex
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::adapt::GRANTS_STATE_DIR;
+  use crate::decoys::*;
+  use crate::expand::*;
+  use crate::rewrites::*;
+  use crate::test_support::AmbientEnv;
+  use arkham_config::config::FileRewrite;
+  use rustls::pki_types::pem::PemObject as _;
+  use std::collections::HashMap;
+  use std::fmt::Write as _;
+  use tempfile::tempdir;
 
   const SOURCE: &str = "/home/ivan/.talos/config";
 
@@ -478,8 +473,6 @@ mod tests {
 
   #[test]
   fn talos_ed25519_client_key_loads_as_pkcs8() {
-    use rustls::pki_types::pem::PemObject as _;
-
     let key_pem = ed25519_private_key_pem();
     let body = format!(
       "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n",
@@ -748,34 +741,14 @@ mod tests {
 
   impl tracing::field::Visit for WarnVisit<'_> {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-      use std::fmt::Write as _;
       let _ = write!(self.0, "{}={value:?};", field.name());
     }
   }
-}
-
-#[cfg(test)]
-mod moved_suite {
-
-  use std::fs;
-
-  use arkham_config::config::{FileRewrite, RewriteFormat};
-  use tempfile::tempdir;
-
-  use crate::decoys::*;
-  use crate::expand::*;
-
-  use crate::rewrites::*;
 
   /// Talosconfig sources adapt with no `envs`, stated or sniffed, and an
   /// `envs` statement is rejected either way. The decoy mounts writable.
   #[test]
   fn talos_rewrites_adapt_stated_or_sniffed() {
-    use std::collections::HashMap;
-
-    use arkham_pki::ca::CertAuthority;
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
     let talos_doc = format!(
       "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n",
       STANDARD.encode(b"CA"),
@@ -783,9 +756,11 @@ mod moved_suite {
       STANDARD.encode(b"KEY"),
     );
     let dir = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(home.path(), xdg.path());
     let source = dir.path().join("talosconfig");
     fs::write(&source, talos_doc).unwrap();
-    let ca = CertAuthority::generate().unwrap();
     let expander = build_expander(HashMap::new());
     let files = dir.path().join("files");
     let guests = dir.path().join("guests");
@@ -804,7 +779,6 @@ mod moved_suite {
         expander: &expander,
         home: "/home/eng",
         host_home: None,
-        kube_ca: Some(&ca),
         guests_dir: &guests,
       })
       .unwrap();
@@ -836,7 +810,6 @@ mod moved_suite {
       expander: &expander,
       home: "/home/eng",
       host_home: None,
-      kube_ca: Some(&ca),
       guests_dir: &guests,
     })
     .unwrap_err()

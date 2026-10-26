@@ -9,7 +9,7 @@ use base64::Engine as _;
 
 use futures::StreamExt;
 
-use super::*;
+use super::fixture::*;
 use crate::transports::nats::fixtures::{mint_user, nats_grants};
 
 const FAKE: &str = "arkham_fake_nats_pass"; // betterleaks:allow
@@ -490,7 +490,7 @@ async fn nats_mtls_plaintext_guest_swaps_the_password() {
   let root = stub.bundle.display().to_string();
   let fake = format!("nats://agent:{FAKE}@localhost:{port}");
   let real = format!("tls://agent:{VALUE}@localhost:{port}?sslrootcert={root}");
-  let grants = super::resolve_mtls_grants("NATS_URL", &fake, &real).expect("nats mtls on a cleartext fake still loads");
+  let grants = resolve_mtls_grants("NATS_URL", &fake, &real).expect("nats mtls on a cleartext fake still loads");
   let scope = grants.first().and_then(|grant| grant.nats(None, port)).expect("scope");
   assert_eq!(scope.guest_tls, arkham_config::grants::GuestTlsMode::Mtls);
   assert!(matches!(scope.upstream_tls, arkham_config::grants::NatsUpstream::Tls { .. }));
