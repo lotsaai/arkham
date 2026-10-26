@@ -1,6 +1,6 @@
 [package]
 name = "arkham-tun"
-version = "0.3.33"
+version = "0.3.34"
 edition = "2024"
 description = "grant-scoped MITM proxy: userspace TUN capture backend"
 license = "Apache-2.0"

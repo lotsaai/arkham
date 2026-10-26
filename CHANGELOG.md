@@ -1,3 +1,8 @@
+## [0.3.34] - 2026-10-26
+
+### 🚜 Refactor
+
+- *(compose)* Compare rendered stacks and share grant and transport helpers (#138)
 ## [0.3.33] - 2026-10-25
 
 ### 🐛 Bug Fixes
@@ -7,6 +12,11 @@
 ### 🚜 Refactor
 
 - *(proxy)* Share one TLS cache and handshake timeout (#136)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.33 [ci skip]
+- Release
 ## [0.3.32] - 2026-10-23
 
 ### 🚜 Refactor
