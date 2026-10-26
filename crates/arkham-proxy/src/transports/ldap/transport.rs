@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use arkham_config::grants::{Grant, LdapScope, RootCert};
+use arkham_config::grants::{Grant, GuestTlsMode, LdapScope, RootCert};
 
 use super::super::PairCtx;
 use super::super::{FlaggedOpen, ServeStream, TlsCache, TlsHalves, Transport, matched_host, open_flagged};
@@ -48,6 +48,14 @@ impl TlsHalves for LdapTransport {
   fn client_paths<'a>(&self, scope: &'a LdapScope) -> Option<(&'a Path, &'a Path)> {
     Some((scope.client_cert.as_deref()?, scope.client_key.as_deref()?))
   }
+
+  fn guest_tls(&self, scope: &LdapScope) -> GuestTlsMode {
+    scope.guest_tls
+  }
+
+  fn upstream_host<'a>(&self, scope: &'a LdapScope) -> &'a str {
+    scope.upstream.host.as_str()
+  }
 }
 
 impl Transport for LdapTransport {
@@ -61,14 +69,7 @@ impl Transport for LdapTransport {
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
   {
     let budget = Duration::from_secs(params.snapshot.proxy.handshake_timeout_secs);
-    let Some(mut opened) = open_flagged(
-      guest,
-      &params,
-      (scope.downstream.host.as_str(), scope.is_downstream_tls),
-      (scope.upstream.host.as_str(), scope.upstream.port),
-    )
-    .await?
-    else {
+    let Some(mut opened) = open_flagged(guest, &params, scope).await? else {
       return Ok(());
     };
     let server_name = opened.server_name.take();
@@ -115,16 +116,7 @@ impl LdapTransport {
   {
     let scope = pump.scope;
     let hold_starttls = scope.is_upstream_tls;
-    let settled = self
-      .settle(
-        scope,
-        opened,
-        scope.is_upstream_tls,
-        scope.guest_tls,
-        scope.upstream.host.as_str(),
-        None,
-      )
-      .await?;
+    let settled = self.settle(scope, opened, None).await?;
     super::super::relay_settled!(settled, relay, pump.ctx, hold_starttls)
   }
 

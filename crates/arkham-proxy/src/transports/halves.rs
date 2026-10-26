@@ -112,6 +112,12 @@ pub(crate) trait TlsHalves: Send + Sync {
   /// Client certificate and key, present together or not at all.
   fn client_paths<'a>(&self, scope: &'a Self::Scope) -> Option<(&'a Path, &'a Path)>;
 
+  /// How the guest leg treats client certificates.
+  fn guest_tls(&self, scope: &Self::Scope) -> GuestTlsMode;
+
+  /// Host the upstream handshake verifies.
+  fn upstream_host<'a>(&self, scope: &'a Self::Scope) -> &'a str;
+
   /// ALPN offered to the guest. `None` offers nothing.
   fn guest_alpn(&self) -> Option<&'static [u8]> {
     None
@@ -195,8 +201,9 @@ pub(crate) trait TlsHalves: Send + Sync {
 
   /// Settle the four `(guest_tls, upstream_tls)` combinations.
   ///
-  /// `budget` bounds each handshake through [`within`]. `None` does not.
-  /// Postgres passes the negotiated upstream result, not the scope flag.
+  /// `opened.upstream_tls` is the scope flag [`super::open_flagged`] copied,
+  /// or the negotiated result Postgres stored. `budget` bounds each handshake
+  /// through [`within`]. `None` does not. The timeout word is [`Self::tls_label`].
   ///
   /// # Errors
   ///
@@ -205,40 +212,41 @@ pub(crate) trait TlsHalves: Send + Sync {
     &self,
     scope: &Self::Scope,
     opened: FlaggedOpen<G>,
-    upstream_tls: bool,
-    mode: GuestTlsMode,
-    upstream_name: &str,
-    budget: Option<(&'static str, Duration)>,
+    budget: Option<Duration>,
   ) -> Result<Settled<Prefixed<G>, ServerTlsStream<Prefixed<G>>, TcpStream, ClientTlsStream<TcpStream>>, Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
   {
+    let mode = self.guest_tls(scope);
+    let upstream_name = self.upstream_host(scope);
     let FlaggedOpen {
       guest,
       guest_head,
       guest_tls,
       upstream,
+      upstream_tls,
       ..
     } = opened;
+    let protocol = self.tls_label();
     match (guest_tls, upstream_tls) {
       (None, false) => Ok(Settled::Clear {
         guest: Prefixed::new(guest_head, guest),
         server: upstream,
       }),
       (Some((hello, identity)), false) => {
-        let guest = bound(budget, self.accept_guest(&identity, Prefixed::new(hello, guest), mode)).await?;
+        let guest = bound(protocol, budget, self.accept_guest(&identity, Prefixed::new(hello, guest), mode)).await?;
         Ok(Settled::GuestTls { guest, server: upstream })
       }
       (None, true) => {
-        let server = bound(budget, self.connect_server(scope, upstream_name, upstream)).await?;
+        let server = bound(protocol, budget, self.connect_server(scope, upstream_name, upstream)).await?;
         Ok(Settled::ServerTls {
           guest: Prefixed::new(guest_head, guest),
           server,
         })
       }
       (Some((hello, identity)), true) => {
-        let guest = bound(budget, self.accept_guest(&identity, Prefixed::new(hello, guest), mode)).await?;
-        let server = bound(budget, self.connect_server(scope, upstream_name, upstream)).await?;
+        let guest = bound(protocol, budget, self.accept_guest(&identity, Prefixed::new(hello, guest), mode)).await?;
+        let server = bound(protocol, budget, self.connect_server(scope, upstream_name, upstream)).await?;
         Ok(Settled::Both { guest, server })
       }
     }
@@ -258,9 +266,9 @@ pub(crate) async fn within<T>(protocol: &'static str, budget: Duration, step: im
   }
 }
 
-async fn bound<T>(budget: Option<(&'static str, Duration)>, step: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
+async fn bound<T>(protocol: &'static str, budget: Option<Duration>, step: impl Future<Output = Result<T, Error>>) -> Result<T, Error> {
   match budget {
-    Some((protocol, limit)) => within(protocol, limit, step).await,
+    Some(limit) => within(protocol, limit, step).await,
     None => step.await,
   }
 }
@@ -347,6 +355,16 @@ mod tests {
         (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),
         _ => None,
       }
+    }
+
+    fn guest_tls(&self, scope: &Material) -> GuestTlsMode {
+      let _ = scope;
+      GuestTlsMode::Tls
+    }
+
+    fn upstream_host<'a>(&self, scope: &'a Material) -> &'a str {
+      let _ = scope;
+      "shared.example"
     }
   }
 

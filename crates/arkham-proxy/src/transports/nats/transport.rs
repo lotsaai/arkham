@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use arkham_config::grants::{Grant, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, RootCert};
+use arkham_config::grants::{Grant, GuestTlsMode, NatsScope, NatsTlsOrder, NatsTrust, NatsUpstream, RootCert};
 
 use super::super::{ServeStream, TLS_RECORD_HANDSHAKE, TlsCache, TlsHalves, Transport, within};
 use super::machine::Nats;
@@ -32,7 +32,7 @@ impl NatsTransport {
 }
 
 impl TlsHalves for NatsTransport {
-  type Scope = NatsTrust;
+  type Scope = NatsScope;
 
   fn tls(&self) -> &TlsCache {
     &self.tls
@@ -42,13 +42,27 @@ impl TlsHalves for NatsTransport {
     "nats"
   }
 
-  fn root_cert<'a>(&self, scope: &'a NatsTrust) -> Option<&'a RootCert> {
-    Some(&scope.root_cert)
+  fn root_cert<'a>(&self, scope: &'a NatsScope) -> Option<&'a RootCert> {
+    match &scope.upstream_tls {
+      NatsUpstream::Tls { trust, .. } => Some(&trust.root_cert),
+      NatsUpstream::Cleartext => None,
+    }
   }
 
-  fn client_paths<'a>(&self, scope: &'a NatsTrust) -> Option<(&'a Path, &'a Path)> {
-    let identity = scope.identity.as_ref()?;
+  fn client_paths<'a>(&self, scope: &'a NatsScope) -> Option<(&'a Path, &'a Path)> {
+    let NatsUpstream::Tls { trust, .. } = &scope.upstream_tls else {
+      return None;
+    };
+    let identity = trust.identity.as_ref()?;
     Some((identity.cert.as_path(), identity.key.as_path()))
+  }
+
+  fn guest_tls(&self, scope: &NatsScope) -> GuestTlsMode {
+    scope.guest_tls
+  }
+
+  fn upstream_host<'a>(&self, scope: &'a NatsScope) -> &'a str {
+    scope.upstream.host.as_str()
   }
 }
 
@@ -81,8 +95,8 @@ impl Transport for NatsTransport {
     match &scope.upstream_tls {
       NatsUpstream::Tls {
         order: NatsTlsOrder::HandshakeFirst,
-        trust,
-      } => self.handshake_first(guest, initial, trust, &open).await,
+        ..
+      } => self.handshake_first(guest, initial, &open).await,
       NatsUpstream::Tls {
         order: NatsTlsOrder::AfterInfo,
         trust,
@@ -134,11 +148,11 @@ impl NatsTransport {
     let Some(rest) = server_info(&mut tcp, &mut up, &mut down, &mut guest).await? else {
       return Ok(());
     };
-    if let Some(trust) = trust {
+    if trust.is_some() {
       let stream = within(
         "nats",
         open.budget,
-        self.connect_server(trust, &upstream.host, Prefixed::new(rest, tcp)),
+        self.connect_server(open.scope, &upstream.host, Prefixed::new(rest, tcp)),
       )
       .await?;
       let server = ServerLeg {
@@ -161,7 +175,7 @@ impl NatsTransport {
 
   /// `handshake_first`: the guest's hello comes before any NATS byte, and
   /// the server leg settles TLS before INFO.
-  async fn handshake_first<G>(&self, mut guest: G, initial: &[u8], trust: &NatsTrust, open: &Open<'_>) -> Result<(), Error>
+  async fn handshake_first<G>(&self, mut guest: G, initial: &[u8], open: &Open<'_>) -> Result<(), Error>
   where
     G: AsyncRead + AsyncWrite + Unpin,
   {
@@ -170,7 +184,7 @@ impl NatsTransport {
     };
     let upstream = &open.scope.upstream;
     let tcp = dial_marked(&upstream.host, upstream.port, open.fwmark).await?;
-    let mut server = within("nats", open.budget, self.connect_server(trust, &upstream.host, tcp)).await?;
+    let mut server = within("nats", open.budget, self.connect_server(open.scope, &upstream.host, tcp)).await?;
     let mut guest = within(
       "nats",
       open.budget,

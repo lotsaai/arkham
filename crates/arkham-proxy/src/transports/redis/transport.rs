@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use arkham_config::grants::{RedisScope, RootCert};
+use arkham_config::grants::{GuestTlsMode, RedisScope, RootCert};
 
 use super::super::PairCtx;
 use super::super::{ServeStream, TlsCache, TlsHalves, Transport, matched_host, open_flagged};
@@ -43,6 +43,14 @@ impl TlsHalves for RedisTransport {
   fn client_paths<'a>(&self, scope: &'a RedisScope) -> Option<(&'a Path, &'a Path)> {
     Some((scope.client_cert.as_deref()?, scope.client_key.as_deref()?))
   }
+
+  fn guest_tls(&self, scope: &RedisScope) -> GuestTlsMode {
+    scope.guest_tls
+  }
+
+  fn upstream_host<'a>(&self, scope: &'a RedisScope) -> &'a str {
+    scope.upstream.host.as_str()
+  }
 }
 
 impl Transport for RedisTransport {
@@ -56,28 +64,12 @@ impl Transport for RedisTransport {
     G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
   {
     // The real string states the far end: the dial follows its host and port.
-    let Some(mut opened) = open_flagged(
-      guest,
-      &params,
-      (scope.downstream.host.as_str(), scope.is_downstream_tls),
-      (scope.upstream.host.as_str(), scope.upstream.port),
-    )
-    .await?
-    else {
+    let Some(mut opened) = open_flagged(guest, &params, scope).await? else {
       return Ok(());
     };
     let server_name = opened.server_name.take();
     let ctx = PairCtx::new(&params, matched_host(server_name.as_deref(), scope.downstream.host.as_str()));
-    let settled = self
-      .settle(
-        scope,
-        opened,
-        scope.is_upstream_tls,
-        scope.guest_tls,
-        scope.upstream.host.as_str(),
-        None,
-      )
-      .await?;
+    let settled = self.settle(scope, opened, None).await?;
     super::super::relay_settled!(settled, relay, &ctx)
   }
 }

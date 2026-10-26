@@ -279,13 +279,8 @@ pub(crate) fn response_has_no_body(status: Option<u16>) -> bool {
 /// # Errors
 ///
 /// Returns `Err(())` when `pairs` contains a complete needle in `held` plus `data`.
-pub(crate) fn scan_close_hold(
-  held: &mut Vec<u8>,
-  data: &[u8],
-  out: &mut Vec<u8>,
-  pairs: &[CredentialPair],
-  bound: usize,
-) -> Result<(), ()> {
+pub(crate) fn scan_close_hold(held: &mut Vec<u8>, data: &[u8], out: &mut Vec<u8>, pairs: &[CredentialPair]) -> Result<(), ()> {
+  let bound = max_tail_size(pairs);
   let mut combined = std::mem::take(held);
   combined.extend_from_slice(data);
   if pairs.iter().any(|pair| find_new_match(&combined, &pair.needle, 0)) {

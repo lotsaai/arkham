@@ -9,7 +9,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, ConfigBuilder, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use arkham_config::grants::{PostgresScope, RootCert, SslMode, SslNegotiation};
+use arkham_config::grants::{GuestTlsMode, PostgresScope, RootCert, SslMode, SslNegotiation};
 
 use super::super::PairCtx;
 use super::super::{FlaggedOpen, ServeStream, TlsCache, TlsHalves, Transport};
@@ -70,6 +70,14 @@ impl TlsHalves for PostgresTransport {
 
   fn client_paths<'a>(&self, scope: &'a PostgresScope) -> Option<(&'a Path, &'a Path)> {
     Some((scope.client_cert.as_deref()?, scope.client_key.as_deref()?))
+  }
+
+  fn guest_tls(&self, scope: &PostgresScope) -> GuestTlsMode {
+    scope.guest_tls
+  }
+
+  fn upstream_host<'a>(&self, scope: &'a PostgresScope) -> &'a str {
+    scope.upstream.host.as_str()
   }
 
   fn client_builder(&self, scope: &PostgresScope) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>, Error> {
@@ -152,9 +160,8 @@ impl Transport for PostgresTransport {
     }
 
     let ctx = PairCtx::new(&params, server_name.as_deref().unwrap_or(raw_host));
-    // The upstream leg verifies against the real string's host, which its
-    // certificate must carry.
-    let upstream_name = scope.upstream.host.as_str();
+    // `upstream_tls` is the negotiated result, not the scope's ssl mode.
+    // The upstream handshake verifies the real string's host.
     let settled = self
       .settle(
         scope,
@@ -164,10 +171,8 @@ impl Transport for PostgresTransport {
           guest_tls,
           server_name: None,
           upstream,
+          upstream_tls: accepted,
         },
-        accepted,
-        scope.guest_tls,
-        upstream_name,
         None,
       )
       .await?;

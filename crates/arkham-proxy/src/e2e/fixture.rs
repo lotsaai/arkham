@@ -1,13 +1,17 @@
+use std::collections::BTreeMap;
 pub(super) use std::net::{IpAddr, SocketAddr};
 pub(super) use std::sync::Arc;
 pub(super) use std::time::Duration;
 
+use arkham_config::config::{AppConfig, HostTlsCfg, IfMissing, ProxyCfg, WorkspaceCfg};
+use arkham_config::grants::resolve;
 pub(super) use arkham_config::grants::{
   Credential, EndpointScope, Grant, GuestTlsMode, PostgresLeg, PostgresScope, RedisScope, ResolvedConfig, Scheme, SslMode, SslNegotiation,
 };
 pub(super) use arkham_config::{PluginDirection, ResolvedPlugin};
 pub(super) use arkham_pki::ca::{CertAuthority, install_crypto_provider};
 pub(super) use rustls::pki_types::ServerName;
+use secrecy::SecretString;
 pub(super) use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub(super) use tokio::net::{TcpListener, TcpStream};
 pub(super) use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -24,12 +28,6 @@ pub(super) fn local_addr(listener: &TcpListener) -> SocketAddr {
 /// Resolve one connection-string rule with `guest_tls_mode = mtls`, the
 /// same path `serve` uses. `Err` is the cleartext-fake rejection.
 pub(super) fn resolve_mtls_grants(env: &str, fake: &str, real: &str) -> Result<Vec<Grant>, Box<arkham_config::Error>> {
-  use std::collections::BTreeMap;
-
-  use arkham_config::config::{AppConfig, HostTlsCfg, IfMissing, ProxyCfg, WorkspaceCfg};
-  use arkham_config::grants::resolve;
-  use secrecy::SecretString;
-
   let mut tls = BTreeMap::new();
   tls.insert(
     env.to_string(),

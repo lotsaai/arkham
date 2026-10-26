@@ -63,7 +63,7 @@ use secrecy::ExposeSecret as _;
 use serde_json::{Map, Value};
 use strum::{EnumIter, EnumString, IntoEnumIterator as _, IntoStaticStr};
 
-use crate::transports::engine::{CredentialPair, Hit, Location, Raw, Rewritten, Wire, max_tail_size, scan_close_hold};
+use crate::transports::engine::{CredentialPair, Hit, Location, Raw, Rewritten, Wire, scan_close_hold};
 
 /// Longest CONNECT line a TLS downstream leg buffers before forwarding the
 /// rest of that line unchanged.
@@ -484,11 +484,7 @@ impl Nats {
     Self::Up(Box::new(Up {
       framer: Framer::new(Side::Server),
       lines: Raw::from_pairs(pairs.clone()),
-      guard: Guard {
-        bound: max_tail_size(&pairs),
-        pairs,
-        held: Vec::new(),
-      },
+      guard: Guard { pairs, held: Vec::new() },
       info: InfoWatch::default(),
     }))
   }
@@ -1073,7 +1069,6 @@ async fn redact(lines: &mut Raw, bytes: &[u8], out: &mut Vec<u8>, hits: &mut Vec
 /// is never rewritten: the real value there closes the leg.
 struct Guard {
   pairs: Vec<CredentialPair>,
-  bound: usize,
   /// Suffix that could still grow into a real value.
   held: Vec<u8>,
 }
@@ -1083,7 +1078,7 @@ impl Guard {
     if data.is_empty() {
       return Ok(());
     }
-    scan_close_hold(&mut self.held, data, out, &self.pairs, self.bound).map_err(|()| CloseLeg)
+    scan_close_hold(&mut self.held, data, out, &self.pairs).map_err(|()| CloseLeg)
   }
 
   /// The frame ended, so its held suffix cannot grow.

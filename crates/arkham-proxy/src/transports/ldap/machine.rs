@@ -833,8 +833,7 @@ impl Ldap {
       out.extend_from_slice(data);
       return Ok(());
     }
-    let bound = up.pair.needle.len().saturating_sub(1);
-    scan_close_hold(&mut self.held, data, out, std::slice::from_ref(&up.pair), bound)
+    scan_close_hold(&mut self.held, data, out, std::slice::from_ref(&up.pair))
   }
 }
 

@@ -930,13 +930,7 @@ impl Amqp {
       out.extend_from_slice(data);
       return Ok(());
     };
-    scan_close_hold(
-      &mut self.tail,
-      data,
-      out,
-      std::slice::from_ref(pair),
-      pair.needle.len().saturating_sub(1),
-    )
+    scan_close_hold(&mut self.tail, data, out, std::slice::from_ref(pair))
   }
 
   fn suffix(&self, data: &[u8]) -> usize {

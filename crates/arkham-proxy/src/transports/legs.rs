@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use arkham_config::grants::Grant;
+use arkham_config::grants::{AmqpScope, Grant, LdapScope, RedisScope, SmtpScope};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 
@@ -24,30 +24,68 @@ pub(crate) struct FlaggedOpen<G> {
   pub(crate) server_name: Option<String>,
   /// Dialed upstream.
   pub(crate) upstream: TcpStream,
+  /// Whether the upstream leg is TLS. [`open_flagged`] copies the scope flag.
+  /// Postgres stores the negotiated result instead.
+  pub(crate) upstream_tls: bool,
 }
+
+/// Downstream and upstream facts [`open_flagged`] reads off a grant scope.
+pub(crate) trait FlaggedScope {
+  /// Host the guest dialed.
+  fn downstream_host(&self) -> &str;
+  /// Whether the guest leg is TLS from the first byte.
+  fn is_downstream_tls(&self) -> bool;
+  /// Host the proxy dials.
+  fn upstream_host(&self) -> &str;
+  /// Port the proxy dials.
+  fn upstream_port(&self) -> u16;
+  /// Whether the upstream leg is TLS from the first byte.
+  fn is_upstream_tls(&self) -> bool;
+}
+
+macro_rules! flagged_scope {
+  ($($ty:ty),+ $(,)?) => {$(
+    impl FlaggedScope for $ty {
+      fn downstream_host(&self) -> &str {
+        self.downstream.host.as_str()
+      }
+      fn is_downstream_tls(&self) -> bool {
+        self.is_downstream_tls
+      }
+      fn upstream_host(&self) -> &str {
+        self.upstream.host.as_str()
+      }
+      fn upstream_port(&self) -> u16 {
+        self.upstream.port
+      }
+      fn is_upstream_tls(&self) -> bool {
+        self.is_upstream_tls
+      }
+    }
+  )+};
+}
+
+flagged_scope!(AmqpScope, LdapScope, RedisScope, SmtpScope);
 
 /// Open the downstream leg and dial upstream. `Ok(None)` closes quietly.
 ///
 /// # Errors
 ///
 /// Returns an error when the hello cannot be read or the upstream dial fails.
-pub(crate) async fn open_flagged<G>(
+pub(crate) async fn open_flagged<G, S: FlaggedScope>(
   mut guest: G,
   params: &CandidateParams<'_>,
-  downstream: (&str, bool),
-  upstream: (&str, u16),
+  scope: &S,
 ) -> Result<Option<FlaggedOpen<G>>, Error>
 where
   G: AsyncRead + AsyncWrite + Unpin,
 {
-  let (downstream_host, downstream_tls) = downstream;
-  let (upstream_host, upstream_port) = upstream;
   let budget = Duration::from_secs(params.snapshot.proxy.handshake_timeout_secs);
   let mut server_name = params.host.map(ToString::to_string);
   let guest_head = params.initial.to_vec();
   let mut guest_tls = None;
-  if downstream_tls {
-    let authority = params.host.or(Some(downstream_host));
+  if scope.is_downstream_tls() {
+    let authority = params.host.or(Some(scope.downstream_host()));
     let Some((hello_buf, identity, sni_name)) =
       guest_tls_opening(&mut guest, params.initial, budget, authority, &params.state.mint).await?
     else {
@@ -56,13 +94,14 @@ where
     server_name = Some(sni_name);
     guest_tls = Some((hello_buf, identity));
   }
-  let dialed = dial_marked(upstream_host, upstream_port, params.state.fwmark).await?;
+  let dialed = dial_marked(scope.upstream_host(), scope.upstream_port(), params.state.fwmark).await?;
   Ok(Some(FlaggedOpen {
     guest,
     guest_head,
     guest_tls,
     server_name,
     upstream: dialed,
+    upstream_tls: scope.is_upstream_tls(),
   }))
 }
 
