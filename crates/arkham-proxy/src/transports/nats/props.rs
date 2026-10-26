@@ -16,7 +16,7 @@ use secrecy::SecretString;
 use crate::transports::engine::harness::{CutPend, feed_parts};
 use crate::transports::nats::fixtures::{mint_user, nats_grants};
 use crate::transports::nats::machine::{self, MAX_COMMAND as NATS_MAX_COMMAND, Nats};
-use crate::transports::nats::server_info;
+use crate::transports::nats::transport::server_info;
 
 fn count_bytes(hay: &[u8], needle: &[u8]) -> usize {
   if needle.is_empty() || hay.len() < needle.len() {

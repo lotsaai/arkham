@@ -259,16 +259,12 @@ pub fn rules_command(root: Option<&Path>) -> Result<String, Error> {
 }
 
 #[cfg(test)]
-mod moved_suite {
-  use std::path::PathBuf;
-
-  use arkham_config::cli::ProxyBackend;
-
-  use crate::decoys::*;
-
+mod tests {
+  use super::*;
   use crate::paths::*;
-
   use crate::test_support::*;
+  use arkham_config::cli::ProxyBackend;
+  use std::path::PathBuf;
 
   #[test]
   fn rules_toml_prints_derived_rules_as_blocks() {

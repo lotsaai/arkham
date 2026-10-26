@@ -22,8 +22,8 @@ use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 
 use super::super::within;
-use super::SmtpTransport;
 use super::machine::{MAX_COMMAND, Smtp, is_opening_command, is_starttls};
+use super::transport::SmtpTransport;
 use crate::Error;
 use crate::relay::{log_hits, relay_guarded};
 use crate::transports::TlsHalves;

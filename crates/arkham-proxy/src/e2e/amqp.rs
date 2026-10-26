@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use super::*;
+use super::fixture::*;
 use amq_protocol::frame::{AMQPFrame, WriteContext, gen_frame, parse_frame};
 use amq_protocol::protocol::{AMQPClass, connection};
 use amq_protocol::types::FieldTable;

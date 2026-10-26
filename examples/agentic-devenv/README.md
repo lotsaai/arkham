@@ -52,7 +52,7 @@ arkham down             # stop both
 | `~/.config/arkham/ca.pem` | arkham's CA, with `ca.crt` and `ca.key` written beside it |
 | `~/.config/arkham/agent-entrypoint.sh` | the agent's entrypoint |
 
-`up` merges three compose layers, later winning: `<config-dir>/arkham/compose.yaml` (or `compose.yml`), the generated file above, then this workspace's `.config/arkham/compose.yaml` (or `.yml`, or the older `.config/arkham.compose.yaml` / `.yml` names).
+`up` merges three compose layers, later winning: `<config-dir>/arkham/compose.yaml` (or `compose.yml`), the generated file above, then this workspace's `.config/arkham/compose.yaml` (or `.yml`).
 
 ## Where the secrets live
 

@@ -844,8 +844,10 @@ impl CliCommand for LogsArgs {
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  use crate::test_support::{set_env, unset_env};
+  use crate::mounts::*;
+  use crate::stack::*;
+  use crate::test_support::*;
+  use crate::workspace::*;
 
   /// Global `compose.yaml` beats `compose.yml`, then the generated file, then the workspace override.
   #[test]
@@ -882,12 +884,6 @@ mod tests {
       vec![global_yaml, generated.clone(), workspace_yaml.clone()],
       "a global compose.yaml hides compose.yml"
     );
-
-    std::fs::remove_file(&workspace_yaml).unwrap();
-    let legacy = root.path().join(".config").join("arkham.compose.yml");
-    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-    std::fs::write(&legacy, "legacy: yml\n").unwrap();
-    assert_eq!(compose_layers(&workspace).last().unwrap(), &legacy);
 
     match previous_config {
       Some(value) => set_env("XDG_CONFIG_HOME", value),
@@ -928,18 +924,6 @@ mod tests {
       "same tree is stable"
     );
   }
-}
-
-#[cfg(test)]
-mod moved_suite {
-
-  use crate::confine::*;
-
-  use crate::mounts::*;
-
-  use crate::stack::*;
-  use crate::test_support::*;
-  use crate::workspace::*;
 
   #[test]
   fn the_example_workspace_loads_and_inherits_registry_hosts() {
@@ -1068,7 +1052,6 @@ mod moved_suite {
 
   #[test]
   fn support_files_are_written_when_absent_and_stale_entrypoints_regenerate() {
-    use std::os::unix::fs::PermissionsExt as _;
     let dir = tempfile::tempdir().unwrap();
     let entrypoint = dir.path().join("agent-entrypoint.sh");
     let storage = dir.path().join("state").join("containers");

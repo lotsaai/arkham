@@ -749,14 +749,16 @@ impl Stack {
 
 #[cfg(test)]
 mod tests {
-  use crate::decoys::{Decoy, uncovered_names, uncovered_warning, validate_passthrough};
-  use crate::mounts::Layout;
+  use super::*;
+  use crate::decoys::{uncovered_names, uncovered_warning};
+  use crate::test_support::*;
+  use crate::workspace::*;
+  use arkham_config::config::WorkspaceBuild;
   use arkham_config::config::{HostTlsCfg, IfMissing, RuleCfg};
-  use arkham_config::grants::GuestTlsMode;
   use arkham_pki::ca::CertAuthority;
   use std::collections::{BTreeMap, BTreeSet};
   use std::fs;
-  use std::path::PathBuf;
+  use tempfile::tempdir;
 
   fn mtls_rule(guest_cert: Option<&str>, guest_key: Option<&str>) -> BTreeMap<String, RuleCfg> {
     let mut tls = BTreeMap::new();
@@ -861,18 +863,6 @@ mod tests {
     assert!(warning.contains("[workspace] passthrough"), "{warning}");
     assert_eq!(uncovered_warning(&[]), None);
   }
-}
-
-#[cfg(test)]
-mod moved_suite {
-
-  use arkham_config::config::WorkspaceBuild;
-  use std::fs;
-  use tempfile::tempdir;
-
-  use crate::stack::*;
-  use crate::test_support::*;
-  use crate::workspace::*;
 
   #[test]
   fn the_agent_service_carries_what_inner_containers_need() {

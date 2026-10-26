@@ -352,15 +352,11 @@ impl ExplicitRewrites<'_> {
 }
 
 #[cfg(test)]
-mod moved_suite {
-
-  use std::slice::from_ref;
-
-  use tempfile::tempdir;
-
+mod tests {
+  use super::*;
   use crate::expand::*;
-
-  use crate::rewrites::*;
+  use std::slice::from_ref;
+  use tempfile::tempdir;
 
   /// Sources rewrite reals to decoys on disk and mount read-only at the
   /// `{home}`-expanded dest; unknown names fail naming the name.

@@ -141,7 +141,7 @@ arkham down             # stop it
 
 1. `<config-dir>/arkham/compose.yaml` (or `compose.yml`), for additions shared by every workspace.
 2. The generated per-workspace `compose.yml`.
-3. The workspace's `.config/arkham/compose.yaml` (or `.yml`; the older `.config/arkham.compose.yaml` and `.yml` names still apply), for additions local to this workspace.
+3. The workspace's `.config/arkham/compose.yaml` (or `.yml`), for additions local to this workspace.
 
 `arkham agent [workspace] [--rm] [-- <command>...]` execs the configured shell as your uid at the translated workspace path, after generating what is missing and starting the stack, with `<command>` in place of the shell when you pass one. It leaves the stack running when that exits, or stops it when `--rm` is set. `logs` reads the stack's logs: `-f` to follow, `--no-log-prefix` for bare lines, `--tail <N|all>` (default `all`), service names to narrow it down, and `--workspace <PATH>` when the workspace is not the current directory.
 

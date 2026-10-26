@@ -45,17 +45,20 @@ pub(crate) fn load_guest_ca(detail: &str) -> Result<CertAuthority, Error> {
 #[must_use]
 pub(crate) fn materialize_client_tls(
   label: &str,
-  client_cert: Option<Vec<u8>>,
-  client_key: Option<Vec<u8>>,
+  client_pair: Option<(Vec<u8>, Vec<u8>)>,
   root_cert: Option<Vec<u8>>,
-  guest_tls_mode: GuestTlsMode,
 ) -> (HostTlsCfg, Vec<(String, Vec<u8>)>) {
+  let (client_cert, client_key) = client_pair.unzip();
   let mut materialized = Vec::new();
   let mut tls = HostTlsCfg {
     client_cert: None,
     client_key: None,
     root_cert: None,
-    guest_tls_mode,
+    guest_tls_mode: if client_cert.is_some() {
+      GuestTlsMode::Mtls
+    } else {
+      GuestTlsMode::Tls
+    },
     guest_cert: None,
     guest_key: None,
   };

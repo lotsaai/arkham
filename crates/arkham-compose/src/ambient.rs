@@ -336,28 +336,22 @@ fn env_source(env_name: &str, default: &str, host_home: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod moved_suite {
-
+mod tests {
+  use super::*;
+  use crate::expand::*;
+  use crate::test_support::*;
+  use arkham_config::grants::NatsSeed;
+  use arkham_pki::ssh::SshKey;
+  use base64::Engine as _;
+  use secrecy::SecretString;
+  use std::collections::HashMap;
   use std::ffi::OsString;
   use tempfile::tempdir;
-
-  use crate::ambient::*;
-
-  use crate::expand::*;
-
-  use crate::test_support::*;
 
   /// The automatic pass maps the default-path sources onto decoy twins at
   /// their default container paths and mints grants, with no declaration.
   #[test]
   fn derive_sources_maps_default_paths_to_twins_and_grants() {
-    use arkham_config::registry::Registry;
-    use arkham_pki::ssh::SshKey;
-    use std::collections::HashMap;
-    use std::env;
-    use std::ffi::OsString;
-    use std::path::Path;
-
     let host = tempdir().unwrap();
     let gitconfig = host.path().join(".gitconfig");
     fs::write(&gitconfig, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
@@ -455,9 +449,6 @@ mod moved_suite {
   /// An nkey context mounts a decoy seed. The real seed stays in the grant.
   #[test]
   fn derive_sources_mounts_a_decoy_nkey() {
-    use arkham_config::grants::NatsSeed;
-    use secrecy::SecretString;
-
     let host = tempdir().unwrap();
     let nats = host.path().join(".config").join("nats");
     fs::create_dir_all(nats.join("context")).unwrap();
@@ -481,10 +472,6 @@ mod moved_suite {
   /// A creds context mounts a decoy file. The real seed and JWT stay in the grant.
   #[test]
   fn derive_sources_mounts_a_decoy_creds_file() {
-    use arkham_config::grants::NatsSeed;
-    use base64::Engine as _;
-    use secrecy::SecretString;
-
     let host = tempdir().unwrap();
     let nats = host.path().join(".config").join("nats");
     let creds_dir = nats.join("creds");
@@ -528,9 +515,6 @@ mod moved_suite {
   /// mounts that context only.
   #[test]
   fn derive_sources_mounts_the_selected_nats_context() {
-    use arkham_config::registry::Registry;
-    use std::collections::HashMap;
-
     let host = tempdir().unwrap();
     token_context(host.path());
     let work = tempdir().unwrap();
@@ -568,9 +552,6 @@ mod moved_suite {
   /// A declared path under `~/.config/nats` stays with that declaration.
   #[test]
   fn declared_nats_context_is_not_derived_again() {
-    use arkham_config::registry::Registry;
-    use std::collections::HashMap;
-
     let host = tempdir().unwrap();
     let nats = token_context(host.path());
     let work = tempdir().unwrap();
@@ -600,10 +581,6 @@ mod moved_suite {
   /// Broken ambient sources warn and skip; the healthy ones still map.
   #[test]
   fn broken_ambient_sources_skip_without_failing() {
-    use arkham_config::registry::Registry;
-    use std::collections::HashMap;
-    use std::env;
-
     let host = tempdir().unwrap();
     let gitconfig = host.path().join(".gitconfig");
     fs::write(&gitconfig, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
