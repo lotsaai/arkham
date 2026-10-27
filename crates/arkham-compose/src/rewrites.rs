@@ -1,6 +1,6 @@
 //! Declared `file_rewrite` pass: each source expands, swaps its plain env
 //! values or runs the format adapter, and lands in the state directory.
-//! A talosconfig mounts writable. Every other rewrite stays read-only.
+//! A kubeconfig or talosconfig mounts writable. Every other rewrite stays read-only.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -378,10 +378,9 @@ impl ExplicitRewrites<'_> {
       path: host.clone(),
       source,
     })?;
-    let talos_mount = match rewrite.format {
-      Some(RewriteFormat::Talos) => true,
-      Some(RewriteFormat::Kubeconfig) => false,
-      None => sniff(&content) == Some(RewriteFormat::Talos),
+    let writable = match rewrite.format {
+      Some(RewriteFormat::Talos | RewriteFormat::Kubeconfig) => true,
+      None => matches!(sniff(&content), Some(RewriteFormat::Talos | RewriteFormat::Kubeconfig)),
     };
     let out_bytes = self.output(rewrite, &host, &content, &pairs)?;
     let out_path = self.files_dir.join(rewrite_file_name(index, &host));
@@ -398,7 +397,7 @@ impl ExplicitRewrites<'_> {
     self.collector.mounts.push(Mount {
       host: out_path,
       container: PathBuf::from(container),
-      ro: !talos_mount,
+      ro: !writable,
     });
     Ok(())
   }
@@ -468,5 +467,37 @@ mod tests {
     .unwrap_err()
     .to_string();
     assert!(error.contains("UNKNOWN_NAME"), "{error}");
+  }
+
+  #[test]
+  fn kubeconfig_file_rewrite_mounts_writable() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("kube.yaml");
+    fs::write(
+      &source,
+      "apiVersion: v1\nkind: Config\ncurrent-context: prod\ncontexts:\n- name: prod\n  context: {cluster: prod, user: alice}\nclusters:\n- name: prod\n  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: alice\n  user: {token: alice-token}\n",
+    )
+    .unwrap();
+    let expander = build_expander(HashMap::new());
+    let outputs = write_rewrites(&RewriteInputs {
+      files_dir: &dir.path().join("files"),
+      root: dir.path(),
+      rewrites: &[FileRewrite {
+        source,
+        dest: "{home}/.kube/other".to_string(),
+        envs: Vec::new(),
+        format: Some(RewriteFormat::Kubeconfig),
+      }],
+      decoys: &[],
+      env: &HashMap::new(),
+      expander: &expander,
+      home: "/home/eng",
+      host_home: None,
+      guests_dir: dir.path(),
+    })
+    .unwrap();
+    assert_eq!(outputs.mounts.len(), 1);
+    assert!(!outputs.mounts[0].ro, "kubectl config use-context writes the mounted kubeconfig");
+    assert_eq!(outputs.mounts[0].container, PathBuf::from("/home/eng/.kube/other"));
   }
 }

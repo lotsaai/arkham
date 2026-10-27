@@ -3,9 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::{HostTlsCfg, RewriteFormat, fake_for};
-use arkham_config::context::{
-  AmbientProtocol, AmbiguousContexts, AmbiguousParty, ContextIdentity, ContextRef, Presented, identities, require_distinct,
-};
+use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, identities};
 use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -122,8 +120,6 @@ struct Opened {
   cluster: String,
   cluster_source: PathBuf,
   server: String,
-  host: String,
-  port: u16,
   token: Option<String>,
   cert: Option<Vec<u8>>,
   key: Option<Vec<u8>>,
@@ -165,7 +161,7 @@ impl KubeContextEntry {
     if scope.scheme != Scheme::Https {
       return Err(bad(format!("server `{server}` is plain HTTP: the API server is TLS-only")));
     }
-    let HostPat::Exact(host) = &scope.host else {
+    let HostPat::Exact(_) = &scope.host else {
       return Err(bad(format!("server `{server}` is not an exact host")));
     };
     let user = doc
@@ -173,18 +169,24 @@ impl KubeContextEntry {
       .iter()
       .find(|entry| entry.name == self.context.user)
       .ok_or_else(|| bad(format!("unknown user `{}`", self.context.user)))?;
-    if user.user.cert_file.is_some() || user.user.key_file.is_some() || cluster.cluster.ca_file.is_some() {
-      return Err(bad(
-        "uses file references; inline them first: `kubectl config view --flatten`".to_string(),
-      ));
-    }
     let token = user.user.bearer();
-    if user.user.exec.is_some() && token.is_none() && user.user.cert_data.is_none() && user.user.key_data.is_none() {
+    let cert = credential_bytes(
+      &user.source,
+      user.user.cert_data.as_deref(),
+      "client-certificate-data",
+      user.user.cert_file.as_deref(),
+      "client-certificate",
+    )?;
+    let key = credential_bytes(
+      &user.source,
+      user.user.key_data.as_deref(),
+      "client-key-data",
+      user.user.key_file.as_deref(),
+      "client-key",
+    )?;
+    if user.user.exec.is_some() && token.is_none() && cert.is_none() && key.is_none() {
       return Err(bad("exec credential plugins are not supported".to_string()));
     }
-    let blob = |value, name| decode(&self.source, RewriteFormat::Kubeconfig, value, name);
-    let cert = blob(user.user.cert_data.as_deref(), "client-certificate-data")?;
-    let key = blob(user.user.key_data.as_deref(), "client-key-data")?;
     if cert.is_some() != key.is_some() {
       return Err(bad(format!("user `{}` carries half of the client pair", user.name)));
     }
@@ -197,6 +199,13 @@ impl KubeContextEntry {
       };
       return Err(bad(detail));
     }
+    let ca = credential_bytes(
+      &cluster.source,
+      cluster.cluster.ca_data.as_deref(),
+      "certificate-authority-data",
+      cluster.cluster.ca_file.as_deref(),
+      "certificate-authority",
+    )?;
     Ok(Opened {
       context: self.name.clone(),
       user: user.name.clone(),
@@ -204,14 +213,38 @@ impl KubeContextEntry {
       cluster: cluster.name.clone(),
       cluster_source: cluster.source.clone(),
       server: server.clone(),
-      host: host.clone(),
-      port: scope.port,
       token: token.map(str::to_string),
       cert,
       key,
-      ca: blob(cluster.cluster.ca_data.as_deref(), "certificate-authority-data")?,
+      ca,
     })
   }
+}
+
+/// Inline `*-data` wins. A file reference is read from the kubeconfig's
+/// directory, the same base client-go uses for a relative path.
+fn credential_bytes(
+  source: &Path,
+  inline: Option<&str>,
+  inline_field: &str,
+  file: Option<&str>,
+  file_field: &str,
+) -> Result<Option<Vec<u8>>, Error> {
+  if let Some(bytes) = decode(source, RewriteFormat::Kubeconfig, inline, inline_field)? {
+    return Ok(Some(bytes));
+  }
+  let Some(file) = file else {
+    return Ok(None);
+  };
+  let reference = Path::new(file);
+  let resolved = if reference.is_absolute() {
+    reference.to_path_buf()
+  } else {
+    source.parent().unwrap_or(Path::new(".")).join(reference)
+  };
+  fs::read(&resolved)
+    .map(Some)
+    .map_err(|err| source.invalid(format!("cannot read `{file_field}` at `{}`: {err}", resolved.display())))
 }
 
 impl Opened {
@@ -241,12 +274,6 @@ impl Opened {
         path: self.cluster_source,
       }),
     }
-  }
-}
-
-impl Derived {
-  fn matches_party(&self, party: &AmbiguousParty) -> bool {
-    party.protocol == self.user_id.protocol && party.name == self.user_id.name && party.source == self.user_id.source
   }
 }
 
@@ -287,54 +314,6 @@ impl DerivedContexts {
       }
     }
     Ok(Self(kept))
-  }
-
-  fn resolve_shared_certs(mut self, current: &str) -> Result<Self, Error> {
-    loop {
-      let ambiguous = match require_distinct(&self.presented()) {
-        Ok(()) => return Ok(self),
-        Err(arkham_config::Error::AmbiguousContexts(ambiguous)) => ambiguous,
-        Err(err) => return Err(err.into()),
-      };
-      let names = self.contexts_of(ambiguous.as_ref());
-      if names.is_empty() || names.iter().any(|name| name == current) {
-        return Err(arkham_config::Error::AmbiguousContexts(ambiguous).into());
-      }
-      let listed = names.join(", ");
-      tracing::warn!(contexts = %listed, host = %ambiguous.host, port = ambiguous.port, "kube contexts skipped");
-      self.0.retain(|derived| !names.iter().any(|name| name == &derived.opened.context));
-    }
-  }
-
-  fn presented(&self) -> Vec<Presented<'_>> {
-    self
-      .0
-      .iter()
-      .filter(|derived| derived.opened.cert.is_some())
-      .map(|derived| Presented {
-        identity: &derived.user_id,
-        host: &derived.opened.host,
-        port: derived.opened.port,
-        decoy: b"",
-      })
-      .collect()
-  }
-
-  fn contexts_of(&self, ambiguous: &AmbiguousContexts) -> Vec<String> {
-    let mut names: Vec<String> = self
-      .0
-      .iter()
-      .filter(|derived| {
-        derived.opened.cert.is_some()
-          && derived.opened.port == ambiguous.port
-          && derived.opened.host.eq_ignore_ascii_case(&ambiguous.host)
-          && ambiguous.parties.iter().any(|party| derived.matches_party(party))
-      })
-      .map(|derived| derived.opened.context.clone())
-      .collect();
-    names.sort();
-    names.dedup();
-    names
   }
 
   fn into_grants(self) -> UserGrants {
@@ -499,9 +478,8 @@ struct GuestUser {
 ///
 /// # Errors
 ///
-/// Returns an error when the document does not parse, the current context
-/// cannot be derived, or two client-certificate users of one host and port
-/// include that context.
+/// Returns an error when the document does not parse or the current context
+/// cannot be derived.
 pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Path) -> Result<Option<RewriteAdapted>, Error> {
   adapt_sources(&[(source, content)], ca, guests_dir)
 }
@@ -514,8 +492,7 @@ pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_di
 /// # Errors
 ///
 /// Returns an error when a document does not parse, a later file is not a
-/// kubeconfig, the current context cannot be derived, or two
-/// client-certificate users of one host and port include that context.
+/// kubeconfig, or the current context cannot be derived.
 pub(crate) fn adapt_sources(sources: &[(&Path, &[u8])], ca: &CertAuthority, guests_dir: &Path) -> Result<Option<RewriteAdapted>, Error> {
   let Some(merged) = MergedKube::load(sources)? else {
     return Ok(None);
@@ -529,7 +506,6 @@ pub(crate) fn adapt_sources(sources: &[(&Path, &[u8])], ca: &CertAuthority, gues
     }
   }
   let rendered = DerivedContexts::identify(opened, &merged.doc.current_context)?
-    .resolve_shared_certs(&merged.doc.current_context)?
     .into_grants()
     .render(ca, guests_dir)?;
   Ok(Some(RewriteAdapted {
@@ -581,10 +557,11 @@ impl MergedKube {
         continue;
       };
       let ca_data = field("certificate-authority-data");
-      if inner.contains_key(&ca_data) {
+      let ca_file = field("certificate-authority");
+      if inner.contains_key(&ca_data) || inner.contains_key(&ca_file) {
         inner.insert(ca_data, guest_ca.clone());
       }
-      inner.remove(field("certificate-authority"));
+      inner.remove(ca_file);
     }
     for user in root.entries_mut("users") {
       let name = user.get(field("name")).and_then(Value::as_str).unwrap_or_default().to_string();
@@ -600,14 +577,17 @@ impl MergedKube {
       }
       let cert_data = field("client-certificate-data");
       let key_data = field("client-key-data");
-      if inner.contains_key(&cert_data) || inner.contains_key(&key_data) {
+      let cert_file = field("client-certificate");
+      let key_file = field("client-key");
+      if inner.contains_key(&cert_data) || inner.contains_key(&key_data) || inner.contains_key(&cert_file) || inner.contains_key(&key_file)
+      {
         let filler = placeholder();
         let (cert, key) = guest.map_or_else(|| (filler.clone(), filler), |guest| (guest.cert.clone(), guest.key.clone()));
         inner.insert(cert_data, Value::from(cert));
         inner.insert(key_data, Value::from(key));
       }
-      inner.remove(field("client-certificate"));
-      inner.remove(field("client-key"));
+      inner.remove(cert_file);
+      inner.remove(key_file);
       if let Some(config) = inner
         .get_mut(field("auth-provider"))
         .and_then(Value::as_mapping_mut)
@@ -810,10 +790,6 @@ users:
   const SOURCE: &str = "/home/ivan/.kube/k3s.yaml";
 
   fn opened_context(context: &str, user: &str) -> Opened {
-    let scope: EndpointScope = "https://10.0.0.1:6443".parse().expect("scope");
-    let HostPat::Exact(host) = &scope.host else {
-      panic!("exact host");
-    };
     Opened {
       context: context.to_string(),
       user: user.to_string(),
@@ -821,8 +797,6 @@ users:
       cluster: "prod".to_string(),
       cluster_source: PathBuf::from(SOURCE),
       server: "https://10.0.0.1:6443".to_string(),
-      host: host.clone(),
-      port: scope.port,
       token: Some("tok".to_string()),
       cert: None,
       key: None,
@@ -1030,11 +1004,96 @@ users:
   }
 
   #[test]
-  fn file_refs_are_an_error() {
-    let doc = BEARER_DOC.replace("certificate-authority-data: Q0E=", "certificate-authority: ca.crt");
+  fn file_refs_are_inlined_from_the_kubeconfig_directory() {
     let dir = tempfile::tempdir().unwrap();
-    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("file refs fail closed");
-    assert!(err.to_string().contains("inline them first"), "{err}");
+    let nested = dir.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(dir.path().join("ca.crt"), b"cluster-ca-bytes").unwrap();
+    fs::write(nested.join("client.crt"), b"client-cert-bytes").unwrap();
+    fs::write(nested.join("client.key"), b"client-key-bytes").unwrap();
+    let source = nested.join("config");
+    let doc = "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {cluster: prod, user: alice}
+clusters:
+- name: prod
+  cluster: {server: https://10.0.0.1:6443, certificate-authority: ../ca.crt}
+users:
+- name: alice
+  user: {client-certificate: client.crt, client-key: client.key}
+";
+    let adapted = adapt(&source, doc.as_bytes(), &test_ca(), dir.path())
+      .expect("file references adapt")
+      .expect("kubeconfig");
+    assert!(adapted.fragment.contains("https://10.0.0.1:6443"), "{}", adapted.fragment);
+    assert!(adapted.decoy.contains("certificate-authority-data:"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("certificate-authority:"), "{}", adapted.decoy);
+    assert!(adapted.decoy.contains("client-certificate-data:"), "{}", adapted.decoy);
+    assert!(adapted.decoy.contains("client-key-data:"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("client-certificate:"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("client-key:"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("cluster-ca-bytes"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("client-cert-bytes"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("client-key-bytes"), "{}", adapted.decoy);
+    let user = identities(&[ContextRef {
+      source: source.as_path(),
+      protocol: AmbientProtocol::KubernetesUser,
+      name: "alice",
+    }])
+    .expect("identity")
+    .into_iter()
+    .next()
+    .expect("one identity");
+    let tls = rules_from(&adapted.fragment)[&user.label].tls.values().next().expect("tls").clone();
+    assert_eq!(tls.guest_tls_mode, GuestTlsMode::Mtls);
+  }
+
+  #[test]
+  fn inline_data_wins_over_a_file_reference() {
+    let doc = BEARER_DOC
+      .replace(
+        "certificate-authority-data: Q0E=",
+        "certificate-authority-data: Q0E=, certificate-authority: missing-ca.crt",
+      )
+      .replace(
+        "client-certificate-data: Q0VSVA==, client-key-data: S0VZ",
+        "client-certificate-data: Q0VSVA==, client-key-data: S0VZ, client-certificate: missing.crt, client-key: missing.key",
+      );
+    let dir = tempfile::tempdir().unwrap();
+    let adapted = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path())
+      .expect("inline data adapts")
+      .expect("kubeconfig");
+    assert!(!adapted.decoy.contains("missing-ca.crt"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("missing.crt"), "{}", adapted.decoy);
+    assert!(!adapted.decoy.contains("missing.key"), "{}", adapted.decoy);
+    assert!(adapted.decoy.contains("certificate-authority-data:"), "{}", adapted.decoy);
+    assert!(adapted.decoy.contains("client-certificate-data:"), "{}", adapted.decoy);
+  }
+
+  #[test]
+  fn missing_file_ref_names_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("config");
+    let doc = "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {cluster: prod, user: alice}
+clusters:
+- name: prod
+  cluster: {server: https://10.0.0.1:6443, certificate-authority: missing-ca.crt}
+users:
+- name: alice
+  user: {token: alice-token}
+";
+    let err = adapt(&source, doc.as_bytes(), &test_ca(), dir.path()).expect_err("a missing file fails closed");
+    let text = err.to_string();
+    assert!(text.contains("cannot read"), "{text}");
+    assert!(text.contains("missing-ca.crt"), "{text}");
   }
 
   #[test]
@@ -1333,7 +1392,7 @@ users:
   }
 
   #[test]
-  fn two_client_cert_users_on_one_server_fail_closed() {
+  fn two_client_cert_users_on_one_server_each_get_a_grant() {
     let doc = "apiVersion: v1
 kind: Config
 current-context: prod
@@ -1351,22 +1410,39 @@ users:
 - name: bob
   user: {client-certificate-data: Qk9C, client-key-data: S0VZ}
 ";
-    let dir = tempfile::tempdir().unwrap();
-    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("shared client certificates fail closed");
-    let Error::Config(source) = err else {
-      panic!("expected AmbiguousContexts, got {err}");
-    };
-    let arkham_config::Error::AmbiguousContexts(ambiguous) = source.as_ref() else {
-      panic!("expected AmbiguousContexts, got {source}");
-    };
-    let names: Vec<&str> = ambiguous.parties.iter().map(|party| party.name.as_str()).collect();
-    assert!(names.contains(&"alice") && names.contains(&"bob"), "{names:?}");
-    assert_eq!(ambiguous.host, "10.0.0.1");
-    assert_eq!(ambiguous.port, 6443);
+    let adapted = adapt_doc(doc);
+    let rules = rules_from(&adapted.fragment);
+    assert_eq!(
+      rules.len(),
+      2,
+      "client-certificate users on one server are two grants: {}",
+      adapted.fragment
+    );
+    assert!(
+      rules
+        .values()
+        .all(|rule| rule.allow.iter().any(|entry| entry == "https://10.0.0.1:6443")),
+      "{}",
+      adapted.fragment
+    );
+    assert!(
+      rules
+        .values()
+        .all(|rule| rule.tls.values().all(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls)),
+      "{rules:?}"
+    );
+    let decoys: Vec<String> = rules.values().map(rule_decoy).collect();
+    assert_ne!(decoys[0], decoys[1]);
+    assert!(
+      !adapted.decoy.contains("Q0VSVA==") && !adapted.decoy.contains("Qk9C"),
+      "{}",
+      adapted.decoy
+    );
+    assert!(adapted.decoy.contains("name: staging"), "{}", adapted.decoy);
   }
 
   #[test]
-  fn cert_users_off_the_current_context_are_skipped() {
+  fn cert_users_beside_the_current_context_are_granted() {
     let doc = "apiVersion: v1
 kind: Config
 current-context: dev
@@ -1390,11 +1466,10 @@ users:
 - name: bob
   user: {client-certificate-data: Qk9C, client-key-data: S0VZ}
 ";
-    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let adapted = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || adapt_doc(doc));
+    let adapted = adapt_doc(doc);
     let rules = rules_from(&adapted.fragment);
-    assert_eq!(rules.len(), 1, "the side collision is not a grant: {}", adapted.fragment);
-    assert!(!adapted.fragment.contains("https://10.0.0.1:6443"), "{}", adapted.fragment);
+    assert_eq!(rules.len(), 3, "every derivable user is a grant: {}", adapted.fragment);
+    assert!(adapted.fragment.contains("https://10.0.0.1:6443"), "{}", adapted.fragment);
     assert!(adapted.fragment.contains("https://10.9.0.1:6443"), "{}", adapted.fragment);
     assert!(
       adapted.decoy.contains("name: prod") && adapted.decoy.contains("name: staging"),
@@ -1407,8 +1482,6 @@ users:
       adapted.decoy
     );
     assert!(!adapted.decoy.contains("carol-token"), "{}", adapted.decoy);
-    let logged = lines.lock().unwrap().join("\n");
-    assert!(logged.contains("prod") && logged.contains("staging"), "{logged}");
   }
 
   #[test]
@@ -1649,6 +1722,7 @@ users:
       let body = fs::read_to_string(&outputs.mounts[0].host).unwrap();
       assert!(body.contains("current-context: k3s-local"), "{body}");
       assert!(!body.contains("probe-token"), "no real credential survives: {body}");
+      assert!(!outputs.mounts[0].ro, "a kubeconfig rewrite mounts writable");
     }
   }
 

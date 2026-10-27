@@ -15,8 +15,7 @@ serve_pid=""
 forward_pid=""
 guest_compose=""
 guest_downs=()
-token_port=18102
-cert_port=18103
+api_port=18102
 # One budget for /readyz, node Ready, and coredns Ready. Cluster create
 # (image pull included) is outside it. Override when a runner is slower.
 ready_timeout=${ARKHAM_K3S_READY_TIMEOUT:-600}
@@ -377,7 +376,7 @@ run_leg bearer "$scratch/token-kubeconfig" 18100
 echo "k3s substitution proven: bearer + cert auth"
 
 k3d_port=${server##*:}
-python3 - "$token_port" "$cert_port" "$k3d_port" <<'PY' &
+python3 - "$api_port" "$k3d_port" <<'PY' &
 import socket
 import sys
 import threading
@@ -409,24 +408,19 @@ def listen(port, target):
         threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
         threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
 
-token_listen = int(sys.argv[1])
-cert_listen = int(sys.argv[2])
-target = int(sys.argv[3])
-threading.Thread(target=listen, args=(token_listen, target), daemon=True).start()
-listen(cert_listen, target)
+listen(int(sys.argv[1]), int(sys.argv[2]))
 PY
 forward_pid=$!
 forward_ready=0
 for _try in 1 2 3 4 5 6 7 8 9 10; do
-  if python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1).close()' "$token_port" \
-    && python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1).close()' "$cert_port"; then
+  if python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1).close()' "$api_port"; then
     forward_ready=1
     break
   fi
   sleep 0.2
 done
 if [ "$forward_ready" -ne 1 ]; then
-  echo "kube API forwarder did not accept on ${token_port} and ${cert_port}" >&2
+  echo "kube API forwarder did not accept on ${api_port}" >&2
   exit 1
 fi
 
@@ -438,10 +432,36 @@ token_alpha=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl create token arkham-
 token_beta=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl create token arkham-beta --duration=3600s)
 admin_cert=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl config view --raw -o jsonpath='{.users[0].user.client-certificate-data}')
 real_ca=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
-if [ -z "$token_alpha" ] || [ -z "$token_beta" ] || [ -z "$admin_cert" ] || [ -z "$real_ca" ]; then
+openssl genrsa -out "$scratch/auditor.key" 2048
+openssl req -new -key "$scratch/auditor.key" -out "$scratch/auditor.csr" -subj "/CN=auditor"
+csr_b64=$(base64 -w 0 "$scratch/auditor.csr")
+cat >"$scratch/auditor-csr.yaml" <<EOF
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata:
+  name: arkham-auditor
+spec:
+  request: ${csr_b64}
+  signerName: kubernetes.io/kube-apiserver-client
+  usages:
+  - client auth
+EOF
+KUBECONFIG="$scratch/cert-kubeconfig" kubectl apply -f "$scratch/auditor-csr.yaml" >/dev/null
+KUBECONFIG="$scratch/cert-kubeconfig" kubectl certificate approve arkham-auditor >/dev/null
+auditor_cert=""
+for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  auditor_cert=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl get csr arkham-auditor -o jsonpath='{.status.certificate}')
+  if [ -n "$auditor_cert" ]; then
+    break
+  fi
+  sleep 1
+done
+if [ -z "$token_alpha" ] || [ -z "$token_beta" ] || [ -z "$admin_cert" ] || [ -z "$real_ca" ] || [ -z "$auditor_cert" ]; then
   echo "failed to read a k3s credential for the guest absence check" >&2
   exit 1
 fi
+printf '%s' "$auditor_cert" | base64 -d >"$scratch/auditor.crt"
+KUBECONFIG="$scratch/cert-kubeconfig" kubectl create clusterrolebinding arkham-auditor --clusterrole=view --user=auditor >/dev/null
 KUBECONFIG="$scratch/cert-kubeconfig" kubectl --token="$token_alpha" get ns --request-timeout=30s >/dev/null
 KUBECONFIG="$scratch/cert-kubeconfig" kubectl --token="$token_beta" get ns --request-timeout=30s >/dev/null
 
@@ -452,14 +472,15 @@ printf '%s' "$real_ca" | base64 -d >"$ca_file"
 admin_user=$(KUBECONFIG="$guest_source" kubectl config view --minify -o 'jsonpath={.users[0].name}')
 admin_context=$(KUBECONFIG="$guest_source" kubectl config current-context)
 orig_cluster=$(KUBECONFIG="$guest_source" kubectl config view --minify -o 'jsonpath={.contexts[0].context.cluster}')
-KUBECONFIG="$guest_source" kubectl config set-cluster shared --server="https://host.docker.internal:${token_port}" --certificate-authority="$ca_file" --embed-certs=true >/dev/null
-KUBECONFIG="$guest_source" kubectl config set-cluster admin-api --server="https://host.docker.internal:${cert_port}" --certificate-authority="$ca_file" --embed-certs=true >/dev/null
+KUBECONFIG="$guest_source" kubectl config set-cluster shared --server="https://host.docker.internal:${api_port}" --certificate-authority="$ca_file" --embed-certs=true >/dev/null
 KUBECONFIG="$guest_source" kubectl config set-credentials alpha --token="$token_alpha" >/dev/null
 KUBECONFIG="$guest_source" kubectl config set-credentials beta --token="$token_beta" >/dev/null
+KUBECONFIG="$guest_source" kubectl config set-credentials auditor --client-certificate="$scratch/auditor.crt" --client-key="$scratch/auditor.key" --embed-certs=true >/dev/null
 KUBECONFIG="$guest_source" kubectl config set-context alpha --cluster=shared --user=alpha >/dev/null
 KUBECONFIG="$guest_source" kubectl config set-context alpha-view --cluster=shared --user=alpha >/dev/null
 KUBECONFIG="$guest_source" kubectl config set-context beta --cluster=shared --user=beta >/dev/null
-KUBECONFIG="$guest_source" kubectl config set-context admin --cluster=admin-api --user="$admin_user" >/dev/null
+KUBECONFIG="$guest_source" kubectl config set-context admin --cluster=shared --user="$admin_user" >/dev/null
+KUBECONFIG="$guest_source" kubectl config set-context auditor --cluster=shared --user=auditor >/dev/null
 KUBECONFIG="$guest_source" kubectl config use-context alpha >/dev/null
 KUBECONFIG="$guest_source" kubectl config delete-context "$admin_context" >/dev/null
 KUBECONFIG="$guest_source" kubectl config delete-cluster "$orig_cluster" >/dev/null
@@ -524,6 +545,7 @@ run_guest() {
   guest kubectl --context alpha-view get ns --request-timeout=30s
   guest kubectl --context beta get ns --request-timeout=30s
   guest kubectl --context admin get ns --request-timeout=30s
+  guest kubectl --context auditor get ns --request-timeout=30s
 
   echo "--- ${backend}: use-context then get ns"
   guest kubectl config use-context beta
@@ -552,11 +574,11 @@ run_guest() {
     echo "use-context did not write the mounted kubeconfig" >&2
     exit 1
   fi
-  if grep -F -q -e "$token_alpha" -e "$token_beta" -e "$admin_cert" -e "$real_ca" -- "$guest_host"; then
+  if grep -F -q -e "$token_alpha" -e "$token_beta" -e "$admin_cert" -e "$auditor_cert" -e "$real_ca" -- "$guest_host"; then
     echo "real credential reached the guest kubeconfig" >&2
     exit 1
   fi
-  for ctx in alpha alpha-view beta admin; do
+  for ctx in alpha alpha-view beta admin auditor; do
     if ! grep -E -q "(^|[[:space:]])name: \"?${ctx}\"?$" "$guest_host"; then
       echo "guest kubeconfig is missing context ${ctx}" >&2
       exit 1
@@ -564,7 +586,7 @@ run_guest() {
   done
   local env_out
   env_out=$(guest sh -c 'env')
-  if printf '%s\n' "$env_out" | grep -F -q -e "$token_alpha" -e "$token_beta" -e "$admin_cert"; then
+  if printf '%s\n' "$env_out" | grep -F -q -e "$token_alpha" -e "$token_beta" -e "$admin_cert" -e "$auditor_cert"; then
     echo "real credential reached the guest environment" >&2
     exit 1
   fi

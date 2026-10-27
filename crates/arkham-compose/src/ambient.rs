@@ -913,7 +913,7 @@ mod tests {
   }
 
   #[test]
-  fn ambiguous_current_kubeconfig_warns_and_skips() {
+  fn two_cert_users_on_one_cluster_mount() {
     let host = tempdir().unwrap();
     let work = tempdir().unwrap();
     let empty_xdg = tempdir().unwrap();
@@ -925,31 +925,29 @@ mod tests {
     )
     .unwrap();
     set_env("KUBECONFIG", &source);
-    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let outputs = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || {
-      derive_sources(&DeriveInputs {
-        files_dir: &work.path().join("files"),
-        root: work.path(),
-        registry: &Registry::load(None).unwrap(),
-        decoys: &[],
-        expander: &build_expander(HashMap::new()),
-        home: "/home/eng",
-        host_home: Some(host.path()),
-        guests_dir: &work.path().join("guests"),
-        rewrites: &[],
-      })
-      .unwrap()
-    });
-    assert!(
-      !outputs
-        .mounts
-        .iter()
-        .any(|mount| { mount.container == Path::new("/home/eng/.kube") || mount.container.ends_with(".kube/config") }),
-      "ambiguous current context derives nothing"
-    );
-    let logged = lines.lock().unwrap().join("\n");
-    assert!(logged.contains("indistinguishable"), "{logged}");
-    assert!(logged.contains("alice") && logged.contains("bob"), "{logged}");
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .expect("both cert users mount");
+    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    assert!(body.contains("name: prod") && body.contains("name: staging"), "{body}");
+    assert!(!body.contains("Q0VSVA==") && !body.contains("Qk9C"), "{body}");
+    let fragment: String = outputs.grants.iter().map(|grant| grant.fragment.as_str()).collect();
+    assert_eq!(fragment.matches("guest_tls_mode = \"mtls\"").count(), 2, "{fragment}");
+    assert!(fragment.contains("https://10.0.0.1:6443"), "{fragment}");
   }
 
   #[test]

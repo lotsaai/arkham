@@ -8,6 +8,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use rama::error::{BoxError, BoxErrorExt as _};
 use rama::extensions::{Extensions, ExtensionsRef};
 use rama::net::address::{Host, HostWithPort};
 use rama::net::client::ConnectorTarget;
@@ -16,9 +17,13 @@ use rama::service::service_fn;
 use rama::tcp::client::TcpStreamConnector;
 use rama::tcp::stream::TokioTcpStream;
 use rama::tls::boring::client::ConnectorConfigClientAuth;
-use rama::tls::boring::core::ssl::SslCredential;
+use rama::tls::boring::core::nid::Nid;
+use rama::tls::boring::core::ssl::{SslCredential, SslVerifyMode};
+use rama::tls::boring::core::x509::X509;
 use rama::tls::boring::core::x509::store::X509Store;
-use rama::tls::boring::proxy::client_auth::{TlsMitmClientAuthInput, TlsMitmClientAuthPlan, TlsMitmClientAuthPolicy};
+use rama::tls::boring::proxy::client_auth::{
+  TlsMitmClientAuthInput, TlsMitmClientAuthPlan, TlsMitmClientAuthPolicy, TlsMitmClientIdentity,
+};
 use rama::tls::client::{ClientAuth, ClientAuthData};
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::Error as PemError};
@@ -120,45 +125,142 @@ pub(crate) fn client_identity(cert: &Path, key: &Path) -> Result<ClientAuth, Err
   }))
 }
 
-/// Per-connection MITM client-auth policy for one https scope: the entry's
-/// upstream identity when upstream requests one, a guest-certificate demand
-/// in `Mtls` mode, and an explicit empty answer otherwise. The empty plan
-/// matters: with no policy the relay rejects an upstream certificate
-/// request outright, while every ordinary TLS client answers it empty and
-/// carries on — which is what servers that request without requiring (like
-/// a kube apiserver) expect.
-pub(crate) fn client_auth_policy(scope: &EndpointScope, trust: &X509Store) -> Result<Option<TlsMitmClientAuthPolicy>, Error> {
-  let auth = match (&scope.client_cert, &scope.client_key) {
-    (Some(cert), Some(key)) => Some(client_identity(cert, key)?),
-    (Some(_) | None, None) | (None, Some(_)) => None,
+/// Upstream identity one https scope offers after the guest handshake.
+#[derive(Clone)]
+struct EgressIdentity {
+  label: String,
+  credential: Option<SslCredential>,
+}
+
+/// Every https scope for one destination, split by whether the guest must
+/// present a certificate.
+#[derive(Clone)]
+struct GuestSelection {
+  mtls: Vec<EgressIdentity>,
+  tls_credential: Option<SslCredential>,
+  require_guest_cert: bool,
+}
+
+/// Per-connection MITM client-auth policy for every https scope of one
+/// destination. An all-`Tls` destination keeps a single empty or fixed
+/// answer: with no policy the relay rejects an upstream certificate request,
+/// while a server that requests without requiring one (a kube apiserver)
+/// expects the empty answer. A destination with any `Mtls` scope asks the
+/// guest for a certificate and picks the upstream identity from that
+/// certificate's common name.
+pub(crate) fn client_auth_policy(scopes: &[(String, EndpointScope)], trust: &X509Store) -> Result<Option<TlsMitmClientAuthPolicy>, Error> {
+  let Some((_, first)) = scopes.first() else {
+    return Ok(None);
   };
-  match (scope.guest_tls, auth) {
-    (GuestTlsMode::Tls, None) => Ok(Some(TlsMitmClientAuthPolicy::new(service_fn(|_: TlsMitmClientAuthInput| async {
+  if scopes.iter().all(|(_, scope)| scope.guest_tls == GuestTlsMode::Tls) {
+    return tls_policy(first);
+  }
+  let selection = guest_selection(scopes)?;
+  let store = trust.clone();
+  Ok(Some(TlsMitmClientAuthPolicy::new(service_fn(
+    move |input: TlsMitmClientAuthInput| {
+      let upstream_requested = input.request.is_some();
+      let selection = selection.clone();
+      let store = store.clone();
+      async move {
+        let require_guest_cert = selection.require_guest_cert;
+        let resolver = service_fn(move |identity: TlsMitmClientIdentity| {
+          let selection = selection.clone();
+          async move { select_upstream(&identity, &selection, upstream_requested) }
+        });
+        let plan = TlsMitmClientAuthPlan::new(resolver);
+        let plan = if require_guest_cert {
+          plan.with_ingress_trust(store)
+        } else {
+          // Request a certificate and check any that arrives, but let a
+          // certless guest finish. That guest is a bearer user of this
+          // same destination.
+          plan.with_ingress(move |ssl| {
+            ssl.set_verify_cert_store(store)?;
+            ssl.set_verify(SslVerifyMode::PEER);
+            Ok(())
+          })
+        };
+        Ok::<_, std::convert::Infallible>(plan)
+      }
+    },
+  ))))
+}
+
+fn tls_policy(scope: &EndpointScope) -> Result<Option<TlsMitmClientAuthPolicy>, Error> {
+  match scope_auth(scope)? {
+    None => Ok(Some(TlsMitmClientAuthPolicy::new(service_fn(|_: TlsMitmClientAuthInput| async {
       Ok::<_, std::convert::Infallible>(TlsMitmClientAuthPlan::fixed(None))
     })))),
-    (GuestTlsMode::Tls, Some(auth)) => TlsMitmClientAuthPolicy::try_from(auth)
+    Some(auth) => TlsMitmClientAuthPolicy::try_from(auth)
       .map(Some)
       .map_err(|err| Error::ClientAuthPolicy { source: err }),
-    (GuestTlsMode::Mtls, auth) => mtls_policy(trust, auth).map(Some),
   }
 }
 
-/// Policy demanding a guest certificate trusted by `store`, offering the
-/// entry's upstream identity only when upstream requests one (`None` admits
-/// the guest without an egress identity).
-fn mtls_policy(store: &X509Store, auth: Option<ClientAuth>) -> Result<TlsMitmClientAuthPolicy, Error> {
-  let credential: Option<SslCredential> = auth
-    .map(|auth| {
-      let configured = ConnectorConfigClientAuth::try_from(auth).map_err(|err| Error::ClientAuthPolicy { source: err })?;
-      SslCredential::try_from(configured).map_err(|err| Error::ClientAuthPolicy { source: err })
-    })
-    .transpose()?;
-  let store = store.clone();
-  Ok(TlsMitmClientAuthPolicy::new(service_fn(move |input: TlsMitmClientAuthInput| {
-    let credential = if input.request.is_some() { credential.clone() } else { None };
-    let store = store.clone();
-    async move { Ok::<_, std::convert::Infallible>(TlsMitmClientAuthPlan::fixed(credential).with_ingress_trust(store)) }
-  })))
+fn scope_auth(scope: &EndpointScope) -> Result<Option<ClientAuth>, Error> {
+  match (&scope.client_cert, &scope.client_key) {
+    (Some(cert), Some(key)) => Ok(Some(client_identity(cert, key)?)),
+    _ => Ok(None),
+  }
+}
+
+fn ssl_credential(auth: ClientAuth) -> Result<SslCredential, Error> {
+  let configured = ConnectorConfigClientAuth::try_from(auth).map_err(|err| Error::ClientAuthPolicy { source: err })?;
+  SslCredential::try_from(configured).map_err(|err| Error::ClientAuthPolicy { source: err })
+}
+
+fn guest_selection(scopes: &[(String, EndpointScope)]) -> Result<GuestSelection, Error> {
+  let require_guest_cert = scopes.iter().all(|(_, scope)| scope.guest_tls == GuestTlsMode::Mtls);
+  let mut mtls = Vec::new();
+  let mut tls_credential = None;
+  let mut saw_tls = false;
+  for (label, scope) in scopes {
+    let credential = scope_auth(scope)?.map(ssl_credential).transpose()?;
+    if scope.guest_tls == GuestTlsMode::Mtls {
+      mtls.push(EgressIdentity {
+        label: label.clone(),
+        credential,
+      });
+    } else if !saw_tls {
+      saw_tls = true;
+      tls_credential = credential;
+    }
+  }
+  Ok(GuestSelection {
+    mtls,
+    tls_credential,
+    require_guest_cert,
+  })
+}
+
+fn select_upstream(
+  identity: &TlsMitmClientIdentity,
+  selection: &GuestSelection,
+  upstream_requested: bool,
+) -> Result<Option<SslCredential>, BoxError> {
+  let offer = |credential: &Option<SslCredential>| upstream_requested.then(|| credential.clone()).flatten();
+  match identity.leaf() {
+    Some(leaf) => {
+      let name = common_name(leaf);
+      let matched = name
+        .as_deref()
+        .and_then(|name| selection.mtls.iter().find(|item| item.label == name));
+      let matched = match (matched, selection.mtls.as_slice()) {
+        (Some(item), _) => item,
+        (None, [only]) => only,
+        (None, _) => return Err(BoxError::from_static_str("guest certificate does not name an mtls user")),
+      };
+      Ok(offer(&matched.credential))
+    }
+    None if !selection.require_guest_cert => Ok(offer(&selection.tls_credential)),
+    None => Err(BoxError::from_static_str("guest certificate required")),
+  }
+}
+
+fn common_name(leaf: &X509) -> Option<String> {
+  let entry = leaf.subject_name().entries_by_nid(Nid::COMMONNAME).next()?;
+  entry.data().as_utf8().ok().map(|text| text.to_string())
 }
 
 /// Failure loading an upstream CA bundle for one entry's extra egress trust.
@@ -365,7 +467,7 @@ mod tests {
 
   #[test]
   fn anonymous_scopes_carry_an_explicit_empty_client_auth_plan() {
-    let policy = client_auth_policy(&tls_scope(), &test_trust()).expect("policy builds");
+    let policy = client_auth_policy(&[("t".into(), tls_scope())], &test_trust()).expect("policy builds");
     assert!(
       policy.is_some(),
       "anonymous legs must answer an upstream certificate request empty instead of dying"

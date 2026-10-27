@@ -72,14 +72,20 @@ impl Transport for HttpsTransport {
     // address) carries no SNI, so the captured destination is the identity
     // to mint for. A grant that does not name it still splices below.
     let identity = host.or(sni.as_deref()).unwrap_or(dial_host);
-    let Some(scope) = snapshot
-      .grants
-      .iter()
-      .find_map(|grant| grant.endpoint(Scheme::Https, Some(identity), port))
-    else {
+    let mut scopes = Vec::new();
+    for grant in &snapshot.grants {
+      let Some(scope) = grant.endpoint(Scheme::Https, Some(identity), port) else {
+        continue;
+      };
+      let Some(label) = grant.credential().map(|credential| credential.label.clone()) else {
+        continue;
+      };
+      scopes.push((label, scope.clone()));
+    }
+    if scopes.is_empty() {
       // No https scope names this identity: nothing to substitute.
       return tcp::splice(guest, dial_host, port, state.fwmark, &buf).await;
-    };
+    }
     let identity = identity.to_string();
     if !state.mint.allow() {
       return Err(Error::BurstExceeded {
@@ -92,7 +98,7 @@ impl Transport for HttpsTransport {
     // can demand a guest certificate: the relay reads the resulting policy
     // off the guest leg's extensions and enforces it on both legs.
     let mut guest_io = guest_io;
-    if let Some(policy) = client_auth_policy(scope, &state.mtls_trust)? {
+    if let Some(policy) = client_auth_policy(&scopes, &state.mtls_trust)? {
       guest_io = guest_io.with_client_auth_policy(policy);
     }
     let bridge = BridgeIo(guest_io, GuestIo::bare(upstream));
@@ -106,7 +112,7 @@ impl Transport for HttpsTransport {
     // Entries naming `root_cert` ride their own relay extending the global
     // egress trust; the map was built from this same config, so a miss is
     // a bug, failed closed.
-    let relay = match &scope.root_cert {
+    let relay = match scopes.first().and_then(|(_, scope)| scope.root_cert.as_ref()) {
       None => state.relay.clone(),
       Some(path) => state
         .extra_relays
