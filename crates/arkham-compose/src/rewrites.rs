@@ -212,6 +212,61 @@ impl RewriteCollector {
     Ok(())
   }
 
+  /// Mount a writable directory with the decoy at `file_name`, so the guest
+  /// can create a lock file beside it. The directory itself stays, because a
+  /// container may already have it mounted.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the directory cannot be cleared or the decoy
+  /// cannot be written.
+  pub(crate) fn twin_in_dir(
+    &mut self,
+    adapted: Vec<RewriteAdapted>,
+    dir_name: &str,
+    file_name: &str,
+    container_dir: &str,
+  ) -> Result<(), Error> {
+    let Some(first) = adapted.first() else {
+      return Ok(());
+    };
+    let host_dir = self.files_dir.join(dir_name);
+    if host_dir.is_dir() {
+      Self::clear_children(&host_dir)?;
+    }
+    fs::create_dir_all(&host_dir).map_err(|source| Error::CreateDir {
+      path: host_dir.clone(),
+      source,
+    })?;
+    let twin_path = host_dir.join(file_name);
+    fs::write(&twin_path, first.decoy.as_bytes()).map_err(|source| Error::WriteFile { path: twin_path, source })?;
+    self.mounts.push(Mount {
+      host: host_dir,
+      container: PathBuf::from(container_dir),
+      ro: false,
+    });
+    self.decoy_files(first)?;
+    self.grants.extend(adapted);
+    Ok(())
+  }
+
+  fn clear_children(dir: &Path) -> Result<(), Error> {
+    let read_err = |path: PathBuf, source| Error::ReadFile { path, source };
+    let entries = fs::read_dir(dir).map_err(|source| read_err(dir.to_path_buf(), source))?;
+    for entry in entries {
+      let entry = entry.map_err(|source| read_err(dir.to_path_buf(), source))?;
+      let path = entry.path();
+      let kind = entry.file_type().map_err(|source| read_err(path.clone(), source))?;
+      let removed = if kind.is_dir() {
+        fs::remove_dir_all(&path)
+      } else {
+        fs::remove_file(&path)
+      };
+      removed.map_err(|source| Error::RemoveFile { path, source })?;
+    }
+    Ok(())
+  }
+
   /// The collected mounts and grants.
   pub(crate) fn outputs(self) -> RewriteOutputs {
     RewriteOutputs {
