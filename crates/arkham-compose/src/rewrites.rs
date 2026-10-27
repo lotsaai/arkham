@@ -212,9 +212,7 @@ impl RewriteCollector {
     Ok(())
   }
 
-  /// Mount a writable directory with the decoy at `file_name`, so the guest
-  /// can create a lock file beside it. The directory itself stays, because a
-  /// container may already have it mounted.
+  /// Mount a writable directory with the decoy at `file_name`.
   ///
   /// # Errors
   ///

@@ -63,10 +63,6 @@ pub(crate) struct DeriveInputs<'a> {
 /// written.
 ///
 /// ponytail: no opt-out exists yet; none has been asked for.
-/// `KUBECONFIG` is a `:`-separated list merged in order. An empty value
-/// means `~/.kube/config`. An entry that is present but cannot be read is
-/// skipped, and the files already read stay in the merge. `TALOSCONFIG`
-/// honors a single path. A list warns and falls back to the default.
 pub(crate) fn derive_sources(inputs: &DeriveInputs<'_>) -> Result<RewriteOutputs, Error> {
   let DeriveInputs {
     files_dir,
@@ -243,25 +239,11 @@ impl AmbientDeriver<'_> {
     }
   }
 
-  /// The kubeconfig list and the talosconfig at its default path.
-  ///
-  /// `KUBECONFIG` is a `:`-separated list merged in order. An empty value
-  /// means `~/.kube/config`. An entry that is present but cannot be read is
-  /// skipped. `TALOSCONFIG` is one path.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when a twin output cannot be written.
   fn kube_and_talos(&mut self) -> Result<(), Error> {
     self.kube()?;
     self.talos()
   }
 
-  /// Merge every readable `KUBECONFIG` entry and mount `{home}/.kube`.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the twin directory cannot be written.
   fn kube(&mut self) -> Result<(), Error> {
     let mut loaded = Vec::new();
     for path in kube_paths(self.host_home) {
@@ -301,11 +283,6 @@ impl AmbientDeriver<'_> {
     self.collector.twin_in_dir(adapted, "kube-home", "config", &dest)
   }
 
-  /// The talosconfig at `TALOSCONFIG` or `~/.talos/config`, mounted writable.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the twin output cannot be written.
   fn talos(&mut self) -> Result<(), Error> {
     let path = env_source("TALOSCONFIG", ".talos/config", self.host_home);
     if self.declared.contains(&path) || !path.is_file() {
@@ -360,8 +337,6 @@ impl AmbientDeriver<'_> {
   }
 }
 
-/// `KUBECONFIG` entries in order. An empty or unset value is `~/.kube/config`.
-/// Empty segments of a `:`-separated list are dropped. Whitespace is kept.
 fn kube_paths(host_home: &Path) -> Vec<PathBuf> {
   let default = host_home.join(".kube").join("config");
   let Some(value) = env::var_os("KUBECONFIG").filter(|value| !value.is_empty()) else {
@@ -371,9 +346,6 @@ fn kube_paths(host_home: &Path) -> Vec<PathBuf> {
   if paths.is_empty() { vec![default] } else { paths }
 }
 
-/// The source path one single-path override such as `TALOSCONFIG` names, or
-/// the default under the host home. A colon-separated list warns and uses
-/// the default. An empty value uses the default.
 fn env_source(env_name: &str, default: &str, host_home: &Path) -> PathBuf {
   match env::var(env_name) {
     Ok(value) if value.trim().is_empty() => host_home.join(default),
@@ -705,7 +677,6 @@ mod tests {
     );
   }
 
-  /// The kubeconfig twin is writable, so `kubectl config use-context` can rewrite it.
   #[test]
   fn kubeconfig_mounts_writable() {
     let host = tempdir().unwrap();
@@ -826,7 +797,6 @@ mod tests {
     assert!(!body.contains("carol-token"), "{body}");
   }
 
-  /// `KUBECONFIG=a:b` merges in order. A later file adds names and does not replace earlier ones.
   #[test]
   fn kubeconfig_list_merges_files_in_order() {
     let host = tempdir().unwrap();
@@ -942,7 +912,6 @@ mod tests {
     assert!(logged.contains(&second.display().to_string()), "{logged}");
   }
 
-  /// An ambiguous current context is warned with the typed error and skipped.
   #[test]
   fn ambiguous_current_kubeconfig_warns_and_skips() {
     let host = tempdir().unwrap();

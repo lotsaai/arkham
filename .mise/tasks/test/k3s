@@ -503,8 +503,6 @@ run_guest() {
   }
 
   echo "--- ${backend}: kubectl in the guest"
-  # A download from the guest is captured by the proxy and reset. Copy the
-  # host binary when the image does not already have kubectl.
   if ! guest sh -c 'command -v kubectl >/dev/null 2>&1'; then
     host_kubectl=$(command -v kubectl)
     host_kubectl=$(readlink -f "$host_kubectl")

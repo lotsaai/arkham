@@ -1,12 +1,3 @@
-//! Kubeconfig adapter: every derivable context becomes a grant. The label
-//! comes from that user's identity. A client certificate presents a minted
-//! guest pair. A token-only user stays plain TLS. The decoy keeps every
-//! context.
-//!
-//! Detection is structural. A YAML mapping with `kind: Config` takes the
-//! adapter path. One file that is not a kubeconfig returns `None`, and the
-//! caller keeps the raw byte-swap.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
