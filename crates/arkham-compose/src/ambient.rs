@@ -346,6 +346,7 @@ mod tests {
   use secrecy::SecretString;
   use std::collections::HashMap;
   use std::ffi::OsString;
+  use std::os::unix::fs::PermissionsExt;
   use tempfile::tempdir;
 
   /// The automatic pass maps the default-path sources onto decoy twins at
@@ -651,6 +652,280 @@ mod tests {
       !containers.contains(&"/home/eng/.kube/config".to_string()),
       "the broken kubeconfig derives nothing: {containers:?}"
     );
+  }
+
+  /// The kubeconfig twin is writable, so `kubectl config use-context` can rewrite it.
+  #[test]
+  fn kubeconfig_mounts_writable() {
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    fs::create_dir_all(host.path().join(".kube")).unwrap();
+    fs::write(
+      host.path().join(".kube").join("config"),
+      "apiVersion: v1\nkind: Config\ncurrent-context: dev\ncontexts:\n- name: dev\n  context: {cluster: dev, user: carol}\nclusters:\n- name: dev\n  cluster: {server: https://10.9.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: carol\n  user: {token: carol-token}\n",
+    )
+    .unwrap();
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .expect("kubeconfig twin");
+    assert!(!mount.ro, "kubeconfig decoy is writable");
+    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    assert!(!body.contains("carol-token"), "{body}");
+  }
+
+  #[test]
+  fn existing_kube_config_file_still_inits() {
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    fs::create_dir_all(host.path().join(".kube")).unwrap();
+    fs::write(
+      host.path().join(".kube").join("config"),
+      "apiVersion: v1\nkind: Config\ncurrent-context: dev\ncontexts:\n- name: dev\n  context: {cluster: dev, user: carol}\nclusters:\n- name: dev\n  cluster: {server: https://10.9.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: carol\n  user: {token: carol-token}\n",
+    )
+    .unwrap();
+    let files = work.path().join("files");
+    fs::create_dir_all(&files).unwrap();
+    let legacy = files.join("kube-config");
+    fs::write(&legacy, "legacy-twin").unwrap();
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &files,
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    assert_eq!(fs::read_to_string(&legacy).unwrap(), "legacy-twin");
+    assert!(legacy.is_file(), "the old twin stays a file");
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .expect("kubeconfig twin");
+    assert_eq!(mount.host, files.join("kube-home"));
+    assert!(mount.host.is_dir());
+    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    assert!(!body.contains("carol-token"), "{body}");
+  }
+
+  #[test]
+  fn kube_home_is_cleared_on_init() {
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    fs::create_dir_all(host.path().join(".kube")).unwrap();
+    fs::write(
+      host.path().join(".kube").join("config"),
+      "apiVersion: v1\nkind: Config\ncurrent-context: dev\ncontexts:\n- name: dev\n  context: {cluster: dev, user: carol}\nclusters:\n- name: dev\n  cluster: {server: https://10.9.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: carol\n  user: {token: carol-token}\n",
+    )
+    .unwrap();
+    let files = work.path().join("files");
+    let home = files.join("kube-home");
+    fs::create_dir_all(home.join("cache")).unwrap();
+    fs::write(home.join("cache").join("discovery"), "stale").unwrap();
+    fs::write(home.join("config.lock"), "lock").unwrap();
+    fs::write(home.join("extra"), "guest-file").unwrap();
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &files,
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .expect("kubeconfig twin");
+    assert_eq!(mount.host, home);
+    assert!(home.is_dir(), "the directory itself stays");
+    assert!(!home.join("config.lock").exists());
+    assert!(!home.join("cache").exists());
+    assert!(!home.join("extra").exists());
+    let body = fs::read_to_string(home.join("config")).unwrap();
+    assert!(body.contains("current-context: dev"), "{body}");
+    assert!(!body.contains("carol-token"), "{body}");
+  }
+
+  /// `KUBECONFIG=a:b` merges in order. A later file adds names and does not replace earlier ones.
+  #[test]
+  fn kubeconfig_list_merges_files_in_order() {
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let first = host.path().join("first.yaml");
+    let second = host.path().join("second.yaml");
+    fs::write(
+      &first,
+      "apiVersion: v1\nkind: Config\ncurrent-context: prod\ncontexts:\n- name: prod\n  context: {cluster: prod, user: alice}\nclusters:\n- name: prod\n  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: alice\n  user: {token: alice-token}\n",
+    )
+    .unwrap();
+    fs::write(
+      &second,
+      "apiVersion: v1\nkind: Config\ncurrent-context: staging\ncontexts:\n- name: prod\n  context: {cluster: evil, user: mallory}\n- name: staging\n  context: {cluster: staging, user: bob}\nclusters:\n- name: evil\n  cluster: {server: https://10.9.0.9:6443, certificate-authority-data: Q0E=}\n- name: staging\n  cluster: {server: https://10.2.0.1:6443, certificate-authority-data: Q1RFU1Q=}\nusers:\n- name: mallory\n  user: {token: mallory-token}\n- name: bob\n  user: {token: bob-token}\n",
+    )
+    .unwrap();
+    set_env("KUBECONFIG", format!("{}:{}", first.display(), second.display()));
+    let outputs = derive_sources(&DeriveInputs {
+      files_dir: &work.path().join("files"),
+      root: work.path(),
+      registry: &Registry::load(None).unwrap(),
+      decoys: &[],
+      expander: &build_expander(HashMap::new()),
+      home: "/home/eng",
+      host_home: Some(host.path()),
+      guests_dir: &work.path().join("guests"),
+      rewrites: &[],
+    })
+    .unwrap();
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .expect("merged kubeconfig twin");
+    assert!(!mount.ro, "kubeconfig decoy is writable");
+    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    assert!(body.contains("current-context: prod"), "{body}");
+    assert!(body.contains("name: prod") && body.contains("name: staging"), "{body}");
+    assert_eq!(body.matches("name: prod").count(), 2, "later prod is not a second context: {body}");
+    assert!(body.contains("cluster: prod") && body.contains("user: alice"), "the first prod stays: {body}");
+    assert!(
+      body.contains("name: evil") && body.contains("name: mallory"),
+      "a new cluster or user name is added: {body}"
+    );
+    assert!(
+      !body.contains("mallory-token") && !body.contains("alice-token") && !body.contains("bob-token"),
+      "{body}"
+    );
+    let fragment: String = outputs.grants.iter().map(|grant| grant.fragment.as_str()).collect();
+    assert!(fragment.contains("https://10.0.0.1:6443"), "{fragment}");
+    assert!(fragment.contains("https://10.2.0.1:6443"), "{fragment}");
+    assert!(
+      !fragment.contains("https://10.9.0.9:6443"),
+      "a context that lost the name grants nothing: {fragment}"
+    );
+  }
+
+  #[test]
+  fn unreadable_kubeconfig_entry_keeps_the_earlier_grant() {
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let first = host.path().join("first.yaml");
+    let second = host.path().join("second.yaml");
+    fs::write(
+      &first,
+      "apiVersion: v1\nkind: Config\ncurrent-context: prod\ncontexts:\n- name: prod\n  context: {cluster: prod, user: alice}\nclusters:\n- name: prod\n  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: alice\n  user: {token: alice-token}\n",
+    )
+    .unwrap();
+    fs::write(
+      &second,
+      "apiVersion: v1\nkind: Config\ncurrent-context: staging\ncontexts:\n- name: staging\n  context: {cluster: staging, user: bob}\nclusters:\n- name: staging\n  cluster: {server: https://10.2.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: bob\n  user: {token: bob-token}\n",
+    )
+    .unwrap();
+    fs::set_permissions(&second, fs::Permissions::from_mode(0o000)).unwrap();
+    let denied = fs::read(&second).expect_err("mode 000 is still readable");
+    assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+    set_env("KUBECONFIG", format!("{}:{}", first.display(), second.display()));
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outputs = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || {
+      derive_sources(&DeriveInputs {
+        files_dir: &work.path().join("files"),
+        root: work.path(),
+        registry: &Registry::load(None).unwrap(),
+        decoys: &[],
+        expander: &build_expander(HashMap::new()),
+        home: "/home/eng",
+        host_home: Some(host.path()),
+        guests_dir: &work.path().join("guests"),
+        rewrites: &[],
+      })
+      .unwrap()
+    });
+    let mount = outputs
+      .mounts
+      .iter()
+      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .expect("the readable entry still mounts");
+    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    assert!(body.contains("name: prod") && body.contains("user: alice"), "{body}");
+    assert!(!body.contains("alice-token") && !body.contains("bob-token"), "{body}");
+    let fragment: String = outputs.grants.iter().map(|grant| grant.fragment.as_str()).collect();
+    assert!(fragment.contains("https://10.0.0.1:6443"), "{fragment}");
+    assert!(!fragment.contains("https://10.2.0.1:6443"), "{fragment}");
+    let logged = lines.lock().unwrap().join("\n");
+    assert!(logged.contains("kubeconfig source skipped"), "{logged}");
+    assert!(logged.contains(&second.display().to_string()), "{logged}");
+  }
+
+  /// An ambiguous current context is warned with the typed error and skipped.
+  #[test]
+  fn ambiguous_current_kubeconfig_warns_and_skips() {
+    let host = tempdir().unwrap();
+    let work = tempdir().unwrap();
+    let empty_xdg = tempdir().unwrap();
+    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
+    let source = host.path().join("kube.yaml");
+    fs::write(
+      &source,
+      "apiVersion: v1\nkind: Config\ncurrent-context: prod\ncontexts:\n- name: prod\n  context: {cluster: shared, user: alice}\n- name: staging\n  context: {cluster: shared, user: bob}\nclusters:\n- name: shared\n  cluster: {server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: alice\n  user: {client-certificate-data: Q0VSVA==, client-key-data: S0VZ}\n- name: bob\n  user: {client-certificate-data: Qk9C, client-key-data: S0VZ}\n",
+    )
+    .unwrap();
+    set_env("KUBECONFIG", &source);
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outputs = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || {
+      derive_sources(&DeriveInputs {
+        files_dir: &work.path().join("files"),
+        root: work.path(),
+        registry: &Registry::load(None).unwrap(),
+        decoys: &[],
+        expander: &build_expander(HashMap::new()),
+        home: "/home/eng",
+        host_home: Some(host.path()),
+        guests_dir: &work.path().join("guests"),
+        rewrites: &[],
+      })
+      .unwrap()
+    });
+    assert!(
+      !outputs.mounts.iter().any(|mount| {
+        mount.container == Path::new("/home/eng/.kube") || mount.container.ends_with(".kube/config")
+      }),
+      "ambiguous current context derives nothing"
+    );
+    let logged = lines.lock().unwrap().join("\n");
+    assert!(logged.contains("indistinguishable"), "{logged}");
+    assert!(logged.contains("alice") && logged.contains("bob"), "{logged}");
   }
 
   /// An empty `TALOSCONFIG` is unset: the default path under the host home.
