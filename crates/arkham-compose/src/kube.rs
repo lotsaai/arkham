@@ -123,7 +123,7 @@ struct Opened {
   cluster_source: PathBuf,
   server: String,
   host: String,
-  scope: EndpointScope,
+  port: u16,
   token: Option<String>,
   cert: Option<Vec<u8>>,
   key: Option<Vec<u8>>,
@@ -205,7 +205,7 @@ impl KubeContextEntry {
       cluster_source: cluster.source.clone(),
       server: server.clone(),
       host: host.clone(),
-      scope,
+      port: scope.port,
       token: token.map(str::to_string),
       cert,
       key,
@@ -314,7 +314,7 @@ impl DerivedContexts {
       .map(|derived| Presented {
         identity: &derived.user_id,
         host: &derived.opened.host,
-        port: derived.opened.scope.port,
+        port: derived.opened.port,
         decoy: b"",
       })
       .collect()
@@ -326,7 +326,7 @@ impl DerivedContexts {
       .iter()
       .filter(|derived| {
         derived.opened.cert.is_some()
-          && derived.opened.scope.port == ambiguous.port
+          && derived.opened.port == ambiguous.port
           && derived.opened.host.eq_ignore_ascii_case(&ambiguous.host)
           && ambiguous.parties.iter().any(|party| derived.matches_party(party))
       })
@@ -348,7 +348,6 @@ impl DerivedContexts {
 
 struct Server {
   url: String,
-  scope: EndpointScope,
   cluster_id: ContextIdentity,
   ca: Option<Vec<u8>>,
 }
@@ -372,7 +371,6 @@ impl UserGrants {
     } = derived;
     let server = Server {
       url: opened.server,
-      scope: opened.scope,
       cluster_id,
       ca: opened.ca,
     };
@@ -433,7 +431,6 @@ impl UserGrant {
       _ => (None, None),
     };
     let mut allow = Vec::new();
-    let mut scopes = Vec::new();
     let mut tls = BTreeMap::new();
     let mut written_ca = BTreeSet::new();
     for server in self.servers {
@@ -453,7 +450,6 @@ impl UserGrant {
         }
       }
       allow.push(server.url.clone());
-      scopes.push(server.scope);
       tls.insert(server.url, entry);
     }
     batch.fragment.push_str(&render_fragment(
@@ -826,7 +822,7 @@ users:
       cluster_source: PathBuf::from(SOURCE),
       server: "https://10.0.0.1:6443".to_string(),
       host: host.clone(),
-      scope,
+      port: scope.port,
       token: Some("tok".to_string()),
       cert: None,
       key: None,
