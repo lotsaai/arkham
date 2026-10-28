@@ -336,7 +336,10 @@ run_leg() {
   # Redirects stay on the arkham invocations only: XDG_CONFIG_HOME breaks the
   # mise shims kubectl and k3d run through, so those keep the real environment.
   local statedir=$scratch/state-$name
-  XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
+  # The task exports KUBECONFIG as the cert file for kubectl. Init must see
+  # this leg's source, which is already a declared rewrite, so ambient
+  # discovery does not add the cert user on the same API server.
+  KUBECONFIG="$source" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
   shopt -s nullglob
   kubedirs=()
   for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
