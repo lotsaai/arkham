@@ -997,9 +997,14 @@ users:
       "user: {client-certificate-data: Q0VSVA==, client-key-data: S0VZ}",
     );
     let adapted = adapt_doc(&doc);
-    assert!(!adapted.decoy.contains("token:"), "no bearer, no token line: {}", adapted.decoy);
     let rules = rules_from(&adapted.fragment);
     let user = kube_identity(AmbientProtocol::KubernetesUser, "admin");
+    let decoy = rule_decoy(&rules[&user.label]);
+    assert!(
+      adapted.decoy.contains(&decoy),
+      "a cert-only user still gets its grant decoy as a token: {}",
+      adapted.decoy
+    );
     assert!(rules[&user.label].value.is_some(), "identity grant still resolves");
   }
 
@@ -1187,6 +1192,16 @@ users:
       "guest file carries the bearer decoy: {}",
       adapted.decoy
     );
+    let cert_decoy = rules
+      .values()
+      .find(|rule| rule.tls.values().any(|tls| tls.guest_tls_mode == GuestTlsMode::Mtls))
+      .map(rule_decoy)
+      .expect("cert grant");
+    assert!(
+      adapted.decoy.contains(&cert_decoy),
+      "guest file carries the cert user's decoy token: {}",
+      adapted.decoy
+    );
     assert!(adapted.decoy.contains("name: prod"), "{}", adapted.decoy);
     assert!(adapted.decoy.contains("name: staging"), "{}", adapted.decoy);
     assert!(!adapted.decoy.contains("alice-token"), "{}", adapted.decoy);
@@ -1260,12 +1275,11 @@ users:
     );
     let decoys: Vec<String> = rules.values().map(rule_decoy).collect();
     assert_ne!(decoys[0], decoys[1]);
-    let bearer = rules
-      .values()
-      .find(|rule| rule.tls.values().any(|tls| tls.guest_tls_mode == GuestTlsMode::Tls))
-      .map(rule_decoy)
-      .expect("bearer grant");
-    assert!(adapted.decoy.contains(&bearer), "{}", adapted.decoy);
+    assert!(
+      decoys.iter().all(|decoy| adapted.decoy.contains(decoy)),
+      "the cert user token is its grant decoy too: {}",
+      adapted.decoy
+    );
     assert!(
       !adapted.decoy.contains("alice-token") && !adapted.decoy.contains("Q0VSVA=="),
       "{}",
@@ -1434,6 +1448,11 @@ users:
     let decoys: Vec<String> = rules.values().map(rule_decoy).collect();
     assert_ne!(decoys[0], decoys[1]);
     assert!(
+      decoys.iter().all(|decoy| adapted.decoy.contains(decoy)),
+      "each cert user token is its grant decoy: {}",
+      adapted.decoy
+    );
+    assert!(
       !adapted.decoy.contains("Q0VSVA==") && !adapted.decoy.contains("Qk9C"),
       "{}",
       adapted.decoy
@@ -1469,6 +1488,12 @@ users:
     let adapted = adapt_doc(doc);
     let rules = rules_from(&adapted.fragment);
     assert_eq!(rules.len(), 3, "every derivable user is a grant: {}", adapted.fragment);
+    let decoys: Vec<String> = rules.values().map(rule_decoy).collect();
+    assert!(
+      decoys.iter().all(|decoy| adapted.decoy.contains(decoy)),
+      "every granted user token is its grant decoy: {}",
+      adapted.decoy
+    );
     assert!(adapted.fragment.contains("https://10.0.0.1:6443"), "{}", adapted.fragment);
     assert!(adapted.fragment.contains("https://10.9.0.1:6443"), "{}", adapted.fragment);
     assert!(

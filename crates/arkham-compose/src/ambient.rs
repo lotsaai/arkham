@@ -704,10 +704,13 @@ mod tests {
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
       .expect("kubeconfig twin");
+    assert_eq!(mount.host, work.path().join("files").join("kube-config"));
+    assert!(mount.host.is_file(), "the kubeconfig twin is one file");
     assert!(!mount.ro, "kubeconfig decoy is writable");
-    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    let body = fs::read_to_string(&mount.host).unwrap();
+    assert!(body.contains("current-context: dev"), "{body}");
     assert!(!body.contains("carol-token"), "{body}");
   }
 
@@ -739,21 +742,21 @@ mod tests {
       rewrites: &[],
     })
     .unwrap();
-    assert_eq!(fs::read_to_string(&legacy).unwrap(), "legacy-twin");
-    assert!(legacy.is_file(), "the old twin stays a file");
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
       .expect("kubeconfig twin");
-    assert_eq!(mount.host, files.join("kube-home"));
-    assert!(mount.host.is_dir());
-    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    assert_eq!(mount.host, legacy);
+    assert!(!mount.ro, "kubeconfig decoy is writable");
+    let body = fs::read_to_string(&mount.host).unwrap();
+    assert!(body.contains("current-context: dev"), "{body}");
     assert!(!body.contains("carol-token"), "{body}");
+    assert!(!body.contains("legacy-twin"), "init replaces the kubeconfig twin: {body}");
   }
 
   #[test]
-  fn kube_home_is_cleared_on_init() {
+  fn kubeconfig_twin_is_a_file() {
     let host = tempdir().unwrap();
     let work = tempdir().unwrap();
     let empty_xdg = tempdir().unwrap();
@@ -785,14 +788,12 @@ mod tests {
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
       .expect("kubeconfig twin");
-    assert_eq!(mount.host, home);
-    assert!(home.is_dir(), "the directory itself stays");
-    assert!(!home.join("config.lock").exists());
-    assert!(!home.join("cache").exists());
-    assert!(!home.join("extra").exists());
-    let body = fs::read_to_string(home.join("config")).unwrap();
+    assert_eq!(mount.host, files.join("kube-config"));
+    assert!(mount.host.is_file());
+    assert!(home.join("cache").join("discovery").is_file(), "an unused directory is not the twin");
+    let body = fs::read_to_string(&mount.host).unwrap();
     assert!(body.contains("current-context: dev"), "{body}");
     assert!(!body.contains("carol-token"), "{body}");
   }
@@ -831,10 +832,11 @@ mod tests {
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
       .expect("merged kubeconfig twin");
+    assert_eq!(mount.host, work.path().join("files").join("kube-config"));
     assert!(!mount.ro, "kubeconfig decoy is writable");
-    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    let body = fs::read_to_string(&mount.host).unwrap();
     assert!(body.contains("current-context: prod"), "{body}");
     assert!(body.contains("name: prod") && body.contains("name: staging"), "{body}");
     assert_eq!(body.matches("name: prod").count(), 2, "later prod is not a second context: {body}");
@@ -899,9 +901,9 @@ mod tests {
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
       .expect("the readable entry still mounts");
-    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    let body = fs::read_to_string(&mount.host).unwrap();
     assert!(body.contains("name: prod") && body.contains("user: alice"), "{body}");
     assert!(!body.contains("alice-token") && !body.contains("bob-token"), "{body}");
     let fragment: String = outputs.grants.iter().map(|grant| grant.fragment.as_str()).collect();
@@ -940,9 +942,10 @@ mod tests {
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
       .expect("both cert users mount");
-    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    let body = fs::read_to_string(&mount.host).unwrap();
+    assert_eq!(body.matches("token:").count(), 2, "each cert user has a decoy token: {body}");
     assert!(body.contains("name: prod") && body.contains("name: staging"), "{body}");
     assert!(!body.contains("Q0VSVA==") && !body.contains("Qk9C"), "{body}");
     let fragment: String = outputs.grants.iter().map(|grant| grant.fragment.as_str()).collect();
