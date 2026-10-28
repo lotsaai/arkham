@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-#MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer + cert auth, guest multi-context)"
+#MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer + cert auth, multi-context)"
 #MISE depends=["build:debug"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
@@ -12,10 +12,6 @@ cluster="arkham-k3s-test"
 scratch=$proj_dir/target/k3s-e2e
 arkham=$proj_dir/target/debug/arkham
 serve_pid=""
-forward_pid=""
-guest_compose=""
-guest_downs=()
-api_port=18102
 # One budget for /readyz, node Ready, and coredns Ready. Cluster create
 # (image pull included) is outside it. Override when a runner is slower.
 ready_timeout=${ARKHAM_K3S_READY_TIMEOUT:-600}
@@ -110,18 +106,6 @@ cleanup() {
   if [ -n "$serve_pid" ]; then
     kill "$serve_pid" 2>/dev/null || true
   fi
-  if [ -n "$forward_pid" ]; then
-    kill "$forward_pid" 2>/dev/null || true
-  fi
-  if [ "$status" -ne 0 ] && [ -n "$guest_compose" ]; then
-    docker compose -f "$guest_compose" logs --tail 200 >&2 || true
-  fi
-  local entry statedir ws
-  for entry in "${guest_downs[@]}"; do
-    statedir=${entry%%|*}
-    ws=${entry#*|}
-    XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" down "$ws" >/dev/null 2>&1 || true
-  done
   k3d cluster delete "$cluster" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -321,10 +305,29 @@ kubectl config set-credentials "$user" --token="$token" >/dev/null
 kubectl config unset "users.$user.client-certificate-data" >/dev/null
 kubectl config unset "users.$user.client-key-data" >/dev/null
 
+# Second bearer on the same API. Two token users share one server. The proxy
+# tells them apart by the bearer.
+export KUBECONFIG="$scratch/cert-kubeconfig"
+kubectl create serviceaccount arkham-b >/dev/null
+kubectl create clusterrolebinding arkham-b --clusterrole=cluster-admin --serviceaccount=default:arkham-b >/dev/null
+token_b=$(kubectl create token arkham-b --duration=3600s)
+ctx_a=$(KUBECONFIG="$scratch/token-kubeconfig" kubectl config current-context)
+cluster_name=$(KUBECONFIG="$scratch/token-kubeconfig" kubectl config view --minify -o 'jsonpath={.clusters[0].name}')
+user_a=$(KUBECONFIG="$scratch/token-kubeconfig" kubectl config view -o 'jsonpath={.users[0].name}')
+cp "$scratch/token-kubeconfig" "$scratch/multi.yaml"
+cp "$scratch/token-kubeconfig" "$scratch/bob.yaml"
+KUBECONFIG="$scratch/multi.yaml" kubectl config set-credentials arkham-b --token="$token_b" >/dev/null
+KUBECONFIG="$scratch/multi.yaml" kubectl config set-context arkham-b --cluster="$cluster_name" --user=arkham-b >/dev/null
+KUBECONFIG="$scratch/bob.yaml" kubectl config set-credentials arkham-b --token="$token_b" >/dev/null
+KUBECONFIG="$scratch/bob.yaml" kubectl config set-context arkham-b --cluster="$cluster_name" --user=arkham-b >/dev/null
+KUBECONFIG="$scratch/bob.yaml" kubectl config use-context arkham-b >/dev/null
+KUBECONFIG="$scratch/bob.yaml" kubectl config delete-context "$ctx_a" >/dev/null
+KUBECONFIG="$scratch/bob.yaml" kubectl config unset "users.${user_a}" >/dev/null
+
 # One leg: init a workspace against a kubeconfig source, serve host-side, and
-# prove the three states — real works direct, decoy fails direct, decoy works
+# prove the three states. Real works direct, decoy fails direct, decoy works
 # through the proxy. Host-side serve cannot resolve the /arkham/grants container
-# mount, so the layer runs as a copy with host paths; substitution behavior
+# mount, so the layer runs as a copy with host paths. Substitution behavior
 # is unaffected by the prefix.
 run_leg() {
   local name=$1 source=$2 port=$3
@@ -334,7 +337,10 @@ run_leg() {
   # Redirects stay on the arkham invocations only: XDG_CONFIG_HOME breaks the
   # mise shims kubectl and k3d run through, so those keep the real environment.
   local statedir=$scratch/state-$name
-  XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
+  # The task exports KUBECONFIG as the cert file for kubectl. Init must see
+  # this leg's source, which is already a declared rewrite, so ambient
+  # discovery does not add the cert user on the same API server.
+  KUBECONFIG="$source" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
   shopt -s nullglob
   kubedirs=()
   for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
@@ -370,250 +376,60 @@ run_leg() {
   serve_pid=""
 }
 
-run_leg cert "$scratch/cert-kubeconfig" 18099
-run_leg bearer "$scratch/token-kubeconfig" 18100
-
-echo "k3s substitution proven: bearer + cert auth"
-
-k3d_port=${server##*:}
-python3 - "$api_port" "$k3d_port" <<'PY' &
-import socket
-import sys
-import threading
-
-def pipe(src, dst):
-    try:
-        while True:
-            data = src.recv(65536)
-            if not data:
-                break
-            dst.sendall(data)
-    except OSError:
-        pass
-    finally:
-        for sock in (src, dst):
-            try:
-                sock.close()
-            except OSError:
-                pass
-
-def listen(port, target):
-    server = socket.socket()
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", port))
-    server.listen()
-    while True:
-        client, _addr = server.accept()
-        upstream = socket.create_connection(("127.0.0.1", target))
-        threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
-        threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()
-
-listen(int(sys.argv[1]), int(sys.argv[2]))
-PY
-forward_pid=$!
-forward_ready=0
-for _try in 1 2 3 4 5 6 7 8 9 10; do
-  if python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 1).close()' "$api_port"; then
-    forward_ready=1
-    break
-  fi
-  sleep 0.2
-done
-if [ "$forward_ready" -ne 1 ]; then
-  echo "kube API forwarder did not accept on ${api_port}" >&2
-  exit 1
-fi
-
-KUBECONFIG="$scratch/cert-kubeconfig" kubectl create serviceaccount arkham-alpha >/dev/null
-KUBECONFIG="$scratch/cert-kubeconfig" kubectl create clusterrolebinding arkham-alpha --clusterrole=cluster-admin --serviceaccount=default:arkham-alpha >/dev/null
-KUBECONFIG="$scratch/cert-kubeconfig" kubectl create serviceaccount arkham-beta >/dev/null
-KUBECONFIG="$scratch/cert-kubeconfig" kubectl create clusterrolebinding arkham-beta --clusterrole=cluster-admin --serviceaccount=default:arkham-beta >/dev/null
-token_alpha=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl create token arkham-alpha --duration=3600s)
-token_beta=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl create token arkham-beta --duration=3600s)
-admin_cert=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl config view --raw -o jsonpath='{.users[0].user.client-certificate-data}')
-real_ca=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl config view --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')
-openssl genrsa -out "$scratch/auditor.key" 2048
-openssl req -new -key "$scratch/auditor.key" -out "$scratch/auditor.csr" -subj "/CN=auditor"
-csr_b64=$(base64 -w 0 "$scratch/auditor.csr")
-cat >"$scratch/auditor-csr.yaml" <<EOF
-apiVersion: certificates.k8s.io/v1
-kind: CertificateSigningRequest
-metadata:
-  name: arkham-auditor
-spec:
-  request: ${csr_b64}
-  signerName: kubernetes.io/kube-apiserver-client
-  usages:
-  - client auth
-EOF
-KUBECONFIG="$scratch/cert-kubeconfig" kubectl apply -f "$scratch/auditor-csr.yaml" >/dev/null
-KUBECONFIG="$scratch/cert-kubeconfig" kubectl certificate approve arkham-auditor >/dev/null
-auditor_cert=""
-for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-  auditor_cert=$(KUBECONFIG="$scratch/cert-kubeconfig" kubectl get csr arkham-auditor -o jsonpath='{.status.certificate}')
-  if [ -n "$auditor_cert" ]; then
-    break
-  fi
-  sleep 1
-done
-if [ -z "$token_alpha" ] || [ -z "$token_beta" ] || [ -z "$admin_cert" ] || [ -z "$real_ca" ] || [ -z "$auditor_cert" ]; then
-  echo "failed to read a k3s credential for the guest absence check" >&2
-  exit 1
-fi
-printf '%s' "$auditor_cert" | base64 -d >"$scratch/auditor.crt"
-KUBECONFIG="$scratch/cert-kubeconfig" kubectl create clusterrolebinding arkham-auditor --clusterrole=view --user=auditor >/dev/null
-KUBECONFIG="$scratch/cert-kubeconfig" kubectl --token="$token_alpha" get ns --request-timeout=30s >/dev/null
-KUBECONFIG="$scratch/cert-kubeconfig" kubectl --token="$token_beta" get ns --request-timeout=30s >/dev/null
-
-guest_source=$scratch/guest-kubeconfig
-cp "$scratch/cert-kubeconfig" "$guest_source"
-ca_file=$scratch/k3s-ca.crt
-printf '%s' "$real_ca" | base64 -d >"$ca_file"
-admin_user=$(KUBECONFIG="$guest_source" kubectl config view --minify -o 'jsonpath={.users[0].name}')
-admin_context=$(KUBECONFIG="$guest_source" kubectl config current-context)
-orig_cluster=$(KUBECONFIG="$guest_source" kubectl config view --minify -o 'jsonpath={.contexts[0].context.cluster}')
-KUBECONFIG="$guest_source" kubectl config set-cluster shared --server="https://host.docker.internal:${api_port}" --certificate-authority="$ca_file" --embed-certs=true >/dev/null
-KUBECONFIG="$guest_source" kubectl config set-credentials alpha --token="$token_alpha" >/dev/null
-KUBECONFIG="$guest_source" kubectl config set-credentials beta --token="$token_beta" >/dev/null
-KUBECONFIG="$guest_source" kubectl config set-credentials auditor --client-certificate="$scratch/auditor.crt" --client-key="$scratch/auditor.key" --embed-certs=true >/dev/null
-KUBECONFIG="$guest_source" kubectl config set-context alpha --cluster=shared --user=alpha >/dev/null
-KUBECONFIG="$guest_source" kubectl config set-context alpha-view --cluster=shared --user=alpha >/dev/null
-KUBECONFIG="$guest_source" kubectl config set-context beta --cluster=shared --user=beta >/dev/null
-KUBECONFIG="$guest_source" kubectl config set-context admin --cluster=shared --user="$admin_user" >/dev/null
-KUBECONFIG="$guest_source" kubectl config set-context auditor --cluster=shared --user=auditor >/dev/null
-KUBECONFIG="$guest_source" kubectl config use-context alpha >/dev/null
-KUBECONFIG="$guest_source" kubectl config delete-context "$admin_context" >/dev/null
-KUBECONFIG="$guest_source" kubectl config delete-cluster "$orig_cluster" >/dev/null
-
-run_guest() {
-  local backend=$1
-  local ws=$scratch/ws-guest-$backend
-  local statedir=$scratch/state-guest-$backend
+# Ambient discovery. `arkham init` reads KUBECONFIG, merges a colon-separated
+# list, and writes the decoy at {home}/.kube/config. Each context is switched
+# with `kubectl config use-context` and read through one serve.
+run_discovered() {
+  local name=$1 port=$2 kubeconfig=$3
+  shift 3
+  local ws=$scratch/ws-$name
   mkdir -p "$ws/.config/arkham"
-  printf '[workspace]\nhome = "%s"\n' "$HOME" >"$ws/.config/arkham/config.toml"
-  guest_downs+=("${statedir}|${ws}")
-  KUBECONFIG="$guest_source" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend "$backend" "$ws"
-  local compose=""
+  printf '%s\n' '[workspace]' >"$ws/.config/arkham/config.toml"
+  local statedir=$scratch/state-$name
+  KUBECONFIG="$kubeconfig" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
   shopt -s nullglob
-  local found=()
-  for compose in "$statedir"/arkham/ws/*/compose.yml; do
-    found+=("$compose")
-  done
+  local kubedirs=() decoys=()
+  for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
+  for d in "$statedir"/arkham/ws/*/files/kube-config; do decoys+=("$d"); done
   shopt -u nullglob
-  if [ "${#found[@]}" -ne 1 ]; then
-    echo "init generated no compose file under $statedir" >&2
+  if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
+    echo "init did not discover a kubeconfig from KUBECONFIG=${kubeconfig}" >&2
     exit 1
   fi
-  compose=${found[0]}
-  guest_compose=$compose
-  XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" up "$ws"
+  local kubedir=${kubedirs[0]} decoy=${decoys[0]}
+  sed "s|/arkham/grants|${kubedir}|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
+  cp "$decoy" "$scratch/proxy-$name.yaml"
+  local discovered
+  discovered=$(KUBECONFIG="$kubeconfig" kubectl config view -o 'jsonpath={.clusters[0].name}')
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster "$discovered" --proxy-url="http://127.0.0.1:$port" >/dev/null
 
-  if [ "$backend" = tun ] && [ ! -e /dev/net/tun ]; then
-    run_privileged modprobe tun || {
-      echo "tun device is missing" >&2
-      exit 1
-    }
-  fi
+  XDG_STATE_HOME=$statedir FNOX_CONFIG_DIR=$scratch/fnox ARKHAM_CONFIG="$scratch/host-layer-$name.toml" ARKHAM_CA_FILE="$scratch/config/arkham/ca.pem" ARKHAM_LISTEN="127.0.0.1:$port" "$arkham" serve &
+  serve_pid=$!
+  sleep 2
 
-  guest() {
-    docker compose -f "$compose" exec -T -i \
-      -e HOME="$HOME" \
-      -e KUBECONFIG="$HOME/.kube/config" \
-      -e PATH="/tmp/arkham-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-      agent "$@"
-  }
-
-  echo "--- ${backend}: kubectl in the guest"
-  if ! guest sh -c 'command -v kubectl >/dev/null 2>&1'; then
-    host_kubectl=$(command -v kubectl)
-    host_kubectl=$(readlink -f "$host_kubectl")
-    guest mkdir -p /tmp/arkham-bin
-    docker compose -f "$compose" cp "$host_kubectl" agent:/tmp/arkham-bin/kubectl
-    docker compose -f "$compose" exec -T -u 0 agent chmod 755 /tmp/arkham-bin/kubectl
-  fi
-
-  local try=0
-  echo "--- ${backend}: --context get ns"
-  until guest kubectl --context alpha get ns --request-timeout=20s; do
-    try=$((try + 1))
-    if [ "$try" -ge 10 ]; then
-      echo "guest kubectl --context alpha did not succeed" >&2
-      exit 1
-    fi
-    sleep 3
+  local ctx
+  echo "--- ${name}: real credentials work direct"
+  for ctx in "$@"; do
+    KUBECONFIG="$kubeconfig" kubectl --context "$ctx" get nodes --request-timeout=30s
   done
-  guest kubectl --context alpha-view get ns --request-timeout=30s
-  guest kubectl --context beta get ns --request-timeout=30s
-  guest kubectl --context admin get ns --request-timeout=30s
-  guest kubectl --context auditor get ns --request-timeout=30s
-
-  echo "--- ${backend}: use-context then get ns"
-  guest kubectl config use-context beta
-  guest kubectl get ns --request-timeout=30s
-  local current
-  current=$(guest kubectl config current-context)
-  if [ "$current" != beta ]; then
-    echo "use-context left current-context as ${current}" >&2
+  echo "--- ${name}: decoy fails direct"
+  if env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy KUBECONFIG="$decoy" kubectl --context "$1" get nodes --request-timeout=30s; then
+    echo "decoy kubeconfig worked without the proxy; substitution unproven" >&2
     exit 1
   fi
-
-  local guest_host=""
-  shopt -s nullglob
-  local candidate
-  for candidate in "$statedir"/arkham/ws/*/files/* "$statedir"/arkham/ws/*/files/*/*; do
-    if [ -f "$candidate" ] && grep -q 'kind: Config' "$candidate"; then
-      guest_host=$candidate
-    fi
+  echo "--- ${name}: decoy works through the proxy"
+  for ctx in "$@"; do
+    KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context "$ctx" >/dev/null
+    KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get nodes --request-timeout=30s
   done
-  shopt -u nullglob
-  if [ -z "$guest_host" ]; then
-    echo "ambient kubeconfig was not mounted" >&2
-    exit 1
-  fi
-  if ! grep -q 'current-context: beta' "$guest_host" && ! grep -q 'current-context: "beta"' "$guest_host"; then
-    echo "use-context did not write the mounted kubeconfig" >&2
-    exit 1
-  fi
-  if grep -F -q -e "$token_alpha" -e "$token_beta" -e "$admin_cert" -e "$auditor_cert" -e "$real_ca" -- "$guest_host"; then
-    echo "real credential reached the guest kubeconfig" >&2
-    exit 1
-  fi
-  for ctx in alpha alpha-view beta admin auditor; do
-    if ! grep -E -q "(^|[[:space:]])name: \"?${ctx}\"?$" "$guest_host"; then
-      echo "guest kubeconfig is missing context ${ctx}" >&2
-      exit 1
-    fi
-  done
-  local env_out
-  env_out=$(guest sh -c 'env')
-  if printf '%s\n' "$env_out" | grep -F -q -e "$token_alpha" -e "$token_beta" -e "$admin_cert" -e "$auditor_cert"; then
-    echo "real credential reached the guest environment" >&2
-    exit 1
-  fi
 
-  guest kubectl config use-context alpha
-  current=$(guest kubectl config current-context)
-  if [ "$current" != alpha ]; then
-    echo "use-context left current-context as ${current}" >&2
-    exit 1
-  fi
-
-  XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" down "$ws"
-  echo "k3s guest multi-context proven: ambient kubeconfig via ${backend}"
+  kill "$serve_pid" 2>/dev/null || true
+  serve_pid=""
 }
 
-# Compose names ghcr.io/lotsaai/arkham:$version. That tag is not published
-# for the version under test, so tag this binary before `arkham up`.
-image_version=$("$arkham" --version)
-image_version=${image_version##* }
-if [ -z "$image_version" ]; then
-  echo "arkham --version did not report a version" >&2
-  exit 1
-fi
-image_ctx=$scratch/arkham-image
-mkdir -p "$image_ctx"
-cp "$arkham" "$image_ctx/arkham"
-docker build -t "ghcr.io/lotsaai/arkham:${image_version}" -f "$proj_dir/Dockerfile" "$image_ctx"
+run_leg cert "$scratch/cert-kubeconfig" 18099
+run_leg bearer "$scratch/token-kubeconfig" 18100
+run_discovered multi 18101 "$scratch/multi.yaml" "$ctx_a" arkham-b
+run_discovered split 18102 "$scratch/token-kubeconfig:$scratch/bob.yaml" "$ctx_a" arkham-b
 
-run_guest tproxy
-run_guest tun
+echo "k3s substitution proven: bearer + cert auth, multi-context, KUBECONFIG list"

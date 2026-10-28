@@ -16,6 +16,8 @@ clap = { workspace = true }
 dirs = { workspace = true }
 gix-config = { workspace = true }
 gix-discover = { workspace = true }
+k8s-openapi = { workspace = true }
+kube-client = { workspace = true }
 libc = { workspace = true }
 pem = { workspace = true }
 regex = { workspace = true }

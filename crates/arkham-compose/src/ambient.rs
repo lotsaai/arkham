@@ -279,8 +279,8 @@ impl AmbientDeriver<'_> {
         return Ok(());
       }
     };
-    let dest = format!("{}/.kube", self.home);
-    self.collector.twin_in_dir(adapted, "kube-home", "config", &dest)
+    let dest = format!("{}/.kube/config", self.home);
+    self.collector.twin_mode(adapted, "kube-config", &dest, false)
   }
 
   fn talos(&mut self) -> Result<(), Error> {
@@ -792,7 +792,10 @@ mod tests {
       .expect("kubeconfig twin");
     assert_eq!(mount.host, files.join("kube-config"));
     assert!(mount.host.is_file());
-    assert!(home.join("cache").join("discovery").is_file(), "an unused directory is not the twin");
+    assert!(
+      home.join("cache").join("discovery").is_file(),
+      "an unused directory is not the twin"
+    );
     let body = fs::read_to_string(&mount.host).unwrap();
     assert!(body.contains("current-context: dev"), "{body}");
     assert!(!body.contains("carol-token"), "{body}");
