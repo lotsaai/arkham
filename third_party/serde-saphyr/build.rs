@@ -3,11 +3,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const CRATE_URL: &str = "https://static.crates.io/crates/serde-saphyr/serde-saphyr-0.0.29.crate";
+const CRATE_SHA256: &str = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4";
+
 fn main() {
-  let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
   let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-  let archive = manifest.join("serde-saphyr-0.0.29.crate");
-  println!("cargo:rerun-if-changed={}", archive.display());
+  let archive = fetch_crate(&out);
 
   let status = Command::new("tar")
     .arg("-xzf")
@@ -23,6 +24,39 @@ fn main() {
   let body = strip_inner_attrs(&lib);
   let entry = rewrite_mods(body, &src);
   fs::write(out.join("entry.rs"), entry).expect("write entry.rs");
+}
+
+fn fetch_crate(out: &Path) -> PathBuf {
+  let dest = out.join("serde-saphyr-0.0.29.crate");
+  if !checksum_matches(&dest) {
+    let status = Command::new("curl")
+      .args(["-fsSL", "--retry", "3", "-o"])
+      .arg(&dest)
+      .arg(CRATE_URL)
+      .status()
+      .unwrap_or_else(|err| panic!("curl is required to fetch serde-saphyr: {err}"));
+    if !status.success() {
+      panic!("curl failed to fetch {CRATE_URL}");
+    }
+    if !checksum_matches(&dest) {
+      panic!("serde-saphyr 0.0.29 checksum mismatch");
+    }
+  }
+  dest
+}
+
+fn checksum_matches(path: &Path) -> bool {
+  if !path.is_file() {
+    return false;
+  }
+  let output = Command::new("sha256sum")
+    .arg(path)
+    .output()
+    .unwrap_or_else(|err| panic!("sha256sum is required to check serde-saphyr: {err}"));
+  if !output.status.success() {
+    return false;
+  }
+  String::from_utf8_lossy(&output.stdout).starts_with(CRATE_SHA256)
 }
 
 fn strip_inner_attrs(lib: &str) -> &str {

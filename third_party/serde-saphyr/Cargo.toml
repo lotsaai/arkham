@@ -9,8 +9,8 @@ readme = false
 
 # kube-client 4.2.0 depends on serde-saphyr ^0.0.29. That release caps
 # smallvec below 1.16, and rama-utils requires smallvec ^1.16. Cargo will
-# not link two 1.x copies. This crate is the published 0.0.29 sources
-# (serde-saphyr-0.0.29.crate) with only that bound changed.
+# not link two 1.x copies. build.rs downloads the published 0.0.29 crate,
+# checks its sha256, and compiles it with the bound below.
 
 [features]
 default = ["serialize", "deserialize"]
