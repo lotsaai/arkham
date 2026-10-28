@@ -1,0 +1,49 @@
+[package]
+name = "serde-saphyr"
+version = "0.0.29"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "serde-saphyr 0.0.29 with the smallvec bound widened to 1.16"
+readme = false
+
+# kube-client 4.2.0 depends on serde-saphyr ^0.0.29. That release caps
+# smallvec below 1.16, and rama-utils requires smallvec ^1.16. Cargo will
+# not link two 1.x copies. This crate is the published 0.0.29 sources
+# (serde-saphyr-0.0.29.crate) with only that bound changed.
+
+[features]
+default = ["serialize", "deserialize"]
+deserialize = [
+  "dep:num-traits",
+  "dep:annotate-snippets",
+  "dep:granit-parser",
+  "dep:smallvec",
+  "dep:encoding_rs_io",
+  "dep:ahash",
+]
+serialize = ["dep:base64", "dep:num-traits", "dep:zmij", "dep:nohash-hasher"]
+figment = []
+figment2 = []
+garde = []
+huge_documents = []
+include = ["deserialize"]
+include_fs = ["include"]
+miette = []
+properties = ["deserialize"]
+robotics = ["deserialize"]
+serde_derived_types = ["dep:serde"]
+validator = []
+
+[dependencies]
+ahash = { version = "0.8", optional = true }
+annotate-snippets = { version = "0.12", optional = true }
+base64 = { version = ">=0.21.0, <=0.22.1", optional = true }
+encoding_rs_io = { version = "0.1", optional = true }
+granit-parser = { version = "0.0.7", optional = true }
+nohash-hasher = { version = "0.2", optional = true }
+num-traits = { version = ">=0.2.0, <=0.2.19", optional = true }
+serde = { version = "1", features = ["derive"], optional = true, default-features = false }
+serde_core = "1"
+smallvec = { version = ">=1.0.0, <2", optional = true }
+zmij = { version = "1.0", optional = true }

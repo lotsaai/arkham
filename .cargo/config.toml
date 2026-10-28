@@ -1,3 +1,9 @@
+# kube-client's config feature still builds k8s-openapi, whose build script
+# refuses to run until one Kubernetes version is selected. Nothing in arkham
+# calls those API types.
+[env]
+K8S_OPENAPI_ENABLED_VERSION = "1.36"
+
 # `clang-<major>` must resolve to the same LLVM major rustc was built
 # with — rustc 1.99.0 = LLVM 23. Locally: /usr/bin/clang-23. CI: installed by
 # the llvm.sh step in ci.yml. Container: Dockerfile.rustbuilder derives it from

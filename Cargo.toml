@@ -115,6 +115,7 @@ httparse = "1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 jwt = "0.16"
+kube-client = { version = "4.2.0", default-features = false, features = ["config"] }
 lapin = { version = "4.12.3", default-features = false, features = ["tokio"] }
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-aws-lc-rs"] }
 lettre = { version = "0.11.23", default-features = false, features = ["aws-lc-rs", "smtp-transport", "tokio1", "tokio1-rustls", "webpki-roots"] }
@@ -197,6 +198,11 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+# serde-saphyr 0.0.29 (kube-client 4.2.0) caps smallvec below 1.16.
+# rama-utils requires smallvec ^1.16. Cargo will not link two 1.x copies.
+[patch.crates-io]
+serde-saphyr = { path = "third_party/serde-saphyr" }
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -178,6 +178,15 @@ pub enum Error {
     #[source]
     source: YamlError,
   },
+  /// A kubeconfig document failed to load.
+  #[error("file rewrite `{}`: {source}", file.display())]
+  Kubeconfig {
+    /// Rewrite source.
+    file: PathBuf,
+    /// Underlying kubeconfig failure.
+    #[source]
+    source: kube_client::config::KubeconfigError,
+  },
   /// An adapted rewrite does not map onto a grant.
   #[error("file rewrite `{}`: invalid {format}: {detail}", file.display())]
   RewriteInvalid {

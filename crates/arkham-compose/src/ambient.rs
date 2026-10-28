@@ -279,8 +279,8 @@ impl AmbientDeriver<'_> {
         return Ok(());
       }
     };
-    let dest = format!("{}/.kube", self.home);
-    self.collector.twin_in_dir(adapted, "kube-home", "config", &dest)
+    let dest = format!("{}/.kube/config", self.home);
+    self.collector.twin_mode(adapted, "kube-config", &dest, false)
   }
 
   fn talos(&mut self) -> Result<(), Error> {
@@ -704,96 +704,11 @@ mod tests {
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
       .expect("kubeconfig twin");
     assert!(!mount.ro, "kubeconfig decoy is writable");
-    let body = fs::read_to_string(mount.host.join("config")).unwrap();
-    assert!(!body.contains("carol-token"), "{body}");
-  }
-
-  #[test]
-  fn existing_kube_config_file_still_inits() {
-    let host = tempdir().unwrap();
-    let work = tempdir().unwrap();
-    let empty_xdg = tempdir().unwrap();
-    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
-    fs::create_dir_all(host.path().join(".kube")).unwrap();
-    fs::write(
-      host.path().join(".kube").join("config"),
-      "apiVersion: v1\nkind: Config\ncurrent-context: dev\ncontexts:\n- name: dev\n  context: {cluster: dev, user: carol}\nclusters:\n- name: dev\n  cluster: {server: https://10.9.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: carol\n  user: {token: carol-token}\n",
-    )
-    .unwrap();
-    let files = work.path().join("files");
-    fs::create_dir_all(&files).unwrap();
-    let legacy = files.join("kube-config");
-    fs::write(&legacy, "legacy-twin").unwrap();
-    let outputs = derive_sources(&DeriveInputs {
-      files_dir: &files,
-      root: work.path(),
-      registry: &Registry::load(None).unwrap(),
-      decoys: &[],
-      expander: &build_expander(HashMap::new()),
-      home: "/home/eng",
-      host_home: Some(host.path()),
-      guests_dir: &work.path().join("guests"),
-      rewrites: &[],
-    })
-    .unwrap();
-    assert_eq!(fs::read_to_string(&legacy).unwrap(), "legacy-twin");
-    assert!(legacy.is_file(), "the old twin stays a file");
-    let mount = outputs
-      .mounts
-      .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
-      .expect("kubeconfig twin");
-    assert_eq!(mount.host, files.join("kube-home"));
-    assert!(mount.host.is_dir());
-    let body = fs::read_to_string(mount.host.join("config")).unwrap();
-    assert!(!body.contains("carol-token"), "{body}");
-  }
-
-  #[test]
-  fn kube_home_is_cleared_on_init() {
-    let host = tempdir().unwrap();
-    let work = tempdir().unwrap();
-    let empty_xdg = tempdir().unwrap();
-    let _env = AmbientEnv::isolate(host.path(), empty_xdg.path());
-    fs::create_dir_all(host.path().join(".kube")).unwrap();
-    fs::write(
-      host.path().join(".kube").join("config"),
-      "apiVersion: v1\nkind: Config\ncurrent-context: dev\ncontexts:\n- name: dev\n  context: {cluster: dev, user: carol}\nclusters:\n- name: dev\n  cluster: {server: https://10.9.0.1:6443, certificate-authority-data: Q0E=}\nusers:\n- name: carol\n  user: {token: carol-token}\n",
-    )
-    .unwrap();
-    let files = work.path().join("files");
-    let home = files.join("kube-home");
-    fs::create_dir_all(home.join("cache")).unwrap();
-    fs::write(home.join("cache").join("discovery"), "stale").unwrap();
-    fs::write(home.join("config.lock"), "lock").unwrap();
-    fs::write(home.join("extra"), "guest-file").unwrap();
-    let outputs = derive_sources(&DeriveInputs {
-      files_dir: &files,
-      root: work.path(),
-      registry: &Registry::load(None).unwrap(),
-      decoys: &[],
-      expander: &build_expander(HashMap::new()),
-      home: "/home/eng",
-      host_home: Some(host.path()),
-      guests_dir: &work.path().join("guests"),
-      rewrites: &[],
-    })
-    .unwrap();
-    let mount = outputs
-      .mounts
-      .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
-      .expect("kubeconfig twin");
-    assert_eq!(mount.host, home);
-    assert!(home.is_dir(), "the directory itself stays");
-    assert!(!home.join("config.lock").exists());
-    assert!(!home.join("cache").exists());
-    assert!(!home.join("extra").exists());
-    let body = fs::read_to_string(home.join("config")).unwrap();
-    assert!(body.contains("current-context: dev"), "{body}");
+    assert_eq!(mount.host, work.path().join("files").join("kube-config"));
+    let body = fs::read_to_string(&mount.host).unwrap();
     assert!(!body.contains("carol-token"), "{body}");
   }
 
@@ -831,10 +746,10 @@ mod tests {
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
       .expect("merged kubeconfig twin");
     assert!(!mount.ro, "kubeconfig decoy is writable");
-    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    let body = fs::read_to_string(&mount.host).unwrap();
     assert!(body.contains("current-context: prod"), "{body}");
     assert!(body.contains("name: prod") && body.contains("name: staging"), "{body}");
     assert_eq!(body.matches("name: prod").count(), 2, "later prod is not a second context: {body}");
@@ -899,9 +814,9 @@ mod tests {
     let mount = outputs
       .mounts
       .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
+      .find(|mount| mount.container == Path::new("/home/eng/.kube/config"))
       .expect("the readable entry still mounts");
-    let body = fs::read_to_string(mount.host.join("config")).unwrap();
+    let body = fs::read_to_string(&mount.host).unwrap();
     assert!(body.contains("name: prod") && body.contains("user: alice"), "{body}");
     assert!(!body.contains("alice-token") && !body.contains("bob-token"), "{body}");
     let fragment: String = outputs.grants.iter().map(|grant| grant.fragment.as_str()).collect();
@@ -913,7 +828,7 @@ mod tests {
   }
 
   #[test]
-  fn two_cert_users_on_one_cluster_mount() {
+  fn two_cert_users_on_one_cluster_are_skipped() {
     let host = tempdir().unwrap();
     let work = tempdir().unwrap();
     let empty_xdg = tempdir().unwrap();
@@ -925,29 +840,31 @@ mod tests {
     )
     .unwrap();
     set_env("KUBECONFIG", &source);
-    let outputs = derive_sources(&DeriveInputs {
-      files_dir: &work.path().join("files"),
-      root: work.path(),
-      registry: &Registry::load(None).unwrap(),
-      decoys: &[],
-      expander: &build_expander(HashMap::new()),
-      home: "/home/eng",
-      host_home: Some(host.path()),
-      guests_dir: &work.path().join("guests"),
-      rewrites: &[],
-    })
-    .unwrap();
-    let mount = outputs
-      .mounts
-      .iter()
-      .find(|mount| mount.container == Path::new("/home/eng/.kube"))
-      .expect("both cert users mount");
-    let body = fs::read_to_string(mount.host.join("config")).unwrap();
-    assert!(body.contains("name: prod") && body.contains("name: staging"), "{body}");
-    assert!(!body.contains("Q0VSVA==") && !body.contains("Qk9C"), "{body}");
-    let fragment: String = outputs.grants.iter().map(|grant| grant.fragment.as_str()).collect();
-    assert_eq!(fragment.matches("guest_tls_mode = \"mtls\"").count(), 2, "{fragment}");
-    assert!(fragment.contains("https://10.0.0.1:6443"), "{fragment}");
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let outputs = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || {
+      derive_sources(&DeriveInputs {
+        files_dir: &work.path().join("files"),
+        root: work.path(),
+        registry: &Registry::load(None).unwrap(),
+        decoys: &[],
+        expander: &build_expander(HashMap::new()),
+        home: "/home/eng",
+        host_home: Some(host.path()),
+        guests_dir: &work.path().join("guests"),
+        rewrites: &[],
+      })
+      .unwrap()
+    });
+    assert!(
+      outputs
+        .mounts
+        .iter()
+        .all(|mount| mount.container != Path::new("/home/eng/.kube/config")),
+      "two cert-only users on one server are not mounted"
+    );
+    let logged = lines.lock().unwrap().join("\n");
+    assert!(logged.contains("kubeconfig source skipped"), "{logged}");
+    assert!(logged.contains("indistinguishable"), "{logged}");
   }
 
   #[test]
