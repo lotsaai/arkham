@@ -440,10 +440,24 @@ fn scopes(file: &Path, allow: &[String]) -> Result<Vec<EndpointScope>, Error> {
 }
 
 fn grant_value(item: &Active) -> String {
-  item
-    .token
-    .clone()
-    .unwrap_or_else(|| String::from_utf8_lossy(item.cert.as_deref().unwrap_or_default()).into_owned())
+  if let Some(token) = &item.token {
+    return token.clone();
+  }
+  // kubectl sends this user's decoy as a bearer. The proxy substitutes the
+  // grant value into that header, and HTTP/2 rejects CR, LF, and NUL there.
+  single_line(&String::from_utf8_lossy(item.cert.as_deref().unwrap_or_default()))
+}
+
+fn single_line(value: &str) -> String {
+  value
+    .chars()
+    .filter(|ch| {
+      let code = u32::from(*ch);
+      code == 0x09 || (0x20..0x7f).contains(&code) || code >= 0x80
+    })
+    .collect::<String>()
+    .trim()
+    .to_owned()
 }
 
 fn render_grants(active: &[Active], decoys: &BTreeMap<String, String>, ca: &CertAuthority, guests_dir: &Path) -> Result<Rendered, Error> {
@@ -824,6 +838,33 @@ users:
       adapted.decoy
     );
     assert!(rules[&user.label].value.is_some(), "identity grant still resolves");
+  }
+
+  #[test]
+  fn cert_only_grant_value_is_a_single_header_line() {
+    let pem = "-----BEGIN CERTIFICATE-----\nCERT\n-----END CERTIFICATE-----\n";
+    let encoded = STANDARD.encode(pem);
+    let doc = format!(
+      "apiVersion: v1
+kind: Config
+current-context: prod
+contexts:
+- name: prod
+  context: {{cluster: prod, user: admin}}
+clusters:
+- name: prod
+  cluster: {{server: https://10.0.0.1:6443, certificate-authority-data: Q0E=}}
+users:
+- name: admin
+  user: {{client-certificate-data: {encoded}, client-key-data: S0VZ}}
+"
+    );
+    let adapted = adapt_doc(&doc);
+    let rules = rules_from(&adapted.fragment);
+    let user = kube_identity(AmbientProtocol::KubernetesUser, "admin");
+    let value = rules[&user.label].value.as_ref().expect("grant value").expose_secret();
+    assert!(!value.contains(['\n', '\r', '\0']), "grant value is one header line: {value:?}");
+    assert!(value.contains("BEGIN CERTIFICATE") && value.contains("CERT"), "{value}");
   }
 
   #[test]
