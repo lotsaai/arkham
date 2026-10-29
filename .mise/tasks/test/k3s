@@ -10,6 +10,7 @@ set -euo pipefail
 
 cluster="arkham-k3s-test"
 scratch=$proj_dir/target/k3s-e2e
+plugin_dir=""
 arkham=$proj_dir/target/debug/arkham
 serve_pid=""
 # One budget for /readyz, node Ready, and coredns Ready. Cluster create
@@ -107,6 +108,9 @@ cleanup() {
     kill "$serve_pid" 2>/dev/null || true
   fi
   k3d cluster delete "$cluster" >/dev/null 2>&1 || true
+  if [ -n "$plugin_dir" ]; then
+    rm -rf "$plugin_dir"
+  fi
 }
 trap cleanup EXIT
 
@@ -316,15 +320,16 @@ cluster_name=$(KUBECONFIG="$scratch/token-kubeconfig" kubectl config view --mini
 cp "$scratch/token-kubeconfig" "$scratch/multi.yaml"
 KUBECONFIG="$scratch/multi.yaml" kubectl config set-credentials arkham-b --token="$token_b" >/dev/null
 KUBECONFIG="$scratch/multi.yaml" kubectl config set-context arkham-b --cluster="$cluster_name" --user=arkham-b >/dev/null
-mkdir -p "$scratch/bin"
-cat >"$scratch/bin/exec-plugin" <<EOF
+# kubectl stores a command under the kubeconfig directory as a relative path.
+plugin_dir=$(mktemp -d)
+cat >"$plugin_dir/exec-plugin" <<EOF
 #!/bin/sh
 printf '%s\n' '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"${token}"}}'
 EOF
-chmod +x "$scratch/bin/exec-plugin"
+chmod +x "$plugin_dir/exec-plugin"
 cp "$scratch/cert-kubeconfig" "$scratch/exec-kubeconfig"
 KUBECONFIG="$scratch/exec-kubeconfig" kubectl config set-credentials "$user" \
-  --exec-command="$scratch/bin/exec-plugin" \
+  --exec-command="$plugin_dir/exec-plugin" \
   --exec-api-version=client.authentication.k8s.io/v1 \
   --exec-interactive-mode=Never >/dev/null
 KUBECONFIG="$scratch/exec-kubeconfig" kubectl config unset "users.$user.client-certificate-data" >/dev/null
