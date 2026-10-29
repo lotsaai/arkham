@@ -1,14 +1,11 @@
 //! Helpers shared by the compose crate tests.
 
-use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::cli::ProxyBackend;
 use arkham_config::config::fake_for;
-use arkham_config::registry::Registry;
 use tempfile::tempdir;
 
 use crate::ambient::*;
@@ -197,6 +194,9 @@ pub(crate) struct DerivedHome {
 }
 
 pub(crate) fn derive_home(host: &Path) -> DerivedHome {
+  use arkham_config::registry::Registry;
+  use std::collections::HashMap;
+
   let work = tempdir().unwrap();
   let xdg = tempdir().unwrap();
   let env = AmbientEnv::isolate(host, xdg.path());
@@ -217,40 +217,6 @@ pub(crate) fn derive_home(host: &Path) -> DerivedHome {
     _xdg: xdg,
     _env: env,
     outputs,
-  }
-}
-
-pub(crate) struct WarnCapture(pub(crate) std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-impl tracing::Subscriber for WarnCapture {
-  fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-    *metadata.level() <= tracing::Level::WARN
-  }
-
-  fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-    tracing::span::Id::from_u64(1)
-  }
-
-  fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-  fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-  fn event(&self, event: &tracing::Event<'_>) {
-    let mut message = String::new();
-    event.record(&mut WarnVisit(&mut message));
-    self.0.lock().unwrap().push(message);
-  }
-
-  fn enter(&self, _span: &tracing::span::Id) {}
-
-  fn exit(&self, _span: &tracing::span::Id) {}
-}
-
-struct WarnVisit<'a>(&'a mut String);
-
-impl tracing::field::Visit for WarnVisit<'_> {
-  fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-    let _ = write!(self.0, "{}={value:?};", field.name());
   }
 }
 

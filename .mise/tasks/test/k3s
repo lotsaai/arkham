@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-#MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer + cert auth, multi-context)"
+#MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer, cert, exec)"
 #MISE depends=["build:debug"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
@@ -313,16 +313,23 @@ kubectl create clusterrolebinding arkham-b --clusterrole=cluster-admin --service
 token_b=$(kubectl create token arkham-b --duration=3600s)
 ctx_a=$(KUBECONFIG="$scratch/token-kubeconfig" kubectl config current-context)
 cluster_name=$(KUBECONFIG="$scratch/token-kubeconfig" kubectl config view --minify -o 'jsonpath={.clusters[0].name}')
-user_a=$(KUBECONFIG="$scratch/token-kubeconfig" kubectl config view -o 'jsonpath={.users[0].name}')
 cp "$scratch/token-kubeconfig" "$scratch/multi.yaml"
-cp "$scratch/token-kubeconfig" "$scratch/bob.yaml"
 KUBECONFIG="$scratch/multi.yaml" kubectl config set-credentials arkham-b --token="$token_b" >/dev/null
 KUBECONFIG="$scratch/multi.yaml" kubectl config set-context arkham-b --cluster="$cluster_name" --user=arkham-b >/dev/null
-KUBECONFIG="$scratch/bob.yaml" kubectl config set-credentials arkham-b --token="$token_b" >/dev/null
-KUBECONFIG="$scratch/bob.yaml" kubectl config set-context arkham-b --cluster="$cluster_name" --user=arkham-b >/dev/null
-KUBECONFIG="$scratch/bob.yaml" kubectl config use-context arkham-b >/dev/null
-KUBECONFIG="$scratch/bob.yaml" kubectl config delete-context "$ctx_a" >/dev/null
-KUBECONFIG="$scratch/bob.yaml" kubectl config unset "users.${user_a}" >/dev/null
+mkdir -p "$scratch/bin"
+cat >"$scratch/bin/exec-plugin" <<EOF
+#!/bin/sh
+printf '%s\n' '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"${token}"}}'
+EOF
+chmod +x "$scratch/bin/exec-plugin"
+cp "$scratch/cert-kubeconfig" "$scratch/exec-kubeconfig"
+KUBECONFIG="$scratch/exec-kubeconfig" kubectl config set-credentials "$user" \
+  --exec-command="$scratch/bin/exec-plugin" \
+  --exec-api-version=client.authentication.k8s.io/v1 \
+  --exec-interactive-mode=Never >/dev/null
+KUBECONFIG="$scratch/exec-kubeconfig" kubectl config unset "users.$user.client-certificate-data" >/dev/null
+KUBECONFIG="$scratch/exec-kubeconfig" kubectl config unset "users.$user.client-key-data" >/dev/null
+KUBECONFIG="$scratch/exec-kubeconfig" kubectl config unset "users.$user.token" >/dev/null
 
 # One leg: init a workspace against a kubeconfig source, serve host-side, and
 # prove the three states. Real works direct, decoy fails direct, decoy works
@@ -352,6 +359,10 @@ run_leg() {
     exit 1
   fi
   local kubedir=${kubedirs[0]} decoy=${decoys[0]}
+  if grep -Eq 'client-certificate-data|client-key-data|exec:|auth-provider:' "$decoy"; then
+    echo "guest kubeconfig kept host auth" >&2
+    exit 1
+  fi
   sed "s|/arkham/grants|$kubedir|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
   cp "$decoy" "$scratch/proxy-$name.yaml"
   local context
@@ -376,9 +387,6 @@ run_leg() {
   serve_pid=""
 }
 
-# Ambient discovery. `arkham init` reads KUBECONFIG, merges a colon-separated
-# list, and writes the decoy at {home}/.kube/config. Each context is switched
-# with `kubectl config use-context` and read through one serve.
 run_discovered() {
   local name=$1 port=$2 kubeconfig=$3
   shift 3
@@ -429,7 +437,7 @@ run_discovered() {
 
 run_leg cert "$scratch/cert-kubeconfig" 18099
 run_leg bearer "$scratch/token-kubeconfig" 18100
+run_leg exec "$scratch/exec-kubeconfig" 18103
 run_discovered multi 18101 "$scratch/multi.yaml" "$ctx_a" arkham-b
-run_discovered split 18102 "$scratch/token-kubeconfig:$scratch/bob.yaml" "$ctx_a" arkham-b
 
-echo "k3s substitution proven: bearer + cert auth, multi-context, KUBECONFIG list"
+echo "k3s substitution proven: bearer, cert, exec, multi-context"
