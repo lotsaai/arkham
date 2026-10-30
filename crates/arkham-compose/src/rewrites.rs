@@ -91,7 +91,7 @@ pub(crate) struct RewriteOutputs {
 /// the env name when a rewrite names one with no known real value or no
 /// decoy, when a kubeconfig source states `envs` or does not map, or when a
 /// source file cannot be read or an output written.
-pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutputs, Error> {
+pub(crate) async fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutputs, Error> {
   let RewriteInputs {
     files_dir,
     root,
@@ -119,7 +119,7 @@ pub(crate) fn write_rewrites(inputs: &RewriteInputs<'_>) -> Result<RewriteOutput
     collector: RewriteCollector::new(files_dir)?,
   };
   for (index, rewrite) in rewrites.iter().enumerate() {
-    pass.write(index, rewrite, root, host_home, env, &by_env)?;
+    pass.write(index, rewrite, root, host_home, env, &by_env).await?;
   }
   Ok(pass.collector.outputs())
 }
@@ -265,7 +265,7 @@ impl ExplicitRewrites<'_> {
   ///
   /// Returns an error when the adapter rejects the document, a side file
   /// cannot be written, or a stated format does not match the document.
-  fn output(&mut self, rewrite: &FileRewrite, host: &Path, content: &[u8], pairs: &RewritePairs) -> Result<Vec<u8>, Error> {
+  async fn output(&mut self, rewrite: &FileRewrite, host: &Path, content: &[u8], pairs: &RewritePairs) -> Result<Vec<u8>, Error> {
     let Some(format) = rewrite.format.or_else(|| sniff(content)) else {
       return Ok(apply_rewrites(content, pairs));
     };
@@ -279,7 +279,7 @@ impl ExplicitRewrites<'_> {
       let guests_dir = self.guests_dir;
       let ca = self.ca()?;
       match format {
-        RewriteFormat::Kubeconfig => kube::adapt(host, content, ca, guests_dir)?.into_iter().collect(),
+        RewriteFormat::Kubeconfig => kube::adapt(host, content, ca).await?.into_iter().collect(),
         RewriteFormat::Talos => {
           let found = talos::adapt(host, content, ca, guests_dir)?;
           tracing::debug!(skipped = found.skipped.len(), "talos contexts left out of the grant set");
@@ -309,7 +309,7 @@ impl ExplicitRewrites<'_> {
   ///
   /// Returns an error when a path fails to expand, the source cannot be
   /// read, or an output cannot be written.
-  fn write(
+  async fn write(
     &mut self,
     index: usize,
     rewrite: &FileRewrite,
@@ -329,7 +329,7 @@ impl ExplicitRewrites<'_> {
       Some(RewriteFormat::Talos | RewriteFormat::Kubeconfig) => true,
       None => matches!(sniff(&content), Some(RewriteFormat::Talos | RewriteFormat::Kubeconfig)),
     };
-    let out_bytes = self.output(rewrite, &host, &content, &pairs)?;
+    let out_bytes = self.output(rewrite, &host, &content, &pairs).await?;
     let out_path = self.files_dir.join(rewrite_file_name(index, &host));
     fs::write(&out_path, out_bytes).map_err(|source| Error::WriteFile {
       path: out_path.clone(),
@@ -359,8 +359,8 @@ mod tests {
 
   /// Sources rewrite reals to decoys on disk and mount read-only at the
   /// `{home}`-expanded dest; unknown names fail naming the name.
-  #[test]
-  fn file_rewrites_swap_reals_for_decoys_on_disk() {
+  #[tokio::test]
+  async fn file_rewrites_swap_reals_for_decoys_on_disk() {
     let dir = tempdir().unwrap();
     let source = dir.path().join("npmrc");
     fs::write(&source, "//registry.npmjs.org/:_authToken=real-secret-1\n").unwrap();
@@ -388,6 +388,7 @@ mod tests {
       host_home: None,
       guests_dir: dir.path(),
     })
+    .await
     .unwrap();
     assert_eq!(outputs.mounts.len(), 1);
     assert!(outputs.mounts[0].ro);
@@ -411,13 +412,14 @@ mod tests {
       host_home: None,
       guests_dir: dir.path(),
     })
+    .await
     .unwrap_err()
     .to_string();
     assert!(error.contains("UNKNOWN_NAME"), "{error}");
   }
 
-  #[test]
-  fn kubeconfig_file_rewrite_mounts_writable() {
+  #[tokio::test]
+  async fn kubeconfig_file_rewrite_mounts_writable() {
     let dir = tempdir().unwrap();
     let source = dir.path().join("kube.yaml");
     fs::write(
@@ -442,6 +444,7 @@ mod tests {
       host_home: None,
       guests_dir: dir.path(),
     })
+    .await
     .unwrap();
     assert_eq!(outputs.mounts.len(), 1);
     assert!(!outputs.mounts[0].ro, "kubectl config use-context writes the mounted kubeconfig");

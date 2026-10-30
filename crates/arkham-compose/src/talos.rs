@@ -747,8 +747,8 @@ mod tests {
 
   /// Talosconfig sources adapt with no `envs`, stated or sniffed, and an
   /// `envs` statement is rejected either way. The decoy mounts writable.
-  #[test]
-  fn talos_rewrites_adapt_stated_or_sniffed() {
+  #[tokio::test]
+  async fn talos_rewrites_adapt_stated_or_sniffed() {
     let talos_doc = format!(
       "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n",
       STANDARD.encode(b"CA"),
@@ -781,6 +781,7 @@ mod tests {
         host_home: None,
         guests_dir: &guests,
       })
+      .await
       .unwrap();
       assert_eq!(outputs.grants.len(), 1);
       assert!(
@@ -812,6 +813,7 @@ mod tests {
       host_home: None,
       guests_dir: &guests,
     })
+    .await
     .unwrap_err()
     .to_string();
     assert!(error.contains("drop `envs`"), "{error}");

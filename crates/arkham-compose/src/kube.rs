@@ -39,12 +39,12 @@ use crate::error::Error;
 /// Returns an error when the document does not parse, names no usable
 /// current context, states a non-HTTPS server, or carries no substitutable
 /// credential.
-pub(crate) fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, _guests_dir: &Path) -> Result<Option<RewriteAdapted>, Error> {
+pub(crate) async fn adapt(source: &Path, content: &[u8], ca: &CertAuthority) -> Result<Option<RewriteAdapted>, Error> {
   let text = String::from_utf8_lossy(content);
   let Some(config) = read_doc(source, &text)? else {
     return Ok(None);
   };
-  let opened = open_all(&config, source)?;
+  let opened = open_all(&config, source).await?;
   let users = identities(&refs(
     source,
     AmbientProtocol::KubernetesUser,
@@ -104,7 +104,7 @@ fn read_doc(file: &Path, text: &str) -> Result<Option<Kubeconfig>, Error> {
   Ok(Some(doc))
 }
 
-fn open_all(config: &Kubeconfig, file: &Path) -> Result<Vec<Opened>, Error> {
+async fn open_all(config: &Kubeconfig, file: &Path) -> Result<Vec<Opened>, Error> {
   let current = config
     .current_context
     .as_deref()
@@ -115,7 +115,7 @@ fn open_all(config: &Kubeconfig, file: &Path) -> Result<Vec<Opened>, Error> {
   }
   let mut opened = Vec::new();
   for entry in &config.contexts {
-    match open_one(entry, config, file) {
+    match open_one(entry, config, file).await {
       Ok(item) => opened.push(item),
       Err(err) if entry.name == current => return Err(err),
       Err(err) => tracing::warn!(context = %entry.name, %err, "kube context skipped"),
@@ -124,7 +124,7 @@ fn open_all(config: &Kubeconfig, file: &Path) -> Result<Vec<Opened>, Error> {
   Ok(opened)
 }
 
-fn open_one(entry: &kube_client::config::NamedContext, config: &Kubeconfig, file: &Path) -> Result<Opened, Error> {
+async fn open_one(entry: &kube_client::config::NamedContext, config: &Kubeconfig, file: &Path) -> Result<Opened, Error> {
   let Some(spec) = &entry.context else {
     return Err(invalid(file, format!("context `{}` names no `cluster` or no `user`", entry.name)));
   };
@@ -158,7 +158,7 @@ fn open_one(entry: &kube_client::config::NamedContext, config: &Kubeconfig, file
       "uses file references; inline them first: `kubectl config view --flatten --minify`",
     ));
   }
-  let (token, pair) = credential(auth, file, user_name)?;
+  let (token, pair) = credential(auth, file, user_name).await?;
   let ca = decode(
     file,
     RewriteFormat::Kubeconfig,
@@ -191,7 +191,7 @@ fn server_scope(file: &Path, server: &str) -> Result<EndpointScope, Error> {
   Ok(scope)
 }
 
-fn credential(auth: &AuthInfo, file: &Path, user: &str) -> Result<(Option<String>, Option<ClientPair>), Error> {
+async fn credential(auth: &AuthInfo, file: &Path, user: &str) -> Result<(Option<String>, Option<ClientPair>), Error> {
   let token = auth
     .token
     .as_ref()
@@ -216,7 +216,7 @@ fn credential(auth: &AuthInfo, file: &Path, user: &str) -> Result<(Option<String
     _ => return Err(invalid(file, format!("user `{user}` carries half of the client pair"))),
   };
   if token.is_none() && pair.is_none() && (auth.exec.is_some() || auth.auth_provider.is_some()) {
-    return Ok((Some(plugin_bearer(auth, file)?), None));
+    return Ok((Some(plugin_bearer(auth, file).await?), None));
   }
   if token.is_none() && pair.is_none() {
     return Err(invalid(
@@ -227,42 +227,26 @@ fn credential(auth: &AuthInfo, file: &Path, user: &str) -> Result<(Option<String
   Ok((token, pair))
 }
 
-fn plugin_bearer(auth: &AuthInfo, file: &Path) -> Result<String, Error> {
-  let handle = tokio::runtime::Handle::try_current().map_err(|err| {
-    invalid(
-      file,
-      format!("resolving an exec credential or auth-provider needs a tokio runtime: {err}"),
-    )
-  })?;
-  if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
-    return Err(invalid(
-      file,
-      "resolving an exec credential or auth-provider needs a multi-thread tokio runtime",
-    ));
-  }
+async fn plugin_bearer(auth: &AuthInfo, file: &Path) -> Result<String, Error> {
   let mut config = kube_client::Config::new(Uri::from_static("https://kubernetes.default.svc"));
   config.auth_info = auth.clone();
-  let header = tokio::task::block_in_place(|| {
-    let layer = ConfigExt::auth_layer(&config).map_err(|source| Error::KubeClient {
-      file: file.to_path_buf(),
-      source: Box::new(source),
-    })?;
-    let Some(layer) = layer else {
-      let detail = if auth.exec.is_some() {
-        "exec credential plugin returned a client certificate"
-      } else {
-        "auth-provider did not produce a bearer token"
-      };
-      return Err(invalid(file, detail));
-    };
-    handle.block_on(async move {
-      let service = ServiceBuilder::new().layer(layer).service(tower::service_fn(echo_authorization));
-      match service.oneshot(Request::new(kube_client::client::Body::empty())).await {
-        Ok(response) => Ok(response.into_body()),
-        Err(err) => Err(invalid(file, format!("credential plugin failed: {err}"))),
-      }
-    })
+  let layer = ConfigExt::auth_layer(&config).map_err(|source| Error::KubeClient {
+    file: file.to_path_buf(),
+    source: Box::new(source),
   })?;
+  let Some(layer) = layer else {
+    let detail = if auth.exec.is_some() {
+      "exec credential plugin returned a client certificate"
+    } else {
+      "auth-provider did not produce a bearer token"
+    };
+    return Err(invalid(file, detail));
+  };
+  let service = ServiceBuilder::new().layer(layer).service(tower::service_fn(echo_authorization));
+  let header = match service.oneshot(Request::new(kube_client::client::Body::empty())).await {
+    Ok(response) => response.into_body(),
+    Err(err) => return Err(invalid(file, format!("credential plugin failed: {err}"))),
+  };
   let Some(header) = header else {
     return Err(invalid(file, "credential plugin produced no Authorization header"));
   };
@@ -510,9 +494,9 @@ users:
     CertAuthority::generate().unwrap()
   }
 
-  fn adapt_doc(doc: &str) -> RewriteAdapted {
-    let dir = tempfile::tempdir().unwrap();
-    adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path())
+  async fn adapt_doc(doc: &str) -> RewriteAdapted {
+    adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca())
+      .await
       .expect("adapt parses")
       .expect("bearer doc is a kubeconfig")
   }
@@ -538,24 +522,25 @@ users:
     .unwrap()
   }
 
-  #[test]
-  fn foreign_content_is_not_a_kubeconfig() {
+  #[tokio::test]
+  async fn foreign_content_is_not_a_kubeconfig() {
     let npmrc = "//registry.npmjs.org/:_authToken=secret";
-    let dir = tempfile::tempdir().unwrap();
-    let err = adapt(Path::new(SOURCE), npmrc.as_bytes(), &test_ca(), dir.path()).expect_err("plain text fails closed");
+    let err = adapt(Path::new(SOURCE), npmrc.as_bytes(), &test_ca())
+      .await
+      .expect_err("plain text fails closed");
     assert!(err.to_string().contains("does not parse as YAML"), "{err}");
   }
 
-  #[test]
-  fn label_comes_from_the_user_identity() {
+  #[tokio::test]
+  async fn label_comes_from_the_user_identity() {
     let label = user_id("admin").label;
-    let adapted = adapt_doc(BEARER_DOC);
+    let adapted = adapt_doc(BEARER_DOC).await;
     assert!(adapted.fragment.contains(&format!("[rules.{label}]")), "{}", adapted.fragment);
   }
 
-  #[test]
-  fn fragment_holds_the_grant_and_parses_as_a_rule() {
-    let adapted = adapt_doc(BEARER_DOC);
+  #[tokio::test]
+  async fn fragment_holds_the_grant_and_parses_as_a_rule() {
+    let adapted = adapt_doc(BEARER_DOC).await;
     let rules = rules_from(&adapted.fragment);
     let rule = rules.get(&user_id("admin").label).expect("rule present");
     assert_eq!(rule.env, user_id("admin").env());
@@ -580,9 +565,9 @@ users:
     assert_eq!(adapted.materialized.len(), 3, "pair plus CA materialize beside the fragment");
   }
 
-  #[test]
-  fn decoy_keeps_the_server_and_swaps_trust_identity_and_token() {
-    let adapted = adapt_doc(BEARER_DOC);
+  #[tokio::test]
+  async fn decoy_keeps_the_server_and_swaps_trust_identity_and_token() {
+    let adapted = adapt_doc(BEARER_DOC).await;
     assert!(adapted.decoy.contains("server: https://10.0.0.1:6443"), "{}", adapted.decoy);
     assert!(
       !adapted.decoy.contains("k3s-token"),
@@ -605,8 +590,8 @@ users:
     );
   }
 
-  #[test]
-  fn decoy_round_trips_spec_fields_and_all_entries() {
+  #[tokio::test]
+  async fn decoy_round_trips_spec_fields_and_all_entries() {
     let doc = "apiVersion: v1
 kind: Config
 preferences: {colors: true}
@@ -627,7 +612,7 @@ users:
 - name: stg-user
   user: {token: stg-real-token}
 ";
-    let adapted = adapt_doc(doc);
+    let adapted = adapt_doc(doc).await;
     let decoy = &adapted.decoy;
     assert!(decoy.contains("namespace: platform"), "{decoy}");
     assert!(decoy.contains("namespace: stg-ns"), "{decoy}");
@@ -670,12 +655,12 @@ users:
     assert_ne!(tokens[0], tokens[1], "granted users do not share a decoy bearer");
   }
 
-  #[test]
-  fn token_and_pair_users_both_take_plain_tls() {
+  #[tokio::test]
+  async fn token_and_pair_users_both_take_plain_tls() {
     // Only unmasked fixture text is touched here, so the bearer value never
     // appears in this test.
     let token_doc = BEARER_DOC.replace(", client-certificate-data: Q0VSVA==, client-key-data: S0VZ", "");
-    let token_rules = rules_from(&adapt_doc(&token_doc).fragment);
+    let token_rules = rules_from(&adapt_doc(&token_doc).await.fragment);
     let token_rule = token_rules.get(&user_id("admin").label).expect("rule present");
     let token_tls = token_rule.tls.get("https://10.0.0.1:6443").expect("tls keyed by the allow entry");
     assert_eq!(
@@ -688,7 +673,7 @@ users:
     let pair_at = BEARER_DOC[fields_at..].find(", client-certificate-data").expect("pair fields") + fields_at + 2;
     let mut pair_doc = BEARER_DOC.to_string();
     pair_doc.replace_range(fields_at..pair_at, "");
-    let pair_rules = rules_from(&adapt_doc(&pair_doc).fragment);
+    let pair_rules = rules_from(&adapt_doc(&pair_doc).await.fragment);
     let pair_rule = pair_rules.get(&user_id("admin").label).expect("rule present");
     let pair_tls = pair_rule.tls.get("https://10.0.0.1:6443").expect("tls keyed by the allow entry");
     assert_eq!(
@@ -700,13 +685,13 @@ users:
     assert!(pair_tls.guest_cert.is_none());
   }
 
-  #[test]
-  fn cert_only_user_maps_to_an_identity_grant() {
+  #[tokio::test]
+  async fn cert_only_user_maps_to_an_identity_grant() {
     let doc = BEARER_DOC.replace(
       "user: {token: k3s-token, client-certificate-data: Q0VSVA==, client-key-data: S0VZ}",
       "user: {client-certificate-data: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSUIKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=, client-key-data: S0VZ}",
     );
-    let adapted = adapt_doc(&doc);
+    let adapted = adapt_doc(&doc).await;
     assert!(
       adapted.decoy.contains("token: "),
       "cert users still get a decoy bearer: {}",
@@ -723,11 +708,12 @@ users:
     assert!(text.contains("BEGIN CERTIFICATE"), "{text}");
   }
 
-  #[test]
-  fn file_refs_are_an_error() {
+  #[tokio::test]
+  async fn file_refs_are_an_error() {
     let doc = BEARER_DOC.replace("certificate-authority-data: Q0E=", "certificate-authority: ca.crt");
-    let dir = tempfile::tempdir().unwrap();
-    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("file refs fail closed");
+    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca())
+      .await
+      .expect_err("file refs fail closed");
     assert!(err.to_string().contains("inline them first"), "{err}");
   }
 
@@ -745,7 +731,7 @@ users:
       "apiVersion: v1\nkind: Config\ncurrent-context: k3s-local\ncontexts:\n- name: k3s-local\n  context: {{cluster: k3s, user: admin}}\nclusters:\n- name: k3s\n  cluster: {{server: https://10.0.0.1:6443}}\nusers:\n- name: admin\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n      interactiveMode: Never\n",
       plugin.display(),
     );
-    let adapted = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).unwrap().unwrap();
+    let adapted = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca()).await.unwrap().unwrap();
     let rules = rules_from(&adapted.fragment);
     let value = rules[&user_id("admin").label].value.as_ref().unwrap();
     assert_eq!(value.expose_secret(), "plugin-token");
@@ -772,7 +758,7 @@ users:
       "apiVersion: v1\nkind: Config\ncurrent-context: k3s-local\ncontexts:\n- name: k3s-local\n  context: {{cluster: k3s, user: admin}}\nclusters:\n- name: k3s\n  cluster: {{server: https://10.0.0.1:6443}}\nusers:\n- name: admin\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: {}\n      interactiveMode: Never\n",
       plugin.display(),
     );
-    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).unwrap_err();
+    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca()).await.unwrap_err();
     assert!(err.to_string().contains("client certificate"), "{err}");
   }
 
@@ -782,8 +768,7 @@ users:
       "user: {token: k3s-token, client-certificate-data: Q0VSVA==, client-key-data: S0VZ}",
       "user: {auth-provider: {name: oidc, config: {id-token: provider-token}}}",
     );
-    let dir = tempfile::tempdir().unwrap();
-    let adapted = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).unwrap().unwrap();
+    let adapted = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca()).await.unwrap().unwrap();
     let rules = rules_from(&adapted.fragment);
     let value = rules[&user_id("admin").label].value.as_ref().unwrap();
     assert_eq!(value.expose_secret(), "provider-token");
@@ -792,47 +777,51 @@ users:
     assert!(adapted.decoy.contains("token: "), "{}", adapted.decoy);
   }
 
-  #[test]
-  fn unknown_context_is_an_error() {
+  #[tokio::test]
+  async fn unknown_context_is_an_error() {
     let doc = BEARER_DOC.replace("current-context: k3s-local", "current-context: nope");
-    let dir = tempfile::tempdir().unwrap();
-    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("unknown context fails closed");
+    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca())
+      .await
+      .expect_err("unknown context fails closed");
     assert!(err.to_string().contains("unknown context"), "{err}");
   }
 
-  #[test]
-  fn half_pair_is_an_error() {
+  #[tokio::test]
+  async fn half_pair_is_an_error() {
     let doc = BEARER_DOC.replace(
       "user: {token: k3s-token, client-certificate-data: Q0VSVA==, client-key-data: S0VZ}",
       "user: {token: k3s-token, client-certificate-data: Q0VSVA==}",
     );
-    let dir = tempfile::tempdir().unwrap();
-    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("half pair fails closed");
+    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca())
+      .await
+      .expect_err("half pair fails closed");
     assert!(err.to_string().contains("half of the client pair"), "{err}");
   }
 
-  #[test]
-  fn plain_http_server_is_an_error() {
+  #[tokio::test]
+  async fn plain_http_server_is_an_error() {
     let doc = BEARER_DOC.replace("https://10.0.0.1:6443", "http://10.0.0.1:8080");
-    let dir = tempfile::tempdir().unwrap();
-    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("plain HTTP fails closed");
+    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca())
+      .await
+      .expect_err("plain HTTP fails closed");
     assert!(err.to_string().contains("plain HTTP"), "{err}");
   }
 
-  #[test]
-  fn credentialless_user_is_an_error() {
+  #[tokio::test]
+  async fn credentialless_user_is_an_error() {
     let doc = BEARER_DOC.replace(
       "user: {token: k3s-token, client-certificate-data: Q0VSVA==, client-key-data: S0VZ}",
       "user: {}",
     );
-    let dir = tempfile::tempdir().unwrap();
-    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca(), dir.path()).expect_err("nothing to swap fails closed");
+    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca())
+      .await
+      .expect_err("nothing to swap fails closed");
     assert!(err.to_string().contains("nothing to substitute"), "{err}");
   }
 
-  #[test]
-  fn state_writes_and_stale_ones_prune() {
-    let adapted = adapt_doc(BEARER_DOC);
+  #[tokio::test]
+  async fn state_writes_and_stale_ones_prune() {
+    let adapted = adapt_doc(BEARER_DOC).await;
     let dir = tempfile::tempdir().unwrap();
     let grants = dir.path().join("grants");
     write_state(&grants, &[adapted]).unwrap();
@@ -848,8 +837,8 @@ users:
   }
 
   /// Kubeconfig sources adapt with no `envs`, stated or sniffed.
-  #[test]
-  fn kube_rewrites_adapt_stated_or_sniffed() {
+  #[tokio::test]
+  async fn kube_rewrites_adapt_stated_or_sniffed() {
     let dir = tempdir().unwrap();
     let home = tempdir().unwrap();
     let xdg = tempdir().unwrap();
@@ -876,6 +865,7 @@ users:
         host_home: None,
         guests_dir: &guests,
       })
+      .await
       .unwrap();
       assert_eq!(outputs.mounts.len(), 1);
       assert_eq!(outputs.grants.len(), 1);
@@ -891,8 +881,8 @@ users:
   }
 
   /// A stated kubeconfig format on a foreign file fails closed.
-  #[test]
-  fn stated_kubeconfig_on_plain_text_is_an_error() {
+  #[tokio::test]
+  async fn stated_kubeconfig_on_plain_text_is_an_error() {
     let dir = tempdir().unwrap();
     let home = tempdir().unwrap();
     let xdg = tempdir().unwrap();
@@ -917,13 +907,14 @@ users:
       host_home: None,
       guests_dir: &guests,
     })
+    .await
     .unwrap_err()
     .to_string();
     assert!(error.contains("does not parse as YAML"), "{error}");
   }
 
-  #[test]
-  fn one_user_two_contexts_is_one_grant() {
+  #[tokio::test]
+  async fn one_user_two_contexts_is_one_grant() {
     let doc = "apiVersion: v1
 kind: Config
 current-context: a
@@ -941,7 +932,7 @@ users:
 - name: admin
   user: {token: k3s-token}
 ";
-    let rules = rules_from(&adapt_doc(doc).fragment);
+    let rules = rules_from(&adapt_doc(doc).await.fragment);
     assert_eq!(rules.len(), 1);
     let mut allow = rules[&user_id("admin").label].allow.clone();
     allow.sort();
@@ -951,10 +942,10 @@ users:
     );
   }
 
-  #[test]
-  fn inactive_context_failure_is_skipped() {
+  #[tokio::test]
+  async fn inactive_context_failure_is_skipped() {
     let doc = BEARER_DOC.replace("clusters:", "- name: gone\n  context: {cluster: missing, user: ghost}\nclusters:");
-    let adapted = adapt_doc(&doc);
+    let adapted = adapt_doc(&doc).await;
     let rules = rules_from(&adapted.fragment);
     assert_eq!(rules.len(), 1);
     assert!(rules.contains_key(&user_id("admin").label));
