@@ -193,7 +193,7 @@ pub(crate) struct DerivedHome {
   pub(crate) outputs: RewriteOutputs,
 }
 
-pub(crate) fn derive_home(host: &Path) -> DerivedHome {
+pub(crate) async fn derive_home(host: &Path) -> DerivedHome {
   use arkham_config::registry::Registry;
   use std::collections::HashMap;
 
@@ -211,6 +211,7 @@ pub(crate) fn derive_home(host: &Path) -> DerivedHome {
     guests_dir: &work.path().join("guests"),
     rewrites: &[],
   })
+  .await
   .unwrap();
   DerivedHome {
     _work: work,

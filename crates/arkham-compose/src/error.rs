@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use arkham_config::Error as ConfigError;
 use arkham_config::config::RewriteFormat;
 use arkham_fnox::Error as FnoxError;
+use kube_client::Error as KubeClientError;
+use kube_client::config::KubeconfigError;
 use serde_json::Error as JsonError;
 use serde_yaml::Error as YamlError;
 use toml::ser::Error as TomlSerializeError;
@@ -168,6 +170,24 @@ pub enum Error {
     file: PathBuf,
     /// The format that took the adapter path.
     format: RewriteFormat,
+  },
+  /// A kubeconfig document failed to parse or merge.
+  #[error("file rewrite `{}`: kubeconfig: {source}", file.display())]
+  Kubeconfig {
+    /// Rewrite source.
+    file: PathBuf,
+    /// Underlying kubeconfig failure.
+    #[source]
+    source: Box<KubeconfigError>,
+  },
+  /// kube-client rejected a user credential.
+  #[error("file rewrite `{}`: kube client: {source}", file.display())]
+  KubeClient {
+    /// Rewrite source.
+    file: PathBuf,
+    /// Underlying client failure.
+    #[source]
+    source: Box<KubeClientError>,
   },
   /// An adapted rewrite is not valid YAML.
   #[error("file rewrite `{}`: does not parse as YAML: {source}", file.display())]

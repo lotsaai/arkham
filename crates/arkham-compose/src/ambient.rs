@@ -65,7 +65,7 @@ pub(crate) struct DeriveInputs<'a> {
 /// ponytail: no opt-out exists yet; none has been asked for.
 /// `KUBECONFIG`/`TALOSCONFIG` honor a single path — a list warns and falls
 /// back to the default.
-pub(crate) fn derive_sources(inputs: &DeriveInputs<'_>) -> Result<RewriteOutputs, Error> {
+pub(crate) async fn derive_sources(inputs: &DeriveInputs<'_>) -> Result<RewriteOutputs, Error> {
   let DeriveInputs {
     files_dir,
     root,
@@ -105,7 +105,7 @@ pub(crate) fn derive_sources(inputs: &DeriveInputs<'_>) -> Result<RewriteOutputs
   deriver.jj()?;
   deriver.ssh()?;
   deriver.nats()?;
-  deriver.kube_and_talos()?;
+  deriver.kube_and_talos().await?;
   Ok(deriver.collector.outputs())
 }
 
@@ -247,7 +247,7 @@ impl AmbientDeriver<'_> {
   /// # Errors
   ///
   /// Returns an error when a twin output cannot be written.
-  fn kube_and_talos(&mut self) -> Result<(), Error> {
+  async fn kube_and_talos(&mut self) -> Result<(), Error> {
     for (name, env_name, default, twin_name, twin_dest) in [
       ("kubeconfig", "KUBECONFIG", ".kube/config", "kube-config", ".kube/config"),
       ("talosconfig", "TALOSCONFIG", ".talos/config", "talos-config", ".talos/config"),
@@ -270,7 +270,8 @@ impl AmbientDeriver<'_> {
       };
       let (adapted, writable) = match name {
         "kubeconfig" => (
-          kube::adapt(&path, &content, ca, guests_dir)
+          kube::adapt(&path, &content, ca)
+            .await
             .ok()
             .flatten()
             .map(|adapted| vec![adapted])
@@ -350,8 +351,8 @@ mod tests {
 
   /// The automatic pass maps the default-path sources onto decoy twins at
   /// their default container paths and mints grants, with no declaration.
-  #[test]
-  fn derive_sources_maps_default_paths_to_twins_and_grants() {
+  #[tokio::test]
+  async fn derive_sources_maps_default_paths_to_twins_and_grants() {
     let host = tempdir().unwrap();
     let gitconfig = host.path().join(".gitconfig");
     fs::write(&gitconfig, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
@@ -408,6 +409,7 @@ mod tests {
       guests_dir: &work.path().join("guests"),
       rewrites: &[],
     })
+    .await
     .unwrap();
     for (name, value) in saved {
       match value {
@@ -447,8 +449,8 @@ mod tests {
   }
 
   /// An nkey context mounts a decoy seed. The real seed stays in the grant.
-  #[test]
-  fn derive_sources_mounts_a_decoy_nkey() {
+  #[tokio::test]
+  async fn derive_sources_mounts_a_decoy_nkey() {
     let host = tempdir().unwrap();
     let nats = host.path().join(".config").join("nats");
     fs::create_dir_all(nats.join("context")).unwrap();
@@ -461,7 +463,7 @@ mod tests {
       format!(r#"{{"url":"nats://nats.internal:4222","nkey":"{}"}}"#, nkey.display()),
     )
     .unwrap();
-    let derived = derive_home(host.path());
+    let derived = derive_home(host.path()).await;
     let guest = mounted_text(&derived.outputs, "/.config/nats/user.nk");
     assert!(!guest.contains(&seed), "{guest}");
     NatsSeed::from_seed(SecretString::from(guest.trim().to_string())).expect("decoy seed");
@@ -470,8 +472,8 @@ mod tests {
   }
 
   /// A creds context mounts a decoy file. The real seed and JWT stay in the grant.
-  #[test]
-  fn derive_sources_mounts_a_decoy_creds_file() {
+  #[tokio::test]
+  async fn derive_sources_mounts_a_decoy_creds_file() {
     let host = tempdir().unwrap();
     let nats = host.path().join(".config").join("nats");
     let creds_dir = nats.join("creds");
@@ -497,7 +499,7 @@ mod tests {
       r#"{"url":"nats://nats.internal:4222","creds":"creds/user.creds"}"#,
     )
     .unwrap();
-    let derived = derive_home(host.path());
+    let derived = derive_home(host.path()).await;
     let guest = mounted_text(&derived.outputs, "/.config/nats/creds/user.creds");
     assert!(!guest.contains(&seed), "{guest}");
     assert!(!guest.contains(&jwt), "{guest}");
@@ -513,8 +515,8 @@ mod tests {
 
   /// The selected `~/.config/nats` context becomes one grant. The guest
   /// mounts that context only.
-  #[test]
-  fn derive_sources_mounts_the_selected_nats_context() {
+  #[tokio::test]
+  async fn derive_sources_mounts_the_selected_nats_context() {
     let host = tempdir().unwrap();
     token_context(host.path());
     let work = tempdir().unwrap();
@@ -531,6 +533,7 @@ mod tests {
       guests_dir: &work.path().join("guests"),
       rewrites: &[],
     })
+    .await
     .unwrap();
     let containers: Vec<String> = outputs.mounts.iter().map(|mount| mount.container.display().to_string()).collect();
     for expected in ["/home/eng/.config/nats/context.txt", "/home/eng/.config/nats/context/demo.json"] {
@@ -550,8 +553,8 @@ mod tests {
   }
 
   /// A declared path under `~/.config/nats` stays with that declaration.
-  #[test]
-  fn declared_nats_context_is_not_derived_again() {
+  #[tokio::test]
+  async fn declared_nats_context_is_not_derived_again() {
     let host = tempdir().unwrap();
     let nats = token_context(host.path());
     let work = tempdir().unwrap();
@@ -574,13 +577,14 @@ mod tests {
       guests_dir: &work.path().join("guests"),
       rewrites: &declared,
     })
+    .await
     .unwrap();
     assert!(!skipped.mounts.iter().any(|mount| mount.container.ends_with("context/demo.json")));
   }
 
   /// Broken ambient sources warn and skip; the healthy ones still map.
-  #[test]
-  fn broken_ambient_sources_skip_without_failing() {
+  #[tokio::test]
+  async fn broken_ambient_sources_skip_without_failing() {
     let host = tempdir().unwrap();
     let gitconfig = host.path().join(".gitconfig");
     fs::write(&gitconfig, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
@@ -631,6 +635,7 @@ mod tests {
       guests_dir: &work.path().join("guests"),
       rewrites: &[],
     })
+    .await
     .unwrap();
     for (name, value) in saved {
       match value {

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-#MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer + cert auth)"
+#MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer, cert, exec)"
 #MISE depends=["build:debug"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
@@ -10,6 +10,7 @@ set -euo pipefail
 
 cluster="arkham-k3s-test"
 scratch=$proj_dir/target/k3s-e2e
+plugin_dir=""
 arkham=$proj_dir/target/debug/arkham
 serve_pid=""
 # One budget for /readyz, node Ready, and coredns Ready. Cluster create
@@ -107,6 +108,9 @@ cleanup() {
     kill "$serve_pid" 2>/dev/null || true
   fi
   k3d cluster delete "$cluster" >/dev/null 2>&1 || true
+  if [ -n "$plugin_dir" ]; then
+    rm -rf "$plugin_dir"
+  fi
 }
 trap cleanup EXIT
 
@@ -197,7 +201,9 @@ k3d cluster create "$cluster" \
   --wait \
   --api-port 127.0.0.1:random \
   --kubeconfig-update-default=false \
-  --kubeconfig-switch-context=false
+  --kubeconfig-switch-context=false \
+  --k3s-arg "--tls-san=127.0.0.1@server:0" \
+  --k3s-arg "--tls-san=host.docker.internal@server:0"
 echo "k3d cluster create returned after $((SECONDS - create_started))s"
 
 # With update-default off, k3d wrote no kubeconfig anywhere; write its
@@ -303,10 +309,37 @@ kubectl config set-credentials "$user" --token="$token" >/dev/null
 kubectl config unset "users.$user.client-certificate-data" >/dev/null
 kubectl config unset "users.$user.client-key-data" >/dev/null
 
+# Second bearer on the same API. Two token users share one server. The proxy
+# tells them apart by the bearer.
+export KUBECONFIG="$scratch/cert-kubeconfig"
+kubectl create serviceaccount arkham-b >/dev/null
+kubectl create clusterrolebinding arkham-b --clusterrole=cluster-admin --serviceaccount=default:arkham-b >/dev/null
+token_b=$(kubectl create token arkham-b --duration=3600s)
+ctx_a=$(KUBECONFIG="$scratch/token-kubeconfig" kubectl config current-context)
+cluster_name=$(KUBECONFIG="$scratch/token-kubeconfig" kubectl config view --minify -o 'jsonpath={.clusters[0].name}')
+cp "$scratch/token-kubeconfig" "$scratch/multi.yaml"
+KUBECONFIG="$scratch/multi.yaml" kubectl config set-credentials arkham-b --token="$token_b" >/dev/null
+KUBECONFIG="$scratch/multi.yaml" kubectl config set-context arkham-b --cluster="$cluster_name" --user=arkham-b >/dev/null
+# kubectl stores a command under the kubeconfig directory as a relative path.
+plugin_dir=$(mktemp -d)
+cat >"$plugin_dir/exec-plugin" <<EOF
+#!/bin/sh
+printf '%s\n' '{"apiVersion":"client.authentication.k8s.io/v1","kind":"ExecCredential","status":{"token":"${token}"}}'
+EOF
+chmod +x "$plugin_dir/exec-plugin"
+cp "$scratch/cert-kubeconfig" "$scratch/exec-kubeconfig"
+KUBECONFIG="$scratch/exec-kubeconfig" kubectl config set-credentials "$user" \
+  --exec-command="$plugin_dir/exec-plugin" \
+  --exec-api-version=client.authentication.k8s.io/v1 \
+  --exec-interactive-mode=Never >/dev/null
+KUBECONFIG="$scratch/exec-kubeconfig" kubectl config unset "users.$user.client-certificate-data" >/dev/null
+KUBECONFIG="$scratch/exec-kubeconfig" kubectl config unset "users.$user.client-key-data" >/dev/null
+KUBECONFIG="$scratch/exec-kubeconfig" kubectl config unset "users.$user.token" >/dev/null
+
 # One leg: init a workspace against a kubeconfig source, serve host-side, and
-# prove the three states — real works direct, decoy fails direct, decoy works
+# prove the three states. Real works direct, decoy fails direct, decoy works
 # through the proxy. Host-side serve cannot resolve the /arkham/grants container
-# mount, so the layer runs as a copy with host paths; substitution behavior
+# mount, so the layer runs as a copy with host paths. Substitution behavior
 # is unaffected by the prefix.
 run_leg() {
   local name=$1 source=$2 port=$3
@@ -316,7 +349,10 @@ run_leg() {
   # Redirects stay on the arkham invocations only: XDG_CONFIG_HOME breaks the
   # mise shims kubectl and k3d run through, so those keep the real environment.
   local statedir=$scratch/state-$name
-  XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
+  # The task exports KUBECONFIG as the cert file for kubectl. Init must see
+  # this leg's source, which is already a declared rewrite, so ambient
+  # discovery does not add the cert user on the same API server.
+  KUBECONFIG="$source" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
   shopt -s nullglob
   kubedirs=()
   for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
@@ -328,6 +364,10 @@ run_leg() {
     exit 1
   fi
   local kubedir=${kubedirs[0]} decoy=${decoys[0]}
+  if grep -Eq 'client-certificate-data|client-key-data|exec:|auth-provider:' "$decoy"; then
+    echo "guest kubeconfig kept host auth" >&2
+    exit 1
+  fi
   sed "s|/arkham/grants|$kubedir|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
   cp "$decoy" "$scratch/proxy-$name.yaml"
   local context
@@ -352,7 +392,57 @@ run_leg() {
   serve_pid=""
 }
 
+run_discovered() {
+  local name=$1 port=$2 kubeconfig=$3
+  shift 3
+  local ws=$scratch/ws-$name
+  mkdir -p "$ws/.config/arkham"
+  printf '%s\n' '[workspace]' >"$ws/.config/arkham/config.toml"
+  local statedir=$scratch/state-$name
+  KUBECONFIG="$kubeconfig" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
+  shopt -s nullglob
+  local kubedirs=() decoys=()
+  for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
+  for d in "$statedir"/arkham/ws/*/files/kube-config; do decoys+=("$d"); done
+  shopt -u nullglob
+  if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
+    echo "init did not discover a kubeconfig from KUBECONFIG=${kubeconfig}" >&2
+    exit 1
+  fi
+  local kubedir=${kubedirs[0]} decoy=${decoys[0]}
+  sed "s|/arkham/grants|${kubedir}|" "$kubedir/arkham.toml" >"$scratch/host-layer-$name.toml"
+  cp "$decoy" "$scratch/proxy-$name.yaml"
+  local discovered
+  discovered=$(KUBECONFIG="$kubeconfig" kubectl config view -o 'jsonpath={.clusters[0].name}')
+  KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config set-cluster "$discovered" --proxy-url="http://127.0.0.1:$port" >/dev/null
+
+  XDG_STATE_HOME=$statedir FNOX_CONFIG_DIR=$scratch/fnox ARKHAM_CONFIG="$scratch/host-layer-$name.toml" ARKHAM_CA_FILE="$scratch/config/arkham/ca.pem" ARKHAM_LISTEN="127.0.0.1:$port" "$arkham" serve &
+  serve_pid=$!
+  sleep 2
+
+  local ctx
+  echo "--- ${name}: real credentials work direct"
+  for ctx in "$@"; do
+    KUBECONFIG="$kubeconfig" kubectl --context "$ctx" get nodes --request-timeout=30s
+  done
+  echo "--- ${name}: decoy fails direct"
+  if env -u HTTPS_PROXY -u https_proxy -u HTTP_PROXY -u http_proxy KUBECONFIG="$decoy" kubectl --context "$1" get nodes --request-timeout=30s; then
+    echo "decoy kubeconfig worked without the proxy; substitution unproven" >&2
+    exit 1
+  fi
+  echo "--- ${name}: decoy works through the proxy"
+  for ctx in "$@"; do
+    KUBECONFIG="$scratch/proxy-$name.yaml" kubectl config use-context "$ctx" >/dev/null
+    KUBECONFIG="$scratch/proxy-$name.yaml" kubectl get nodes --request-timeout=30s
+  done
+
+  kill "$serve_pid" 2>/dev/null || true
+  serve_pid=""
+}
+
 run_leg cert "$scratch/cert-kubeconfig" 18099
 run_leg bearer "$scratch/token-kubeconfig" 18100
+run_leg exec "$scratch/exec-kubeconfig" 18103
+run_discovered multi 18101 "$scratch/multi.yaml" "$ctx_a" arkham-b
 
-echo "k3s substitution proven: bearer + cert auth"
+echo "k3s substitution proven: bearer, cert, exec, multi-context"

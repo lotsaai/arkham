@@ -138,7 +138,7 @@ impl<'a> StackBuilder<'a> {
   ///
   /// Returns an error when a rewrite names an env with no known value or no
   /// decoy, or its dest does not expand to an absolute container path.
-  fn rewrites(mut self) -> Result<Self, Error> {
+  async fn rewrites(mut self) -> Result<Self, Error> {
     let files_dir = self.layout.files_dir();
     let guests_dir = self.layout.guests_dir();
     let rewritten = write_rewrites(&RewriteInputs {
@@ -151,7 +151,8 @@ impl<'a> StackBuilder<'a> {
       home: self.layout.home(),
       host_home: self.layout.host_home(),
       guests_dir: &guests_dir,
-    })?;
+    })
+    .await?;
     self.grants = rewritten.grants;
     self.file_mounts = rewritten.mounts;
     Ok(self)
@@ -165,7 +166,7 @@ impl<'a> StackBuilder<'a> {
   ///
   /// Returns an error when a source does not map onto grants or a decoy
   /// twin.
-  fn ambient(mut self) -> Result<Self, Error> {
+  async fn ambient(mut self) -> Result<Self, Error> {
     let files_dir = self.layout.files_dir();
     let guests_dir = self.layout.guests_dir();
     let derived = derive_sources(&DeriveInputs {
@@ -178,7 +179,8 @@ impl<'a> StackBuilder<'a> {
       host_home: self.layout.host_home(),
       guests_dir: &guests_dir,
       rewrites: &self.config.workspace.file_rewrite,
-    })?;
+    })
+    .await?;
     self.grants.extend(derived.grants);
     self.file_mounts.extend(derived.mounts);
     Ok(self)
@@ -310,8 +312,10 @@ pub(crate) async fn generate_stack(root: &Path, backend: ProxyBackend, arkham_ve
   let stack = StackBuilder::resolve(root, backend, arkham_version)
     .await?
     .secrets()?
-    .rewrites()?
-    .ambient()?
+    .rewrites()
+    .await?
+    .ambient()
+    .await?
     .grants()?
     .profiles()?
     .guest_identities()?
