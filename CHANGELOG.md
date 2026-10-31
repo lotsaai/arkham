@@ -1,8 +1,18 @@
+## [0.3.35] - 2026-10-31
+
+### 🚀 Features
+
+- *(kube)* Grant every user on one cluster endpoint (#115)
 ## [0.3.34] - 2026-10-26
 
 ### 🚜 Refactor
 
 - *(compose)* Compare rendered stacks and share grant and transport helpers (#138)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.34 [ci skip]
+- Release
 ## [0.3.33] - 2026-10-25
 
 ### 🐛 Bug Fixes
