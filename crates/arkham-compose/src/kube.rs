@@ -499,7 +499,6 @@ fn invalid(file: &Path, detail: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
-  use std::fmt::Write as _;
   use std::fs;
   use std::os::unix::fs::PermissionsExt;
   use std::sync::{Arc, Mutex};
@@ -814,13 +813,18 @@ users:
     let doc = format!(
       "apiVersion: v1\nkind: Config\ncurrent-context: current\ncontexts:\n- name: skipped\n  context: {{cluster: skipped, user: skipped-user}}\n- name: current\n  context: {{cluster: current, user: current-user}}\nclusters:\n- name: skipped\n  cluster: {{server: https://10.0.0.2:6443}}\n- name: current\n  cluster: {{server: https://10.0.0.1:6443}}\nusers:\n- name: skipped-user\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: \"{command}\"\n      interactiveMode: Never\n- name: current-user\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: \"{command}\"\n      interactiveMode: Never\n",
     );
-    let lines = Arc::new(Mutex::new(Vec::new()));
-    let guard = tracing::subscriber::set_default(WarnCapture(Arc::clone(&lines)));
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+      .with_writer(LogBuf(Arc::clone(&buf)))
+      .with_ansi(false)
+      .with_max_level(tracing::Level::WARN)
+      .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
     let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca())
       .await
       .expect_err("failing exec plugin");
     drop(guard);
-    let logged = lines.lock().unwrap().join("\n");
+    let logged = String::from_utf8(std::mem::take(&mut *buf.lock().unwrap())).unwrap();
     assert!(logged.contains("skipped"), "skipped context was not logged: {logged}");
     let display = err.to_string();
     let debug = format!("{err:?}");
@@ -1032,37 +1036,25 @@ users:
     assert!(rules.contains_key(&user_id("admin").label));
   }
 
-  struct WarnCapture(Arc<Mutex<Vec<String>>>);
+  #[derive(Clone)]
+  struct LogBuf(Arc<Mutex<Vec<u8>>>);
 
-  impl tracing::Subscriber for WarnCapture {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-      *metadata.level() <= tracing::Level::WARN
+  impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      self.0.lock().unwrap().extend_from_slice(buf);
+      Ok(buf.len())
     }
 
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-      tracing::span::Id::from_u64(1)
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
     }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-      let mut message = String::new();
-      event.record(&mut WarnVisit(&mut message));
-      self.0.lock().unwrap().push(message);
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
   }
 
-  struct WarnVisit<'a>(&'a mut String);
+  impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = Self;
 
-  impl tracing::field::Visit for WarnVisit<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-      let _ = write!(self.0, "{}={value:?};", field.name());
+    fn make_writer(&'a self) -> Self::Writer {
+      self.clone()
     }
   }
 }
