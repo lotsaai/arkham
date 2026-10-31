@@ -13,6 +13,7 @@
 //! client certificate.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error as StdError;
 use std::path::Path;
 
 use arkham_config::config::{RewriteFormat, fake_for};
@@ -21,7 +22,7 @@ use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme, decoy_
 use arkham_pki::ca::CertAuthority;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http::{Request, Uri};
-use kube_client::client::ConfigExt;
+use kube_client::client::{AuthError, ConfigExt};
 use kube_client::config::{AuthInfo, Kubeconfig, KubeconfigError};
 use secrecy::ExposeSecret;
 use serde_yaml::{Mapping, Value, from_str};
@@ -230,10 +231,7 @@ async fn credential(auth: &AuthInfo, file: &Path, user: &str) -> Result<(Option<
 async fn plugin_bearer(auth: &AuthInfo, file: &Path) -> Result<String, Error> {
   let mut config = kube_client::Config::new(Uri::from_static("https://kubernetes.default.svc"));
   config.auth_info = auth.clone();
-  let layer = ConfigExt::auth_layer(&config).map_err(|source| Error::KubeClient {
-    file: file.to_path_buf(),
-    source: Box::new(source),
-  })?;
+  let layer = ConfigExt::auth_layer(&config).map_err(|source| invalid(file, plugin_failure(auth, &source)))?;
   let Some(layer) = layer else {
     let detail = if auth.exec.is_some() {
       "exec credential plugin returned a client certificate"
@@ -245,7 +243,7 @@ async fn plugin_bearer(auth: &AuthInfo, file: &Path) -> Result<String, Error> {
   let service = ServiceBuilder::new().layer(layer).service(tower::service_fn(echo_authorization));
   let header = match service.oneshot(Request::new(kube_client::client::Body::empty())).await {
     Ok(response) => response.into_body(),
-    Err(err) => return Err(invalid(file, format!("credential plugin failed: {err}"))),
+    Err(err) => return Err(invalid(file, plugin_failure(auth, err.as_ref()))),
   };
   let Some(header) = header else {
     return Err(invalid(file, "credential plugin produced no Authorization header"));
@@ -257,6 +255,47 @@ async fn plugin_bearer(auth: &AuthInfo, file: &Path) -> Result<String, Error> {
     return Err(invalid(file, "credential plugin produced no bearer token"));
   }
   Ok(token.to_owned())
+}
+
+/// The kube-client error is dropped because its `Display` includes plugin stdout and stderr.
+fn plugin_failure(auth: &AuthInfo, err: &(dyn StdError + 'static)) -> String {
+  let kind = if auth.auth_provider.is_some() { "auth-provider" } else { "exec" };
+  match auth_class(err) {
+    Some(class) => format!("credential plugin failed: {kind} {class}"),
+    None => format!("credential plugin failed: {kind}"),
+  }
+}
+
+fn auth_class(err: &(dyn StdError + 'static)) -> Option<String> {
+  if let Some(auth) = err.downcast_ref::<AuthError>() {
+    return Some(classify_auth(auth));
+  }
+  if let Some(kube_client::Error::Auth(auth)) = err.downcast_ref::<kube_client::Error>() {
+    return Some(classify_auth(auth));
+  }
+  err.source().and_then(auth_class)
+}
+
+fn classify_auth(err: &AuthError) -> String {
+  match err {
+    AuthError::AuthExecRun { status, .. } => match status.code() {
+      Some(code) => format!("exited {code}"),
+      None => "exited without a status code".to_owned(),
+    },
+    AuthError::AuthExecParse(_) | AuthError::ParseTokenKey(_) => "output was not valid JSON".to_owned(),
+    AuthError::AuthExecStart(_) => "could not start".to_owned(),
+    AuthError::MissingCommand => "missing command".to_owned(),
+    AuthError::ExecPluginFailed => "response had no status".to_owned(),
+    AuthError::AuthExec(_) => "rejected".to_owned(),
+    AuthError::ExecMissingClusterInfo => "missing cluster info".to_owned(),
+    AuthError::MalformedTokenExpirationDate(_) => "malformed token expiration".to_owned(),
+    AuthError::UnrefreshableTokenResponse => "non-refreshable token".to_owned(),
+    AuthError::InvalidBasicAuth(_) => "invalid basic auth".to_owned(),
+    AuthError::InvalidBearerToken(_) => "invalid bearer token".to_owned(),
+    AuthError::AuthExecSerialize(_) => "could not serialize input".to_owned(),
+    AuthError::ReadTokenFile(_, _) => "could not read token file".to_owned(),
+    AuthError::NoValidNativeRootCA(_) => "no valid native root CA".to_owned(),
+  }
 }
 
 async fn echo_authorization(request: Request<kube_client::client::Body>) -> Result<http::Response<Option<String>>, tower::BoxError> {
@@ -462,6 +501,7 @@ fn invalid(file: &Path, detail: impl Into<String>) -> Error {
 mod tests {
   use std::fs;
   use std::os::unix::fs::PermissionsExt;
+  use std::sync::{Arc, Mutex};
 
   use super::*;
   use crate::adapt::write_state;
@@ -762,6 +802,51 @@ users:
     assert!(err.to_string().contains("client certificate"), "{err}");
   }
 
+  #[tokio::test(flavor = "current_thread")]
+  async fn failed_exec_plugin_keeps_output_out_of_errors_and_logs() {
+    const SECRET: &str = "arkham-fake-plugin-secret-9f3c";
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("exec-plugin-fail.sh");
+    fs::copy(Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/exec-plugin-fail.sh"), &plugin).unwrap();
+    fs::set_permissions(&plugin, fs::Permissions::from_mode(0o755)).unwrap();
+    let command = plugin.display().to_string();
+    let doc = format!(
+      "apiVersion: v1\nkind: Config\ncurrent-context: current\ncontexts:\n- name: skipped\n  context: {{cluster: skipped, user: skipped-user}}\n- name: current\n  context: {{cluster: current, user: current-user}}\nclusters:\n- name: skipped\n  cluster: {{server: https://10.0.0.2:6443}}\n- name: current\n  cluster: {{server: https://10.0.0.1:6443}}\nusers:\n- name: skipped-user\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: \"{command}\"\n      interactiveMode: Never\n- name: current-user\n  user:\n    exec:\n      apiVersion: client.authentication.k8s.io/v1\n      command: \"{command}\"\n      interactiveMode: Never\n",
+    );
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+      .with_writer(LogBuf(Arc::clone(&buf)))
+      .with_ansi(false)
+      .with_max_level(tracing::Level::WARN)
+      .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let err = adapt(Path::new(SOURCE), doc.as_bytes(), &test_ca())
+      .await
+      .expect_err("failing exec plugin");
+    drop(guard);
+    let logged = String::from_utf8(std::mem::take(&mut *buf.lock().unwrap())).unwrap();
+    assert!(logged.contains("skipped"), "skipped context was not logged: {logged}");
+    let display = err.to_string();
+    let debug = format!("{err:?}");
+    let mut leaks = Vec::new();
+    if display.contains(SECRET) {
+      leaks.push("display");
+    }
+    if debug.contains(SECRET) {
+      leaks.push("debug");
+    }
+    if logged.contains(SECRET) {
+      leaks.push("logs");
+    }
+    assert!(
+      leaks.is_empty(),
+      "secret leaked via {leaks:?}\ndisplay={display}\ndebug={debug}\nlogs={logged}"
+    );
+    let classification = "credential plugin failed: exec exited 1";
+    assert!(display.contains(classification), "{display}");
+    assert!(logged.contains(classification), "{logged}");
+  }
+
   #[tokio::test(flavor = "multi_thread")]
   async fn auth_provider_token_lands_in_the_host_grant() {
     let doc = BEARER_DOC.replace(
@@ -949,5 +1034,27 @@ users:
     let rules = rules_from(&adapted.fragment);
     assert_eq!(rules.len(), 1);
     assert!(rules.contains_key(&user_id("admin").label));
+  }
+
+  #[derive(Clone)]
+  struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+  impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      self.0.lock().unwrap().extend_from_slice(buf);
+      Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+      self.clone()
+    }
   }
 }
