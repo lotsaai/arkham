@@ -23,7 +23,7 @@ Host matching is a pure predicate over a finite pattern language. Java/TLC is no
 | `crates/arkham-config/src/grants/scope.rs` — `EndpointScope::from_str` (http/https/tcp) | allow entry parse used by the grid |
 | `crates/arkham-config/src/grants/resolve.rs` — `endpoint_match` / `host_port_match` | Token grant match predicate (harness inlines the same boolean) |
 
-Last sync commit: `d530869f641640da1fa4ea0d4cdd229e7de3fa07` (confirm before trusting after grant-matching edits; move this forward only after re-running `run.sh` and confirming the oracle still describes the code).
+Last sync commit: `3c20783559d84f7b155d8e4778094d679589f266` (confirm before trusting after grant-matching edits; move this forward only after re-running `run.sh` and confirming the oracle still describes the code).
 
 Proven able to fail: a scratch edit that let `*.example.com` match apex `example.com` produced 13 oracle mismatches; restoring `scope.rs` returned PASS.
 
