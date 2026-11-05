@@ -729,12 +729,118 @@ fn a_prepare_error_does_not_reach_the_wrapper() {
   assert!(!stderr.contains(".yaml"), "{stderr}");
 }
 
+#[test]
+fn the_sandbox_cannot_read_the_home_credential_or_the_ca_key() {
+  let isolated = Isolated::new();
+  let workspace = tempfile::tempdir().unwrap();
+  let root = workspace.path();
+  std::fs::write(root.join("fnox.toml"), "# REAL_SECRET_VALUE\n").unwrap();
+  let home = login_home();
+  let credential = home.join(".arkham-credential-probe");
+  std::fs::write(&credential, "HOME_SECRET_MARKER\n").unwrap();
+  let key_dir = home.join(".config/arkham");
+  std::fs::create_dir_all(&key_dir).unwrap();
+  let key = key_dir.join("ca.key");
+  let created_key = !key.exists();
+  if created_key {
+    std::fs::write(&key, "CA_KEY_MARKER\n").unwrap();
+  }
+  let script = root.join("home.sh");
+  std::fs::write(
+    &script,
+    format!(
+      "one() {{ printf '%s\\n' \"$1:$(cat \"$2\" 2>/dev/null | tr '\\n' ' ')\"; }}\none FILE fnox.toml\none HOME {}\none CAKEY {}\nprintf '%s\\n' \"USR:$(ls /usr/bin/sh 2>/dev/null)\"\n",
+      credential.display(),
+      key.display()
+    ),
+  )
+  .unwrap();
+  let _daemon = Daemon::start(&isolated);
+  let output = isolated
+    .command(&["agent", "--isolate", "bwrap", "--", "sh", "home.sh"])
+    .current_dir(root)
+    .output()
+    .unwrap();
+  let _ = std::fs::remove_file(&credential);
+  if created_key {
+    let _ = std::fs::remove_file(&key);
+  }
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(output.status.success(), "{stdout}{stderr}");
+  assert!(line_of(&stdout, "FILE").contains("arkham-decoy"), "{stdout}");
+  assert!(!line_of(&stdout, "FILE").contains("REAL_SECRET_VALUE"), "{stdout}");
+  assert!(line_of(&stdout, "USR").contains("sh"), "{stdout}");
+  assert!(!stdout.contains("HOME_SECRET_MARKER"), "{stdout}");
+  assert!(!stdout.contains("CA_KEY_MARKER"), "{stdout}");
+  assert!(line_of(&stdout, "HOME").is_empty(), "home credential was readable: {stdout}");
+  assert!(line_of(&stdout, "CAKEY").is_empty(), "CA key was readable: {stdout}");
+}
+
+#[test]
+fn a_symlinked_import_and_age_key_are_forged_at_the_link_and_the_target() {
+  let isolated = Isolated::new();
+  let workspace = tempfile::tempdir().unwrap();
+  let root = workspace.path().canonicalize().unwrap();
+  let outside = tempfile::tempdir().unwrap();
+  let outside = outside.path().canonicalize().unwrap();
+  let real_import = outside.join("real-import.toml");
+  std::fs::write(&real_import, "# IMPORT_SECRET_VALUE\n").unwrap();
+  std::os::unix::fs::symlink(&real_import, root.join("import-link.toml")).unwrap();
+  let real_age = outside.join("real.age");
+  std::fs::write(&real_age, "AGE-SECRET-KEY-REAL\n").unwrap();
+  std::os::unix::fs::symlink(&real_age, root.join("age-link")).unwrap();
+  std::fs::write(
+    root.join("fnox.toml"),
+    "import = [\"import-link.toml\"]\nage_key_file = \"age-link\"\n",
+  )
+  .unwrap();
+  let script = root.join("links.sh");
+  std::fs::write(
+    &script,
+    format!(
+      "one() {{ printf '%s\\n' \"$1:$(cat \"$2\" 2>/dev/null | tr '\\n' ' ')\"; }}\none LINK import-link.toml\none TARGET {}\none AGELINK age-link\none AGETARGET {}\n",
+      real_import.display(),
+      real_age.display()
+    ),
+  )
+  .unwrap();
+  let _daemon = Daemon::start(&isolated);
+  let output = isolated
+    .command(&["agent", "--isolate", "bwrap", "--", "sh", "links.sh"])
+    .current_dir(&root)
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(output.status.success(), "{stdout}{stderr}");
+  assert!(line_of(&stdout, "LINK").contains("arkham-decoy"), "{stdout}");
+  assert!(line_of(&stdout, "TARGET").contains("arkham-decoy"), "{stdout}");
+  assert!(line_of(&stdout, "AGELINK").contains("ARKHAM-DECOY-KEY"), "{stdout}");
+  assert!(line_of(&stdout, "AGETARGET").contains("ARKHAM-DECOY-KEY"), "{stdout}");
+  assert!(!stdout.contains("IMPORT_SECRET_VALUE"), "{stdout}");
+  assert!(!stdout.contains("AGE-SECRET-KEY-REAL"), "{stdout}");
+}
+
 struct SudoRemove(String);
 
 impl Drop for SudoRemove {
   fn drop(&mut self) {
     let _ = Command::new("sudo").args(["-n", "rm", "-rf", &self.0]).status();
   }
+}
+
+fn login_home() -> PathBuf {
+  let uid = current_uid().to_string();
+  let text = std::fs::read_to_string("/etc/passwd").unwrap();
+  let home = text.lines().find_map(|line| {
+    let mut parts = line.split(':');
+    if parts.nth(2) != Some(uid.as_str()) {
+      return None;
+    }
+    parts.nth(2).map(PathBuf::from)
+  });
+  home.unwrap()
 }
 
 fn current_uid() -> u32 {
