@@ -18,6 +18,14 @@ Scope captured here: a local execution backend for `arkham agent` that confines 
 - Rama abstracts per-OS capture. Linux has `ip_transparent` socket options plus a tproxy connector layer (`rama-net/src/socket/opts.rs`, `socket/linux/tproxy.rs`). Windows has a WFP redirect-context reader (`socket/windows/tproxy.rs`): the redirect record is queried with `SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT`, our code provides the `WfpContextDecoder`, and an absent record (`WSAEINVAL`) means the socket was not redirected. macOS has the `rama-net-apple-networkextension` crate plus a full transparent-proxy example (`ffi/apple/examples/transparent_proxy`) with container app, system extension, signing scripts, and install flow.
 - Public precedent for one policy with per-OS backends is Chromium: Linux combines namespaces with seccomp-bpf, macOS uses Seatbelt profiles (`sandbox/mac/seatbelt.cc`), and Windows combines a restricted token with a job object, a separate desktop, and integrity levels (`docs/design/sandbox.md`).
 
+## Daemon and wrapper
+
+Protection for host backends comes from a long-running daemon: a LaunchDaemon plus an optional menu-bar app on macOS, a systemd service plus an optional tray icon on Linux, and a Windows service plus an optional tray icon on Windows. The daemon owns the proxy and its project registry, the capture backend, and on macOS the `arkham` user and the FUSE mounts.
+
+Agents start only through the required wrapper, `arkham agent -- <agent command>`. The wrapper connects to the running daemon, registers the session, and only then launches the agent confined: under bwrap or Landlock projections on Linux, and as the `arkham` user under Seatbelt with the FUSE projection on macOS. Both give the same boundary. If no daemon is running, the wrapper fails closed at once and starts no process. A daemon that starts after an agent was launched some other way does nothing for that agent: it was never registered, so it never gets confinement or substitution.
+
+The wrapper's cwd is configuration, not authorization. It links the session's pid to a project before launch. Project discovery walks up from the cwd to the nearest `fnox.toml`, which marks the project root, then resolves that root through `code-workspace`. A directory with no `fnox.toml` falls back to the nearest registered root. The project and its secret set are fixed when the session registers. Later cwd changes inside the agent never switch credentials.
+
 ## Write profiles
 
 A profile names readable paths and writable paths for one workspace execution. Modes are `read-only` (deny writes, keep the `/dev/null` sink shells require) and `workspace-write` (writable workspace root plus a backend-defined temp area). A third spelling, `danger-full-access`, drops filesystem write and read restrictions only (no Landlock, Seatbelt, or token policy). It is orthogonal to secret protection: decoy env, forged secret files (`fnox.toml`, `fnox.*.toml`), and transparent capture still apply, so the agent still never holds a real secret. Network and process visibility stay outside this vocabulary: the network is governed by capture, not by policy flags. One shared helper derives the writable set, and every renderer plus every test reads that helper. No renderer invents its own roots.
@@ -34,7 +42,7 @@ The bwrap invocation keeps the filesystem shape from the compose inputs (workspa
 
 ## macOS: arkham user, FUSE projection, NetworkExtension dispatcher
 
-The agent runs as a dedicated local user, `arkham`. The OS user boundary is the primary wall: the agent cannot read the operator's home, keychain, 1Password, `~/.ssh`, or fnox identity because they belong to another user. Seatbelt narrows further on top of that. Nothing moves and there is no migrate step: `arkham agent` sets everything up per run and tears it down on exit.
+The agent runs as a dedicated local user, `arkham`. The OS user boundary is the primary wall: the agent cannot read the operator's home, keychain, 1Password, `~/.ssh`, or fnox identity because they belong to another user. Seatbelt narrows further on top of that. Nothing moves and there is no migrate step: the daemon owns the user, the FUSE mounts, and the proxy, and `arkham agent` registers the session with it (see Daemon and wrapper).
 
 ### User story
 
@@ -124,6 +132,19 @@ macOS emits SBPL from the shared writable roots as a second layer under the `ark
 Every root is canonicalized first: Seatbelt matches resolved paths, so `/tmp` renders as `/private/tmp` and symlinked ancestors resolve. Launch is `sandbox-exec -p <profile> -- <command>` as the `arkham` user. A missing `sandbox-exec` fails the probe and Seatbelt reports unavailable; the user boundary still holds, so enforcement reports `partial`. The App Sandbox entitlement path is rejected because it needs a signed bundle and Xcode packaging for a CLI tool.
 
 Windows uses raw restricted tokens, not AppContainer. The child token derives from `CreateRestrictedToken` with `WRITE_RESTRICTED`, `DISABLE_MAX_PRIVILEGE`, and `LUA_TOKEN`, with distinct workspace and private-temp capability SIDs. The token intersects writes only, so reads keep ambient access. AppContainer is rejected because its token carries no ambient reads: every readable path would need pre-granting, which means wholesale host DACL mutation for an agent that reads toolchains across the disk. One standing workspace ACE per workspace plus a random private temp directory with a revocable ACE per live session pair keeps sessions from inheriting each other temp authority. The Low integrity layer applies, and ambient deletes are denied through the parent `FILE_DELETE_CHILD` right. Partial is always reported: hard-link aliasing, unconfined reads, and trees ACLed by other tools.
+
+## Invariants and acceptance tests
+
+Every secret file is a projection. There is no passthrough for secret files on any backend. AWS credentials, kubeconfig, Talos config, and the rest use the existing rewrites, and fnox files are forged. Reads of forged files succeed and return bogus content. Each invariant below needs an acceptance test with equivalent assertions on Linux and macOS (and Windows once that backend exists):
+
+- Original-path denial: the real original of every projected file is unreachable from the agent by absolute path, symlink, hard link, or any alternate path into the enlisted tree.
+- Complete projection: every config file fnox loads is a projection, not only `fnox.toml` and `fnox.*.toml`. That includes `.fnox.toml`, `.fnox.<profile>.toml`, `.fnox.local.toml`, imported files, global config, and identity paths.
+- Immutable session configuration: a session cannot change its registered project or secret set after launch. Agent-writable project arkham config is snapshotted before launch, and later edits have no effect on the running session.
+- Daemon-required wrapper: `arkham agent --` starts no process without a running daemon.
+- Session identity: the pid-to-session link cannot be raced or reused by another process.
+- Authenticated handoff: the loopback handoff listener authenticates its peer, so a local process cannot forge a header naming another project. Host backends refuse a non-loopback `ARKHAM_LISTEN`.
+- Authenticated control plane: the privileged daemon and XPC endpoints authenticate their clients. CA signing stays with the daemon.
+- Read confidentiality on macOS: Seatbelt `(allow default)` gives none, so reads are governed by the separate user plus the FUSE projection, and tests assert reads through that path.
 
 ## Security analysis
 

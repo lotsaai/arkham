@@ -91,7 +91,9 @@ jobs:
   # macOS has no compose stack, no capture backends and no integration
   # services, so this job checks that the workspace builds, lints clean and
   # passes the Rust tests there. Lint (hk) runs on Linux only; the platform
-  # specific part it would add here is clippy.
+  # specific part it would add here is clippy. arkham-ebpf, arkham-tproxy and
+  # arkham-tun are Linux capture backends (netlink, eBPF, TUN) and are only
+  # Linux dependencies of the binary, so they are excluded here.
   macos:
     runs-on: macos-latest
     env:
@@ -113,7 +115,10 @@ jobs:
           key: aarch64-apple-darwin
 
       - name: Clippy
-        run: cargo clippy --locked --workspace --exclude arkham-ebpf-programs --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --exclude arkham-ebpf-programs --exclude arkham-ebpf --exclude arkham-tproxy --exclude arkham-tun --all-targets -- -D warnings
 
       - name: Test
-        run: mise run test:rust
+        run: |-
+          set -euo pipefail
+          mise run build:plugins
+          ARKHAM_PLUGIN_FIXTURES="$PWD/target/plugins" cargo nextest run --locked --cargo-quiet --workspace --exclude arkham-ebpf-programs --exclude arkham-ebpf --exclude arkham-tproxy --exclude arkham-tun --status-level=slow
