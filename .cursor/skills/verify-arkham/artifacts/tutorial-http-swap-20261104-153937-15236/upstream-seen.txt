@@ -1,1 +1,0 @@
-Bearer real-secret-xxxxxxxxxxxxxxxxxxxx
