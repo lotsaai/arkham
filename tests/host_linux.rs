@@ -212,6 +212,10 @@ fn bwrap_hides_secret_files_and_proxy_env() {
   }
   for label in ["OUTHARD", "OUTSYM"] {
     let line = line_of(&out, label);
+    assert!(
+      line.is_empty() || line.contains("arkham-decoy"),
+      "{label} was neither empty nor a decoy: {line}"
+    );
     assert!(!line.contains("REAL_SECRET_VALUE"), "{label}: {line}");
   }
   let ca = line_of(&out, "CA");
@@ -335,20 +339,21 @@ fn fnox_projection_names_are_forged() {
 fn the_secret_set_does_not_change_after_launch() {
   let isolated = Isolated::new();
   let workspace = tempfile::tempdir().unwrap();
-  let other = tempfile::tempdir().unwrap();
   let root = workspace.path();
+  let other = root.join("other");
+  std::fs::create_dir(&other).unwrap();
   std::fs::write(root.join("fnox.toml"), "# REAL_SECRET_VALUE\n").unwrap();
-  std::fs::write(other.path().join("fnox.toml"), "OTHER_SECRET_MARKER\n").unwrap();
+  std::fs::write(other.join("fnox.toml"), "# OTHER_SECRET_MARKER\n").unwrap();
   let ready = root.join("ready");
   let go = root.join("go");
   let script = root.join("hold.sh");
   std::fs::write(
     &script,
     format!(
-      "echo ready > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\ncat fnox.toml\necho ---\ncat '{}' 2>/dev/null || true\n",
+      "echo ready > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nprintf '%s\\n' \"ROOT:$(cat fnox.toml | tr '\\n' ' ')\"\ncd other\nprintf '%s\\n' \"NEST:$(cat fnox.toml | tr '\\n' ' ')\"\nprintf '%s\\n' \"ABS:$(cat '{}' | tr '\\n' ' ')\"\n",
       ready.display(),
       go.display(),
-      other.path().join("fnox.toml").display()
+      other.join("fnox.toml").display()
     ),
   )
   .unwrap();
@@ -369,15 +374,20 @@ fn the_secret_set_does_not_change_after_launch() {
     std::thread::sleep(Duration::from_millis(20));
   }
   std::fs::write(root.join("fnox.toml"), "NEW_SECRET_MARKER\n").unwrap();
-  std::fs::write(other.path().join("fnox.toml"), "OTHER_SECRET_MARKER\n").unwrap();
+  std::fs::write(other.join("fnox.toml"), "NEW_SECRET_MARKER\n").unwrap();
   std::fs::write(&go, "go\n").unwrap();
   let output = child.wait_with_output().unwrap();
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(output.status.success(), "{stdout}{stderr}");
-  assert!(stdout.contains("arkham-decoy"), "{stdout}");
-  assert!(!stdout.contains("NEW_SECRET_MARKER"), "{stdout}");
-  assert!(!stdout.contains("OTHER_SECRET_MARKER"), "{stdout}");
+  for label in ["ROOT", "NEST", "ABS"] {
+    let line = line_of(&stdout, label);
+    assert!(line.contains("arkham-decoy"), "{label}: {line}\n{stdout}");
+    assert!(
+      !line.contains("NEW_SECRET_MARKER") && !line.contains("OTHER_SECRET_MARKER"),
+      "{label}: {line}"
+    );
+  }
   assert!(
     !stderr.contains("NEW_SECRET_MARKER") && !stderr.contains("OTHER_SECRET_MARKER"),
     "{stderr}"
@@ -545,6 +555,92 @@ fn the_wrapper_refuses_a_socket_it_does_not_own() {
 }
 
 #[test]
+fn a_nested_fnox_file_stays_forged_after_chdir() {
+  let isolated = Isolated::new();
+  let workspace = tempfile::tempdir().unwrap();
+  let root = workspace.path();
+  std::fs::create_dir(root.join("nested")).unwrap();
+  std::fs::write(root.join("fnox.toml"), "# REAL_SECRET_VALUE\n").unwrap();
+  std::fs::write(root.join("nested").join("fnox.toml"), "# NESTED_SECRET_VALUE\n").unwrap();
+  let script = root.join("chdir.sh");
+  std::fs::write(&script, "cd nested\nprintf '%s\\n' \"NEST:$(cat fnox.toml 2>/dev/null)\"\n").unwrap();
+  let _daemon = Daemon::start(&isolated);
+  let output = isolated
+    .command(&["agent", "--isolate", "bwrap", "--", "sh", "chdir.sh"])
+    .current_dir(root)
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(output.status.success(), "{stdout}{stderr}");
+  assert!(stdout.contains("arkham-decoy"), "{stdout}");
+  assert!(!stdout.contains("NESTED_SECRET_VALUE"), "{stdout}");
+  assert!(!stdout.contains("REAL_SECRET_VALUE"), "{stdout}");
+}
+
+#[test]
+fn the_daemon_does_not_create_a_tmp_socket_dir() {
+  let uid = current_uid();
+  let dir = format!("/tmp/arkham-{uid}");
+  let _cleanup = SudoRemove(dir.clone());
+  let _ = Command::new("sudo").args(["-n", "rm", "-rf", &dir]).status();
+  let isolated = Isolated::new();
+  let mut child = isolated
+    .command(&["daemon"])
+    .env_remove("XDG_RUNTIME_DIR")
+    .env("ARKHAM_LISTEN", "127.0.0.1:0")
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = child.stderr.take().unwrap();
+  let mut buf = Vec::new();
+  let started = Instant::now();
+  let mut byte = [0u8; 1];
+  while started.elapsed() < Duration::from_secs(5) {
+    if stderr.read(&mut byte).unwrap_or(0) == 0 {
+      break;
+    }
+    buf.push(byte[0]);
+    if buf.windows(13).any(|window| window == b"daemon: ready") {
+      break;
+    }
+  }
+  let _ = child.kill();
+  let _ = child.wait();
+  let text = String::from_utf8_lossy(&buf);
+  assert!(!text.contains("daemon: ready"), "{text}");
+  assert!(text.contains("XDG_RUNTIME_DIR"), "{text}");
+  assert!(
+    !Path::new(&dir).join("arkham").join("daemon.sock").exists(),
+    "created a socket under {dir}"
+  );
+}
+
+#[test]
+fn the_wrapper_refuses_a_group_writable_socket() {
+  let isolated = Isolated::new();
+  let workspace = tempfile::tempdir().unwrap();
+  std::fs::write(workspace.path().join("fnox.toml"), "# REAL_SECRET_VALUE\n").unwrap();
+  let _daemon = Daemon::start(&isolated);
+  let sock = isolated.runtime.path().join("arkham").join("daemon.sock");
+  std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660)).unwrap();
+  let output = isolated
+    .command(&["agent", "--isolate", "bwrap", "--", "cat", "fnox.toml"])
+    .current_dir(workspace.path())
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(!output.status.success(), "{stdout}{stderr}");
+  assert!(
+    !stdout.contains("REAL_SECRET_VALUE") && !stderr.contains("REAL_SECRET_VALUE"),
+    "{stdout}{stderr}"
+  );
+  assert!(!stderr.contains("enforcement:"), "{stderr}");
+}
+
+#[test]
 fn bwrap_registers_the_workspace_argument() {
   let isolated = Isolated::new();
   let here = tempfile::tempdir().unwrap();
@@ -629,6 +725,8 @@ fn a_prepare_error_does_not_reach_the_wrapper() {
   let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(!output.status.success(), "{stdout}{stderr}");
   assert!(!stdout.contains(marker) && !stderr.contains(marker), "{stdout}{stderr}");
+  assert!(stderr.contains("configuration could not be read"), "{stderr}");
+  assert!(!stderr.contains(".yaml"), "{stderr}");
 }
 
 struct SudoRemove(String);

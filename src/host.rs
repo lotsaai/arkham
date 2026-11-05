@@ -141,7 +141,10 @@ async fn one_client(
   let line = read_line(&mut stream).await?;
   let request = decode_request(&line)?;
   let roots = registered.lock().unwrap_or_else(PoisonError::into_inner).clone();
-  let root = project_root(&request.cwd, &roots);
+  let Some(root) = project_root(&request.cwd, &roots) else {
+    reject(&mut stream, "no project").await?;
+    return Ok(());
+  };
   let scratch = session_dir()?.join(format!("{pid}-{started}"));
   std::fs::create_dir_all(&scratch)?;
   let cert = scratch.join("ca.pem");
@@ -197,10 +200,7 @@ async fn one_client(
 const REGISTRATION_FAILED: &str = "registration failed";
 
 fn wrapper_detail(err: &arkham_compose::Error) -> String {
-  match err {
-    arkham_compose::Error::SessionCgroup { .. } => err.to_string(),
-    _ => REGISTRATION_FAILED.to_string(),
-  }
+  err.registration_detail()
 }
 
 async fn reject_logged(stream: &mut UnixStream, err: &impl std::fmt::Debug, detail: &str) -> eyre::Result<()> {

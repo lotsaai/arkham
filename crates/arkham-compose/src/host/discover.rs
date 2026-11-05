@@ -38,29 +38,70 @@ pub fn cgroup_is_confined(path: &str) -> bool {
 
 /// Resolve the project root for a wrapper that started in `start`.
 ///
-/// Walks ancestors for a fnox config file, then resolves that directory
-/// through the workspace root. With no fnox file, the nearest registered
-/// root that contains `start` wins, then the workspace root, then `start`.
+/// The walk stops at the nearest registered root and never returns `/`.
+/// A directory symlink is not entered, so a link cannot move the project
+/// onto its target. `None` means there is no project.
 #[must_use]
-pub fn project_root(start: &Path, registered: &[PathBuf]) -> PathBuf {
-  if let Some(marker) = nearest_fnox_dir(start) {
-    return workspace_root(&marker).unwrap_or(marker);
+pub fn project_root(start: &Path, registered: &[PathBuf]) -> Option<PathBuf> {
+  if start == Path::new("/") {
+    return None;
   }
-  if let Some(root) = nearest_registered(start, registered) {
-    return root;
-  }
-  workspace_root(start).unwrap_or_else(|| start.to_path_buf())
+  let ceiling = nearest_registered(start, registered).filter(|root| root.as_path() != Path::new("/"));
+  let found = nearest_fnox_dir(start, ceiling.as_deref()).map(|marker| {
+    let resolved = workspace_root(&marker).unwrap_or_else(|| marker.clone());
+    if resolved.as_path() != Path::new("/") && ceiling.as_ref().is_none_or(|limit| resolved.starts_with(limit)) {
+      resolved
+    } else {
+      marker
+    }
+  });
+  let chosen = found.or(ceiling).or_else(|| {
+    let anchored = lexical_anchor(start);
+    let resolved = workspace_root(&anchored).unwrap_or(anchored);
+    (resolved.as_path() != Path::new("/")).then_some(resolved)
+  });
+  chosen.filter(|path| path.as_path() != Path::new("/"))
 }
 
-fn nearest_fnox_dir(start: &Path) -> Option<PathBuf> {
+fn nearest_fnox_dir(start: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
   let mut dir = Some(start.to_path_buf());
   while let Some(current) = dir {
+    if current.as_path() == Path::new("/") {
+      return None;
+    }
+    if is_dir_symlink(&current) {
+      dir = current.parent().map(Path::to_path_buf);
+      continue;
+    }
     if dir_has_fnox(&current) {
       return Some(current);
+    }
+    if ceiling.is_some_and(|ceiling| current == ceiling) {
+      return None;
     }
     dir = current.parent().map(Path::to_path_buf);
   }
   None
+}
+
+fn is_dir_symlink(path: &Path) -> bool {
+  std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// Directory that contains `start` after skipping directory symlinks.
+fn lexical_anchor(start: &Path) -> PathBuf {
+  let mut current = start.to_path_buf();
+  while current.as_path() != Path::new("/") && is_dir_symlink(&current) {
+    let Some(parent) = current.parent() else {
+      break;
+    };
+    current = parent.to_path_buf();
+  }
+  if current.as_path() == Path::new("/") {
+    start.to_path_buf()
+  } else {
+    current
+  }
 }
 
 fn dir_has_fnox(dir: &Path) -> bool {
@@ -137,11 +178,45 @@ mod tests {
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(project.join("fnox.toml"), "[providers]\n").unwrap();
     let found = project_root(&nested, &[]);
-    assert_eq!(found, project);
+    assert_eq!(found, Some(project));
 
     let other = root.path().join("other");
     std::fs::create_dir_all(other.join("nested")).unwrap();
     let registered = vec![other.clone()];
-    assert_eq!(project_root(&other.join("nested"), &registered), other);
+    assert_eq!(project_root(&other.join("nested"), &registered), Some(other));
+  }
+
+  #[test]
+  fn a_fnox_file_above_the_registered_root_does_not_move_the_project() {
+    let base = tempfile::tempdir().unwrap();
+    let project = base.path().join("project");
+    let nested = project.join("sub");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(base.path().join("fnox.toml"), "secret = true\n").unwrap();
+    assert_eq!(project_root(&nested, std::slice::from_ref(&project)), Some(project));
+  }
+
+  #[test]
+  fn a_symlinked_directory_does_not_become_the_project() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("fnox.toml"), "secret = true\n").unwrap();
+    let link = project.join("link");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let found = project_root(&link, std::slice::from_ref(&project)).unwrap();
+    assert_eq!(found, project);
+    assert!(found.canonicalize().unwrap().starts_with(&project));
+    let unregistered = project_root(&link, &[]).unwrap();
+    assert_eq!(unregistered, project);
+    assert!(unregistered.canonicalize().unwrap().starts_with(&project));
+  }
+
+  #[test]
+  fn the_filesystem_root_is_not_a_project() {
+    assert!(project_root(std::path::Path::new("/"), &[]).is_none());
   }
 }

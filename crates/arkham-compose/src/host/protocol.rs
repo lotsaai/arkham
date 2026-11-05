@@ -36,17 +36,19 @@ pub struct RegisterResponse {
   pub error: Option<String>,
 }
 
-/// Path of the daemon socket.
+/// Path of the daemon socket, `$XDG_RUNTIME_DIR/arkham/daemon.sock`.
 ///
-/// `$XDG_RUNTIME_DIR/arkham/daemon.sock` when that directory is set, otherwise
-/// `/tmp/arkham-<uid>/arkham/daemon.sock`.
-#[must_use]
-pub fn daemon_socket_path() -> PathBuf {
-  let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
-    || PathBuf::from(format!("/tmp/arkham-{}", crate::stack::current_uid())),
-    PathBuf::from,
-  );
-  base.join("arkham").join("daemon.sock")
+/// There is no `/tmp` fallback. A missing or empty runtime directory is an
+/// error so a pre-created `/tmp/arkham-<uid>` cannot capture the socket.
+///
+/// # Errors
+///
+/// Returns [`Error::RuntimeDir`] when `XDG_RUNTIME_DIR` is unset or empty.
+pub fn daemon_socket_path() -> Result<PathBuf, Error> {
+  let Some(base) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) else {
+    return Err(Error::RuntimeDir);
+  };
+  Ok(PathBuf::from(base).join("arkham").join("daemon.sock"))
 }
 
 /// Decode one register request.
