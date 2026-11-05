@@ -16,7 +16,7 @@ use crate::paths::{expand, translate};
 use crate::stack::{current_uid, generate_stack};
 use crate::workspace::Workspace;
 use arkham_config::cli::{Cli, CliCommand, ProxyBackend};
-use arkham_config::config::{AppConfig, RuleCfg, WorkspaceBuild, config_dir};
+use arkham_config::config::{AppConfig, RuleCfg, WorkspaceBuild, config_dir, user_config_dirs};
 use arkham_pki::ca::load_or_generate;
 use clap::Args;
 use dirs::home_dir;
@@ -395,7 +395,8 @@ pub(crate) async fn init_workspace(
 /// The compose files on disk, in layer order: global `compose.yaml` or
 /// `compose.yml`, the generated stack, then the workspace override.
 fn compose_layers(workspace: &Workspace) -> Vec<PathBuf> {
-  let global = config_dir().and_then(|dir| {
+  let roots = config_dir().into_iter().chain(user_config_dirs().into_iter().map(|root| root.join("arkham")));
+  let global = roots.into_iter().find_map(|dir| {
     let yaml = dir.join("compose.yaml");
     if yaml.is_file() {
       Some(yaml)
@@ -1141,9 +1142,12 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     assert!(resolve_backend(None).is_err(), "no capture backend exists outside Linux");
 
-    assert_eq!(resolve_backend(Some(ProxyBackend::Tun)).unwrap(), ProxyBackend::Tun);
-    let err = resolve_backend(Some(ProxyBackend::None)).unwrap_err();
-    assert!(err.to_string().contains("none"), "{err:?}");
+    #[cfg(target_os = "linux")]
+    {
+      assert_eq!(resolve_backend(Some(ProxyBackend::Tun)).unwrap(), ProxyBackend::Tun);
+      let err = resolve_backend(Some(ProxyBackend::None)).unwrap_err();
+      assert!(err.to_string().contains("none"), "{err:?}");
+    }
   }
 
   /// `init` writes the workspace config once and never overwrites it: a stack

@@ -98,6 +98,7 @@ code-workspace = "0.1.4"
 confique = { version = "0.4", features = ["toml"] }
 dashmap = "6"
 dirs = "7"
+etcetera = "0.11"
 eyre = "0.6"
 fe2o3-amqp = { version = "0.18.3", default-features = false, features = ["acceptor"] }
 fe2o3-amqp-types = "0.18.0"

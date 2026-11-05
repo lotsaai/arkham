@@ -22,7 +22,7 @@ httlib-hpack = { workspace = true }
 httparse = { workspace = true }
 memchr = { workspace = true }
 pgwire = { workspace = true, features = ["client-api-aws-lc-rs", "server-api-aws-lc-rs"] }
-rama = { workspace = true, features = ["boring", "tcp"] }
+rama = { workspace = true, features = ["boring", "tcp", "haproxy"] }
 rasn = { workspace = true }
 rasn-ldap = { workspace = true }
 russh = { workspace = true }

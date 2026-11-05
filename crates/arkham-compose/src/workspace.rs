@@ -9,7 +9,6 @@ use arkham_config::config::{
   AppConfig, load, project_config_dir, project_config_file, project_config_write_path, project_rules_dir, rules_dir,
 };
 use arkham_config::registry::Registry;
-use dirs::state_dir;
 
 use crate::decoys::Selection;
 use crate::error::Error;
@@ -82,7 +81,7 @@ impl Workspace {
   /// generated stack lives here and the agent's inner-runtime storage sits
   /// beside it.
   pub(crate) fn state_dir(&self) -> PathBuf {
-    state_dir()
+    arkham_config::config::user_state_dir()
       .unwrap_or_else(|| PathBuf::from("."))
       .join("arkham")
       .join("ws")

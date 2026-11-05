@@ -39,6 +39,7 @@ mod connection;
 #[cfg(test)]
 mod e2e;
 mod error;
+mod handoff;
 mod identity;
 mod mint;
 mod transports;
@@ -61,6 +62,7 @@ type HttpsRelay = TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCert
 
 pub use connection::TrustAnchorsError;
 pub use error::Error;
+pub use handoff::{bind_handoff, serve_handoff};
 
 /// Shared proxy state: live config snapshot, boring MITM relays, and the
 /// issuance burst guard.

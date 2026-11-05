@@ -5,15 +5,19 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
+#[cfg(target_os = "linux")]
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use rama::extensions::{Extensions, ExtensionsRef};
 use rama::net::address::{Host, HostWithPort};
 use rama::net::client::ConnectorTarget;
+#[cfg(target_os = "linux")]
 use rama::net::socket::SocketOptions;
 use rama::service::service_fn;
+#[cfg(target_os = "linux")]
 use rama::tcp::client::TcpStreamConnector;
+#[cfg(target_os = "linux")]
 use rama::tcp::stream::TokioTcpStream;
 use rama::tls::boring::client::ConnectorConfigClientAuth;
 use rama::tls::boring::core::ssl::SslCredential;
@@ -238,6 +242,7 @@ pub(crate) async fn dial_marked(host: &str, port: u16, fwmark: Option<u32>) -> s
   Err(last_err)
 }
 
+#[cfg(target_os = "linux")]
 async fn dial_one(addr: SocketAddr, fwmark: Option<u32>) -> std::io::Result<TcpStream> {
   if fwmark.is_none() {
     return TcpStream::connect(addr).await;
@@ -248,6 +253,16 @@ async fn dial_one(addr: SocketAddr, fwmark: Option<u32>) -> std::io::Result<TcpS
   });
   // The mark lives on the fd, so the tokio stream converts losslessly.
   opts.connect(addr).await.map(TokioTcpStream::from).map_err(std::io::Error::other)
+}
+
+/// `SO_MARK` is Linux-only. Refuse a marked dial instead of silently dropping
+/// the mark, so a capture loop can never form unnoticed.
+#[cfg(not(target_os = "linux"))]
+async fn dial_one(addr: SocketAddr, fwmark: Option<u32>) -> std::io::Result<TcpStream> {
+  if fwmark.is_some() {
+    return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "fwmark requires Linux"));
+  }
+  TcpStream::connect(addr).await
 }
 
 /// A stream prefixed with already-read bytes (replays `initial_buf` first).

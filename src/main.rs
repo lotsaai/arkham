@@ -6,6 +6,7 @@
 //! else splices through byte-identical.
 
 mod commands;
+#[cfg(target_os = "linux")]
 mod fwd;
 
 use std::path::{Path, PathBuf};
@@ -102,8 +103,7 @@ fn ca_path(proxy: &arkham_config::config::ProxyCfg) -> eyre::Result<PathBuf> {
   if mounted.is_file() {
     return Ok(mounted.to_path_buf());
   }
-  dirs::config_dir()
-    .map(|dir: PathBuf| dir.join("arkham").join("ca.pem"))
+  arkham_config::config::user_config_file(Path::new("arkham").join("ca.pem"))
     .ok_or_else(|| eyre::eyre!("unable to resolve user config directory"))
 }
 
@@ -196,8 +196,6 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     ProxyBackend::Tproxy => Some(arkham_tproxy::EGRESS_MARK),
     ProxyBackend::Tun => Some(arkham_tun::FWMARK),
   };
-  #[cfg(not(target_os = "linux"))]
-  let fwmark = None;
   #[cfg(target_os = "linux")]
   let state = std::sync::Arc::new(match fwmark {
     Some(mark) => arkham_proxy::ProxyState::new(resolved, &ca)?.with_fwmark(mark),
@@ -260,6 +258,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
 /// instead of silently degrading to explicit-proxy only. The signal handler
 /// lives here, at process level, never inside the capture task: aborting the
 /// task is what runs its teardown, and every backend has host state to unwind.
+#[cfg(target_os = "linux")]
 async fn with_capture<F>(
   listener: arkham_proxy::RamaTcpListener,
   state: std::sync::Arc<arkham_proxy::ProxyState>,

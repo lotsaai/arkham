@@ -21,7 +21,7 @@ use crate::talos;
 use arkham_config::config::FileRewrite;
 use arkham_config::registry::Registry;
 use arkham_pki::ca::CertAuthority;
-use dirs::config_dir as dirs_config_dir;
+use arkham_config::config::user_config_dirs;
 use xpanda::Xpanda;
 
 /// Inputs for [`derive_sources`]: the generation context the ambient
@@ -145,9 +145,7 @@ impl AmbientDeriver<'_> {
   /// Returns an error when the twin output cannot be written.
   fn git(&mut self) -> Result<(), Error> {
     let mut git_sources = vec![self.host_home.join(".gitconfig")];
-    if let Some(dir) = dirs_config_dir() {
-      git_sources.push(dir.join("git").join("config"));
-    }
+    git_sources.extend(user_config_dirs().into_iter().map(|dir| dir.join("git").join("config")));
     if let Some(path) = env::var_os("GIT_CONFIG_GLOBAL") {
       git_sources.push(PathBuf::from(path));
     }

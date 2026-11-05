@@ -17,6 +17,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use arkham_config::config::user_config_dirs;
 use toml::Table;
 use toml::Value;
 
@@ -26,7 +27,9 @@ use crate::git::{self, text};
 /// The platform user-config path: the anchor for error messages and the
 /// path a declared rewrite is compared against.
 pub(crate) fn config_path() -> PathBuf {
-  dirs::config_dir().map_or_else(PathBuf::new, |dir| dir.join("jj").join("config.toml"))
+  user_config_dirs()
+    .last()
+    .map_or_else(PathBuf::new, |dir| dir.join("jj").join("config.toml"))
 }
 /// The chain paths in load order, for the declared-rewrite comparison.
 pub(crate) fn chain_paths() -> Vec<PathBuf> {
@@ -91,7 +94,8 @@ fn user_chain() -> Vec<PathBuf> {
   if let Some(home) = std::env::var_os("HOME") {
     chain.push(PathBuf::from(home).join(".jjconfig.toml"));
   }
-  if let Some(config_dir) = dirs::config_dir() {
+  // Later roots win: on macOS the XDG root comes last, and it is the one jj reads.
+  for config_dir in user_config_dirs() {
     chain.push(config_dir.join("jj").join("config.toml"));
     chain.extend(sorted_tomls(&config_dir.join("jj").join("conf.d")));
   }

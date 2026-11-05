@@ -798,22 +798,39 @@ fn global_config_path() -> Option<PathBuf> {
   if let Ok(path) = env::var("ARKHAM_CONFIG") {
     return Some(PathBuf::from(path));
   }
-  let standard = dirs::config_dir().map(|dir| dir.join("arkham").join("config.toml"));
-  if let Some(path) = &standard
-    && path.exists()
-  {
-    return Some(path.clone());
-  }
+  user_config_file(Path::new("arkham").join("config.toml"))
+}
+
+/// Per-user config roots in lookup order. macOS checks the platform
+/// directory, then the XDG one (`$XDG_CONFIG_HOME`, else `~/.config`), where
+/// command-line tools keep theirs.
+#[must_use]
+pub fn user_config_dirs() -> Vec<PathBuf> {
+  let mut roots: Vec<PathBuf> = dirs::config_dir().into_iter().collect();
   #[cfg(target_os = "macos")]
-  {
-    if let Some(home) = dirs::home_dir() {
-      let path = home.join(".config").join("arkham").join("config.toml");
-      if path.exists() {
-        return Some(path);
-      }
+  if let Ok(xdg) = etcetera::base_strategy::Xdg::new() {
+    use etcetera::BaseStrategy as _;
+    let xdg = xdg.config_dir();
+    if !roots.contains(&xdg) {
+      roots.push(xdg);
     }
   }
-  standard
+  roots
+}
+
+/// `relative` under the first per-user config root that holds it, else under
+/// the first root, so a file not yet created lands in the platform default.
+#[must_use]
+pub fn user_config_file(relative: impl AsRef<Path>) -> Option<PathBuf> {
+  let candidates: Vec<PathBuf> = user_config_dirs().iter().map(|root| root.join(relative.as_ref())).collect();
+  candidates.iter().find(|path| path.exists()).or_else(|| candidates.first()).cloned()
+}
+
+/// Per-user state root. Only the compose stack keeps state here; the macOS
+/// model keeps the agent's state in its own user account instead.
+#[must_use]
+pub fn user_state_dir() -> Option<PathBuf> {
+  dirs::state_dir()
 }
 
 /// Directory holding the global config file, and `rules.d` beside it.

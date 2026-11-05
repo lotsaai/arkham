@@ -48,10 +48,12 @@ backend = "aqua:tamasfe/taplo"
 specifiers = ["latest"]
 
 [tools."aqua:tamasfe/taplo"."platforms.linux-arm64"]
+checksum = "sha256:033681d01eec8376c3fd38fa3703c79316f5e14bb013d859943b60a07bccdcc3"
 url = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-aarch64.gz"
 url_api = "https://api.github.com/repos/tamasfe/taplo/releases/assets/257322597"
 
 [tools."aqua:tamasfe/taplo"."platforms.linux-arm64-musl"]
+checksum = "sha256:033681d01eec8376c3fd38fa3703c79316f5e14bb013d859943b60a07bccdcc3"
 url = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-aarch64.gz"
 url_api = "https://api.github.com/repos/tamasfe/taplo/releases/assets/257322597"
 
@@ -61,18 +63,22 @@ url = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86
 url_api = "https://api.github.com/repos/tamasfe/taplo/releases/assets/257322600"
 
 [tools."aqua:tamasfe/taplo"."platforms.linux-x64-musl"]
+checksum = "sha256:8fe196b894ccf9072f98d4e1013a180306e17d244830b03986ee5e8eabeb6156"
 url = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-x86_64.gz"
 url_api = "https://api.github.com/repos/tamasfe/taplo/releases/assets/257322600"
 
 [tools."aqua:tamasfe/taplo"."platforms.macos-arm64"]
+checksum = "sha256:713734314c3e71894b9e77513c5349835eefbd52908445a0d73b0c7dc469347d"
 url = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-aarch64.gz"
 url_api = "https://api.github.com/repos/tamasfe/taplo/releases/assets/257323110"
 
 [tools."aqua:tamasfe/taplo"."platforms.macos-x64"]
+checksum = "sha256:898122cde3a0b1cd1cbc2d52d3624f23338218c91b5ddb71518236a4c2c10ef2"
 url = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-darwin-x86_64.gz"
 url_api = "https://api.github.com/repos/tamasfe/taplo/releases/assets/257323116"
 
 [tools."aqua:tamasfe/taplo"."platforms.windows-x64"]
+checksum = "sha256:1615eed140039bd58e7089109883b1c434de5d6de8f64a993e6e8c80ca57bdf9"
 url = "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-windows-x86_64.zip"
 url_api = "https://api.github.com/repos/tamasfe/taplo/releases/assets/257323062"
 
@@ -514,31 +520,6 @@ checksum = "sha256:49d0b9c796f5b8ba6f58a1dd5469e8b7b34bf9b6ce9078633eedb2789680a
 url = "https://github.com/k3d-io/k3d/releases/download/v5.9.0/k3d-windows-amd64.exe"
 url_api = "https://api.github.com/repos/k3d-io/k3d/releases/assets/436305724"
 
-[[tools.k3s]]
-version = "1.37.0+k3s1"
-backend = "aqua:k3s-io/k3s"
-specifiers = ["latest"]
-
-[tools.k3s."platforms.linux-arm64"]
-checksum = "sha256:9bc2c128a597bf7c10ee45df844f2838251ba53806f7673d7fea24a6cb1b6a99"
-url = "https://github.com/k3s-io/k3s/releases/download/v1.37.0%2Bk3s1/k3s-arm64"
-url_api = "https://api.github.com/repos/k3s-io/k3s/releases/assets/563705554"
-
-[tools.k3s."platforms.linux-arm64-musl"]
-checksum = "sha256:9bc2c128a597bf7c10ee45df844f2838251ba53806f7673d7fea24a6cb1b6a99"
-url = "https://github.com/k3s-io/k3s/releases/download/v1.37.0%2Bk3s1/k3s-arm64"
-url_api = "https://api.github.com/repos/k3s-io/k3s/releases/assets/563705554"
-
-[tools.k3s."platforms.linux-x64"]
-checksum = "sha256:39eed8f53f277497dfc2542f66eab0ed68a94dfc598946dbebfb50366916c7a2"
-url = "https://github.com/k3s-io/k3s/releases/download/v1.37.0%2Bk3s1/k3s"
-url_api = "https://api.github.com/repos/k3s-io/k3s/releases/assets/563704602"
-
-[tools.k3s."platforms.linux-x64-musl"]
-checksum = "sha256:39eed8f53f277497dfc2542f66eab0ed68a94dfc598946dbebfb50366916c7a2"
-url = "https://github.com/k3s-io/k3s/releases/download/v1.37.0%2Bk3s1/k3s"
-url_api = "https://api.github.com/repos/k3s-io/k3s/releases/assets/563704602"
-
 [[tools.lychee]]
 version = "0.24.2"
 backend = "aqua:lycheeverse/lychee"
@@ -603,11 +584,6 @@ url_api = "https://api.github.com/repos/rui314/mold/releases/assets/557036001"
 checksum = "sha256:6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855"
 url = "https://github.com/rui314/mold/releases/download/v2.42.1/mold-2.42.1-x86_64-linux.tar.gz"
 url_api = "https://api.github.com/repos/rui314/mold/releases/assets/557036001"
-
-[tools.mold."platforms.windows-x64"]
-checksum = "sha256:ce38c5d5d6a5169e05883d598592b367976a9575abfafcdc49889fcc788b51c0"
-url = "https://github.com/rui314/mold/releases/download/v2.42.1/mold-2.42.1-x86_64-windows.zip"
-url_api = "https://api.github.com/repos/rui314/mold/releases/assets/557036000"
 
 [[tools.node]]
 version = "24.21.0"
@@ -683,14 +659,6 @@ url = "https://github.com/apple/pkl/releases/download/0.32.1/pkl-windows-amd64.e
 url_api = "https://api.github.com/repos/apple/pkl/releases/assets/487426668"
 
 [[tools.rust]]
-version = "nightly-2026-09-18"
-backend = "core:rust"
-specifiers = ["nightly-2026-09-18"]
-
-[tools.rust.options]
-components = "llvm-tools,rust-src,rustfmt"
-
-[[tools.rust]]
 version = "stable"
 backend = "core:rust"
 specifiers = ["stable"]
@@ -699,6 +667,14 @@ specifiers = ["stable"]
 components = "llvm-tools,rust-analyzer,rust-src"
 profile = "default"
 targets = "aarch64-apple-darwin,wasm32-unknown-unknown,wasm32-wasip2"
+
+[[tools.rust]]
+version = "nightly-2026-09-18"
+backend = "core:rust"
+specifiers = ["nightly-2026-09-18"]
+
+[tools.rust.options]
+components = "llvm-tools,rust-src,rustfmt"
 
 [[tools.shellcheck]]
 version = "0.11.0"

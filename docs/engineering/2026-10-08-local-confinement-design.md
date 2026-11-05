@@ -20,9 +20,9 @@ Scope captured here: a local execution backend for `arkham agent` that confines 
 
 ## Write profiles
 
-A profile names readable paths and writable paths for one workspace execution. Modes are `read-only` (deny writes, keep the `/dev/null` sink shells require) and `workspace-write` (writable workspace root plus a backend-defined temp area). A third spelling, `danger-full-access`, bypasses confinement and never reaches a backend. Network and process visibility stay outside this vocabulary: the network is governed by capture, not by policy flags. One shared helper derives the writable set, and every renderer plus every test reads that helper. No renderer invents its own roots.
+A profile names readable paths and writable paths for one workspace execution. Modes are `read-only` (deny writes, keep the `/dev/null` sink shells require) and `workspace-write` (writable workspace root plus a backend-defined temp area). A third spelling, `danger-full-access`, drops filesystem write and read restrictions only (no Landlock, Seatbelt, or token policy). It is orthogonal to secret protection: decoy env, forged secret files (`fnox.toml`, `fnox.*.toml`), and transparent capture still apply, so the agent still never holds a real secret. Network and process visibility stay outside this vocabulary: the network is governed by capture, not by policy flags. One shared helper derives the writable set, and every renderer plus every test reads that helper. No renderer invents its own roots.
 
-Renderers are per OS, selected by platform first and functional probe second. Linux tries bwrap, then the Landlock launcher. macOS uses Seatbelt. Windows uses the restricted-token runner. Each candidate probes once with the real profile (`true` under it, exit 0 wins) and the verdict caches for the process lifetime. A platform with no usable runner errors instead of running bare. An operator `runnerCommand` override may assert its own enforcement and skip probes.
+Renderers are per OS, selected by platform first and functional probe second. Linux tries bwrap, then the Landlock launcher. macOS uses Seatbelt. Windows uses the restricted-token runner. Each candidate probes once with the real profile (`true` under it, exit 0 wins) and the verdict caches for the process lifetime. A platform with no usable runner refuses to start the agent. There is no proxy-only fallback flag. An operator `runnerCommand` override may assert its own enforcement and skip probes.
 
 Enforcement is a reported fact. Backends return `full` or `partial`. Older Landlock ABIs report partial. Windows reports partial for hard-link aliasing and unconfined reads. Callers that need an absolute boundary reject partial. Nothing claims full without a passing probe.
 
@@ -32,33 +32,50 @@ Each sandbox runs in its own cgroup. The eBPF programs (`arkham-ebpf-programs`: 
 
 The bwrap invocation keeps the filesystem shape from the compose inputs (workspace root and `include` entries with their ro flags, `file_mounts` and guest mounts read only, `tool_mounts` with their flags, fnox binds and grants mounts never entering) plus `--unshare-pid --unshare-uts --unshare-ipc --die-with-parent --new-session`, the CA as a read-only bind with trust env pointers, and decoy env values. `--unshare-net` stays off: the sandbox shares the host stack and eBPF sees its flows through cgroup membership.
 
-## macOS: NetworkExtension dispatcher plus sidecars
+## macOS: arkham user, FUSE projection, NetworkExtension dispatcher
 
-The provider attributes and dispatches. It never substitutes. Each intercepted TCP flow is handed to the workspace sidecar that owns the originating process, and the sidecar performs MITM plus substitution. Secrets stay out of the system extension, and `arkham-proxy` is reused with one addition: parsing a PROXY header on the loopback handoff.
+The agent runs as a dedicated local user, `arkham`. The OS user boundary is the primary wall: the agent cannot read the operator's home, keychain, 1Password, `~/.ssh`, or fnox identity because they belong to another user. Seatbelt narrows further on top of that. Nothing moves and there is no migrate step: `arkham agent` sets everything up per run and tears it down on exit.
 
-Three components, following the rama example layout. A host controller app installs and manages the proxy profile through `NETransparentProxyManager` with `start`, `stop`, and `status`. A system extension implements `NETransparentProxyProvider` and links a Rust dispatcher as a static library through the rama C ABI bridge. One arkham sidecar process per workspace accepts dispatched flows on its claimed loopback port. macOS owns the extension lifecycle: it starts, stops, and restarts the extension as needed, so the dispatcher restarts cleanly from externally persisted configuration, and the controller re-pushes the workspace table on every start and every change.
+### User story
 
-Per-flow data path, grounded in the bridge surface (`ffi/apple/RamaAppleNetworkExtension`). `handleNewFlow` snapshots `NEFlowMetaData` at the adapter boundary: source app bundle identifier, audit token bytes, PID when set, remote hostname, protocol, and both endpoints. The snapshot crosses FFI as a plain struct (`rama_apple_ne_ffi.h`: endpoint metadata plus `source_app_bundle_identifier`, `source_app_audit_token_bytes`, `source_app_pid` with its `is_set` flag). The Rust engine returns one verdict per flow: dispatch to a workspace, bypass, or block. TCP and UDP flows share the core logic through the `TcpFlowLike` and `UdpFlowLike` protocols, with the modern macOS 15 UDP callback plus the legacy fallback. Interception rules stay TCP only: UDP is excluded, which keeps QUIC and DNS on the system path by construction.
+The operator runs `arkham agent` in `~/github/foo`. Arkham registers the project and its secret mapping with the controller, projects the enlisted roots into `/Users/arkham` through FUSE, and starts the agent as `arkham` in `/Users/arkham/github/foo` with decoy env only. The agent edits files and the edits land in the operator's real tree. It reads `fnox.toml`, finds a valid fnox setup, and every value resolves to a decoy. Its network traffic is captured by the system extension, attributed to the `arkham` user and the project, and substituted by the proxy. The operator's own tree, tools, and fnox keep working untouched.
 
-Attribution resolves in order. The source PID when set, or the audit token through `rama_apple_audit_token_to_pid`, indexes the supervisor process table: agent PIDs with start times, pushed over XPC on spawn and exit, where start times defeat PID reuse. The bundle identifier covers agents running as distinct signed helpers. Anything unattributed bypasses: connectivity fails open while secrets stay safe, because bypassed flows carry decoys. `NENetworkRule` objects select remote networks and TCP while excluding loopback, private ranges, and DNS.
+### Filesystem: FUSE fake-data provider plus permission projections
 
-Dispatch is a loopback handoff. The provider opens an `NWConnection` to `127.0.0.1:<workspace-port>`, writes a PROXY v1 header carrying the original destination, then relays bytes both ways. The sidecar parses the header and continues down the existing transparent-stream path. Egress keeps the bridge default of stamping the original flow metadata (`preserve_original_meta_data`), so upstream connections present the true source identity.
+A FUSE filesystem, built on macFUSE through libfuse3 (not FSKit), mounts each configured entry under `/Users/arkham`. Entries come in two kinds:
 
-Secrets never cross Apple-logged paths. The opaque config payload appears in system diagnostics with no suppression, so it carries timeouts and exclusions only. The CA follows the example: the sysext generates the MITM root CA into `/Library/Keychains/System.keychain` with boring TLS on first start and reuses it; the controller rotates it live over XPC and clears it on request. The container app never creates or reads CA material.
+- `enlist`: broad source roots such as `~/wagyu` and `~/github`, mounted whole at the mirrored path (`/Users/arkham/wagyu`, `/Users/arkham/github`). The agent can search across them. Projects are subdirectories the registry knows.
+- `mirror`: supporting tool state the agent needs, such as hindsight data and heimdall config, mounted at its usual location under `/Users/arkham`.
 
-Packaging is an app bundle with the embedded extension, copied to `/Applications` and registered. It surfaces under Filters and Proxies, needs one user approval, and persists across reboots. Two signing tracks share one extension implementation with the entitlement payload switched per track: Apple Development with automatic signing for local work, Developer ID with notarize plus staple for distribution, distinct bundle IDs per track, both extension IDs uninstalled when switching. Logging goes through unified logging with the bridge privacy split: endpoints and attribution are private metadata, never public text. Debug persistence stays development only.
+Each entry is read-only or writable. Files pass through to the operator's real tree, with one exception: secret files are forged. The initial set is `fnox.toml` and `fnox.*.toml`. A forged fnox file declares the same names with decoy values encrypted to a fresh age identity that exists only under `/Users/arkham`, so `fnox` inside the agent works and only ever yields decoys.
 
-Verification: install developer signed, start, prove an unattributed `curl` bypasses, prove an attributed agent flow substitutes with zero proxy env set, kill a sidecar and prove its flows bypass, rotate the CA live over XPC.
+Reads of secret files are allowed by design. In practice an agent that finds a broken or unreadable fnox setup tries to fix its environment and uploads the file while doing so; that happened under the compose stack, where the workspace bind exposed the real `fnox.toml` to the agent even though the identity stayed hidden. The requirement is that every byte the agent can read is bogus, not that reads fail. Writes to forged files never reach the real file, so the agent cannot overwrite real config with decoys.
+
+Everything outside the mounts is a permission projection: the `arkham` user's ownership and ACLs decide what is reachable at all, and a Seatbelt profile restricts writes to the mounts plus temp and denies `mach-lookup` to credential services. Seatbelt is defense in depth; the user boundary holds if `sandbox-exec` breaks.
+
+### Network: one proxy, project registry, per-flow secret selection
+
+Project isolation is not a goal. Guarding secrets is, which means knowing which secrets apply to which flow. The proxy follows the shared host shape (see Proxy shape): one process with a project registry. The controller registers and unregisters projects as `arkham agent` starts and exits.
+
+Three components follow the rama example layout. A host controller app installs and manages the proxy profile through `NETransparentProxyManager` and owns the project registry and agent process table, pushed to the extension over XPC (`rama-net-apple-xpc`) and re-pushed on every extension start. A system extension implements `NETransparentProxyProvider` and links a Rust dispatcher through the rama C ABI bridge. The proxy accepts dispatched flows on loopback.
+
+Per-flow data path. `handleNewFlow` snapshots `NEFlowMetaData` (audit token, PID when set, bundle identifier, endpoints). The audit token carries the UID, so flows from the `arkham` user are agent flows; everything else bypasses. The agent process table (PIDs with start times) resolves the flow to a project. Project discovery works across broad enlisted roots: the controller reads the source process's cwd with `proc_pidinfo` (`PROC_PIDVNODEPATHINFO`) and walks up to the nearest `fnox.toml`, which marks the project root and is resolved through `code-workspace`. A directory with no `fnox.toml` falls back to the nearest registered root. The dispatcher opens a loopback connection to the proxy, writes a PROXY v2 header carrying the original destination plus a TLV naming the project, and relays bytes. The proxy selects the project's secret set before building substitution pairs; it never infers the project from a decoy value, because decoys are deterministic per env name and collide across projects. Interception rules stay TCP only and exclude loopback, private ranges, and DNS. Unattributed flows bypass and carry decoys only.
+
+The CA follows the example: the sysext generates the MITM root into `/Library/Keychains/System.keychain` with boring TLS and the controller rotates or clears it over XPC. The agent trusts it through `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and `REQUESTS_CA_BUNDLE`. Secrets never cross Apple-logged paths: the opaque provider config carries timeouts and exclusions only.
+
+Packaging is an app bundle with the embedded extension, copied to `/Applications`, approved once under Filters and Proxies. Two signing tracks share one implementation: Apple Development for local work, Developer ID with notarize plus staple for distribution, distinct bundle IDs per track.
+
+Verification: install developer signed with SIP on, prove an unattributed `curl` bypasses, prove an agent flow as `arkham` substitutes with zero proxy env set, prove the agent reads a forged `fnox.toml` while the operator reads the real one at the same project, prove writes to the forged file never reach the real one, and rotate the CA live over XPC.
 
 ## Windows: WFP callout driver plus Rama
 
 Two parts with a hard responsibility split. A kernel callout driver decides what happens to traffic. Rama in userspace decides how redirected traffic is handled. The driver holds no proxy logic and no secrets.
 
-Filters select TCP v4 and v6 while excluding loopback, private ranges, DNS, and UDP 443 (QUIC drops to force fallback, parity with the nft rules). The redirect callout sits at `ALE_CONNECT_REDIRECT`, where the destination can still change. Its classify function reads the originating process ID, looks it up in the driver-side process table arkham pushes (agent PID subtrees tagged per workspace), rewrites the destination to `127.0.0.1:<workspace-port>`, attaches the redirect handle, and writes the context blob carrying the original destination plus the workspace tag. An `ALE_AUTH_CONNECT` callout owns allow-or-block decisions: QUIC drops, pinned-app bypasses, system-service exclusions. Unknown processes get no tag and their flows are permitted direct.
+Filters select TCP v4 and v6 while excluding loopback, private ranges, DNS, and UDP 443 (QUIC drops to force fallback, parity with the nft rules). The redirect callout sits at `ALE_CONNECT_REDIRECT`, where the destination can still change. Its classify function reads the originating process ID, looks it up in the driver-side process table arkham pushes (agent PID subtrees tagged per workspace), rewrites the destination to the proxy listener on `127.0.0.1`, attaches the redirect handle, and writes the context blob carrying the original destination plus the workspace tag. An `ALE_AUTH_CONNECT` callout owns allow-or-block decisions: QUIC drops, pinned-app bypasses, system-service exclusions. Unknown processes get no tag and their flows are permitted direct.
 
-Each workspace sidecar accepts on its claimed port, queries `SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT` on the socket, and decodes the record with arkham `WfpContextDecoder`: original destination out, workspace tag cross-checked against the port. The flow then continues down the existing transparent-stream path. An absent record (`WSAEINVAL`) means the socket was not redirected, and the flow splices. No PROXY header is needed here: the context already carries the original destination.
+The proxy accepts the redirected socket, queries `SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT` on the socket, and decodes the record with arkham `WfpContextDecoder`: original destination and workspace tag out, the tag selecting the project's secret set. The flow then continues down the existing transparent-stream path. An absent record (`WSAEINVAL`) means the socket was not redirected, and the flow splices. No PROXY header is needed here: the context already carries the original destination.
 
-Driver and proxy talk through a device object with IOCTLs. Arkham pushes proxy endpoints, sidecar ports, and process-table deltas on agent spawn and exit, and pulls counters for verification. All runtime state lives in driver memory only, is set at proxy startup, and clears automatically when arkham exits, tracked through kernel process notifications. Proxy updates need no reboot: start the new instance, let it register, confirm substitution, stop the old one, where the tracked PID keeps the old instance from clearing the new config. Driver updates need a reboot. Verification reads driver load state, the service entry, registered filters and callouts, and the Base Filtering Engine status. Debug tooling is DebugView for kernel output, WinDbg in a VM for deep work, Process Explorer and WinObj for inspection.
+Driver and proxy talk through a device object with IOCTLs. Arkham pushes the proxy endpoint and process-table deltas on agent spawn and exit, and pulls counters for verification. All runtime state lives in driver memory only, is set at proxy startup, and clears automatically when arkham exits, tracked through kernel process notifications. Proxy updates need no reboot: start the new instance, let it register, confirm substitution, stop the old one, where the tracked PID keeps the old instance from clearing the new config. Driver updates need a reboot. Verification reads driver load state, the service entry, registered filters and callouts, and the Base Filtering Engine status. Debug tooling is DebugView for kernel output, WinDbg in a VM for deep work, Process Explorer and WinObj for inspection.
 
 The installer needs admin rights: service registration with a BFE dependency, a private sublayer with a documented weight for coexistence with VPNs and other WFP products, persistent filter install, and clean removal undoing all of it. Development uses test signing. The production signing path is an open question below.
 
@@ -66,9 +83,11 @@ Failure strategy is fail open for connectivity: no proxy configured, local or pr
 
 ## Proxy shape
 
-One arkham process per workspace. Each sidecar holds exactly one `ResolvedConfig`, which makes cross-workspace leakage structurally impossible and needs zero proxy code changes: `serve` already takes one snapshot. The recorded alternative is a multi-listener single process (local port or source key selects the snapshot, per-workspace plugin registries and mint stores). Unknown source splices with no swap in every shape.
+Compose keeps its shape: one arkham process per stack, holding one `ResolvedConfig` on the fixed `127.0.0.1:8099` inside the stack's own netns.
 
-Port allocation: the fixed `127.0.0.1:8099` works in compose because each stack owns its netns. Host sidecars share loopback, so each workspace claims its own port. Keep a claim record under the workspace state dir (`<state-dir>/arkham/ws/<slug>/proxy.port`) holding port plus owner PID. On start, reuse a live claim, reap a dead one after a bind probe, else claim the next free port from the configured range. `ARKHAM_LISTEN` keeps overriding everything, so operators and tests pin ports directly. A slug-hash default without claims is rejected: collisions fail at bind time with a confusing error instead of self-healing. Down teardown (`rm`) drops the claim.
+Every host backend (Linux bwrap and Landlock, macOS, Windows) uses one arkham proxy process with a project registry. Project isolation is not the goal; guarding secrets is, which means knowing which secrets apply to which flow. Each registered project maps its root to its secret set (resolved config, plugin registry, mint store). `arkham agent` registers its project on start and unregisters on exit. The capture backend attributes each flow to a project (cgroup on Linux, audit token plus process table on macOS, the WFP workspace tag on Windows), and the proxy selects that project's secret set before building substitution pairs. Attribution reaches the proxy per backend as follows: Linux reads the cgroup id from the eBPF `FLOW` map, macOS reads a project TLV from the PROXY v2 header on the loopback handoff, and Windows reads the workspace tag from the WFP redirect context. It never infers the project from a decoy value: decoys are deterministic per env name and collide across projects. Unknown source splices with no swap.
+
+One listener on loopback serves every project, so there are no per-workspace ports, no claim records, and no state directory for host backends. `ARKHAM_LISTEN` keeps overriding the listen address for operators and tests. `ProxyState` grows from one write-once snapshot to a registry with live add and remove; that change, plus the per-flow selection step, is the proxy work for host backends.
 
 ## Filesystem backends
 
@@ -94,7 +113,7 @@ bwrap \
 
 No `HTTP_PROXY` variables appear. Landlock is the chain fallback with `--ro / --rw <roots>` grants from the same profile. `read-only` mode drops the workspace bind and the tmpfs.
 
-macOS emits SBPL from the shared writable roots:
+macOS emits SBPL from the shared writable roots as a second layer under the `arkham` user and the FUSE projection (see the macOS section):
 
 ```
 (version 1) (allow default) (deny file-write*)
@@ -102,7 +121,7 @@ macOS emits SBPL from the shared writable roots:
 (allow file-write* (subpath "<root>") (subpath "<tmp>"))
 ```
 
-Every root is canonicalized first: Seatbelt matches resolved paths, so `/tmp` renders as `/private/tmp` and symlinked ancestors resolve. Launch is `sandbox-exec -p <profile> -- <command>`. A missing `sandbox-exec` fails the probe and the backend reports unavailable. The App Sandbox entitlement path is rejected because it needs a signed bundle and Xcode packaging for a CLI tool.
+Every root is canonicalized first: Seatbelt matches resolved paths, so `/tmp` renders as `/private/tmp` and symlinked ancestors resolve. Launch is `sandbox-exec -p <profile> -- <command>` as the `arkham` user. A missing `sandbox-exec` fails the probe and Seatbelt reports unavailable; the user boundary still holds, so enforcement reports `partial`. The App Sandbox entitlement path is rejected because it needs a signed bundle and Xcode packaging for a CLI tool.
 
 Windows uses raw restricted tokens, not AppContainer. The child token derives from `CreateRestrictedToken` with `WRITE_RESTRICTED`, `DISABLE_MAX_PRIVILEGE`, and `LUA_TOKEN`, with distinct workspace and private-temp capability SIDs. The token intersects writes only, so reads keep ambient access. AppContainer is rejected because its token carries no ambient reads: every readable path would need pre-granting, which means wholesale host DACL mutation for an agent that reads toolchains across the disk. One standing workspace ACE per workspace plus a random private temp directory with a revocable ACE per live session pair keeps sessions from inheriting each other temp authority. The Low integrity layer applies, and ambient deletes are denied through the parent `FILE_DELETE_CHILD` right. Partial is always reported: hard-link aliasing, unconfined reads, and trees ACLed by other tools.
 
@@ -114,27 +133,24 @@ Per-backend gaps: bwrap leaves kernel exploits and abstract-socket or D-Bus peer
 
 ## Work areas
 
-Policy and scaffold: policy types plus the shared writable-roots helper in `arkham-config`, one `Error` variant for unavailable confinement, the probe harness running `true` under a `read-only` profile, port claim records, and the `--isolate bwrap|compose` switch with compose default.
+Policy and scaffold: policy types plus the shared writable-roots helper in `arkham-config`, one `Error` variant for unavailable confinement, the probe harness running `true` under a `read-only` profile, the project registry, and the `--isolate bwrap|compose` switch with compose default.
 
-Linux: bwrap argv renderer from stack inputs, Landlock chain with partial reporting, eBPF per-workspace cgroup capture, sidecar lifecycle in `AgentArgs`.
+Linux: bwrap argv renderer from stack inputs, Landlock chain with partial reporting, eBPF per-workspace cgroup capture with the cgroup selecting the project, project registration in `AgentArgs`.
 
-macOS: Seatbelt renderer with canonicalization, host controller plus sysext packaging from the rama example layout, both signing tracks, CA lifecycle, `NENetworkRule` selection, attribution mapping, unified logging.
+macOS: `arkham` user provisioning, FUSE projection with `enlist` and `mirror` entries and forged `fnox.toml` / `fnox.*.toml`, Seatbelt renderer with canonicalization, host controller plus sysext packaging from the rama example layout, project registry and agent process table over XPC, both signing tracks, CA lifecycle, `NENetworkRule` selection, unified logging.
 
 Windows: restricted-token renderer with ACE lifecycle, callout driver (minimal, redirect plus tagging), filter set, installer with service and BFE wiring, redirect-context decoder, verification and debug docs.
 
-Proxy: per-workspace sidecars with claim records. Multi-listener single process is the recorded alternative.
+Proxy: one process with a project registry for every host backend, live project add and remove, and per-flow secret-set selection from capture attribution. Compose keeps one process per stack.
 
 Verification throughout: e2e per backend proving outside-root writes fail in the backend denial dialect, reads fail where the backend governs them, decoys substitute through transparent capture with no proxy env set on the agent, host `/tmp` stays untouched under bwrap, and unknown-source flows splice. Run `mise run format` and `mise run --force test` for Rust changes.
 
 ## Open questions
 
-- macOS identity for supervisor-spawned CLI agents: the bridge delivers bundle identifier, audit token, and PID when set, but which of those a `sandbox-exec` child actually presents is unverified. Spike against the rama example: spawn a CLI child, read its flow metadata, confirm one stable key. Fallbacks if none is stable: distinct signed helper executables per workspace, or UID-keyed correlation.
+- Forged fnox contents: how decoy values and the fresh age identity are generated so `fnox` behaves identically, and whether other secret file shapes join `fnox.toml` and `fnox.*.toml`.
 - Windows driver signing path for production (attestation versus EV) and the installer shape. Test signing covers development.
 - Windows redirect-context schema and its versioning between driver and arkham releases. The driver writes it, arkham decodes it, so both sides stay in this repo.
-- Port range defaults and claim file format. Proposed `18080-19999` and TOML.
-- Proxy-only fallback on systems with no usable runner: refuse by default, allow behind an explicit flag. Flag spelling undecided.
-- PROXY header version on the macOS loopback handoff. Proposed v1 text format for TCP v4 and v6; v2 only if a TLV need appears.
-- Whether `danger-full-access` needs an approval record beyond the existing escalation vocabulary. Proposed shape resolves it per call without calling the backend.
+- Whether `danger-full-access` stays at all, given it only relaxes filesystem policy and secret protection is unaffected.
 
 ## References
 
