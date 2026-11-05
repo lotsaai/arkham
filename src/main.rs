@@ -206,6 +206,9 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   // Bind before capture side effects: a bad listen addr must fail
   // before nft rules and routes touch the host.
   let listener = arkham_proxy::bind_explicit(listen_addr).await?;
+  if !listen_addr.ip().is_loopback() {
+    tracing::warn!(listen = %listen_addr, "listening on a non-loopback address: anyone reaching this port can trigger real-secret substitution");
+  }
   tracing::info!(listen = %listen_addr, grants = grant_count, "serving");
   #[cfg(target_os = "linux")]
   if args.proxy_backend == ProxyBackend::Tun {

@@ -239,17 +239,13 @@ pub async fn serve(listener: RamaTcpListener, state: Arc<ProxyState>) {
 
 /// Bind the explicit listener with rama socket options: plain TCP socket for
 /// the configured address, bound and listening, ready to serve. Backlog
-/// matches `std` (128). The address must be loopback.
+/// matches `std` (128).
 ///
 /// # Errors
 ///
-/// Returns [`Error::NonLoopbackListen`] when `addr` is not loopback.
 /// Returns an error when the socket cannot be built, bound, or marked
 /// listening.
 pub async fn bind_explicit(addr: SocketAddr) -> Result<RamaTcpListener, Error> {
-  if !addr.ip().is_loopback() {
-    return Err(Error::NonLoopbackListen { addr });
-  }
   let domain = if addr.is_ipv4() { Domain::IPv4 } else { Domain::IPv6 };
   let socket = SocketOptions {
     address: Some(SocketAddress::from(addr)),
@@ -475,11 +471,8 @@ mod bind_explicit_tests {
   use super::*;
 
   #[tokio::test]
-  async fn bind_explicit_refuses_a_non_loopback_address() {
-    for addr in ["0.0.0.0:0", "192.0.2.1:9", "[::]:0", "[::ffff:127.0.0.1]:0"] {
-      let err = bind_explicit(addr.parse().unwrap()).await.unwrap_err();
-      assert!(matches!(err, Error::NonLoopbackListen { .. }), "{addr} produced {err:?}");
-    }
+  async fn bind_explicit_accepts_the_compose_wildcard() {
+    bind_explicit("0.0.0.0:0".parse().unwrap()).await.unwrap();
   }
 
   #[tokio::test]
