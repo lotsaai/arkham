@@ -8,6 +8,8 @@
 mod commands;
 #[cfg(target_os = "linux")]
 mod fwd;
+#[cfg(target_os = "linux")]
+mod host;
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +18,7 @@ use arkham_fnox::FnoxSource;
 use clap::{Parser, Subcommand};
 
 use arkham_compose::{AgentArgs, DownArgs, ExposeArgs, InitArgs, LogsArgs, UpArgs};
-use commands::{CaArgs, ConfigArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, SchemesArgs, ServeArgs};
+use commands::{CaArgs, ConfigArgs, DaemonArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, SchemesArgs, ServeArgs};
 
 #[derive(Parser, Debug)]
 #[command(name = "arkham", about = "grant-scoped MITM proxy", version)]
@@ -87,6 +89,8 @@ enum Command {
   Down(DownArgs),
   /// Read the stack's logs.
   Logs(LogsArgs),
+  /// Run the host daemon: one proxy, the project registry, and the control socket.
+  Daemon(DaemonArgs),
 }
 
 #[global_allocator]
@@ -107,8 +111,22 @@ fn ca_path(proxy: &arkham_config::config::ProxyCfg) -> eyre::Result<PathBuf> {
     .ok_or_else(|| eyre::eyre!("unable to resolve user config directory"))
 }
 
+fn main() -> eyre::Result<()> {
+  if std::env::args().nth(1).as_deref() == Some("--landlock-exec") {
+    #[cfg(target_os = "linux")]
+    {
+      return arkham_compose::landlock_exec().map_err(Into::into);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+      eyre::bail!("the landlock launcher runs on Linux");
+    }
+  }
+  runtime_main()
+}
+
 #[tokio::main]
-async fn main() -> eyre::Result<()> {
+async fn runtime_main() -> eyre::Result<()> {
   arkham_pki::ca::install_crypto_provider();
   tracing_subscriber::fmt()
     .pretty()
@@ -134,6 +152,7 @@ async fn main() -> eyre::Result<()> {
     Command::Expose(args) => args.run(&cli, arkham_version).await?,
     Command::Down(args) => args.run(&cli, arkham_version).await?,
     Command::Logs(args) => args.run(&cli, arkham_version).await?,
+    Command::Daemon(args) => args.run(&cli, arkham_version).await?,
   }
   Ok(())
 }

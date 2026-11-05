@@ -47,6 +47,8 @@ pub(crate) struct CandidateParams<'a> {
   pub(crate) raw_host: &'a str,
   /// Pipelined bytes read past the ingress head.
   pub(crate) initial: &'a [u8],
+  /// Cgroup id from capture. Zero is the process snapshot.
+  pub(crate) cgroup_id: u64,
 }
 
 /// How a destination is served, from the grant scopes that cover it.

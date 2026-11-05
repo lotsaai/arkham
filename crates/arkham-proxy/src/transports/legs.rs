@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use arkham_config::grants::{AmqpScope, Grant, LdapScope, RedisScope, SmtpScope};
@@ -148,7 +149,7 @@ pub(crate) struct PairCtx<'a> {
   /// Connection endpoint port.
   pub(crate) port: u16,
   /// Per-connection plugin registry.
-  pub(crate) plugins: &'a arkham_plugin::Registry,
+  pub(crate) plugins: Arc<arkham_plugin::Registry>,
   /// Runtime token-mint store; `None` keeps value-swap-only behavior.
   pub(crate) mint: Option<MintStore>,
 }
@@ -161,8 +162,8 @@ impl<'a> PairCtx<'a> {
       grants: &params.snapshot.grants,
       host,
       port: params.port,
-      plugins: &params.state.plugins,
-      mint: Some(params.state.mint_store()),
+      plugins: params.state.plugins_for(params.cgroup_id),
+      mint: Some(params.state.mint_for(params.cgroup_id)),
     }
   }
 }

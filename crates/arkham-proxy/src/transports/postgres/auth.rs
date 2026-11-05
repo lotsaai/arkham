@@ -432,7 +432,7 @@ fn short(message: &str) -> std::io::Error {
 
 #[cfg(test)]
 mod tests {
-  use std::sync::OnceLock;
+  use std::sync::{Arc, OnceLock};
   use std::time::Instant;
 
   use arkham_config::grants::{Credential, Grant};
@@ -451,9 +451,9 @@ mod tests {
   const REAL: &str = "arkham_real_pg_pass"; // betterleaks:allow
   const LEAK: &str = "upstream-leak-marker";
 
-  fn registry() -> &'static Registry {
-    static REGISTRY: OnceLock<Registry> = OnceLock::new();
-    REGISTRY.get_or_init(|| Registry::load(&[]).expect("empty plugin registry"))
+  fn registry() -> Arc<Registry> {
+    static REGISTRY: OnceLock<Arc<Registry>> = OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| Arc::new(Registry::load(&[]).expect("empty plugin registry"))))
   }
 
   fn grant() -> Grant {

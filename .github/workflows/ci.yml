@@ -28,7 +28,7 @@ jobs:
       # nftables and bpftool are for the k3s task's failure dump
       # (`nft list ruleset`, `bpftool cgroup tree`), not for the build.
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd mold nftables linux-tools-common linux-tools-generic
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd mold nftables linux-tools-common linux-tools-generic bubblewrap
 
       # Pinned by hand to the LLVM major the pinned rustc ships. rustc is
       # NOT installed yet when this step runs, so probing `rustc -Vv` here

@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod confine;
 pub mod context;
 mod error;
 pub mod grants;
@@ -13,6 +14,10 @@ pub mod import;
 pub mod plugins;
 pub mod registry;
 pub use config::{AppConfig, ProxyCfg, RuleCfg, fake_for, load};
+pub use confine::{
+  Enforcement, FsPolicy, Isolate, RunnerChoice, RunnerKind, WriteProfile, choose_runner, fs_policy, is_fnox_config_name,
+  is_fnox_config_path, require_loopback_listen,
+};
 pub use error::Error;
 pub use grants::{
   Credential, EndpointScope, Grant, HostPat, PostgresLeg, PostgresScope, ResolvedConfig, Scheme, SslMode, SslNegotiation, decoy_for_rule,

@@ -66,9 +66,15 @@ Curate an `oauth2` registry fragment from a saved discovery or OpenAPI document.
 
 Generate the workspace stack: the CA and the agent entrypoint when they are missing, and `<state-dir>/arkham/ws/<slug>/compose.yml`. That compose file is generated state. Overrides go in `~/.config/arkham/compose.yaml` or `<workspace>/.config/arkham/compose.yaml`. Rules are not written anywhere: they derive at serve time from fnox declarations the registry knows, and config holds overrides only. An existing stack is rewritten when the rendered file would change and left untouched when it matches. `--backend` picks the capture backend (`ebpf` by default, Linux only). A named backend is part of the render and replaces the file when the output differs. An unnamed backend keeps the one already rendered. Prints a warning when no rule is in play, since then nothing would be substituted.
 
-## `arkham agent [WORKSPACE] [--rm] [-- <COMMAND>...]`
+## `arkham daemon`
+
+Linux only. One loopback proxy and a per-user control socket for host-confined agents. A non-loopback `ARKHAM_LISTEN` is refused, and a second daemon exits when one is already listening. Prints `daemon: ready` on stderr once the socket is bound.
+
+## `arkham agent [WORKSPACE] [--rm] [--isolate <compose|bwrap>] [--write-profile <PROFILE>] [-- <COMMAND>...]`
 
 The whole lifecycle in one idempotent run: what `init` does, then `up`, then the configured shell (or `COMMAND`) in the agent. The stack keeps running when that exits, so the next call starts at the exec. `--rm` stops the stack instead: teardown runs after the shell or command exits, including when the terminal's interrupt ends it.
+
+`--isolate` defaults to `compose`. `--isolate bwrap` (Linux) does not start a stack. It requires a running `arkham daemon`, then runs `COMMAND` with decoy environment and forged secret files. `--write-profile` is `workspace-write` (the default), `read-only`, or `danger-full-access`. Stderr reports `enforcement: full` or `enforcement: partial`. With no daemon, the command starts nothing.
 
 ## `arkham up [WORKSPACE]`
 
