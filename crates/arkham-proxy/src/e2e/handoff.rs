@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -16,8 +17,8 @@ struct HandoffBind {
 }
 
 fn current_uid() -> u32 {
-  // SAFETY: getuid has no preconditions.
-  unsafe { libc::getuid() }
+  let (a, _b) = UnixStream::pair().unwrap();
+  a.peer_cred().unwrap().uid()
 }
 
 fn other_uid() -> u32 {
@@ -78,6 +79,16 @@ async fn expect_eof(client: &mut UnixStream) {
     .unwrap()
     .unwrap();
   assert_eq!(n, 0);
+}
+
+async fn expect_closed(client: &mut UnixStream) {
+  let mut buf = [0u8; 8];
+  let result = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await.unwrap();
+  match result {
+    Ok(0) => {}
+    Err(err) if err.kind() == ErrorKind::ConnectionReset => {}
+    other => panic!("expected a closed connection, got {other:?}"),
+  }
 }
 
 #[tokio::test]
@@ -220,9 +231,12 @@ async fn a_peer_with_the_wrong_uid_does_not_dial() {
   let mut client = UnixStream::connect(&bind.path).await.unwrap();
   let header = Addresses::new_tcp4(Ipv4Addr::new(203, 0, 113, 9), Ipv4Addr::LOCALHOST, 9, stub_port).to_string();
   client.write_all(header.as_bytes()).await.unwrap();
-  client.write_all(b"SHOULD_NOT_ARRIVE").await.unwrap();
-  client.shutdown().await.unwrap();
-  expect_eof(&mut client).await;
+  match client.write_all(b"SHOULD_NOT_ARRIVE").await {
+    Ok(()) => client.shutdown().await.unwrap(),
+    Err(err) if matches!(err.kind(), ErrorKind::BrokenPipe | ErrorKind::ConnectionReset) => {}
+    Err(err) => panic!("unexpected write error: {err:?}"),
+  }
+  expect_closed(&mut client).await;
   tokio::time::timeout(Duration::from_secs(2), stub.accept()).await.unwrap_err();
   bind.task.abort();
 }

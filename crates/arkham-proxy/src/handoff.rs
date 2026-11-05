@@ -3,7 +3,6 @@
 use std::fs::Permissions;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -29,9 +28,9 @@ pub struct HandoffListener {
 /// Bind a Unix-domain handoff listener.
 ///
 /// Only a peer whose uid matches `allowed_uid` (the Network Extension or
-/// daemon uid) is admitted. The check uses [`getpeereid`] on macOS/BSD and
-/// `SO_PEERCRED` on Linux. This is not a TCP listener and not a shared
-/// secret.
+/// daemon uid) is admitted. The check uses [`UnixStream::peer_cred`], which
+/// reads getpeereid on macOS/BSD and `SO_PEERCRED` on Linux. This is not a
+/// TCP listener and not a shared secret.
 ///
 /// An existing file at `path` is removed first. The socket file is mode
 /// `0o600` after bind.
@@ -39,8 +38,6 @@ pub struct HandoffListener {
 /// # Errors
 ///
 /// Returns an error when the path cannot be replaced, bound, or chmod'd.
-///
-/// [`getpeereid`]: https://man.freebsd.org/cgi/man.cgi?query=getpeereid
 pub async fn bind_handoff(path: impl AsRef<Path>, allowed_uid: u32) -> Result<HandoffListener, Error> {
   let path = path.as_ref();
   match std::fs::remove_file(path) {
@@ -133,53 +130,7 @@ impl SocketPeer {
 }
 
 fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-  peer_ids_fd(stream.as_raw_fd()).map(|(uid, _gid)| uid)
-}
-
-#[cfg(any(
-  target_os = "macos",
-  target_os = "ios",
-  target_os = "freebsd",
-  target_os = "dragonfly",
-  target_os = "openbsd",
-  target_os = "netbsd"
-))]
-fn peer_ids_fd(fd: i32) -> io::Result<(u32, u32)> {
-  let mut uid: libc::uid_t = 0;
-  let mut gid: libc::gid_t = 0;
-  // SAFETY: `fd` is a live Unix socket borrowed from `UnixStream` for this call.
-  let rc = unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) };
-  if rc == 0 { Ok((uid, gid)) } else { Err(io::Error::last_os_error()) }
-}
-
-#[cfg(target_os = "linux")]
-fn peer_ids_fd(fd: i32) -> io::Result<(u32, u32)> {
-  let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
-  // A length that does not fit `socklen_t` is an unproven peer. `from_uid`
-  // maps this error there. It is not a reason to guess a uid.
-  let Ok(expected) = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>()) else {
-    return Err(io::Error::other("ucred length does not fit socklen_t"));
-  };
-  let mut len = expected;
-  // SAFETY: `fd` is a live Unix socket borrowed from `UnixStream` for this
-  // call. `cred` and `len` are valid for a `SO_PEERCRED` `ucred` write.
-  let rc = unsafe {
-    libc::getsockopt(
-      fd,
-      libc::SOL_SOCKET,
-      libc::SO_PEERCRED,
-      std::ptr::from_mut(&mut cred).cast(),
-      &raw mut len,
-    )
-  };
-  if rc != 0 {
-    return Err(io::Error::last_os_error());
-  }
-  // A short write would leave the zeroed uid in place. That uid is root.
-  if len != expected {
-    return Err(io::Error::other("SO_PEERCRED returned a short credential"));
-  }
-  Ok((cred.uid, cred.gid))
+  stream.peer_cred().map(|cred| cred.uid())
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -366,25 +317,16 @@ mod tests {
     assert!(matches!(unproven, Handoff::Close(CloseReason::UnprovenPeer)));
   }
 
-  #[cfg(target_os = "linux")]
   #[tokio::test]
-  async fn so_peercred_reports_the_process_uid() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("handoff.sock");
-    let listener = UnixListener::bind(&path).unwrap();
-    let client_path = path.clone();
-    let client = tokio::spawn(async move { UnixStream::connect(client_path).await.unwrap() });
-    let (server, _) = listener.accept().await.unwrap();
-    // SAFETY: `getuid` takes no pointers and only reads this process's credential.
-    let uid = unsafe { libc::getuid() };
+  async fn peer_cred_admits_the_connected_peer_uid() {
+    let (server, _client) = UnixStream::pair().unwrap();
+    let uid = server.peer_cred().unwrap().uid();
     assert_eq!(peer_uid(&server).unwrap(), uid);
     assert!(matches!(SocketPeer::observe(&server, uid), SocketPeer::Allowed));
     assert!(matches!(
       SocketPeer::observe(&server, uid.wrapping_add(1)),
       SocketPeer::Forbidden { .. }
     ));
-    drop(server);
-    client.await.unwrap();
   }
 
   #[test]

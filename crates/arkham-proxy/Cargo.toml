@@ -20,7 +20,6 @@ arkham-plugin = { workspace = true }
 fe2o3-amqp-types = { workspace = true }
 httlib-hpack = { workspace = true }
 httparse = { workspace = true }
-libc = { workspace = true }
 memchr = { workspace = true }
 pgwire = { workspace = true, features = ["client-api-aws-lc-rs", "server-api-aws-lc-rs"] }
 rama = { workspace = true, features = ["boring", "tcp", "haproxy"] }
