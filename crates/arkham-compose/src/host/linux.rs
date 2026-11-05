@@ -12,7 +12,7 @@ use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 
-use arkham_config::{Enforcement, FsPolicy, RunnerKind, WriteProfile, choose_runner, fs_policy};
+use arkham_config::{FsPolicy, WriteProfile, choose_runner, fs_policy};
 use landlock::{ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus};
 use tokio::process::Command;
 
@@ -316,14 +316,9 @@ pub async fn agent(profile: WriteProfile, workspace: Option<&Path>, command: &[O
   let Some(plan) = response.plan else {
     return Err(Error::NoDaemon);
   };
-  let choice = probe(&plan).await?;
-  let RunnerKind::Bwrap = choice.runner;
-  let word = match choice.enforcement {
-    Enforcement::Full => "full",
-    Enforcement::Partial => "partial",
-  };
+  probe(&plan).await?;
   eprintln!("runner: bwrap");
-  eprintln!("enforcement: {word}");
+  eprintln!("enforcement: full");
   let plan_file = plan_memfd(&plan)?;
   let plan_fd = plan_file.as_raw_fd();
   let inner = sandboxed_command(&plan, command)?;
@@ -430,18 +425,19 @@ fn clear_cloexec(fd: i32) -> std::io::Result<()> {
 
 /// Apply the plan's Landlock rules and replace this process with the command.
 ///
-/// Invoked as `arkham --landlock-exec <plan> [--report] -- <command>` from
-/// inside bubblewrap. A Landlock failure still execs the command: bubblewrap
-/// is the runner, and Landlock only adds to it.
+/// Invoked as `arkham --landlock-exec <plan> -- <command>` from inside
+/// bubblewrap. [`WriteProfile::DangerFullAccess`] does not apply Landlock.
+/// Every other profile returns before exec unless the ruleset is fully
+/// enforced.
 ///
 /// # Errors
 ///
-/// Returns an error when the plan cannot be read or the command cannot be
-/// exec'd. A successful exec does not return.
+/// Returns an error when the plan cannot be read, Landlock does not fully
+/// enforce the profile, or the command cannot be exec'd. A successful exec
+/// does not return.
 pub fn landlock_exec() -> Result<(), Error> {
   let args: Vec<OsString> = std::env::args_os().collect();
   let mut plan_path = None;
-  let mut report = false;
   let mut command = Vec::new();
   let mut index = 0;
   while index < args.len() {
@@ -449,8 +445,6 @@ pub fn landlock_exec() -> Result<(), Error> {
     if arg == "--landlock-exec" {
       index = index.saturating_add(1);
       plan_path = args.get(index).cloned();
-    } else if arg == "--report" {
-      report = true;
     } else if arg == "--" {
       command.extend(args.iter().skip(index.saturating_add(1)).cloned());
       break;
@@ -462,16 +456,8 @@ pub fn landlock_exec() -> Result<(), Error> {
   };
   let text = std::fs::read(&plan_path)?;
   let plan: LaunchPlan = serde_json::from_slice(&text).map_err(|source| Error::ControlMessage { source })?;
-  match apply_landlock(&plan) {
-    Ok(enforcement) if report => {
-      let word = match enforcement {
-        Enforcement::Full => "full",
-        Enforcement::Partial => "partial",
-      };
-      eprintln!("enforcement: {word}");
-    }
-    Ok(_) => {}
-    Err(err) => tracing::debug!(%err, "landlock did not add a restriction"),
+  if plan.profile != WriteProfile::DangerFullAccess {
+    apply_landlock(&plan)?;
   }
   let command = if command.is_empty() {
     vec![OsString::from(plan.shell)]
@@ -485,11 +471,21 @@ pub fn landlock_exec() -> Result<(), Error> {
   Err(error.into())
 }
 
-fn apply_landlock(plan: &LaunchPlan) -> Result<Enforcement, Error> {
-  let policy = fs_policy(plan.profile, &plan.workspace, Path::new(TEMP_DIR));
-  if matches!(policy, FsPolicy::Unrestricted) {
-    return Ok(Enforcement::Partial);
+/// Accept only a fully enforced Landlock status.
+///
+/// # Errors
+///
+/// Returns [`Error::LandlockIncomplete`] when the kernel did not enforce
+/// every requested restriction.
+fn require_full_enforcement(status: &RulesetStatus) -> Result<(), Error> {
+  match status {
+    RulesetStatus::FullyEnforced => Ok(()),
+    RulesetStatus::PartiallyEnforced | RulesetStatus::NotEnforced => Err(Error::LandlockIncomplete),
   }
+}
+
+fn apply_landlock(plan: &LaunchPlan) -> Result<(), Error> {
+  let policy = fs_policy(plan.profile, &plan.workspace, Path::new(TEMP_DIR));
   let abi = ABI::V1;
   let read = AccessFs::from_read(abi);
   let all = AccessFs::from_all(abi);
@@ -512,10 +508,7 @@ fn apply_landlock(plan: &LaunchPlan) -> Result<Enforcement, Error> {
     FsPolicy::Unrestricted => {}
   }
   let status = ruleset.restrict_self().map_err(|source| Error::Landlock { source })?;
-  match status.ruleset {
-    RulesetStatus::FullyEnforced => Ok(Enforcement::Full),
-    RulesetStatus::PartiallyEnforced | RulesetStatus::NotEnforced => Ok(Enforcement::Partial),
-  }
+  require_full_enforcement(&status.ruleset)
 }
 
 fn add_path(ruleset: RulesetCreated, path: &Path, access: landlock::BitFlags<AccessFs>) -> Result<RulesetCreated, Error> {
@@ -528,8 +521,8 @@ fn add_path(ruleset: RulesetCreated, path: &Path, access: landlock::BitFlags<Acc
     .map_err(|source| Error::Landlock { source })
 }
 
-async fn probe(plan: &LaunchPlan) -> Result<arkham_config::RunnerChoice, Error> {
-  choose_runner(probe_bwrap(plan).await, None).map_err(Error::from)
+async fn probe(plan: &LaunchPlan) -> Result<(), Error> {
+  choose_runner(probe_bwrap(plan).await).map_err(Error::from)
 }
 
 async fn probe_bwrap(plan: &LaunchPlan) -> bool {
@@ -586,6 +579,15 @@ mod tests {
       let _ = self.0.kill();
       let _ = self.0.wait();
     }
+  }
+
+  #[test]
+  fn a_partial_or_unenforced_landlock_status_refuses_the_command() {
+    let partial = require_full_enforcement(&RulesetStatus::PartiallyEnforced).unwrap_err();
+    assert_eq!(partial.registration_detail(), "landlock did not enforce the profile");
+    let absent = require_full_enforcement(&RulesetStatus::NotEnforced).unwrap_err();
+    assert_eq!(absent.registration_detail(), "landlock did not enforce the profile");
+    require_full_enforcement(&RulesetStatus::FullyEnforced).unwrap();
   }
 
   #[test]

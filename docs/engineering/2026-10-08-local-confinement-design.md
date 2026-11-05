@@ -30,9 +30,7 @@ The wrapper's cwd is configuration, not authorization. It links the session's pi
 
 A profile names readable paths and writable paths for one workspace execution. Modes are `read-only` (deny writes, keep the `/dev/null` sink shells require) and `workspace-write` (writable workspace root plus a backend-defined temp area). A third spelling, `danger-full-access`, drops filesystem write and read restrictions only (no Landlock, Seatbelt, or token policy). It is orthogonal to secret protection: decoy env, forged secret files (`fnox.toml`, `fnox.*.toml`), and transparent capture still apply, so the agent still never holds a real secret. Network and process visibility stay outside this vocabulary: the network is governed by capture, not by policy flags. One shared helper derives the writable set, and every renderer plus every test reads that helper. No renderer invents its own roots.
 
-Renderers are per OS, selected by platform first and functional probe second. Linux runs bubblewrap. Landlock adds restrictions inside that sandbox and does not launch a process on its own. macOS uses Seatbelt. Windows uses the restricted-token runner. Bubblewrap probes once with the real profile (`true` under it, exit 0 wins). A failed probe refuses to start the agent. There is no proxy-only fallback flag. An operator `runnerCommand` override may assert its own enforcement and skip probes.
-
-Enforcement is a reported fact. Backends return `full` or `partial`. Older Landlock ABIs report partial. Windows reports partial for hard-link aliasing and unconfined reads. Callers that need an absolute boundary reject partial. Nothing claims full without a passing probe.
+Renderers are per OS. Linux runs bubblewrap. Landlock adds restrictions inside that sandbox and does not launch a process on its own. macOS uses Seatbelt. Windows uses the restricted-token runner. Bubblewrap probes once with the real profile (`true` under it, exit 0 wins). A failed probe refuses to start the agent. A Landlock error, or a ruleset that is not fully enforced, refuses to start the command. `danger-full-access` does not apply Landlock. That skip is the profile.
 
 ## Linux: eBPF capture with cgroup attribution
 
@@ -119,7 +117,7 @@ bwrap \
   -- <shell-or-command>
 ```
 
-No `HTTP_PROXY` variables appear. Landlock, when the kernel enforces it, adds read and write rules from the same profile inside the bubblewrap process. `read-only` mode drops the workspace bind and the tmpfs.
+No `HTTP_PROXY` variables appear. Landlock adds read and write rules from the same profile inside the bubblewrap process. A ruleset the kernel does not fully enforce refuses to start the command. `danger-full-access` does not apply Landlock. `read-only` mode drops the workspace bind and the tmpfs.
 
 macOS emits SBPL from the shared writable roots as a second layer under the `arkham` user and the FUSE projection (see the macOS section):
 
@@ -129,9 +127,9 @@ macOS emits SBPL from the shared writable roots as a second layer under the `ark
 (allow file-write* (subpath "<root>") (subpath "<tmp>"))
 ```
 
-Every root is canonicalized first: Seatbelt matches resolved paths, so `/tmp` renders as `/private/tmp` and symlinked ancestors resolve. Launch is `sandbox-exec -p <profile> -- <command>` as the `arkham` user. A missing `sandbox-exec` fails the probe and Seatbelt reports unavailable; the user boundary still holds, so enforcement reports `partial`. The App Sandbox entitlement path is rejected because it needs a signed bundle and Xcode packaging for a CLI tool.
+Every root is canonicalized first: Seatbelt matches resolved paths, so `/tmp` renders as `/private/tmp` and symlinked ancestors resolve. Launch is `sandbox-exec -p <profile> -- <command>` as the `arkham` user. A missing `sandbox-exec` fails the probe and starts nothing. The App Sandbox entitlement path is rejected because it needs a signed bundle and Xcode packaging for a CLI tool.
 
-Windows uses raw restricted tokens, not AppContainer. The child token derives from `CreateRestrictedToken` with `WRITE_RESTRICTED`, `DISABLE_MAX_PRIVILEGE`, and `LUA_TOKEN`, with distinct workspace and private-temp capability SIDs. The token intersects writes only, so reads keep ambient access. AppContainer is rejected because its token carries no ambient reads: every readable path would need pre-granting, which means wholesale host DACL mutation for an agent that reads toolchains across the disk. One standing workspace ACE per workspace plus a random private temp directory with a revocable ACE per live session pair keeps sessions from inheriting each other temp authority. The Low integrity layer applies, and ambient deletes are denied through the parent `FILE_DELETE_CHILD` right. Partial is always reported: hard-link aliasing, unconfined reads, and trees ACLed by other tools.
+Windows uses raw restricted tokens, not AppContainer. The child token derives from `CreateRestrictedToken` with `WRITE_RESTRICTED`, `DISABLE_MAX_PRIVILEGE`, and `LUA_TOKEN`, with distinct workspace and private-temp capability SIDs. The token intersects writes only, so reads keep ambient access. AppContainer is rejected because its token carries no ambient reads: every readable path would need pre-granting, which means wholesale host DACL mutation for an agent that reads toolchains across the disk. One standing workspace ACE per workspace plus a random private temp directory with a revocable ACE per live session pair keeps sessions from inheriting each other temp authority. The Low integrity layer applies, and ambient deletes are denied through the parent `FILE_DELETE_CHILD` right. Hard-link aliasing, unconfined reads, and trees ACLed by other tools stay outside the token.
 
 ## Invariants and acceptance tests
 
@@ -150,13 +148,13 @@ Every secret file is a projection. There is no passthrough for secret files on a
 
 Threat model: the agent is untrusted code holding decoys only. Real secrets live in arkham processes. Host data outside the profile stays unreadable where the backend allows (bwrap hides, Seatbelt and Windows deny) and unwritable everywhere. Workspaces cannot reach each other secrets or writable roots.
 
-Per-backend gaps: bwrap leaves kernel exploits and abstract-socket or D-Bus peers outside the mount view, covered by the denylist (`--unshare-ipc`, minimal env, no host socket binds). Landlock leaves older ABIs partial. Seatbelt leaves reads visible, depends on deprecated `sandbox-exec`, and overbroad network denies break unix-socket IPC. Windows tokens leave reads unconfined with hard-link aliasing, partial by construction. Capture leaves pinned or embedded-trust flows bypassed, which carries decoys only.
+Per-backend gaps: bwrap leaves kernel exploits and abstract-socket or D-Bus peers outside the mount view, covered by the denylist (`--unshare-ipc`, minimal env, no host socket binds). Landlock refuses to start when the kernel cannot enforce the whole ruleset. Seatbelt leaves reads visible, depends on deprecated `sandbox-exec`, and overbroad network denies break unix-socket IPC. Windows tokens leave reads unconfined, including hard-link aliasing. Capture leaves pinned or embedded-trust flows bypassed, which carries decoys only.
 
 ## Work areas
 
-Policy and scaffold: policy types plus the shared writable-roots helper in `arkham-config`, one `Error` variant for unavailable confinement, the probe harness running `true` under a `read-only` profile, the project registry, and the `--isolate bwrap|compose` switch with compose default.
+Policy and scaffold: policy types plus the shared writable-roots helper in `arkham-config`, one `Error` variant when bubblewrap rejects the profile, the probe harness running `true` under a `read-only` profile, the project registry, and the `--isolate bwrap|compose` switch with compose default.
 
-Linux: bwrap argv renderer from stack inputs, Landlock chain with partial reporting, eBPF per-workspace cgroup capture with the cgroup selecting the project, project registration in `AgentArgs`.
+Linux: bwrap argv renderer from stack inputs, Landlock rules inside bubblewrap that refuse to start unless fully enforced, eBPF per-workspace cgroup capture with the cgroup selecting the project, project registration in `AgentArgs`.
 
 macOS: `arkham` user provisioning, FUSE projection with `enlist` and `mirror` entries and forged `fnox.toml` / `fnox.*.toml`, Seatbelt renderer with canonicalization, host controller plus sysext packaging from the rama example layout, project registry and agent process table over XPC, both signing tracks, CA lifecycle, `NENetworkRule` selection, unified logging.
 

@@ -38,8 +38,8 @@ pub struct RegisterResponse {
 
 /// Path of the daemon socket, `$XDG_RUNTIME_DIR/arkham/daemon.sock`.
 ///
-/// There is no `/tmp` fallback. A missing or empty runtime directory is an
-/// error so a pre-created `/tmp/arkham-<uid>` cannot capture the socket.
+/// A missing or empty runtime directory is an error, so a pre-created
+/// `/tmp/arkham-<uid>` cannot capture the socket.
 ///
 /// # Errors
 ///

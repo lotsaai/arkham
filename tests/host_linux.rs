@@ -424,7 +424,7 @@ fn a_peer_with_the_wrong_uid_gets_no_plan() {
 }
 
 #[test]
-fn a_hijacked_fallback_socket_directory_is_refused() {
+fn an_unset_runtime_dir_does_not_use_a_tmp_socket_directory() {
   let uid = current_uid();
   let dir = format!("/tmp/arkham-{uid}");
   let _cleanup = SudoRemove(dir.clone());
@@ -854,6 +854,50 @@ fn current_uid() -> u32 {
     .unwrap()
     .parse()
     .unwrap()
+}
+
+#[test]
+fn a_landlock_failure_does_not_start_the_command() {
+  let dir = tempfile::tempdir().unwrap();
+  let missing = dir.path().join("missing-workspace");
+  let plan = dir.path().join("plan.json");
+  let body = format!(
+    r#"{{"profile":"workspace-write","workspace":"{workspace}","binds":[],"ca_host":"{ca}","ca_dest":"/arkham/ca.pem","env":[],"workdir":"/tmp","shell":"sh"}}"#,
+    workspace = missing.display(),
+    ca = dir.path().join("ca.pem").display(),
+  );
+  std::fs::write(&plan, body).unwrap();
+  let output = Command::new(env!("CARGO_BIN_EXE_arkham"))
+    .args(["--landlock-exec", plan.to_str().unwrap(), "--", "echo", "COMMAND_RAN"])
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(!output.status.success(), "{stdout}{stderr}");
+  assert!(!stdout.contains("COMMAND_RAN"), "{stdout}{stderr}");
+  assert!(stderr.contains("landlock did not enforce the profile"), "{stderr}");
+  assert!(!stderr.contains("missing-workspace"), "{stderr}");
+}
+
+#[test]
+fn danger_full_access_starts_the_command() {
+  let dir = tempfile::tempdir().unwrap();
+  let missing = dir.path().join("missing-workspace");
+  let plan = dir.path().join("plan.json");
+  let body = format!(
+    r#"{{"profile":"danger-full-access","workspace":"{workspace}","binds":[],"ca_host":"{ca}","ca_dest":"/arkham/ca.pem","env":[],"workdir":"/tmp","shell":"sh"}}"#,
+    workspace = missing.display(),
+    ca = dir.path().join("ca.pem").display(),
+  );
+  std::fs::write(&plan, body).unwrap();
+  let output = Command::new(env!("CARGO_BIN_EXE_arkham"))
+    .args(["--landlock-exec", plan.to_str().unwrap(), "--", "echo", "COMMAND_RAN"])
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(output.status.success(), "{stdout}{stderr}");
+  assert!(stdout.contains("COMMAND_RAN"), "{stdout}{stderr}");
 }
 
 fn outside_hard_changed(path: &Path) -> bool {

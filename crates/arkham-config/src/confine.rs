@@ -39,35 +39,6 @@ pub enum WriteProfile {
   DangerFullAccess,
 }
 
-/// What a confinement backend is allowed to report.
-///
-/// `Full` is only returned after a probe that enforced every requested
-/// restriction. An older Landlock ABI reports [`Enforcement::Partial`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Enforcement {
-  /// The probe enforced the whole profile.
-  Full,
-  /// The probe passed, and some requested restriction is absent.
-  Partial,
-}
-
-/// Which host runner won the probe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunnerKind {
-  /// Bubblewrap.
-  Bwrap,
-}
-
-/// The runner a probe sequence selected, and the enforcement it reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunnerChoice {
-  /// Selected runner.
-  pub runner: RunnerKind,
-  /// Enforcement that runner reported.
-  pub enforcement: Enforcement,
-}
-
 /// Writable set for one profile.
 ///
 /// The variants are the whole policy. A read-only profile has no writable
@@ -105,24 +76,15 @@ pub fn fs_policy(profile: WriteProfile, workspace: &Path, temp: &Path) -> FsPoli
   }
 }
 
-/// Pick a runner from probe results.
+/// Refuse to start when bubblewrap did not accept the profile.
 ///
 /// `bwrap` is true only when `true` exited 0 under the real profile.
-/// `landlock` is accepted so a caller can pass a probe result, and it never
-/// selects a runner. Bubblewrap reports full. Anything else refuses to start.
 ///
 /// # Errors
 ///
 /// Returns [`Error::NoRunner`] when bubblewrap did not accept the profile.
-pub fn choose_runner(bwrap: bool, landlock: Option<Enforcement>) -> Result<RunnerChoice, Error> {
-  let _ = landlock;
-  if bwrap {
-    return Ok(RunnerChoice {
-      runner: RunnerKind::Bwrap,
-      enforcement: Enforcement::Full,
-    });
-  }
-  Err(Error::NoRunner)
+pub fn choose_runner(bwrap: bool) -> Result<(), Error> {
+  if bwrap { Ok(()) } else { Err(Error::NoRunner) }
 }
 
 /// Refuse a host-backend listen address that is not loopback.
@@ -215,23 +177,13 @@ mod tests {
   }
 
   #[test]
-  fn a_passing_bwrap_probe_wins_and_reports_full() {
-    let choice = choose_runner(true, Some(Enforcement::Partial)).unwrap();
-    assert_eq!(choice.runner, RunnerKind::Bwrap);
-    assert_eq!(choice.enforcement, Enforcement::Full);
+  fn a_passing_bwrap_probe_starts() {
+    choose_runner(true).unwrap();
   }
 
   #[test]
-  fn landlock_without_bwrap_does_not_start() {
-    let partial = choose_runner(false, Some(Enforcement::Partial)).unwrap_err();
-    assert!(matches!(partial, Error::NoRunner));
-    let full = choose_runner(false, Some(Enforcement::Full)).unwrap_err();
-    assert!(matches!(full, Error::NoRunner));
-  }
-
-  #[test]
-  fn no_passing_probe_refuses() {
-    let err = choose_runner(false, None).unwrap_err();
+  fn a_rejected_bwrap_probe_does_not_start() {
+    let err = choose_runner(false).unwrap_err();
     assert!(matches!(err, Error::NoRunner));
   }
 

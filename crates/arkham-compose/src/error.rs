@@ -415,6 +415,10 @@ pub enum Error {
     #[source]
     source: landlock::RulesetError,
   },
+  /// Landlock applied nothing, or only part of the ruleset.
+  #[cfg(target_os = "linux")]
+  #[error("landlock did not enforce the profile")]
+  LandlockIncomplete,
 }
 
 impl Error {
@@ -510,7 +514,7 @@ impl Error {
       | Self::NoCgroup { .. }
       | Self::HostLinuxOnly => "registration failed",
       #[cfg(target_os = "linux")]
-      Self::LandlockPath { .. } | Self::Landlock { .. } => "registration failed",
+      Self::LandlockPath { .. } | Self::Landlock { .. } | Self::LandlockIncomplete => "landlock did not enforce the profile",
     }
   }
 }
@@ -562,5 +566,14 @@ mod tests {
   #[test]
   fn a_private_runtime_failure_keeps_its_own_sentence() {
     assert_eq!(Error::RuntimeDir.registration_detail(), "XDG_RUNTIME_DIR is unset or not private");
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn a_landlock_failure_names_neither_a_path_nor_a_weaker_mode() {
+    assert_eq!(
+      Error::LandlockIncomplete.registration_detail(),
+      "landlock did not enforce the profile"
+    );
   }
 }
