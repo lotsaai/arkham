@@ -36,38 +36,98 @@ pub struct SessionSlot {
 /// Create `arkham-host/<pid>-<starttime>` under this process's cgroup and
 /// move `pid` into it.
 ///
-/// The start time and the cgroup path are read again after the write. A
-/// mismatch moves the process back when it entered the session, removes the
-/// directory, and returns [`Error::SessionReused`].
+/// A pidfd is opened before the directory exists. After the pid is written,
+/// that fd must still name the process and `/proc/<pid>/stat` must still
+/// show `starttime`. A mismatch moves the process back when it entered the
+/// session, removes the directory, and returns [`Error::SessionReused`].
+/// A pid that is already gone does not leave a directory.
 ///
 /// # Errors
 ///
 /// Returns [`Error::SessionCgroup`] when the directory cannot be created or
-/// the process cannot be moved, [`Error::SessionReused`] when the process
-/// identity does not match the directory, and [`Error::NoStarttime`] or
-/// [`Error::NoCgroup`] when `/proc` cannot be read.
+/// the process cannot be moved, and [`Error::SessionReused`] when the
+/// process is gone or its identity does not match the directory.
 pub fn create_session(pid: u32, starttime: u64) -> Result<SessionSlot, Error> {
+  let pidfd = PidFd::open(pid)?;
+  if !identity_holds(&pidfd, pid, starttime)? {
+    return Err(Error::SessionReused);
+  }
   let parent = host_cgroup()?;
   let path = parent.join(format!("{pid}-{starttime}"));
   std::fs::create_dir(&path).map_err(|source| session_cgroup_io(&path, source))?;
-  if read_starttime(pid)? != starttime {
-    let _ = std::fs::remove_dir(&path);
+  let placed = place_session(&pidfd, pid, starttime, &path);
+  if placed.is_err() {
+    undo_session(&path, pid);
+  }
+  placed
+}
+
+fn place_session(pidfd: &PidFd, pid: u32, starttime: u64, path: &Path) -> Result<SessionSlot, Error> {
+  if !identity_holds(pidfd, pid, starttime)? {
     return Err(Error::SessionReused);
   }
-  std::fs::write(path.join("cgroup.procs"), pid.to_string()).map_err(|source| session_cgroup_io(&path, source))?;
-  match placement_holds(pid, starttime, &path) {
-    Ok(true) => {}
-    Ok(false) => {
-      undo_session(&path, pid);
+  std::fs::write(path.join("cgroup.procs"), pid.to_string()).map_err(|source| session_cgroup_io(path, source))?;
+  if !identity_holds(pidfd, pid, starttime)? || !placement_holds(pid, starttime, path)? {
+    return Err(Error::SessionReused);
+  }
+  let id = std::fs::metadata(path).map_err(|source| session_cgroup_io(path, source))?.ino();
+  Ok(SessionSlot {
+    path: path.to_path_buf(),
+    id,
+  })
+}
+
+/// A pidfd held across the cgroup write so a recycled pid cannot enter.
+struct PidFd(i32);
+
+impl PidFd {
+  fn open(pid: u32) -> Result<Self, Error> {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
       return Err(Error::SessionReused);
+    };
+    // SAFETY: `pidfd_open` takes a pid and a flags word. A negative return is
+    // an error and is not stored.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    if fd < 0 {
+      let err = std::io::Error::last_os_error();
+      if err.raw_os_error() == Some(libc::ESRCH) {
+        return Err(Error::SessionReused);
+      }
+      return Err(err.into());
     }
-    Err(err) => {
-      undo_session(&path, pid);
-      return Err(err);
+    let Ok(fd) = i32::try_from(fd) else {
+      return Err(Error::SessionReused);
+    };
+    Ok(Self(fd))
+  }
+
+  fn alive(&self) -> bool {
+    // SAFETY: signal 0 checks that this pidfd still names a process and sends
+    // nothing. A null `siginfo_t` is the documented form of that check.
+    let rc = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.0, 0, std::ptr::null::<libc::c_void>(), 0u32) };
+    rc == 0
+  }
+}
+
+impl Drop for PidFd {
+  fn drop(&mut self) {
+    if self.0 >= 0 {
+      // SAFETY: the descriptor came from `pidfd_open` and is closed once.
+      unsafe { libc::close(self.0) };
     }
   }
-  let id = std::fs::metadata(&path).map_err(|source| session_cgroup_io(&path, source))?.ino();
-  Ok(SessionSlot { path, id })
+}
+
+fn identity_holds(pidfd: &PidFd, pid: u32, starttime: u64) -> Result<bool, Error> {
+  if !pidfd.alive() {
+    return Ok(false);
+  }
+  match read_starttime(pid) {
+    Ok(found) => Ok(found == starttime),
+    Err(Error::NoStarttime { .. }) => Ok(false),
+    Err(Error::Io(source)) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+    Err(err) => Err(err),
+  }
 }
 
 fn session_cgroup_io(path: &Path, source: std::io::Error) -> Error {
@@ -147,44 +207,44 @@ pub fn read_cgroup(pid: u32) -> Result<String, Error> {
     .ok_or(Error::NoCgroup { pid })
 }
 
-/// Create the socket directory mode `0700` and return the socket path.
+/// Create `$XDG_RUNTIME_DIR/arkham` mode `0700` and return the socket path.
 ///
-/// Every directory this function creates is mode `0700`. An existing
-/// directory is refused when it is a symlink or owned by another user.
-/// `$XDG_RUNTIME_DIR`, when set, must already exist and be owned by this user.
+/// `$XDG_RUNTIME_DIR` must already exist, be owned by this user, and not be
+/// writable by the group or by others. This function does not change its
+/// mode. The `arkham` directory is created mode `0700` when it is missing.
 ///
 /// # Errors
 ///
-/// Returns [`Error::SocketOwner`] when a directory is missing, is a symlink,
-/// or is not owned by this user. Returns an I/O error when creation fails
-/// for another reason.
+/// Returns [`Error::RuntimeDir`] when the runtime directory is unset,
+/// missing, a symlink, owned by someone else, or group/other writable.
+/// Returns [`Error::SocketOwner`] when `arkham` is a symlink or not owned
+/// by this user. Returns an I/O error when creation fails for another reason.
 pub fn ensure_socket_dir() -> Result<PathBuf, Error> {
-  let path = daemon_socket_path();
+  let path = daemon_socket_path()?;
   let uid = crate::stack::current_uid();
   let Some(socket_dir) = path.parent() else {
-    return Err(Error::SocketOwner);
+    return Err(Error::RuntimeDir);
   };
-  if std::env::var_os("XDG_RUNTIME_DIR").is_some() {
-    let Some(runtime) = socket_dir.parent() else {
-      return Err(Error::SocketOwner);
-    };
-    require_existing_dir(runtime, uid)?;
-  } else if let Some(fallback) = socket_dir.parent() {
-    ensure_private_dir(fallback, uid)?;
-  }
+  let Some(runtime) = socket_dir.parent() else {
+    return Err(Error::RuntimeDir);
+  };
+  require_private_runtime(runtime, uid)?;
   ensure_private_dir(socket_dir, uid)?;
   Ok(path)
 }
 
-fn require_existing_dir(path: &Path, uid: u32) -> Result<(), Error> {
+fn require_private_runtime(path: &Path, uid: u32) -> Result<(), Error> {
   let meta = match std::fs::symlink_metadata(path) {
     Ok(meta) => meta,
     Err(source) => {
       tracing::debug!(%source, path = %path.display(), "runtime directory");
-      return Err(Error::SocketOwner);
+      return Err(Error::RuntimeDir);
     }
   };
-  owned_dir(path, uid, &meta)
+  if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != uid || meta.permissions().mode() & 0o022 != 0 {
+    return Err(Error::RuntimeDir);
+  }
+  Ok(())
 }
 
 fn ensure_private_dir(path: &Path, uid: u32) -> Result<(), Error> {
@@ -211,7 +271,7 @@ fn owned_dir(path: &Path, uid: u32, meta: &std::fs::Metadata) -> Result<(), Erro
   }
   std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
   let after = std::fs::symlink_metadata(path)?;
-  if after.file_type().is_symlink() || after.uid() != uid {
+  if after.file_type().is_symlink() || after.uid() != uid || after.permissions().mode() & 0o077 != 0 {
     return Err(Error::SocketOwner);
   }
   Ok(())
@@ -228,7 +288,7 @@ fn owned_dir(path: &Path, uid: u32, meta: &std::fs::Metadata) -> Result<(), Erro
 /// Returns an error when registration or the bubblewrap probe fails. A
 /// running child replaces this return with [`std::process::exit`].
 pub async fn agent(profile: WriteProfile, workspace: Option<&Path>, command: &[OsString]) -> Result<(), Error> {
-  let socket = daemon_socket_path();
+  let socket = daemon_socket_path()?;
   trusted_socket(&socket)?;
   let mut stream = tokio::net::UnixStream::connect(&socket).await.map_err(|source| {
     tracing::debug!(%source, "no host daemon");
@@ -244,10 +304,7 @@ pub async fn agent(profile: WriteProfile, workspace: Option<&Path>, command: &[O
   if !peer_uid_allowed(cred.uid(), crate::stack::current_uid()) {
     return Err(Error::SocketOwner);
   }
-  let cwd = match workspace {
-    Some(path) => std::fs::canonicalize(path)?,
-    None => std::env::current_dir()?,
-  };
+  let cwd = launch_cwd(workspace)?;
   let request = RegisterRequest { cwd, profile };
   let bytes = serde_json::to_vec(&request).map_err(|source| Error::ControlMessage { source })?;
   write_line(&mut stream, &bytes).await?;
@@ -283,16 +340,39 @@ pub async fn agent(profile: WriteProfile, workspace: Option<&Path>, command: &[O
   std::process::exit(status.code().unwrap_or(1));
 }
 
+fn launch_cwd(workspace: Option<&Path>) -> Result<PathBuf, Error> {
+  match workspace {
+    Some(path) if path.is_absolute() => Ok(path.to_path_buf()),
+    Some(path) => Ok(std::env::current_dir()?.join(path)),
+    None => std::env::current_dir().map_err(Error::from),
+  }
+}
+
 fn trusted_socket(path: &Path) -> Result<(), Error> {
+  let uid = crate::stack::current_uid();
   let meta = match std::fs::symlink_metadata(path) {
     Ok(meta) => meta,
     Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Err(Error::NoDaemon),
     Err(source) => return Err(source.into()),
   };
-  if meta.file_type().is_symlink() || meta.uid() != crate::stack::current_uid() {
+  if meta.file_type().is_symlink() || meta.uid() != uid || meta.permissions().mode() & 0o077 != 0 {
     return Err(Error::SocketOwner);
   }
-  Ok(())
+  let Some(parent) = path.parent() else {
+    return Err(Error::SocketOwner);
+  };
+  let parent_meta = std::fs::symlink_metadata(parent)?;
+  if parent_meta.file_type().is_symlink()
+    || !parent_meta.is_dir()
+    || parent_meta.uid() != uid
+    || parent_meta.permissions().mode() & 0o022 != 0
+  {
+    return Err(Error::SocketOwner);
+  }
+  let Some(runtime) = parent.parent() else {
+    return Err(Error::RuntimeDir);
+  };
+  require_private_runtime(runtime, uid)
 }
 
 fn sandboxed_command(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsString>, Error> {
@@ -567,5 +647,42 @@ mod tests {
     release_session(&slot.path);
     assert!(!placement_holds(pid, start, &slot.path).unwrap());
     let _ = child.0.kill();
+  }
+
+  #[test]
+  fn a_dead_pid_does_not_leave_a_session_cgroup() {
+    let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+    let mut child = Kill(child);
+    let pid = child.0.id();
+    let start = read_starttime(pid).unwrap();
+    let parent = host_cgroup().unwrap();
+    let path = parent.join(format!("{pid}-{start}"));
+    let _ = child.0.kill();
+    let _ = child.0.wait();
+    let err = create_session(pid, start).unwrap_err();
+    assert!(!path.exists(), "left {path:?} after {err:?}");
+  }
+
+  #[test]
+  fn a_world_writable_runtime_dir_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+    perms.set_mode(0o777);
+    std::fs::set_permissions(dir.path(), perms).unwrap();
+    // SAFETY: this test process does not share its environment with another test.
+    unsafe { std::env::set_var("XDG_RUNTIME_DIR", dir.path()) };
+    let err = ensure_socket_dir().unwrap_err();
+    let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o777, "the runtime dir was repaired instead of refused");
+    assert_eq!(err.to_string(), "XDG_RUNTIME_DIR is unset or not private");
+    assert!(!dir.path().join("arkham").exists());
+  }
+
+  #[test]
+  fn an_unset_runtime_dir_is_refused() {
+    // SAFETY: this test process does not share its environment with another test.
+    unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+    let err = ensure_socket_dir().unwrap_err();
+    assert_eq!(err.to_string(), "XDG_RUNTIME_DIR is unset or not private");
   }
 }

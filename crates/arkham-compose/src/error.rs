@@ -353,6 +353,9 @@ pub enum Error {
   /// A socket path or a directory created for it is not owned by this user.
   #[error("daemon socket is not owned by this user")]
   SocketOwner,
+  /// `$XDG_RUNTIME_DIR` is unset, missing, or not private to this user.
+  #[error("XDG_RUNTIME_DIR is unset or not private")]
+  RuntimeDir,
   /// `/proc/<pid>/stat` did not contain a start time.
   #[error("process {pid} has no start time")]
   NoStarttime {
@@ -414,6 +417,104 @@ pub enum Error {
   },
 }
 
+impl Error {
+  /// Text a wrapper may print.
+  ///
+  /// Original paths and secret material stay in the operator log.
+  #[must_use]
+  pub fn registration_detail(&self) -> String {
+    if self.registration_keeps_display() {
+      return self.to_string();
+    }
+    self.registration_summary().to_string()
+  }
+
+  fn registration_keeps_display(&self) -> bool {
+    matches!(
+      self,
+      Self::SessionCgroup { .. }
+        | Self::SessionReused
+        | Self::RuntimeDir
+        | Self::SocketOwner
+        | Self::NoDaemon
+        | Self::AlreadyConfined
+        | Self::ControlUnauthorized
+        | Self::NoStarttime { .. }
+        | Self::NoCgroup { .. }
+        | Self::HostLinuxOnly
+    )
+  }
+
+  fn registration_summary(&self) -> &'static str {
+    match self {
+      Self::Config(_)
+      | Self::Fnox(_)
+      | Self::Pki(_)
+      | Self::IncludeMissing { .. }
+      | Self::ConfigDir { .. }
+      | Self::GuestCa { .. }
+      | Self::ReadFile { .. }
+      | Self::ExpandValue { .. }
+      | Self::SecretNoValue { .. }
+      | Self::PassthroughOverlapRule { .. }
+      | Self::PassthroughOverlapDecoy { .. }
+      | Self::EmptyImage
+      | Self::BuildDockerfileMissing { .. }
+      | Self::BuildContextMissing { .. }
+      | Self::BuildNotConfigured
+      | Self::RewriteNoValue { .. }
+      | Self::RewriteNoDecoy { .. }
+      | Self::RewriteDestNotAbsolute { .. }
+      | Self::RewriteWithEnvs { .. }
+      | Self::Kubeconfig { .. }
+      | Self::RewriteYaml { .. }
+      | Self::RewriteInvalid { .. }
+      | Self::SourceInvalid { .. }
+      | Self::MiseParse { .. }
+      | Self::ResolveWorkspace { .. }
+      | Self::ToolNameInvalid { .. }
+      | Self::ToolConfigNotAbsolute { .. }
+      | Self::ExposeConfigParse { .. }
+      | Self::ExposeConfigType { .. }
+      | Self::FragmentParse { .. } => "configuration could not be read",
+      Self::Io(_)
+      | Self::WriteFile { .. }
+      | Self::RemoveFile { .. }
+      | Self::CreateDir { .. }
+      | Self::SerializeFragment { .. }
+      | Self::SerializeDecoy { .. }
+      | Self::SerializeExpose { .. }
+      | Self::ChmodFile { .. } => "session files could not be prepared",
+      Self::NatsDecoy
+      | Self::LinuxOnly
+      | Self::BackendNone
+      | Self::NoComposeLayers { .. }
+      | Self::SpawnCompose { .. }
+      | Self::ComposeFailed { .. }
+      | Self::ExposeRegistry { .. }
+      | Self::ExposeInUse { .. }
+      | Self::ExposeVerify { .. }
+      | Self::ExposeNoPort
+      | Self::NoHome
+      | Self::DaemonRejected { .. }
+      | Self::ControlMessage { .. }
+      | Self::ControlLimit
+      | Self::SessionCgroup { .. }
+      | Self::SessionReused
+      | Self::RuntimeDir
+      | Self::SocketOwner
+      | Self::NoDaemon
+      | Self::AlreadyConfined
+      | Self::ControlUnauthorized
+      | Self::NoStarttime { .. }
+      | Self::NoCgroup { .. }
+      | Self::HostLinuxOnly => "registration failed",
+      #[cfg(target_os = "linux")]
+      Self::LandlockPath { .. } | Self::Landlock { .. } => "registration failed",
+    }
+  }
+}
+
 impl From<ConfigError> for Error {
   fn from(source: ConfigError) -> Self {
     Self::Config(Box::new(source))
@@ -423,5 +524,43 @@ impl From<ConfigError> for Error {
 impl From<FnoxError> for Error {
   fn from(source: FnoxError) -> Self {
     Self::Fnox(Box::new(source))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn a_fragment_parse_failure_names_neither_the_file_nor_the_secret() {
+    let source = toml::from_str::<toml::Value>("MARKER_SECRET [").unwrap_err();
+    let err = Error::FragmentParse { source };
+    let text = err.registration_detail();
+    assert_eq!(text, "configuration could not be read");
+    assert!(!text.contains("MARKER_SECRET"));
+  }
+
+  #[test]
+  fn a_missing_secret_name_does_not_reach_the_wrapper() {
+    let err = Error::SecretNoValue {
+      name: "MARKER_SECRET".to_string(),
+    };
+    assert_eq!(err.registration_detail(), "configuration could not be read");
+  }
+
+  #[test]
+  fn a_cgroup_denial_keeps_the_directory_and_the_os_error() {
+    let err = Error::SessionCgroup {
+      path: PathBuf::from("/sys/fs/cgroup/arkham-host"),
+      source: std::io::Error::from_raw_os_error(13),
+    };
+    let text = err.registration_detail();
+    assert!(text.contains("/sys/fs/cgroup/arkham-host"), "{text}");
+    assert!(text.to_ascii_lowercase().contains("permission denied"), "{text}");
+  }
+
+  #[test]
+  fn a_private_runtime_failure_keeps_its_own_sentence() {
+    assert_eq!(Error::RuntimeDir.registration_detail(), "XDG_RUNTIME_DIR is unset or not private");
   }
 }

@@ -14,8 +14,12 @@ use crate::Error;
 const FORGED_TOML: &[u8] = b"# arkham projection\nvalue = \"arkham-decoy\"\n";
 const FORGED_KEY: &[u8] = b"ARKHAM-DECOY-KEY\n";
 
-/// Fnox config files from `workspace` up through its parents, the global
-/// fnox directory, and every `import` or `age_key_file` those files name.
+/// Fnox config files inside `workspace`, the global fnox directory, and
+/// every `import` or `age_key_file` those files name.
+///
+/// The walk does not leave `workspace`. Directory symlinks are not entered.
+/// `/` is not a candidate. A symlinked config contributes the link path and
+/// its target file, not the target's sibling tree.
 ///
 /// # Errors
 ///
@@ -23,14 +27,8 @@ const FORGED_KEY: &[u8] = b"ARKHAM-DECOY-KEY\n";
 /// an unreadable import list would leave a secret file unprojected.
 pub(crate) fn projection_files(workspace: &Path) -> Result<Vec<PathBuf>, Error> {
   let mut out = Vec::new();
-  let mut dir = Some(workspace.to_path_buf());
-  while let Some(current) = dir {
-    push_dir(&mut out, &current)?;
-    let nested = current.join(".config");
-    if nested.is_dir() {
-      push_dir(&mut out, &nested)?;
-    }
-    dir = current.parent().map(Path::to_path_buf);
+  if workspace != Path::new("/") {
+    collect_tree(&mut out, workspace)?;
   }
   if let Some(global) = fnox_config_dir() {
     for name in ["config.toml", "age.txt"] {
@@ -47,6 +45,37 @@ pub(crate) fn projection_files(workspace: &Path) -> Result<Vec<PathBuf>, Error> 
     index = index.saturating_add(1);
   }
   Ok(out)
+}
+
+fn collect_tree(out: &mut Vec<PathBuf>, dir: &Path) -> Result<(), Error> {
+  let meta = match std::fs::symlink_metadata(dir) {
+    Ok(meta) => meta,
+    Err(source) if source.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+    Err(source) => return Err(source.into()),
+  };
+  if meta.file_type().is_symlink() || !meta.is_dir() {
+    return Ok(());
+  }
+  push_dir(out, dir)?;
+  let config = dir.join(".config");
+  if std::fs::symlink_metadata(&config).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink()) {
+    push_dir(out, &config)?;
+  }
+  let entries = match std::fs::read_dir(dir) {
+    Ok(entries) => entries,
+    Err(source) if source.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+    Err(source) => return Err(source.into()),
+  };
+  for entry in entries {
+    let path = entry?.path();
+    let Ok(child) = std::fs::symlink_metadata(&path) else {
+      continue;
+    };
+    if child.is_dir() && !child.file_type().is_symlink() {
+      collect_tree(out, &path)?;
+    }
+  }
+  Ok(())
 }
 
 fn push_dir(out: &mut Vec<PathBuf>, dir: &Path) -> Result<(), Error> {
@@ -157,12 +186,18 @@ pub(crate) fn forged_bytes(path: &Path) -> Vec<u8> {
 /// projected path. A root nested under one already listed is dropped.
 #[must_use]
 pub(crate) fn scan_roots(workspace: &Path, projected: &[PathBuf]) -> Vec<PathBuf> {
-  let mut roots = vec![workspace.to_path_buf()];
-  if let Some(dir) = fnox_config_dir() {
+  let mut roots = Vec::new();
+  if workspace != Path::new("/") {
+    roots.push(workspace.to_path_buf());
+  }
+  if let Some(dir) = fnox_config_dir().filter(|dir| dir != Path::new("/")) {
     roots.push(dir);
   }
   for path in projected {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path
+      .parent()
+      .filter(|parent| *parent != Path::new("/") && !parent.as_os_str().is_empty())
+    {
       roots.push(parent.to_path_buf());
     }
   }
@@ -351,5 +386,28 @@ mod tests {
     let aliases = indexed_aliases(&index, &link);
     assert!(aliases.iter().any(|path| path == &hard), "{aliases:?}");
     assert!(aliases.iter().all(|path| path.starts_with(base.as_path())), "{aliases:?}");
+  }
+
+  #[test]
+  fn a_nested_fnox_file_is_projected_and_an_outside_symlink_is_not_walked() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().canonicalize().unwrap();
+    let project = base.join("project");
+    let nested = project.join("sub").join("fnox.toml");
+    std::fs::create_dir_all(project.join("sub")).unwrap();
+    std::fs::write(&nested, "nested = true\n").unwrap();
+    let above = base.join("fnox.toml");
+    std::fs::write(&above, "above = true\n").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside = outside.path().canonicalize().unwrap();
+    std::fs::write(outside.join("fnox.toml"), "secret = true\n").unwrap();
+    std::fs::create_dir(outside.join("deeper")).unwrap();
+    std::fs::write(outside.join("deeper").join(".fnox.toml"), "deeper = true\n").unwrap();
+    std::os::unix::fs::symlink(outside.join("fnox.toml"), project.join("fnox.toml")).unwrap();
+    let files = projection_files(&project).unwrap();
+    assert!(files.iter().any(|path| path == &nested), "{files:?}");
+    assert!(files.iter().any(|path| path == &outside.join("fnox.toml")), "{files:?}");
+    assert!(!files.iter().any(|path| path == &above), "{files:?}");
+    assert!(!files.iter().any(|path| path.ends_with("deeper/.fnox.toml")), "{files:?}");
   }
 }
