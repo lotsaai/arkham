@@ -432,6 +432,8 @@ async fn https_global_root_certs_trust_private_upstream_ca() {
       ResolvedConfig {
         proxy: arkham_config::config::ProxyCfg {
           listen: "127.0.0.1:0".parse().unwrap(),
+          handoff_socket: None,
+          handoff_uid: None,
           ca_file: None,
           root_certs: vec![bundle],
           ssh_host_key: None,

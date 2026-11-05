@@ -148,8 +148,8 @@ fn generation_registry() -> eyre::Result<arkham_config::registry::Registry> {
   )?)
 }
 
-/// `arkham serve`: bind the explicit listener, then run the selected capture
-/// backend alongside it.
+/// `arkham serve`: bind the explicit listener and the Unix-socket PROXY
+/// handoff, then run the selected capture backend alongside them.
 async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   #[cfg(not(target_os = "linux"))]
   if args.proxy_backend != ProxyBackend::None {
@@ -187,6 +187,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   }
   let ca = arkham_pki::ca::load_or_generate(&ca_path(&resolved.proxy)?)?;
   let listen_addr = resolved.proxy.listen;
+  let (handoff_path, handoff_uid) = resolve_handoff_endpoint(&resolved.proxy)?;
   let grant_count = resolved.grants.len();
   #[cfg(target_os = "linux")]
   let fwmark = match args.proxy_backend {
@@ -206,16 +207,23 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   // Bind before capture side effects: a bad listen addr must fail
   // before nft rules and routes touch the host.
   let listener = arkham_proxy::bind_explicit(listen_addr).await?;
+  let handoff = bind_handoff_listener(&handoff_path, handoff_uid).await?;
   if !listen_addr.ip().is_loopback() {
     tracing::warn!(listen = %listen_addr, "listening on a non-loopback address: anyone reaching this port can trigger real-secret substitution");
   }
-  tracing::info!(listen = %listen_addr, grants = grant_count, "serving");
+  tracing::info!(
+    listen = %listen_addr,
+    handoff = %handoff_path.display(),
+    uid = handoff_uid,
+    grants = grant_count,
+    "serving"
+  );
   #[cfg(target_os = "linux")]
   if args.proxy_backend == ProxyBackend::Tun {
     let capture = std::sync::Arc::clone(&state);
     // Dropping the task runs its teardown guard, which removes the policy
     // routes; a leaked default route in the capture table blackholes all egress.
-    return with_capture(listener, state, "TUN", async move {
+    return with_capture(listener, handoff, state, "TUN", async move {
       arkham_tun::run_tun(capture).await.map_err(eyre::Report::from)
     })
     .await;
@@ -224,7 +232,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   if args.proxy_backend == ProxyBackend::Tproxy {
     let capture = std::sync::Arc::clone(&state);
     let allow_root_netns = args.tproxy_allow_root_netns;
-    return with_capture(listener, state, "TPROXY", async move {
+    return with_capture(listener, handoff, state, "TPROXY", async move {
       arkham_tproxy::run_tproxy(capture, allow_root_netns)
         .await
         .map_err(eyre::Report::from)
@@ -240,15 +248,46 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     let capture = std::sync::Arc::clone(&state);
     let bypass = args.ebpf_bypass.clone();
     let bypass_file = args.ebpf_bypass_file.clone();
-    return with_capture(listener, state, "eBPF", async move {
+    return with_capture(listener, handoff, state, "eBPF", async move {
       arkham_ebpf::run_ebpf(capture, cgroup, bypass, bypass_file)
         .await
         .map_err(eyre::Report::from)
     })
     .await;
   }
-  arkham_proxy::serve(listener, state).await;
+  serve_explicit_and_handoff(listener, handoff, state).await;
   Ok(())
+}
+
+fn resolve_handoff_endpoint(proxy: &arkham_config::config::ProxyCfg) -> eyre::Result<(PathBuf, u32)> {
+  let path = proxy
+    .handoff_socket
+    .clone()
+    .or_else(|| arkham_config::config::user_config_file(Path::new("arkham").join("handoff.sock")))
+    .ok_or_else(|| eyre::eyre!("unable to resolve handoff socket path"))?;
+  let uid = proxy.handoff_uid.unwrap_or_else(|| rustix::process::getuid().as_raw());
+  Ok((path, uid))
+}
+
+async fn bind_handoff_listener(path: &Path, uid: u32) -> eyre::Result<arkham_proxy::HandoffListener> {
+  if let Some(parent) = path.parent() {
+    std::fs::create_dir_all(parent)?;
+  }
+  Ok(arkham_proxy::bind_handoff(path, uid).await?)
+}
+
+/// Serve the explicit TCP listener and the authenticated Unix-socket handoff
+/// together. Either future running forever is the process; they stop together
+/// when the process exits.
+async fn serve_explicit_and_handoff(
+  listener: arkham_proxy::RamaTcpListener,
+  handoff: arkham_proxy::HandoffListener,
+  state: std::sync::Arc<arkham_proxy::ProxyState>,
+) {
+  tokio::join!(
+    arkham_proxy::serve(listener, std::sync::Arc::clone(&state)),
+    arkham_proxy::serve_handoff(handoff, state),
+  );
 }
 
 /// Serve the explicit listener while a capture backend runs beside it, failing
@@ -261,6 +300,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
 #[cfg(target_os = "linux")]
 async fn with_capture<F>(
   listener: arkham_proxy::RamaTcpListener,
+  handoff: arkham_proxy::HandoffListener,
   state: std::sync::Arc<arkham_proxy::ProxyState>,
   name: &'static str,
   capture: F,
@@ -270,7 +310,7 @@ where
 {
   let mut handle = tokio::spawn(capture);
   tokio::select! {
-    () = arkham_proxy::serve(listener, state) => Ok(()),
+    () = serve_explicit_and_handoff(listener, handoff, state) => Ok(()),
     capture_result = &mut handle => match capture_result {
       Ok(inner) => inner.map_err(|err| eyre::eyre!("{name} capture failed: {err:?}")),
       Err(err) => Err(eyre::eyre!("{name} task failed: {err}")),
@@ -300,5 +340,108 @@ mod tests {
       .expect("ebpf without a cgroup served the explicit listener")
       .unwrap_err();
     assert_eq!(err.to_string(), "--ebpf-cgroup is required for --proxy-backend ebpf");
+  }
+}
+
+#[cfg(all(test, unix))]
+mod serve_handoff_tests {
+  use std::os::unix::fs::PermissionsExt as _;
+  use std::path::{Path, PathBuf};
+  use std::time::Duration;
+
+  use arkham_config::cli::Cli;
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+  use tokio::net::{TcpListener, UnixStream};
+
+  use super::{ServeArgs, serve};
+
+  fn write_serve_config(work: &Path, listen: &str) -> PathBuf {
+    let path = work.join("arkham.toml");
+    let ca = work.join("ca.pem");
+    std::fs::write(&path, format!("[proxy]\nlisten = \"{listen}\"\nca_file = \"{}\"\n", ca.display())).unwrap();
+    path
+  }
+
+  fn isolate_serve_env(home: &Path, handoff: &Path) {
+    // SAFETY: nextest runs this test in its own process. HOME and overlay env
+    // must not touch the operator's real config directory.
+    unsafe {
+      std::env::set_var("HOME", home);
+      std::env::set_var("XDG_CONFIG_HOME", home.join("xdg-config"));
+      std::env::set_var("XDG_STATE_HOME", home.join("xdg-state"));
+      std::env::remove_var("ARKHAM_CONFIG");
+      std::env::remove_var("ARKHAM_LISTEN");
+      std::env::remove_var("ARKHAM_CA_FILE");
+      std::env::set_var("ARKHAM_HANDOFF_SOCKET", handoff);
+      std::env::remove_var("ARKHAM_HANDOFF_UID");
+    }
+  }
+
+  async fn wait_for_handoff_socket(path: &Path, serve_task: &tokio::task::JoinHandle<eyre::Result<()>>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+      if path.exists() {
+        return;
+      }
+      assert!(
+        !serve_task.is_finished(),
+        "serve exited before binding the handoff socket at {}",
+        path.display()
+      );
+      assert!(
+        tokio::time::Instant::now() < deadline,
+        "handoff socket was not bound at {}",
+        path.display()
+      );
+      tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+  }
+
+  /// `arkham serve` must expose the Unix-socket PROXY handoff the Network
+  /// Extension connects to, not only the explicit TCP listener.
+  #[tokio::test]
+  async fn serve_binds_the_configured_handoff_socket_and_relays_proxy_v1() {
+    arkham_pki::ca::install_crypto_provider();
+    let work = tempfile::tempdir().unwrap();
+    let handoff = work.path().join("handoff.sock");
+    let config = write_serve_config(work.path(), "127.0.0.1:0");
+
+    isolate_serve_env(work.path(), &handoff);
+
+    let cli = Cli { config: Some(config) };
+    let serve_task = tokio::spawn(async move { serve(&cli, ServeArgs::default()).await });
+
+    wait_for_handoff_socket(&handoff, &serve_task).await;
+    assert!(!serve_task.is_finished(), "serve exited after binding the handoff socket");
+
+    let mode = std::fs::metadata(&handoff).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "handoff socket must be mode 0600");
+
+    let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = stub.local_addr().unwrap().port();
+    let stub_task = tokio::spawn(async move {
+      let (mut conn, _) = tokio::time::timeout(Duration::from_secs(5), stub.accept())
+        .await
+        .expect("stub accept timed out")
+        .unwrap();
+      let mut got = vec![0u8; 4];
+      conn.read_exact(&mut got).await.unwrap();
+      assert_eq!(&got, b"ping");
+      conn.write_all(b"pong").await.unwrap();
+    });
+
+    let mut client = UnixStream::connect(&handoff).await.expect("connect to serve handoff socket");
+    let header = format!("PROXY TCP4 203.0.113.9 127.0.0.1 9 {stub_port}\r\n");
+    client.write_all(header.as_bytes()).await.unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let mut reply = vec![0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+      .await
+      .expect("handoff reply timed out")
+      .unwrap();
+    assert_eq!(&reply, b"pong");
+    stub_task.await.unwrap();
+
+    serve_task.abort();
   }
 }

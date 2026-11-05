@@ -49,6 +49,8 @@ fn cfg_with_db(fake: &str, real: &str) -> AppConfig {
   AppConfig {
     proxy: ProxyCfg {
       listen: "127.0.0.1:8080".parse().unwrap(),
+      handoff_socket: None,
+      handoff_uid: None,
       ca_file: None,
       root_certs: Vec::new(),
       handshake_timeout_secs: 10,
@@ -986,6 +988,8 @@ fn cfg_with_tls(entries: &[&str], tls: BTreeMap<String, HostTlsCfg>) -> AppConfi
   AppConfig {
     proxy: ProxyCfg {
       listen: "127.0.0.1:8080".parse().unwrap(),
+      handoff_socket: None,
+      handoff_uid: None,
       ca_file: None,
       ssh_host_key: None,
       ssh_known_hosts: None,
@@ -1021,6 +1025,8 @@ fn config_with_rule(label: &str, env: &str, value: &str, allow: Vec<&str>) -> Ap
   AppConfig {
     proxy: ProxyCfg {
       listen: "127.0.0.1:8080".parse().unwrap(),
+      handoff_socket: None,
+      handoff_uid: None,
       ca_file: None,
       ssh_host_key: None,
       ssh_known_hosts: None,
@@ -1406,6 +1412,8 @@ fn cfg_with_ssh(entries: &[&str], ssh: BTreeMap<String, HostSshCfg>) -> AppConfi
   AppConfig {
     proxy: ProxyCfg {
       listen: "127.0.0.1:8080".parse().unwrap(),
+      handoff_socket: None,
+      handoff_uid: None,
       ca_file: None,
       ssh_host_key: None,
       ssh_known_hosts: None,

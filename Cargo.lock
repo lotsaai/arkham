@@ -387,6 +387,7 @@ dependencies = [
  "eyre",
  "libc",
  "mimalloc",
+ "rustix",
  "tempfile",
  "tokio",
  "tracing",

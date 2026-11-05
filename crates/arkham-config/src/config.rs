@@ -319,6 +319,21 @@ pub struct ProxyCfg {
   #[config(default = "127.0.0.1:8080", env = "ARKHAM_LISTEN")]
   #[config(layer_attr(arg(long = "listen", help = "explicit-proxy listen address")))]
   pub listen: SocketAddr,
+  /// Unix-socket path for the authenticated NE/daemon PROXY handoff.
+  /// When unset, `<config-dir>/arkham/handoff.sock`.
+  #[config(env = "ARKHAM_HANDOFF_SOCKET")]
+  #[config(layer_attr(arg(
+    long = "handoff-socket",
+    help = "unix socket path for the NE/daemon PROXY handoff (default <config-dir>/arkham/handoff.sock)"
+  )))]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub handoff_socket: Option<PathBuf>,
+  /// Peer uid admitted on the handoff socket. When unset, this process's uid.
+  /// Only the Network Extension or daemon uid is admitted.
+  #[config(env = "ARKHAM_HANDOFF_UID")]
+  #[config(layer_attr(arg(long = "handoff-uid", help = "uid admitted on the handoff socket (default: this process)")))]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub handoff_uid: Option<u32>,
   /// CA PEM path (default `/certs/ca.pem` when the generated stack mounted
   /// it there, else `<config-dir>/arkham/ca.pem`).
   #[config(env = "ARKHAM_CA_FILE")]
@@ -1185,7 +1200,13 @@ mod tests {
   }
 
   fn scrub_env() {
-    for key in ["ARKHAM_CONFIG", "ARKHAM_LISTEN", "ARKHAM_CA_FILE"] {
+    for key in [
+      "ARKHAM_CONFIG",
+      "ARKHAM_LISTEN",
+      "ARKHAM_CA_FILE",
+      "ARKHAM_HANDOFF_SOCKET",
+      "ARKHAM_HANDOFF_UID",
+    ] {
       // SAFETY: test-only mutation, serialized by ENV_LOCK.
       unsafe { env::remove_var(key) };
     }

@@ -289,6 +289,8 @@ fn mtls_grants(fake: &str, real: &str) -> Result<Vec<Grant>, Box<arkham_config::
   let cfg = AppConfig {
     proxy: ProxyCfg {
       listen: "127.0.0.1:8080".parse().unwrap(),
+      handoff_socket: None,
+      handoff_uid: None,
       ca_file: None,
       root_certs: Vec::new(),
       handshake_timeout_secs: 10,
