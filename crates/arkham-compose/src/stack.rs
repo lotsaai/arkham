@@ -8,7 +8,7 @@ use arkham_config::cli::ProxyBackend;
 use arkham_config::config::{AppConfig, ExposeMap, config_dir, project_profiles_dir};
 use arkham_config::grants::GuestTlsMode;
 use dirs::home_dir;
-use libc::getuid;
+use rustix::process::getuid;
 use xpanda::Xpanda;
 
 use crate::adapt::{self, GRANTS_STATE_DIR, RewriteAdapted, load_guest_ca};
@@ -326,8 +326,7 @@ pub(crate) async fn generate_stack(root: &Path, backend: ProxyBackend, arkham_ve
 /// The process's user id, from the kernel: the same value `id -u` prints,
 /// without the subprocess.
 pub(crate) fn current_uid() -> u32 {
-  // Safety: `getuid` takes no arguments, cannot fail, and touches no memory.
-  unsafe { getuid() }
+  getuid().as_raw()
 }
 
 /// What the generated agent service is built from: container-side paths and
