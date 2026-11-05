@@ -10,7 +10,9 @@
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::path::Path;
+use std::path::PathBuf;
 
 use arkham_config::WriteProfile;
 #[cfg(target_os = "linux")]

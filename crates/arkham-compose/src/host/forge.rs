@@ -331,24 +331,25 @@ mod tests {
   #[test]
   fn a_symlinked_fnox_toml_projects_the_link_the_target_and_its_hard_links() {
     let root = tempfile::tempdir().unwrap();
-    let vault = root.path().join("vault");
+    let base = root.path().canonicalize().unwrap();
+    let vault = base.as_path().join("vault");
     std::fs::create_dir(&vault).unwrap();
     let real = vault.join("real.toml");
     std::fs::write(&real, "# REAL_SECRET_VALUE\n").unwrap();
-    let link = root.path().join("fnox.toml");
+    let link = base.as_path().join("fnox.toml");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let hard = vault.join("alias.toml");
     std::fs::hard_link(&real, &hard).unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::fs::hard_link(&real, outside.path().join("alias.toml")).unwrap();
-    let files = projection_files(root.path()).unwrap();
+    let files = projection_files(base.as_path()).unwrap();
     assert!(files.iter().any(|path| path == &link), "{files:?}");
     assert!(files.iter().any(|path| path == &real), "{files:?}");
     let mut devices = HashSet::new();
     devices.insert(std::fs::metadata(&real).unwrap().dev());
-    let index = inode_index(&devices, &scan_roots(root.path(), &files));
+    let index = inode_index(&devices, &scan_roots(base.as_path(), &files));
     let aliases = indexed_aliases(&index, &link);
     assert!(aliases.iter().any(|path| path == &hard), "{aliases:?}");
-    assert!(aliases.iter().all(|path| path.starts_with(root.path())), "{aliases:?}");
+    assert!(aliases.iter().all(|path| path.starts_with(base.as_path())), "{aliases:?}");
   }
 }
