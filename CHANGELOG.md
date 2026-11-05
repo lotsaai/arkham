@@ -1,8 +1,18 @@
+## [0.3.36] - 2026-11-05
+
+### 🐛 Bug Fixes
+
+- *(kube)* Keep credential plugin output out of errors (#141)
 ## [0.3.35] - 2026-10-31
 
 ### 🚀 Features
 
 - *(kube)* Grant every user on one cluster endpoint (#115)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.35 [ci skip]
+- Release
 ## [0.3.34] - 2026-10-26
 
 ### 🚜 Refactor
