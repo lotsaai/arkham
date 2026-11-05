@@ -32,8 +32,7 @@ fi
 
 mkdir -p "$ARTIFACTS" "$WORK"
 cleanup() {
-  for pid_var in OFF_PID UPSTREAM_PID PROXY_PID; do
-    pid="${!pid_var:-}"
+  for pid in "${OFF_PID:-}" "${UPSTREAM_PID:-}" "${PROXY_PID:-}"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
