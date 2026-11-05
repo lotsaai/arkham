@@ -331,10 +331,7 @@ impl CliCommand for DaemonArgs {
   /// loopback, or when the daemon cannot bind its socket.
   async fn run(self, _cli: &Cli, arkham_version: &str) -> Result<(), Self::Error> {
     #[cfg(not(target_os = "linux"))]
-    {
-      let _ = (self, arkham_version);
-      bail!("the host daemon runs on Linux");
-    }
+    bail!("the host daemon runs on Linux, not this arkham {arkham_version} build");
     #[cfg(target_os = "linux")]
     crate::host::run(arkham_version).await
   }
