@@ -762,11 +762,14 @@ pub(crate) struct OrigDst {
   pub port: u32,
   /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17).
   pub proto: u8,
-  /// Padding, mirroring `arkham-ebpf-programs::OrigDst`.
-  pub _pad: [u8; 3],
+  /// Padding, mirroring `arkham-ebpf-programs::OrigDst`. Seven bytes put
+  /// `cgroup_id` at offset 16 with no compiler-inserted gap.
+  pub _pad: [u8; 7],
+  /// Cgroup id sampled by `connect4` in the connecting task.
+  pub cgroup_id: u64,
 }
 
-// SAFETY: `repr(C)`, integer fields only.
+// SAFETY: `repr(C)`, integer fields only, every padding byte explicit.
 unsafe impl aya::Pod for OrigDst {}
 
 impl OrigDst {
@@ -967,7 +970,8 @@ mod tests {
       ip: encode_addr(Ipv4Addr::LOCALHOST),
       port: encode_port(TCP_LISTEN_PORT),
       proto: 6,
-      _pad: [0; 3],
+      _pad: [0; 7],
+      cgroup_id: 0,
     };
     assert_eq!(orig.socket_addr(), SocketAddr::from(([127, 0, 0, 1], TCP_LISTEN_PORT)));
   }
@@ -1010,11 +1014,15 @@ mod tests {
     assert_eq!(offset_of!(FlowRecord, cookie), 0);
     assert_eq!(offset_of!(FlowRecord, cgroup_id), 8);
 
-    assert_eq!(size_of::<OrigDst>(), 12);
+    // 4 + 4 + 1 + 7 explicit padding + 8. Alignment is 8, and the pad reaches
+    // that boundary so the compiler inserts nothing.
+    assert_eq!(size_of::<OrigDst>(), 24);
+    assert_eq!(align_of::<OrigDst>(), 8);
     assert_eq!(offset_of!(OrigDst, ip), 0);
     assert_eq!(offset_of!(OrigDst, port), 4);
     assert_eq!(offset_of!(OrigDst, proto), 8);
     assert_eq!(offset_of!(OrigDst, _pad), 9);
+    assert_eq!(offset_of!(OrigDst, cgroup_id), 16);
     assert_eq!(size_of::<Config>(), 80);
     assert_eq!(align_of::<Config>(), 8);
     assert_eq!(offset_of!(Config, proxy_pid), 0);
