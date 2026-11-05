@@ -2,6 +2,7 @@
 
 use std::error::Error as StdError;
 use std::io::Error as IoError;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use crate::connection::TrustAnchorsError;
@@ -108,6 +109,12 @@ pub enum Error {
     /// Underlying bind failure.
     #[source]
     source: Box<dyn StdError + Send + Sync>,
+  },
+  /// A TCP listener was asked to bind an address that is not loopback.
+  #[error("listen address {addr} is not loopback")]
+  NonLoopbackListen {
+    /// Address that was refused.
+    addr: SocketAddr,
   },
   /// The client head read times out.
   #[error("client head read timed out")]

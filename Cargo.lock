@@ -558,6 +558,7 @@ dependencies = [
  "lapin",
  "ldap3",
  "lettre",
+ "libc",
  "memchr",
  "nkeys",
  "pgwire",

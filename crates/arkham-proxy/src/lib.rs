@@ -62,7 +62,7 @@ type HttpsRelay = TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCert
 
 pub use connection::TrustAnchorsError;
 pub use error::Error;
-pub use handoff::{bind_handoff, serve_handoff};
+pub use handoff::{HandoffListener, bind_handoff, serve_handoff};
 
 /// Shared proxy state: live config snapshot, boring MITM relays, and the
 /// issuance burst guard.
@@ -239,13 +239,17 @@ pub async fn serve(listener: RamaTcpListener, state: Arc<ProxyState>) {
 
 /// Bind the explicit listener with rama socket options: plain TCP socket for
 /// the configured address, bound and listening, ready to serve. Backlog
-/// matches `std` (128).
+/// matches `std` (128). The address must be loopback.
 ///
 /// # Errors
 ///
+/// Returns [`Error::NonLoopbackListen`] when `addr` is not loopback.
 /// Returns an error when the socket cannot be built, bound, or marked
 /// listening.
 pub async fn bind_explicit(addr: SocketAddr) -> Result<RamaTcpListener, Error> {
+  if !addr.ip().is_loopback() {
+    return Err(Error::NonLoopbackListen { addr });
+  }
   let domain = if addr.is_ipv4() { Domain::IPv4 } else { Domain::IPv6 };
   let socket = SocketOptions {
     address: Some(SocketAddress::from(addr)),
@@ -464,4 +468,23 @@ fn parse_authority(authority: &str, default_port: Option<u16>) -> Option<(String
   };
   let port = url.port().or(default_port)?;
   Some((host, port))
+}
+
+#[cfg(test)]
+mod bind_explicit_tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn bind_explicit_refuses_a_non_loopback_address() {
+    for addr in ["0.0.0.0:0", "192.0.2.1:9", "[::]:0", "[::ffff:127.0.0.1]:0"] {
+      let err = bind_explicit(addr.parse().unwrap()).await.unwrap_err();
+      assert!(matches!(err, Error::NonLoopbackListen { .. }), "{addr} produced {err:?}");
+    }
+  }
+
+  #[tokio::test]
+  async fn bind_explicit_accepts_loopback() {
+    bind_explicit("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    bind_explicit("[::1]:0".parse().unwrap()).await.unwrap();
+  }
 }

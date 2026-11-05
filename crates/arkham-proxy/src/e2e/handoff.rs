@@ -1,23 +1,46 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 
 use rama::proxy::haproxy::protocol::v1::Addresses;
 use rama::proxy::haproxy::protocol::v2::PROTOCOL_PREFIX;
+use tokio::net::UnixStream;
 
 use super::fixture::*;
 use crate::{bind_handoff, serve_handoff};
 
-async fn listen(addr: &str, state: Arc<ProxyState>) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-  let listener = bind_handoff(addr.parse().unwrap()).await.unwrap();
-  let bound = listener.local_addr().unwrap();
+struct HandoffBind {
+  path: PathBuf,
+  _dir: tempfile::TempDir,
+  task: tokio::task::JoinHandle<()>,
+}
+
+fn current_uid() -> u32 {
+  // SAFETY: getuid has no preconditions.
+  unsafe { libc::getuid() }
+}
+
+fn other_uid() -> u32 {
+  u32::from(current_uid() == 0)
+}
+
+async fn listen(state: Arc<ProxyState>) -> HandoffBind {
+  listen_for_uid(state, current_uid()).await
+}
+
+async fn listen_for_uid(state: Arc<ProxyState>, allowed_uid: u32) -> HandoffBind {
+  let dir = tempfile::tempdir().unwrap();
+  let path = dir.path().join("handoff.sock");
+  let listener = bind_handoff(&path, allowed_uid).await.unwrap();
   let task = tokio::spawn(async move {
     serve_handoff(listener, state).await;
   });
-  (bound, task)
+  HandoffBind { path, _dir: dir, task }
 }
 
 /// One write of a v1 header plus `payload`. The stub must see `payload`
 /// only, and the client must see `reply` unchanged.
-async fn relay_payload(proxy_addr: SocketAddr, stub: TcpListener, header: String, payload: &[u8], reply: &[u8]) {
+async fn relay_payload(path: &Path, stub: TcpListener, header: String, payload: &[u8], reply: &[u8]) {
   let expect = payload.to_vec();
   let reply_bytes = reply.to_vec();
   let stub_task = tokio::spawn(async move {
@@ -34,7 +57,7 @@ async fn relay_payload(proxy_addr: SocketAddr, stub: TcpListener, header: String
     assert_eq!(n, 0);
     conn.write_all(&reply_bytes).await.unwrap();
   });
-  let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+  let mut client = UnixStream::connect(path).await.unwrap();
   let mut bytes = header.into_bytes();
   bytes.extend_from_slice(payload);
   client.write_all(&bytes).await.unwrap();
@@ -48,7 +71,7 @@ async fn relay_payload(proxy_addr: SocketAddr, stub: TcpListener, header: String
   stub_task.await.unwrap();
 }
 
-async fn expect_eof(client: &mut TcpStream) {
+async fn expect_eof(client: &mut UnixStream) {
   let mut buf = [0u8; 8];
   let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
     .await
@@ -91,7 +114,7 @@ async fn v1_tcp4_then_tls_substitutes_by_sni() {
     oauth2: None,
   }];
   let state = test_state_with(grants, &ca);
-  let (proxy_addr, proxy) = listen("127.0.0.1:0", state).await;
+  let bind = listen(state).await;
   let stub_task = tokio::spawn(async move {
     let (conn, peer) = stub.accept().await.unwrap();
     assert_ne!(peer.ip(), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
@@ -106,7 +129,7 @@ async fn v1_tcp4_then_tls_substitutes_by_sni() {
       .await
       .unwrap();
   });
-  let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+  let mut client = UnixStream::connect(&bind.path).await.unwrap();
   let header = Addresses::new_tcp4(Ipv4Addr::new(203, 0, 113, 9), Ipv4Addr::LOCALHOST, 9, stub_port).to_string();
   client.write_all(header.as_bytes()).await.unwrap();
   let mut roots = rustls::RootCertStore::empty();
@@ -127,35 +150,35 @@ async fn v1_tcp4_then_tls_substitutes_by_sni() {
   assert!(!resp.contains(VALUE), "{resp}");
   let expect = format!("echo:{FAKE}");
   assert_eq!(read_body(&mut tls, &response, expect.len()).await, expect.as_bytes());
-  proxy.abort();
+  bind.task.abort();
 }
 
 #[tokio::test]
 async fn v1_tcp4_splice_relays_blob_verbatim() {
   let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let stub_port = local_addr(&stub).port();
-  let (proxy_addr, proxy) = listen("127.0.0.1:0", test_state()).await;
+  let bind = listen(test_state()).await;
   let blob: Vec<u8> = (0..256u32).map(|i| u8::try_from(i % 251).expect("fits u8")).collect();
   let header = Addresses::new_tcp4(Ipv4Addr::new(203, 0, 113, 9), Ipv4Addr::LOCALHOST, 9, stub_port).to_string();
-  relay_payload(proxy_addr, stub, header, &blob, b"splice-reply").await;
-  proxy.abort();
+  relay_payload(&bind.path, stub, header, &blob, b"splice-reply").await;
+  bind.task.abort();
 }
 
 #[tokio::test]
 async fn rejected_preambles_close_without_dial() {
   let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let (proxy_addr, proxy) = listen("127.0.0.1:0", test_state()).await;
-  let mut silent = TcpStream::connect(proxy_addr).await.unwrap();
+  let bind = listen(test_state()).await;
+  let mut silent = UnixStream::connect(&bind.path).await.unwrap();
   silent.shutdown().await.unwrap();
   expect_eof(&mut silent).await;
-  let mut http = TcpStream::connect(proxy_addr).await.unwrap();
+  let mut http = UnixStream::connect(&bind.path).await.unwrap();
   http.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
   expect_eof(&mut http).await;
-  let mut v2 = TcpStream::connect(proxy_addr).await.unwrap();
+  let mut v2 = UnixStream::connect(&bind.path).await.unwrap();
   v2.write_all(PROTOCOL_PREFIX).await.unwrap();
   expect_eof(&mut v2).await;
   tokio::time::timeout(Duration::from_secs(2), stub.accept()).await.unwrap_err();
-  proxy.abort();
+  bind.task.abort();
 }
 
 #[tokio::test]
@@ -164,8 +187,8 @@ async fn silent_peer_stays_open_until_handshake_budget() {
   let ca = CertAuthority::generate().unwrap();
   let state = test_state_with_budget(Vec::new(), Vec::new(), &ca, 1);
   let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let (proxy_addr, proxy) = listen("127.0.0.1:0", state).await;
-  let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+  let bind = listen(state).await;
+  let mut client = UnixStream::connect(&bind.path).await.unwrap();
   let mut buf = [0u8; 1];
   let early = tokio::time::timeout(Duration::from_millis(400), client.read(&mut buf)).await;
   assert!(early.is_err(), "read still pending at 400ms");
@@ -175,16 +198,39 @@ async fn silent_peer_stays_open_until_handshake_budget() {
     .unwrap();
   assert_eq!(n, 0);
   tokio::time::timeout(Duration::from_secs(2), stub.accept()).await.unwrap_err();
-  proxy.abort();
+  bind.task.abort();
 }
 
 #[tokio::test]
 async fn v1_tcp6_splice_relays_short_payload() {
   let stub = TcpListener::bind("[::1]:0").await.unwrap();
   let stub_port = local_addr(&stub).port();
-  let (proxy_addr, proxy) = listen("[::1]:0", test_state()).await;
+  let bind = listen(test_state()).await;
   let payload: Vec<u8> = (0..32u32).map(|i| u8::try_from(i).expect("fits u8")).collect();
   let header = Addresses::new_tcp6("2001:db8::1".parse::<Ipv6Addr>().unwrap(), Ipv6Addr::LOCALHOST, 9, stub_port).to_string();
-  relay_payload(proxy_addr, stub, header, &payload, b"tcp6-reply").await;
-  proxy.abort();
+  relay_payload(&bind.path, stub, header, &payload, b"tcp6-reply").await;
+  bind.task.abort();
+}
+
+#[tokio::test]
+async fn a_peer_with_the_wrong_uid_does_not_dial() {
+  let stub = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let stub_port = local_addr(&stub).port();
+  let bind = listen_for_uid(test_state(), other_uid()).await;
+  let mut client = UnixStream::connect(&bind.path).await.unwrap();
+  let header = Addresses::new_tcp4(Ipv4Addr::new(203, 0, 113, 9), Ipv4Addr::LOCALHOST, 9, stub_port).to_string();
+  client.write_all(header.as_bytes()).await.unwrap();
+  client.write_all(b"SHOULD_NOT_ARRIVE").await.unwrap();
+  client.shutdown().await.unwrap();
+  expect_eof(&mut client).await;
+  tokio::time::timeout(Duration::from_secs(2), stub.accept()).await.unwrap_err();
+  bind.task.abort();
+}
+
+#[tokio::test]
+async fn the_handoff_socket_is_mode_600() {
+  let bind = listen(test_state()).await;
+  let mode = std::fs::metadata(&bind.path).unwrap().permissions().mode() & 0o777;
+  assert_eq!(mode, 0o600);
+  bind.task.abort();
 }

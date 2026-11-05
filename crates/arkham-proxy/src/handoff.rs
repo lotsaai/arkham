@@ -1,93 +1,121 @@
-//! Loopback PROXY protocol v1 accept side.
+//! Authenticated Unix-socket PROXY protocol v1 accept side.
 
-use std::convert::Infallible;
+use std::fs::Permissions;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::os::fd::AsRawFd as _;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rama::Service;
 use rama::proxy::haproxy::protocol::v1;
 use rama::proxy::haproxy::protocol::v2;
-use rama::tcp::server::TcpListener as RamaTcpListener;
-use rama::tcp::stream::TcpStream as RamaTcpStream;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{UnixListener, UnixStream};
 
 use crate::Error;
 use crate::ProxyState;
 use crate::connection::Prefixed;
 use crate::serve_transparent_stream;
 
-/// Bind the handoff listener.
+/// Unix-domain handoff listener that admits one peer uid.
+#[derive(Debug)]
+pub struct HandoffListener {
+  listener: UnixListener,
+  allowed_uid: u32,
+}
+
+/// Bind a Unix-domain handoff listener.
 ///
-/// Plain TCP, backlog 128, the same socket as [`crate::bind_explicit`].
-/// The listen address is not required to be loopback. A peer that is not
-/// loopback is rejected after accept.
+/// Only a peer whose uid matches `allowed_uid` (the Network Extension or
+/// daemon uid) is admitted. The check uses [`getpeereid`] on macOS/BSD and
+/// `SO_PEERCRED` on Linux. This is not a TCP listener and not a shared
+/// secret.
+///
+/// An existing file at `path` is removed first. The socket file is mode
+/// `0o600` after bind.
 ///
 /// # Errors
 ///
-/// Returns an error when the socket cannot be built, bound, or marked
-/// listening.
-pub async fn bind_handoff(addr: SocketAddr) -> Result<RamaTcpListener, Error> {
-  super::bind_explicit(addr).await
+/// Returns an error when the path cannot be replaced, bound, or chmod'd.
+///
+/// [`getpeereid`]: https://man.freebsd.org/cgi/man.cgi?query=getpeereid
+pub async fn bind_handoff(path: impl AsRef<Path>, allowed_uid: u32) -> Result<HandoffListener, Error> {
+  let path = path.as_ref();
+  match std::fs::remove_file(path) {
+    Ok(()) => {}
+    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+    Err(err) => return Err(err.into()),
+  }
+  let listener = UnixListener::bind(path)?;
+  std::fs::set_permissions(path, Permissions::from_mode(0o600))?;
+  Ok(HandoffListener { listener, allowed_uid })
 }
 
 /// Serve handoff connections until the listener stops.
 ///
-/// A loopback peer that writes a PROXY protocol v1 TCP4 or TCP6 header is
-/// handed to [`crate::serve_transparent_stream`] with the header destination
-/// as the dial target. Any other peer or header is dropped. Accept errors
-/// are logged by the listener and do not end the process.
-pub async fn serve_handoff(listener: RamaTcpListener, state: Arc<ProxyState>) {
-  listener.serve(HandoffService { state }).await;
+/// A peer whose uid matches the listener's allowed uid and that writes a
+/// PROXY protocol v1 TCP4 or TCP6 header is handed to
+/// [`crate::serve_transparent_stream`] with the header destination as the
+/// dial target. Any other peer or header is dropped. Accept errors are
+/// logged and do not end the process.
+pub async fn serve_handoff(listener: HandoffListener, state: Arc<ProxyState>) {
+  let HandoffListener { listener, allowed_uid } = listener;
+  loop {
+    match listener.accept().await {
+      Ok((stream, _)) => {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+          serve_one(stream, &state, allowed_uid).await;
+        });
+      }
+      Err(err) => {
+        tracing::debug!(?err, "handoff accept failed");
+      }
+    }
+  }
 }
 
 fn handshake_budget(state: &ProxyState) -> Duration {
   Duration::from_secs(state.snapshot().proxy.handshake_timeout_secs)
 }
 
-#[derive(Clone, Debug)]
-struct HandoffService {
-  state: Arc<ProxyState>,
-}
-
-impl Service<RamaTcpStream> for HandoffService {
-  type Output = ();
-  type Error = Infallible;
-
-  async fn serve(&self, input: RamaTcpStream) -> Result<(), Infallible> {
-    let client = TcpStream::from(input);
-    let peer = SocketPeer::observe(&client.peer_addr());
-    let budget = handshake_budget(&self.state);
-    match peer.decide(client, budget).await {
-      Ok(Handoff::Serve(agent)) => {
-        if let Err(err) = agent.serve(&self.state).await {
-          tracing::debug!(?err, "handoff connection failed");
-        }
-      }
-      Ok(Handoff::Close(reason)) => {
-        tracing::debug!(?reason, "handoff closed");
-      }
-      Err(err) => {
+async fn serve_one(stream: UnixStream, state: &ProxyState, allowed_uid: u32) {
+  let peer = SocketPeer::observe(&stream, allowed_uid);
+  let budget = handshake_budget(state);
+  match peer.decide(stream, budget).await {
+    Ok(Handoff::Serve(agent)) => {
+      if let Err(err) = agent.serve(state).await {
         tracing::debug!(?err, "handoff connection failed");
       }
     }
-    Ok(())
+    Ok(Handoff::Close(reason)) => {
+      tracing::debug!(?reason, "handoff closed");
+    }
+    Err(err) => {
+      tracing::debug!(?err, "handoff connection failed");
+    }
   }
 }
 
+/// Kernel-attested peer identity for one accepted Unix socket.
 #[derive(Debug)]
 enum SocketPeer {
-  Loopback(LoopbackPeer),
-  Foreign(SocketAddr),
+  Allowed,
+  Forbidden { uid: u32 },
   Unproven,
 }
 
 impl SocketPeer {
-  fn observe(peer: &std::io::Result<SocketAddr>) -> Self {
-    match peer {
-      Ok(addr) if addr.ip().is_loopback() => Self::Loopback(LoopbackPeer),
-      Ok(addr) => Self::Foreign(*addr),
+  fn observe(stream: &UnixStream, allowed_uid: u32) -> Self {
+    Self::from_uid(&peer_uid(stream), allowed_uid)
+  }
+
+  fn from_uid(uid: &io::Result<u32>, allowed_uid: u32) -> Self {
+    match uid {
+      Ok(uid) if *uid == allowed_uid => Self::Allowed,
+      Ok(uid) => Self::Forbidden { uid: *uid },
       Err(_) => Self::Unproven,
     }
   }
@@ -97,15 +125,54 @@ impl SocketPeer {
     G: AsyncRead + Unpin,
   {
     match self {
-      Self::Foreign(addr) => Ok(Handoff::Close(CloseReason::ForeignPeer(addr))),
+      Self::Forbidden { uid } => Ok(Handoff::Close(CloseReason::ForbiddenPeer(uid))),
       Self::Unproven => Ok(Handoff::Close(CloseReason::UnprovenPeer)),
-      Self::Loopback(peer) => read_header(stream, peer, budget).await,
+      Self::Allowed => read_header(stream, budget).await,
     }
   }
 }
 
-#[derive(Debug)]
-struct LoopbackPeer;
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+  peer_ids_fd(stream.as_raw_fd()).map(|(uid, _gid)| uid)
+}
+
+#[cfg(any(
+  target_os = "macos",
+  target_os = "ios",
+  target_os = "freebsd",
+  target_os = "dragonfly",
+  target_os = "openbsd",
+  target_os = "netbsd"
+))]
+fn peer_ids_fd(fd: i32) -> io::Result<(u32, u32)> {
+  let mut uid: libc::uid_t = 0;
+  let mut gid: libc::gid_t = 0;
+  // SAFETY: `fd` is a live Unix socket borrowed from `UnixStream` for this call.
+  let rc = unsafe { libc::getpeereid(fd, &raw mut uid, &raw mut gid) };
+  if rc == 0 { Ok((uid, gid)) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_ids_fd(fd: i32) -> io::Result<(u32, u32)> {
+  let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+  let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+  // SAFETY: `fd` is a live Unix socket borrowed from `UnixStream` for this
+  // call. `cred` and `len` are valid for a `SO_PEERCRED` `ucred` write.
+  let rc = unsafe {
+    libc::getsockopt(
+      fd,
+      libc::SOL_SOCKET,
+      libc::SO_PEERCRED,
+      std::ptr::from_mut(&mut cred).cast(),
+      &raw mut len,
+    )
+  };
+  if rc == 0 {
+    Ok((cred.uid, cred.gid))
+  } else {
+    Err(io::Error::last_os_error())
+  }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Destination(SocketAddr);
@@ -123,7 +190,7 @@ enum Handoff<G> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseReason {
-  ForeignPeer(SocketAddr),
+  ForbiddenPeer(u32),
   UnprovenPeer,
   MissingHeader,
   Malformed,
@@ -143,6 +210,9 @@ where
   G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
   async fn serve(self, state: &ProxyState) -> Result<(), Error> {
+    // The header carries the original destination. It does not select a
+    // project: Linux attribution is the cgroup id on the captured flow, and
+    // this listener keeps the process snapshot.
     let snapshot = state.snapshot();
     let dial_host = self.destination.0.ip().to_string();
     let port = self.destination.0.port();
@@ -211,11 +281,10 @@ fn tcp_prefix(buf: &[u8], destination: Destination, header_len: usize) -> Prefix
   }
 }
 
-async fn read_header<G>(stream: G, peer: LoopbackPeer, budget: Duration) -> Result<Handoff<G>, Error>
+async fn read_header<G>(stream: G, budget: Duration) -> Result<Handoff<G>, Error>
 where
   G: AsyncRead + Unpin,
 {
-  let LoopbackPeer = peer;
   match tokio::time::timeout(budget, read_header_inner(stream)).await {
     Ok(decided) => decided,
     Err(_elapsed) => Ok(Handoff::Close(CloseReason::TimedOut)),
@@ -280,35 +349,21 @@ mod tests {
     }
   }
 
-  fn addr(text: &str) -> SocketAddr {
-    text.parse().unwrap()
-  }
-
   #[tokio::test]
-  async fn foreign_and_unproven_close_without_reading() {
+  async fn forbidden_and_unproven_close_without_reading() {
     let budget = Duration::from_secs(10);
-    let peer = addr("192.0.2.1:9");
-    let foreign = SocketPeer::Foreign(peer).decide(Explode, budget).await.unwrap();
-    assert!(matches!(foreign, Handoff::Close(CloseReason::ForeignPeer(found)) if found == peer));
+    let forbidden = SocketPeer::Forbidden { uid: 42 }.decide(Explode, budget).await.unwrap();
+    assert!(matches!(forbidden, Handoff::Close(CloseReason::ForbiddenPeer(42))));
     let unproven = SocketPeer::Unproven.decide(Explode, budget).await.unwrap();
     assert!(matches!(unproven, Handoff::Close(CloseReason::UnprovenPeer)));
   }
 
   #[test]
-  fn observe_accepts_loopback_and_rejects_mapped() {
-    assert!(matches!(SocketPeer::observe(&Ok(addr("127.0.0.1:1"))), SocketPeer::Loopback(_)));
-    assert!(matches!(
-      SocketPeer::observe(&Ok(addr("127.255.255.255:1"))),
-      SocketPeer::Loopback(_)
-    ));
-    assert!(matches!(SocketPeer::observe(&Ok(addr("[::1]:1"))), SocketPeer::Loopback(_)));
-    assert!(matches!(SocketPeer::observe(&Ok(addr("192.0.2.1:9"))), SocketPeer::Foreign(_)));
-    assert!(matches!(
-      SocketPeer::observe(&Ok(addr("[::ffff:127.0.0.1]:1"))),
-      SocketPeer::Foreign(_)
-    ));
-    let err = Err(std::io::Error::other("peer"));
-    assert!(matches!(SocketPeer::observe(&err), SocketPeer::Unproven));
+  fn from_uid_admits_only_the_allowed_uid() {
+    assert!(matches!(SocketPeer::from_uid(&Ok(501), 501), SocketPeer::Allowed));
+    assert!(matches!(SocketPeer::from_uid(&Ok(502), 501), SocketPeer::Forbidden { uid: 502 }));
+    let err = Err(io::Error::other("peer"));
+    assert!(matches!(SocketPeer::from_uid(&err, 501), SocketPeer::Unproven));
   }
 
   #[test]
