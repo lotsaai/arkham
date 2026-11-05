@@ -115,7 +115,11 @@ fn main() -> eyre::Result<()> {
   if std::env::args().nth(1).as_deref() == Some("--landlock-exec") {
     #[cfg(target_os = "linux")]
     {
-      return arkham_compose::landlock_exec().map_err(Into::into);
+      if let Err(err) = arkham_compose::landlock_exec() {
+        eprintln!("{}", err.registration_detail());
+        std::process::exit(1);
+      }
+      return Ok(());
     }
     #[cfg(not(target_os = "linux"))]
     {

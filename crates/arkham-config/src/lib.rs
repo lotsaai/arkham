@@ -15,8 +15,7 @@ pub mod plugins;
 pub mod registry;
 pub use config::{AppConfig, ProxyCfg, RuleCfg, fake_for, load};
 pub use confine::{
-  Enforcement, FsPolicy, Isolate, RunnerChoice, RunnerKind, WriteProfile, choose_runner, fs_policy, is_fnox_config_name,
-  is_fnox_config_path, require_loopback_listen,
+  FsPolicy, Isolate, WriteProfile, choose_runner, fs_policy, is_fnox_config_name, is_fnox_config_path, require_loopback_listen,
 };
 pub use error::Error;
 pub use grants::{
