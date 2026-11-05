@@ -40,7 +40,7 @@ pub(crate) fn projection_files(workspace: &Path) -> Result<Vec<PathBuf>, Error> 
   while index < out.len() {
     let path = out[index].clone();
     for imported in imports_of(&path)? {
-      push_unique(&mut out, imported);
+      consider(&mut out, imported);
     }
     index = index.saturating_add(1);
   }
@@ -102,10 +102,12 @@ fn consider(out: &mut Vec<PathBuf>, path: PathBuf) {
     return;
   };
   if meta.file_type().is_symlink() {
-    push_unique(out, path.clone());
+    // The target is recorded first. Its forged bytes follow the target file,
+    // and a later alias of the link must not replace that bind.
     if let Ok(target) = std::fs::canonicalize(&path) {
       push_unique(out, target);
     }
+    push_unique(out, path.clone());
     return;
   }
   if meta.is_file() {
@@ -386,6 +388,32 @@ mod tests {
     let aliases = indexed_aliases(&index, &link);
     assert!(aliases.iter().any(|path| path == &hard), "{aliases:?}");
     assert!(aliases.iter().all(|path| path.starts_with(base.as_path())), "{aliases:?}");
+  }
+
+  #[test]
+  fn a_symlinked_import_and_age_key_project_the_link_and_the_target() {
+    let root = tempfile::tempdir().unwrap();
+    let base = root.path().canonicalize().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let outside = outside.path().canonicalize().unwrap();
+    let real_import = outside.join("real-import.toml");
+    std::fs::write(&real_import, "# IMPORT_SECRET_VALUE\n").unwrap();
+    let import_link = base.join("import-link.toml");
+    std::os::unix::fs::symlink(&real_import, &import_link).unwrap();
+    let real_age = outside.join("real.age");
+    std::fs::write(&real_age, "AGE-SECRET-KEY-REAL\n").unwrap();
+    let age_link = base.join("age-link");
+    std::os::unix::fs::symlink(&real_age, &age_link).unwrap();
+    std::fs::write(
+      base.join("fnox.toml"),
+      "import = [\"import-link.toml\"]\nage_key_file = \"age-link\"\n",
+    )
+    .unwrap();
+    let files = projection_files(&base).unwrap();
+    assert!(files.iter().any(|path| path == &import_link), "{files:?}");
+    assert!(files.iter().any(|path| path == &real_import), "{files:?}");
+    assert!(files.iter().any(|path| path == &age_link), "{files:?}");
+    assert!(files.iter().any(|path| path == &real_age), "{files:?}");
   }
 
   #[test]

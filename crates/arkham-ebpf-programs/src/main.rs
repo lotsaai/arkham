@@ -14,6 +14,8 @@
 //! 3. `recvmsg4` rewrites the *source* address a connected UDP socket observes,
 //!    so replies that physically come from arkham's listener still look like
 //!    they came from the address the client connected to.
+//! 4. `release_flow` deletes the maps when the socket closes. It looks the
+//!    4-tuple up by socket cookie, because this hook cannot read `src_port`.
 //!
 //! No netfilter, no policy routes, no `IP_TRANSPARENT`: the kernel's own socket
 //! address rewrite is the whole mechanism.
@@ -30,9 +32,9 @@
 use aya_ebpf::{
   EbpfContext as _,
   helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_netns_cookie, bpf_get_socket_cookie},
-  macros::{cgroup_skb, cgroup_sock_addr, map},
+  macros::{cgroup_skb, cgroup_sock, cgroup_sock_addr, map},
   maps::{Array, LruHashMap},
-  programs::{SkBuffContext, SockAddrContext},
+  programs::{SkBuffContext, SockAddrContext, SockContext},
 };
 
 /// Loader-provided configuration: map key 0.
@@ -169,6 +171,13 @@ pub struct FlowRecord {
 /// client's local 4-tuple → cookie and cgroup.
 #[map]
 static FLOW: LruHashMap<FlowKey, FlowRecord> = LruHashMap::with_max_entries(MAX_ENTRIES, 0);
+
+/// cookie → the `FLOW` key, so `release_flow` can delete it.
+///
+/// `sock_release` may read the socket cookie and may not read `src_port`.
+/// The egress hook records the key under the cookie it already holds.
+#[map]
+static COOKIE_FLOW: LruHashMap<u64, FlowKey> = LruHashMap::with_max_entries(MAX_ENTRIES, 0);
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -418,6 +427,7 @@ pub fn capture_egress(ctx: SkBuffContext) -> i32 {
     port: ctx.skb.local_port() as u16,
     _pad: [0; 2],
   };
+  let _ = COOKIE_FLOW.insert(cookie, key, 0);
   let _ = FLOW.insert(
     key,
     FlowRecord {
@@ -426,5 +436,30 @@ pub fn capture_egress(ctx: SkBuffContext) -> i32 {
     },
     0,
   );
+  1
+}
+
+/// `release_flow`: drop the maps for a socket that is going away.
+///
+/// `FLOW` is keyed by the local 4-tuple and `ORIG_DST` by the socket cookie.
+/// Neither entry is useful after `close`, and a reused source port would
+/// otherwise be attributed to the cgroup that connected last time. Loopback
+/// connects never insert, so there is nothing for them to delete.
+#[cgroup_sock(sock_release)]
+pub fn release_flow(ctx: SockContext) -> i32 {
+  if is_proxy() {
+    return 1;
+  }
+  // SAFETY: `ctx.as_ptr()` is the context the kernel supplied to this hook.
+  let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
+  if cookie == 0 {
+    return 1;
+  }
+  // SAFETY: the value is copied out before either map is updated.
+  if let Some(key) = unsafe { COOKIE_FLOW.get(cookie) }.copied() {
+    let _ = FLOW.remove(&key);
+  }
+  let _ = COOKIE_FLOW.remove(&cookie);
+  let _ = ORIG_DST.remove(&cookie);
   1
 }

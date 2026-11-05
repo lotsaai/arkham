@@ -84,10 +84,38 @@ impl FlowTables {
   }
 }
 
+/// Cgroup a captured flow may still be served as.
+///
+/// `recorded` is the id stored when the socket connected. `live` is the
+/// cgroup of the socket being accepted. A close deletes the map entry, so
+/// accept then sees `0`. A reused source port that still has the old entry
+/// carries the previous project only when the live socket is that same cgroup.
+#[must_use]
+pub(crate) fn retained_cgroup(recorded: u64, live: u64) -> Option<u64> {
+  if recorded == 0 || live == 0 || recorded != live {
+    None
+  } else {
+    Some(recorded)
+  }
+}
+
 /// A redirected flow: where the client was going, and which cgroup it ran in.
 pub(crate) struct CapturedFlow {
   /// Original destination, before the hook rewrote it.
   pub destination: SocketAddr,
   /// Cgroup id of the connecting process.
   pub cgroup_id: u64,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::retained_cgroup;
+
+  #[test]
+  fn a_reused_port_after_close_does_not_inherit_the_old_project() {
+    assert_eq!(retained_cgroup(0, 22), None);
+    assert_eq!(retained_cgroup(11, 22), None);
+    assert_eq!(retained_cgroup(11, 0), None);
+    assert_eq!(retained_cgroup(11, 11), Some(11));
+  }
 }

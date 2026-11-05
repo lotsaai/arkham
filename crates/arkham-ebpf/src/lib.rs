@@ -12,7 +12,7 @@ use arkham_proxy::ProxyState;
 use aya::{
   Ebpf,
   maps::{Array, MapData},
-  programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr},
+  programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSock, CgroupSockAddr},
 };
 use std::fs::File;
 use std::io::ErrorKind;
@@ -158,8 +158,17 @@ impl SelfExclusion {
 /// the cgroup id has no namespace of its own. `0` means it could not be
 /// determined, leaving the pid as the only guard.
 fn own_cgroup_id() -> u64 {
+  cgroup_id_of_pid(std::process::id())
+}
+
+/// Cgroup id of `pid`, as `bpf_get_current_cgroup_id` reports it for a
+/// process still in that cgroup. `0` means the id could not be read.
+pub(crate) fn cgroup_id_of_pid(pid: u32) -> u64 {
   use std::os::unix::fs::MetadataExt as _;
-  let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") else {
+  if pid == 0 {
+    return 0;
+  }
+  let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
     return 0;
   };
   let Some(own) = own_cgroup_path(&content) else {
@@ -843,6 +852,7 @@ fn attach(bpf: &mut Ebpf, cgroup: &std::path::Path) -> Result<(), Error> {
   let mode = CgroupAttachMode::Single;
   attach_sock_addr(bpf, "connect4", &file, mode)?;
   attach_sock_addr(bpf, "recvmsg4", &file, mode)?;
+  attach_cgroup_sock(bpf, "release_flow", &file, mode)?;
   let program: &mut CgroupSkb = bpf
     .program_mut("capture_egress")
     .ok_or_else(|| Error::ProgramMissing {
@@ -863,6 +873,29 @@ fn attach(bpf: &mut Ebpf, cgroup: &std::path::Path) -> Result<(), Error> {
       name: "capture_egress".to_string(),
       origin: err,
     })?;
+  Ok(())
+}
+
+/// Load and attach one `cgroup_sock` program.
+///
+/// `sock_release` uses this type. The attach type comes from the section name.
+fn attach_cgroup_sock(bpf: &mut Ebpf, name: &str, cgroup: &File, mode: CgroupAttachMode) -> Result<(), Error> {
+  let program: &mut CgroupSock = bpf
+    .program_mut(name)
+    .ok_or_else(|| Error::ProgramMissing { name: name.to_string() })?
+    .try_into()
+    .map_err(|err| Error::UnexpectedProgramType {
+      name: name.to_string(),
+      origin: err,
+    })?;
+  program.load().map_err(|err| Error::LoadProgram {
+    name: name.to_string(),
+    origin: err,
+  })?;
+  program.attach(cgroup, mode).map_err(|err| Error::AttachProgram {
+    name: name.to_string(),
+    origin: err,
+  })?;
   Ok(())
 }
 
@@ -1185,9 +1218,9 @@ mod tests {
       .relocate_calls(&text_sections)
       .expect("every call must resolve; an unresolved helper extern is the usual cause");
 
-    // All three attachment points must be present: a rename that drifted from
+    // Every attachment point must be present: a rename that drifted from
     // `attach()` would otherwise only fail on a root-only run.
-    for name in ["connect4", "recvmsg4", "capture_egress"] {
+    for name in ["connect4", "recvmsg4", "capture_egress", "release_flow"] {
       assert!(obj.programs.contains_key(name), "program `{name}` missing from the object");
     }
   }
