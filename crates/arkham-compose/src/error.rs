@@ -338,9 +338,21 @@ pub enum Error {
   /// Host path translation needs a home directory.
   #[error("home directory is unset")]
   NoHome,
-  /// The pid's start time changed before the cgroup write.
-  #[error("session identity changed before the cgroup write")]
+  /// The pid's start time changed, or the process is not in the session cgroup.
+  #[error("session identity changed before the cgroup was confirmed")]
   SessionReused,
+  /// The process cgroup does not allow a session child to be created.
+  #[error("session cgroup {} cannot be created: {source}", path.display())]
+  SessionCgroup {
+    /// Directory that could not be created or written.
+    path: PathBuf,
+    /// Underlying I/O failure.
+    #[source]
+    source: IoError,
+  },
+  /// A socket path or a directory created for it is not owned by this user.
+  #[error("daemon socket is not owned by this user")]
+  SocketOwner,
   /// `/proc/<pid>/stat` did not contain a start time.
   #[error("process {pid} has no start time")]
   NoStarttime {

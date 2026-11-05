@@ -123,14 +123,14 @@ async fn one_client(
   let started = match read_starttime(pid) {
     Ok(value) => value,
     Err(err) => {
-      reject(&mut stream, err.to_string()).await?;
+      reject_logged(&mut stream, &err, &wrapper_detail(&err)).await?;
       return Ok(());
     }
   };
   let cgroup = match read_cgroup(pid) {
     Ok(path) => path,
     Err(err) => {
-      reject(&mut stream, err.to_string()).await?;
+      reject_logged(&mut stream, &err, &wrapper_detail(&err)).await?;
       return Ok(());
     }
   };
@@ -150,7 +150,7 @@ async fn one_client(
     Ok(prepared) => prepared,
     Err(err) => {
       let _ = std::fs::remove_dir_all(&scratch);
-      reject(&mut stream, err.to_string()).await?;
+      reject_logged(&mut stream, &err, &wrapper_detail(&err)).await?;
       return Ok(());
     }
   };
@@ -158,14 +158,14 @@ async fn one_client(
     Ok(slot) => slot,
     Err(err) => {
       let _ = std::fs::remove_dir_all(&scratch);
-      reject(&mut stream, err.to_string()).await?;
+      reject_logged(&mut stream, &err, &wrapper_detail(&err)).await?;
       return Ok(());
     }
   };
   if let Err(err) = state.register_project(slot.id, prepared.resolved, ca) {
     release_session(&slot.path);
     let _ = std::fs::remove_dir_all(&scratch);
-    reject(&mut stream, err.to_string()).await?;
+    reject_logged(&mut stream, &err, REGISTRATION_FAILED).await?;
     return Ok(());
   }
   registered.lock().unwrap_or_else(PoisonError::into_inner).push(root.clone());
@@ -192,6 +192,20 @@ async fn one_client(
   }
   let _ = std::fs::remove_dir_all(&scratch);
   Ok(())
+}
+
+const REGISTRATION_FAILED: &str = "registration failed";
+
+fn wrapper_detail(err: &arkham_compose::Error) -> String {
+  match err {
+    arkham_compose::Error::SessionCgroup { .. } => err.to_string(),
+    _ => REGISTRATION_FAILED.to_string(),
+  }
+}
+
+async fn reject_logged(stream: &mut UnixStream, err: &impl std::fmt::Debug, detail: &str) -> eyre::Result<()> {
+  tracing::error!(error = ?err, "registration failed");
+  reject(stream, detail).await
 }
 
 async fn reject(stream: &mut UnixStream, detail: impl Into<String>) -> eyre::Result<()> {

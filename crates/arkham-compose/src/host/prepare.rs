@@ -69,11 +69,12 @@ pub async fn prepare_session(
   let projected = projection_files(root)?;
   let mut devices = std::collections::HashSet::new();
   for path in projected.iter().chain(binds.iter().map(|bind| &bind.dest)) {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
+    if let Ok(meta) = std::fs::metadata(path) {
       devices.insert(meta.dev());
     }
   }
-  let inodes = inode_index(&devices);
+  let roots = crate::host::forge::scan_roots(root, &projected);
+  let inodes = inode_index(&devices, &roots);
   let mut index = 0u32;
   for path in projected {
     let source = forged_dir.join(index.to_string());
@@ -129,11 +130,17 @@ pub async fn prepare_session(
 
 fn push_with_aliases(binds: &mut Vec<Bind>, inodes: &std::collections::HashMap<(u64, u64), Vec<PathBuf>>, source: PathBuf, dest: PathBuf) {
   for alias in indexed_aliases(inodes, &dest) {
-    binds.push(Bind {
-      source: source.clone(),
-      dest: alias,
-      read_only: true,
-    });
+    push_file_bind(binds, source.clone(), alias);
+  }
+  push_file_bind(binds, source, dest);
+}
+
+fn push_file_bind(binds: &mut Vec<Bind>, source: PathBuf, dest: PathBuf) {
+  if std::fs::symlink_metadata(&dest).is_ok_and(|meta| meta.file_type().is_symlink()) {
+    return;
+  }
+  if binds.iter().any(|existing| existing.dest == dest) {
+    return;
   }
   binds.push(Bind {
     source,

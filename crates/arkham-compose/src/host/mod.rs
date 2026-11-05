@@ -18,23 +18,36 @@ pub use plan::LaunchPlan;
 pub use prepare::{PreparedSession, prepare_session};
 pub use protocol::{RegisterRequest, RegisterResponse, daemon_socket_path, decode_request, encode_response, read_line, write_line};
 
-/// Register with the daemon and launch. On a non-Linux host this refuses
-/// before starting a process.
+/// Register `workspace` (or the current directory) and launch. On a non-Linux
+/// host this refuses before starting a process.
 ///
 /// # Errors
 ///
 /// Returns [`Error::HostLinuxOnly`] off Linux, [`Error::NoDaemon`] when the
-/// socket is absent, and [`Error::NoRunner`] (via config) when both probes fail.
-pub async fn run_agent(profile: arkham_config::WriteProfile, command: &[std::ffi::OsString]) -> Result<(), crate::Error> {
-  #[cfg(target_os = "linux")]
-  {
-    return linux::agent(profile, command).await;
-  }
-  #[cfg(not(target_os = "linux"))]
-  {
-    let _ = (profile, command);
-    Err(crate::Error::HostLinuxOnly)
-  }
+/// socket is absent, and [`Error::NoRunner`] (via config) when bubblewrap
+/// does not accept the profile.
+#[cfg(target_os = "linux")]
+pub async fn run_agent(
+  profile: arkham_config::WriteProfile,
+  workspace: Option<&std::path::Path>,
+  command: &[std::ffi::OsString],
+) -> Result<(), crate::Error> {
+  linux::agent(profile, workspace, command).await
+}
+
+/// Register `workspace` and launch. This host has no bubblewrap runner.
+///
+/// # Errors
+///
+/// Returns [`Error::HostLinuxOnly`].
+#[cfg(not(target_os = "linux"))]
+pub fn run_agent(
+  profile: arkham_config::WriteProfile,
+  workspace: Option<&std::path::Path>,
+  command: &[std::ffi::OsString],
+) -> Result<(), crate::Error> {
+  let _ = (profile, workspace, command);
+  Err(crate::Error::HostLinuxOnly)
 }
 
 #[cfg(target_os = "linux")]

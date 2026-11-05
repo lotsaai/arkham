@@ -633,8 +633,8 @@ pub enum Error {
   /// A presented destination host is empty after trimming.
   #[error("wire host is empty")]
   WireHostEmpty,
-  /// Neither bubblewrap nor Landlock accepted the profile.
-  #[error("no usable confinement runner")]
+  /// Bubblewrap did not accept the profile. Landlock is not a runner.
+  #[error("bubblewrap did not accept the profile")]
   NoRunner,
   /// A host backend was asked to listen on a non-loopback address.
   #[error("host backends refuse a non-loopback listen address {listen}")]

@@ -6,11 +6,15 @@
 //! creating that directory would write the host filesystem or fail on the
 //! read-only mount.
 
+#[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use arkham_config::{FsPolicy, WriteProfile, fs_policy};
+use arkham_config::WriteProfile;
+#[cfg(target_os = "linux")]
+use arkham_config::{FsPolicy, fs_policy};
 use serde::{Deserialize, Serialize};
 
 /// One bind the agent sees. `source` is the file the daemon wrote. `dest`
@@ -50,16 +54,19 @@ pub struct LaunchPlan {
 pub const CA_DEST: &str = "/arkham/ca.pem";
 
 /// Temp directory the workspace-write profile passes to [`fs_policy`].
+#[cfg(target_os = "linux")]
 pub const TEMP_DIR: &str = "/tmp";
 
 /// Cgroup mount the agent must not be able to write. A writable
 /// `cgroup.procs` would let the agent leave its session.
+#[cfg(target_os = "linux")]
 const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 
 /// Argv for `bwrap`, not including the `bwrap` program name.
 ///
 /// `/` is remounted read-only after the mounts are in place. Mounts created
 /// before that keep the flags they were given.
+#[cfg(target_os = "linux")]
 #[must_use]
 pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Vec<OsString> {
   let policy = fs_policy(plan.profile, &plan.workspace, Path::new(TEMP_DIR));
@@ -103,6 +110,7 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Vec<OsString> {
 ///
 /// `dev` and `proc` are left out because `--dev` and `--proc` create them.
 /// `arkham` is left out so [`bwrap_argv`] can create that directory itself.
+#[cfg(target_os = "linux")]
 fn push_host_entries(args: &mut Vec<OsString>, writable: bool) {
   let Ok(entries) = std::fs::read_dir("/") else {
     return;
@@ -131,6 +139,7 @@ fn push_host_entries(args: &mut Vec<OsString>, writable: bool) {
   }
 }
 
+#[cfg(target_os = "linux")]
 fn skipped_root(name: &OsStr) -> bool {
   name == "dev" || name == "proc" || name == "arkham"
 }
@@ -140,6 +149,7 @@ fn skipped_root(name: &OsStr) -> bool {
 /// `--tmpfs /tmp` hides the host directory, including symlinks that point at
 /// a projected file. Binding each wiped top-level directory read-only keeps
 /// those links, and the per-file binds that follow replace the secret files.
+#[cfg(target_os = "linux")]
 fn push_tmp_restores(args: &mut Vec<OsString>, plan: &LaunchPlan) {
   let tmp = Path::new(TEMP_DIR);
   let mut restored = BTreeSet::new();
@@ -158,6 +168,7 @@ fn push_tmp_restores(args: &mut Vec<OsString>, plan: &LaunchPlan) {
 
 /// `/tmp/<name>` for a path nested under the temp directory, when that
 /// directory exists on the host.
+#[cfg(target_os = "linux")]
 fn tmp_tree(dest: &Path, tmp: &Path) -> Option<PathBuf> {
   let rest = dest.strip_prefix(tmp).ok()?;
   let first = rest.components().next()?;
@@ -165,6 +176,7 @@ fn tmp_tree(dest: &Path, tmp: &Path) -> Option<PathBuf> {
   if top == dest || !top.is_dir() { None } else { Some(top) }
 }
 
+#[cfg(target_os = "linux")]
 fn bind_flag(profile: WriteProfile, read_only: bool) -> &'static str {
   if read_only || profile == WriteProfile::ReadOnly {
     "--ro-bind"
@@ -179,7 +191,7 @@ pub fn is_proxy_env(name: &str) -> bool {
   matches!(name.to_ascii_lowercase().as_str(), "http_proxy" | "https_proxy" | "all_proxy")
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
   use super::*;
 

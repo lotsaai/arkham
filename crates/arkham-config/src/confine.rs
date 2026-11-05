@@ -13,9 +13,8 @@ use crate::Error;
 
 /// How `arkham agent` confines the command.
 ///
-/// `compose` is the default. `bwrap` is the Linux host backend: bubblewrap
-/// when its probe passes, otherwise the Landlock launcher. Landlock is not a
-/// separate flag.
+/// `compose` is the default. `bwrap` is the Linux host backend. Landlock can
+/// add restrictions inside bubblewrap. It is not a runner and not a flag.
 #[derive(ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Isolate {
   /// The compose stack.
@@ -58,8 +57,6 @@ pub enum Enforcement {
 pub enum RunnerKind {
   /// Bubblewrap.
   Bwrap,
-  /// The Landlock launcher.
-  Landlock,
 }
 
 /// The runner a probe sequence selected, and the enforcement it reported.
@@ -111,24 +108,18 @@ pub fn fs_policy(profile: WriteProfile, workspace: &Path, temp: &Path) -> FsPoli
 /// Pick a runner from probe results.
 ///
 /// `bwrap` is true only when `true` exited 0 under the real profile.
-/// `landlock` is `Some` only when that probe exited 0, and the enforcement
-/// value is the one the Landlock ABI reported. Bubblewrap wins and reports
-/// full. No passing probe refuses to start.
+/// `landlock` is accepted so a caller can pass a probe result, and it never
+/// selects a runner. Bubblewrap reports full. Anything else refuses to start.
 ///
 /// # Errors
 ///
-/// Returns [`Error::NoRunner`] when both probes failed.
+/// Returns [`Error::NoRunner`] when bubblewrap did not accept the profile.
 pub fn choose_runner(bwrap: bool, landlock: Option<Enforcement>) -> Result<RunnerChoice, Error> {
+  let _ = landlock;
   if bwrap {
     return Ok(RunnerChoice {
       runner: RunnerKind::Bwrap,
       enforcement: Enforcement::Full,
-    });
-  }
-  if let Some(enforcement) = landlock {
-    return Ok(RunnerChoice {
-      runner: RunnerKind::Landlock,
-      enforcement,
     });
   }
   Err(Error::NoRunner)
@@ -231,12 +222,11 @@ mod tests {
   }
 
   #[test]
-  fn landlock_keeps_the_enforcement_its_probe_reported() {
-    let choice = choose_runner(false, Some(Enforcement::Partial)).unwrap();
-    assert_eq!(choice.runner, RunnerKind::Landlock);
-    assert_eq!(choice.enforcement, Enforcement::Partial);
-    let full = choose_runner(false, Some(Enforcement::Full)).unwrap();
-    assert_eq!(full.enforcement, Enforcement::Full);
+  fn landlock_without_bwrap_does_not_start() {
+    let partial = choose_runner(false, Some(Enforcement::Partial)).unwrap_err();
+    assert!(matches!(partial, Error::NoRunner));
+    let full = choose_runner(false, Some(Enforcement::Full)).unwrap_err();
+    assert!(matches!(full, Error::NoRunner));
   }
 
   #[test]
