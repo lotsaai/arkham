@@ -155,7 +155,12 @@ fn peer_ids_fd(fd: i32) -> io::Result<(u32, u32)> {
 #[cfg(target_os = "linux")]
 fn peer_ids_fd(fd: i32) -> io::Result<(u32, u32)> {
   let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
-  let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+  // A length that does not fit `socklen_t` is an unproven peer. `from_uid`
+  // maps this error there. It is not a reason to guess a uid.
+  let Ok(expected) = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>()) else {
+    return Err(io::Error::other("ucred length does not fit socklen_t"));
+  };
+  let mut len = expected;
   // SAFETY: `fd` is a live Unix socket borrowed from `UnixStream` for this
   // call. `cred` and `len` are valid for a `SO_PEERCRED` `ucred` write.
   let rc = unsafe {
@@ -167,11 +172,14 @@ fn peer_ids_fd(fd: i32) -> io::Result<(u32, u32)> {
       &raw mut len,
     )
   };
-  if rc == 0 {
-    Ok((cred.uid, cred.gid))
-  } else {
-    Err(io::Error::last_os_error())
+  if rc != 0 {
+    return Err(io::Error::last_os_error());
   }
+  // A short write would leave the zeroed uid in place. That uid is root.
+  if len != expected {
+    return Err(io::Error::other("SO_PEERCRED returned a short credential"));
+  }
+  Ok((cred.uid, cred.gid))
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -356,6 +364,27 @@ mod tests {
     assert!(matches!(forbidden, Handoff::Close(CloseReason::ForbiddenPeer(42))));
     let unproven = SocketPeer::Unproven.decide(Explode, budget).await.unwrap();
     assert!(matches!(unproven, Handoff::Close(CloseReason::UnprovenPeer)));
+  }
+
+  #[cfg(target_os = "linux")]
+  #[tokio::test]
+  async fn so_peercred_reports_the_process_uid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("handoff.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let client_path = path.clone();
+    let client = tokio::spawn(async move { UnixStream::connect(client_path).await.unwrap() });
+    let (server, _) = listener.accept().await.unwrap();
+    // SAFETY: `getuid` takes no pointers and only reads this process's credential.
+    let uid = unsafe { libc::getuid() };
+    assert_eq!(peer_uid(&server).unwrap(), uid);
+    assert!(matches!(SocketPeer::observe(&server, uid), SocketPeer::Allowed));
+    assert!(matches!(
+      SocketPeer::observe(&server, uid.wrapping_add(1)),
+      SocketPeer::Forbidden { .. }
+    ));
+    drop(server);
+    client.await.unwrap();
   }
 
   #[test]
