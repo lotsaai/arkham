@@ -9,10 +9,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::WorkspaceBuild;
+use arkham_config::config::user_config_dirs;
 use arkham_config::config::{HostTlsCfg, RuleCfg};
 use arkham_config::grants::GuestTlsMode;
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
-use arkham_config::config::user_config_dirs;
 
 use crate::error::Error;
 use crate::paths::{Mount, covering, expand, translate};

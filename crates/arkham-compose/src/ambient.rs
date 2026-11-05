@@ -19,9 +19,9 @@ use crate::rewrites::{RewriteCollector, RewriteOutputs};
 use crate::ssh;
 use crate::talos;
 use arkham_config::config::FileRewrite;
+use arkham_config::config::user_config_dirs;
 use arkham_config::registry::Registry;
 use arkham_pki::ca::CertAuthority;
-use arkham_config::config::user_config_dirs;
 use xpanda::Xpanda;
 
 /// Inputs for [`derive_sources`]: the generation context the ambient

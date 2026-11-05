@@ -395,7 +395,9 @@ pub(crate) async fn init_workspace(
 /// The compose files on disk, in layer order: global `compose.yaml` or
 /// `compose.yml`, the generated stack, then the workspace override.
 fn compose_layers(workspace: &Workspace) -> Vec<PathBuf> {
-  let roots = config_dir().into_iter().chain(user_config_dirs().into_iter().map(|root| root.join("arkham")));
+  let roots = config_dir()
+    .into_iter()
+    .chain(user_config_dirs().into_iter().map(|root| root.join("arkham")));
   let global = roots.into_iter().find_map(|dir| {
     let yaml = dir.join("compose.yaml");
     if yaml.is_file() {
