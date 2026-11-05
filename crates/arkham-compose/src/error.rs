@@ -9,6 +9,7 @@ use arkham_fnox::Error as FnoxError;
 use kube_client::config::KubeconfigError;
 use serde_json::Error as JsonError;
 use serde_yaml::Error as YamlError;
+use toml::de::Error as TomlDeError;
 use toml::ser::Error as TomlSerializeError;
 use toml_edit::TomlError;
 
@@ -328,6 +329,77 @@ pub enum Error {
   /// `expose` without a port or `--list` names nothing to do.
   #[error("`arkham expose` needs a container port or `--list`")]
   ExposeNoPort,
+  /// The host wrapper found no daemon socket.
+  #[error("no host daemon is running")]
+  NoDaemon,
+  /// `--isolate bwrap` was asked for on a system other than Linux.
+  #[error("the host backend runs on Linux")]
+  HostLinuxOnly,
+  /// Host path translation needs a home directory.
+  #[error("home directory is unset")]
+  NoHome,
+  /// The pid's start time changed before the cgroup write.
+  #[error("session identity changed before the cgroup write")]
+  SessionReused,
+  /// `/proc/<pid>/stat` did not contain a start time.
+  #[error("process {pid} has no start time")]
+  NoStarttime {
+    /// Process id that could not be identified.
+    pid: u32,
+  },
+  /// `/proc/<pid>/cgroup` had no cgroup v2 line.
+  #[error("process {pid} has no cgroup")]
+  NoCgroup {
+    /// Process id whose cgroup could not be read.
+    pid: u32,
+  },
+  /// The daemon sent a rejection.
+  #[error("daemon rejected the session: {detail}")]
+  DaemonRejected {
+    /// Message the daemon sent.
+    detail: String,
+  },
+  /// The control client is a different user from the daemon.
+  #[error("control client is not the daemon user")]
+  ControlUnauthorized,
+  /// The peer is already inside a daemon cgroup.
+  #[error("a confined process cannot register")]
+  AlreadyConfined,
+  /// A control message exceeded the cap or was not the expected JSON.
+  #[error("control message is not valid")]
+  ControlMessage {
+    /// Why the message was rejected.
+    #[source]
+    source: JsonError,
+  },
+  /// A control message was larger than the cap, or the socket closed mid-read.
+  #[error("control message exceeds 1 MiB or ended early")]
+  ControlLimit,
+  /// A grant fragment does not parse as rules.
+  #[error("grant fragment does not parse")]
+  FragmentParse {
+    /// Underlying parse failure.
+    #[source]
+    source: TomlDeError,
+  },
+  /// Landlock could not open a path it was asked to grant.
+  #[cfg(target_os = "linux")]
+  #[error("landlock path {path}", path = path.display())]
+  LandlockPath {
+    /// Path that could not be opened.
+    path: PathBuf,
+    /// Underlying open failure.
+    #[source]
+    source: landlock::PathFdError,
+  },
+  /// Landlock rejected the ruleset.
+  #[cfg(target_os = "linux")]
+  #[error("landlock restriction failed")]
+  Landlock {
+    /// Underlying ruleset failure.
+    #[source]
+    source: landlock::RulesetError,
+  },
 }
 
 impl From<ConfigError> for Error {

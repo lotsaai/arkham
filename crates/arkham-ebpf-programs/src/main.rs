@@ -145,9 +145,22 @@ static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 #[map]
 static ORIG_DST: LruHashMap<u64, OrigDst> = LruHashMap::with_max_entries(MAX_ENTRIES, 0);
 
-/// client's local 4-tuple → cookie.
+/// Cookie plus the cgroup id of the process that connected.
+///
+/// Both fields are `u64`, so the layout has no padding. Userspace duplicates
+/// this struct; the two sides cannot share a type.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FlowRecord {
+  /// Socket cookie, the key into `ORIG_DST`.
+  pub cookie: u64,
+  /// `bpf_get_current_cgroup_id` for the connecting process.
+  pub cgroup_id: u64,
+}
+
+/// client's local 4-tuple → cookie and cgroup.
 #[map]
-static FLOW: LruHashMap<FlowKey, u64> = LruHashMap::with_max_entries(MAX_ENTRIES, 0);
+static FLOW: LruHashMap<FlowKey, FlowRecord> = LruHashMap::with_max_entries(MAX_ENTRIES, 0);
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -392,6 +405,8 @@ pub fn capture_egress(ctx: SkBuffContext) -> i32 {
     port: ctx.skb.local_port() as u16,
     _pad: [0; 2],
   };
-  let _ = FLOW.insert(key, cookie, 0);
+  // SAFETY: querying the current cgroup id has no preconditions.
+  let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+  let _ = FLOW.insert(key, FlowRecord { cookie, cgroup_id }, 0);
   1
 }

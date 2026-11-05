@@ -24,7 +24,7 @@ use rama::tls::client::ServerVerifyMode;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
-use crate::connection::{dial_marked, trust_anchors};
+use crate::connection::dial_marked;
 use crate::identity::{Expect, expect};
 use crate::mint::{MintBucket, MintStore};
 use crate::transports::PairCtx;
@@ -42,6 +42,7 @@ mod error;
 mod handoff;
 mod identity;
 mod mint;
+mod projects;
 mod transports;
 
 mod relay;
@@ -92,6 +93,8 @@ pub struct ProxyState {
   mint_store: MintStore,
   fwmark: Option<u32>,
   plugins: Arc<arkham_plugin::Registry>,
+  /// Host-backend projects, keyed by cgroup id. Empty for a compose proxy.
+  projects: projects::Projects,
 }
 
 impl std::fmt::Debug for ProxyState {
@@ -153,21 +156,7 @@ impl ProxyState {
   /// when a configured plugin cannot be loaded.
   pub fn new(resolved: ResolvedConfig, ca: &CertAuthority) -> Result<Self, Error> {
     let plugins = Arc::new(arkham_plugin::Registry::load(&resolved.plugins)?);
-    let mut global = Vec::new();
-    for path in &resolved.proxy.root_certs {
-      global.extend(trust_anchors(path)?);
-    }
-    let relay = https_relay(ca, &global)?;
-    let mut extra_relays = HashMap::new();
-    for path in entry_anchors(&resolved) {
-      let mut anchors = global.clone();
-      anchors.extend(trust_anchors(&path)?);
-      let extra_relay = https_relay(ca, &anchors).map_err(|source| Error::EntryTrustBundle {
-        path: path.clone(),
-        source: Box::new(source),
-      })?;
-      extra_relays.insert(path, extra_relay);
-    }
+    let (relay, extra_relays) = projects::build_relays(&resolved, ca)?;
     // Trust for the `mtls` guest leg: the same CA that mints the leaves.
     // Per-connection policies built from it demand a guest certificate.
     let (crt, _) = ca.boring_pair()?;
@@ -196,6 +185,7 @@ impl ProxyState {
       mint_store: MintStore::default(),
       fwmark: None,
       plugins,
+      projects: projects::Projects::new(),
     })
   }
 
@@ -212,12 +202,6 @@ impl ProxyState {
   #[must_use]
   pub fn snapshot(&self) -> Arc<ResolvedConfig> {
     Arc::clone(&self.config)
-  }
-
-  /// Clone of the runtime token-mint store. Clones share the pair map.
-  #[must_use]
-  pub(crate) fn mint_store(&self) -> MintStore {
-    self.mint_store.clone()
   }
 
   /// `SO_MARK` for upstream sockets (`None` = unmarked).
@@ -350,6 +334,7 @@ where
         host: Some(host),
         raw_host: host,
         initial,
+        cgroup_id: 0,
       },
     )
     .await
@@ -386,6 +371,46 @@ where
         host: None,
         raw_host,
         initial: &[],
+        cgroup_id: 0,
+      },
+    )
+    .await
+}
+
+/// Serve a captured stream attributed to `cgroup_id`.
+///
+/// The project's secret set is selected before the arm is chosen. An unknown
+/// id uses the process snapshot, which a host daemon leaves empty so the
+/// flow splices.
+///
+/// # Errors
+///
+/// Returns an error when peeking fails, or when the upstream dial fails.
+/// Empty input closes quietly (`Ok(())`).
+pub async fn serve_captured_stream<G>(
+  guest: G,
+  state: &ProxyState,
+  cgroup_id: u64,
+  dial_host: &str,
+  port: u16,
+  raw_host: &str,
+) -> Result<(), Error>
+where
+  G: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+  let snapshot = state.snapshot_for(cgroup_id);
+  expect(&snapshot.grants, None, port)
+    .serve(
+      guest,
+      CandidateParams {
+        state,
+        snapshot: &snapshot,
+        dial_host,
+        port,
+        host: None,
+        raw_host,
+        initial: &[],
+        cgroup_id,
       },
     )
     .await
@@ -412,8 +437,8 @@ async fn forward_arm(mut client: TcpStream, head: &[u8], target: &str, state: &P
     grants: &snapshot.grants,
     host: &host,
     port,
-    plugins: &state.plugins,
-    mint: Some(state.mint_store()),
+    plugins: state.plugins_for(0),
+    mint: Some(state.mint_for(0)),
   };
   let (mut downstream_machine, mut upstream_machine) = http_pair(&ctx);
   relay_guarded(client, upstream, &mut downstream_machine, &mut upstream_machine, head, &[]).await

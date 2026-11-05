@@ -151,9 +151,11 @@ fn state_with(grants: Vec<Grant>, ca: &arkham_pki::ca::CertAuthority) -> Arc<Pro
   )
 }
 
-/// Start capture, move this process into its cgroup, and fail loudly if the
-/// attach never came up.
-async fn start_capture(
+/// Start capture and fail loudly if the attach never came up.
+///
+/// The process stays in its current cgroup. Callers that want this process
+/// captured move it themselves.
+async fn attach_capture(
   cgroup: &TestCgroup,
   state: Arc<ProxyState>,
   upstream_override: Option<SocketAddr>,
@@ -190,6 +192,18 @@ async fn start_capture(
       panic!("capture task not ready after 5s: {result:?}");
     }
   }
+  capture
+}
+
+/// Start capture and move this process into its cgroup.
+async fn start_capture(
+  cgroup: &TestCgroup,
+  state: Arc<ProxyState>,
+  upstream_override: Option<SocketAddr>,
+  bypass: Vec<(Ipv4Addr, u8)>,
+  bypass_file: Option<PathBuf>,
+) -> JoinHandle<Result<(), Error>> {
+  let capture = attach_capture(cgroup, state, upstream_override, bypass, bypass_file).await;
   cgroup.admit(std::process::id());
   capture
 }
@@ -339,6 +353,164 @@ async fn ebpf_live_tcp_mitm_substitutes() {
   // The response came back redacted: the guest never sees the real value.
   assert_eq!(body, expect.as_bytes());
   stub_task.await.unwrap();
+  stop_capture(capture).await;
+}
+
+fn cgroup_grant(port: u16, bundle: PathBuf) -> Grant {
+  Grant::Token {
+    credential: Credential {
+      label: "t".into(),
+      fake: "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+      value: secrecy::SecretString::from("ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    },
+    allow: vec![EndpointScope {
+      scheme: Scheme::Https,
+      host: "testcgroup.invalid".parse().unwrap(),
+      port,
+      client_cert: None,
+      client_key: None,
+      root_cert: Some(bundle),
+      guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+    }],
+    pattern: None,
+    oauth2: None,
+  }
+}
+
+fn resolved_with(grants: Vec<Grant>) -> ResolvedConfig {
+  ResolvedConfig {
+    proxy: ProxyCfg {
+      listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+      ca_file: None,
+      ssh_host_key: None,
+      ssh_known_hosts: None,
+      root_certs: Vec::new(),
+      handshake_timeout_secs: 10,
+    },
+    grants,
+    plugins: Vec::new(),
+  }
+}
+
+/// One captured request. Returns the bearer token the stub observed.
+async fn captured_bearer(
+  connector: &tokio_rustls::TlsConnector,
+  stub: &TcpListener,
+  acceptor: &tokio_rustls::TlsAcceptor,
+  dst: SocketAddr,
+) -> String {
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+  // The proxy dials the stub only after it has read SNI, and the stub's TLS
+  // handshake has to run alongside the client's. Waiting for `accept` before
+  // the client writes ClientHello never reaches the dial.
+  let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(dst))
+    .await
+    .unwrap()
+    .unwrap();
+  let server_name = rustls::pki_types::ServerName::try_from("testcgroup.invalid").unwrap();
+  let (mut server, mut client) = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::join!(
+      async {
+        let (conn, _) = stub.accept().await.unwrap();
+        acceptor.accept(conn).await.unwrap()
+      },
+      async { connector.connect(server_name, tcp).await.unwrap() },
+    )
+  })
+  .await
+  .unwrap();
+  client
+    .write_all(b"GET /x HTTP/1.1\r\nHost: testcgroup.invalid\r\nAuthorization: Bearer ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n")
+    .await
+    .unwrap();
+  let mut head = Vec::new();
+  let mut chunk = [0u8; 4096];
+  while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+    let n = server.read(&mut chunk).await.unwrap();
+    head.extend_from_slice(&chunk[..n]);
+  }
+  let head_str = String::from_utf8(head).unwrap();
+  let bearer = head_str
+    .split("Bearer ")
+    .nth(1)
+    .and_then(|rest| rest.split(['\r', ' ']).next())
+    .unwrap_or("")
+    .to_string();
+  let body = format!("echo:{bearer}");
+  server
+    .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+    .await
+    .unwrap();
+  let _ = server.shutdown().await;
+  let mut resp = vec![0u8; 64];
+  let _ = client.read(&mut resp).await;
+  bearer
+}
+
+/// A registered cgroup substitutes. An unregistered cgroup of the same process
+/// splices the empty base snapshot, so the stub sees the fake.
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes)"]
+async fn ebpf_live_cgroup_selects_the_project() {
+  const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const DST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 17);
+
+  let _live = LIVE_LOCK.lock().await;
+  arkham_pki::ca::install_crypto_provider();
+  let ca = arkham_pki::ca::CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let bundle = dir.path().join("arkham-ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let ca_der = ca.cert_der().clone();
+  let stub_cert = arkham_pki::ca::generate_domain_cert("testcgroup.invalid", &ca).unwrap();
+  let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&stub_cert.server_config));
+  let stub = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await.unwrap();
+  let stub_port = stub.local_addr().unwrap().port();
+  let state = state_with(Vec::new(), &ca);
+  let home = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+  let home = home.lines().find_map(|line| line.strip_prefix("0::")).unwrap();
+  let home = std::path::Path::new("/sys/fs/cgroup").join(home.trim_start_matches('/'));
+  let parent = TestCgroup::create("cgroup-select");
+  let registered = parent.path().join("registered");
+  let other = parent.path().join("other");
+  std::fs::create_dir(&registered).unwrap();
+  std::fs::create_dir(&other).unwrap();
+  let registered_id = {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(&registered).unwrap().ino()
+  };
+  state
+    .register_project(registered_id, resolved_with(vec![cgroup_grant(stub_port, bundle)]), &ca)
+    .unwrap();
+
+  let capture = attach_capture(
+    &parent,
+    Arc::clone(&state),
+    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, stub_port))),
+    Vec::new(),
+    None,
+  )
+  .await;
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(ca_der).unwrap();
+  let connector = tokio_rustls::TlsConnector::from(Arc::new(
+    rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth(),
+  ));
+  let dst = SocketAddr::from((DST, stub_port));
+
+  std::fs::write(registered.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+  let saw = captured_bearer(&connector, &stub, &acceptor, dst).await;
+  assert_eq!(saw, VALUE);
+
+  std::fs::write(other.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+  let saw = captured_bearer(&connector, &stub, &acceptor, dst).await;
+  assert_eq!(saw, FAKE);
+
+  std::fs::write(home.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+  std::fs::remove_dir(&registered).unwrap();
+  std::fs::remove_dir(&other).unwrap();
   stop_capture(capture).await;
 }
 

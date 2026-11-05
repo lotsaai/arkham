@@ -8,11 +8,9 @@ mod layers;
 
 pub use error::Error;
 
-#[cfg(test)]
-use std::path::Path;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::path::Path;
 
 use arkham_config::config::{AppConfig, IfMissing, RuleCfg};
 use arkham_config::registry::{Registry, authority_of};
@@ -66,7 +64,23 @@ impl FnoxSource {
   /// Returns an error when a discovered config file is malformed, when its
   /// profiles are unresolvable, or when fnox cannot list its declared secrets.
   pub fn open() -> Result<Option<Self>, Error> {
-    let Some(config) = discovered_or_none(crate::layers::discover())? else {
+    Self::from_discovered(crate::layers::discover())
+  }
+
+  /// Open the chain discovered from `start`, or `None` when no config exists.
+  ///
+  /// The host daemon prepares a project whose root is not the process cwd.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when a discovered config file is malformed, when its
+  /// profiles are unresolvable, or when fnox cannot list its declared secrets.
+  pub fn open_from(start: &Path) -> Result<Option<Self>, Error> {
+    Self::from_discovered(crate::layers::discover_from(start))
+  }
+
+  fn from_discovered(found: fnox_core::Result<fnox_core::config::Config>) -> Result<Option<Self>, Error> {
+    let Some(config) = discovered_or_none(found)? else {
       return Ok(None);
     };
     let profiles = active_profiles(&config)?;

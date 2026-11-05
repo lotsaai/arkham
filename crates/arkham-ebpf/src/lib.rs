@@ -794,6 +794,23 @@ pub(crate) struct FlowKey {
 // SAFETY: `repr(C)`, integer fields only.
 unsafe impl aya::Pod for FlowKey {}
 
+/// Value of the `FLOW` map: the socket cookie and the connecting cgroup.
+///
+/// Duplicated from `arkham-ebpf-programs::FlowRecord`. The programs crate
+/// cannot export a type the host links against.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FlowRecord {
+  /// Socket cookie, the key into `ORIG_DST`.
+  pub cookie: u64,
+  /// Cgroup id of the process that connected. Zero when the kernel reported
+  /// none.
+  pub cgroup_id: u64,
+}
+
+// SAFETY: `repr(C)`, two `u64` fields, no padding.
+unsafe impl aya::Pod for FlowRecord {}
+
 impl FlowKey {
   /// Key for a connection whose peer address is `peer`, as reported by
   /// `accept()` or `recv_from()`. The hook records the client's local 4-tuple,
@@ -987,6 +1004,11 @@ mod tests {
     assert_eq!(offset_of!(FlowKey, ip), 0);
     assert_eq!(offset_of!(FlowKey, port), 4);
     assert_eq!(offset_of!(FlowKey, _pad), 6);
+
+    assert_eq!(size_of::<FlowRecord>(), 16);
+    assert_eq!(align_of::<FlowRecord>(), 8);
+    assert_eq!(offset_of!(FlowRecord, cookie), 0);
+    assert_eq!(offset_of!(FlowRecord, cgroup_id), 8);
 
     assert_eq!(size_of::<OrigDst>(), 12);
     assert_eq!(offset_of!(OrigDst, ip), 0);

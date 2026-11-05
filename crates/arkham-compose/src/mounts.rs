@@ -92,6 +92,10 @@ pub(crate) struct Layout {
   home: String,
   /// The host home, when resolvable.
   host_home: Option<PathBuf>,
+  /// Directory rewritten files are written under. `None` uses the compose
+  /// state directory. Host sessions pass a scratch directory that is removed
+  /// when the session ends.
+  scratch: Option<PathBuf>,
 }
 
 /// Split a trailing `:ro` or `:rw` off an include entry; bare paths are rw.
@@ -115,7 +119,19 @@ impl Layout {
       root: root.to_path_buf(),
       home,
       host_home,
+      scratch: None,
     }
+  }
+
+  /// Write rewritten files under `scratch` instead of the compose state directory.
+  pub(crate) fn with_scratch(mut self, scratch: PathBuf) -> Self {
+    self.scratch = Some(scratch);
+    self
+  }
+
+  /// Directory material for this run lives in.
+  fn material_dir(&self) -> PathBuf {
+    self.scratch.clone().unwrap_or_else(|| self.state_dir())
   }
 
   /// The absolute workspace root.
@@ -140,12 +156,12 @@ impl Layout {
 
   /// State directory the rewritten files land in.
   pub(crate) fn files_dir(&self) -> PathBuf {
-    self.state_dir().join("files")
+    self.material_dir().join("files")
   }
 
   /// Guest pairs mint here; the adapters read them back for the decoy.
   pub(crate) fn guests_dir(&self) -> PathBuf {
-    self.state_dir().join("guests")
+    self.material_dir().join("guests")
   }
 
   /// Mounts for the workspace root and `[workspace] include`, deepest path
