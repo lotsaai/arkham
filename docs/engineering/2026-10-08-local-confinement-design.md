@@ -30,7 +30,7 @@ The wrapper's cwd is configuration, not authorization. It links the session's pi
 
 A profile names readable paths and writable paths for one workspace execution. Modes are `read-only` (deny writes, keep the `/dev/null` sink shells require) and `workspace-write` (writable workspace root plus a backend-defined temp area). A third spelling, `danger-full-access`, drops filesystem write and read restrictions only (no Landlock, Seatbelt, or token policy). It is orthogonal to secret protection: decoy env, forged secret files (`fnox.toml`, `fnox.*.toml`), and transparent capture still apply, so the agent still never holds a real secret. Network and process visibility stay outside this vocabulary: the network is governed by capture, not by policy flags. One shared helper derives the writable set, and every renderer plus every test reads that helper. No renderer invents its own roots.
 
-Renderers are per OS, selected by platform first and functional probe second. Linux tries bwrap, then the Landlock launcher. macOS uses Seatbelt. Windows uses the restricted-token runner. Each candidate probes once with the real profile (`true` under it, exit 0 wins) and the verdict caches for the process lifetime. A platform with no usable runner refuses to start the agent. There is no proxy-only fallback flag. An operator `runnerCommand` override may assert its own enforcement and skip probes.
+Renderers are per OS, selected by platform first and functional probe second. Linux runs bubblewrap. Landlock adds restrictions inside that sandbox and does not launch a process on its own. macOS uses Seatbelt. Windows uses the restricted-token runner. Bubblewrap probes once with the real profile (`true` under it, exit 0 wins). A failed probe refuses to start the agent. There is no proxy-only fallback flag. An operator `runnerCommand` override may assert its own enforcement and skip probes.
 
 Enforcement is a reported fact. Backends return `full` or `partial`. Older Landlock ABIs report partial. Windows reports partial for hard-link aliasing and unconfined reads. Callers that need an absolute boundary reject partial. Nothing claims full without a passing probe.
 
@@ -119,7 +119,7 @@ bwrap \
   -- <shell-or-command>
 ```
 
-No `HTTP_PROXY` variables appear. Landlock is the chain fallback with `--ro / --rw <roots>` grants from the same profile. `read-only` mode drops the workspace bind and the tmpfs.
+No `HTTP_PROXY` variables appear. Landlock, when the kernel enforces it, adds read and write rules from the same profile inside the bubblewrap process. `read-only` mode drops the workspace bind and the tmpfs.
 
 macOS emits SBPL from the shared writable roots as a second layer under the `arkham` user and the FUSE projection (see the macOS section):
 

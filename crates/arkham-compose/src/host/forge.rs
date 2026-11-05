@@ -35,9 +35,7 @@ pub(crate) fn projection_files(workspace: &Path) -> Result<Vec<PathBuf>, Error> 
   if let Some(global) = fnox_config_dir() {
     for name in ["config.toml", "age.txt"] {
       let path = global.join(name);
-      if path.is_file() {
-        push_unique(&mut out, path);
-      }
+      consider(&mut out, path);
     }
   }
   let mut index = 0;
@@ -63,11 +61,27 @@ fn push_dir(out: &mut Vec<PathBuf>, dir: &Path) -> Result<(), Error> {
     let Some(name) = name.to_str() else {
       continue;
     };
-    if is_fnox_config_name(name) && entry.path().is_file() {
-      push_unique(out, entry.path());
+    if is_fnox_config_name(name) {
+      consider(out, entry.path());
     }
   }
   Ok(())
+}
+
+fn consider(out: &mut Vec<PathBuf>, path: PathBuf) {
+  let Ok(meta) = std::fs::symlink_metadata(&path) else {
+    return;
+  };
+  if meta.file_type().is_symlink() {
+    push_unique(out, path.clone());
+    if let Ok(target) = std::fs::canonicalize(&path) {
+      push_unique(out, target);
+    }
+    return;
+  }
+  if meta.is_file() {
+    push_unique(out, path);
+  }
 }
 
 fn push_unique(out: &mut Vec<PathBuf>, path: PathBuf) {
@@ -137,17 +151,59 @@ pub(crate) fn forged_bytes(path: &Path) -> Vec<u8> {
   }
 }
 
-/// Map `(device, inode)` to every non-directory path on `devices`.
+/// Directories whose trees may contain a hard link of a projected file.
 ///
-/// Directories on any other device are not entered, so `/proc`, `/sys`, and
-/// `/dev` drop out when the secret files live on the root filesystem.
+/// The workspace, the fnox config directory, and the directory of each
+/// projected path. A root nested under one already listed is dropped.
 #[must_use]
-pub(crate) fn inode_index(devices: &HashSet<u64>) -> HashMap<(u64, u64), Vec<PathBuf>> {
+pub(crate) fn scan_roots(workspace: &Path, projected: &[PathBuf]) -> Vec<PathBuf> {
+  let mut roots = vec![workspace.to_path_buf()];
+  if let Some(dir) = fnox_config_dir() {
+    roots.push(dir);
+  }
+  for path in projected {
+    if let Some(parent) = path.parent() {
+      roots.push(parent.to_path_buf());
+    }
+  }
+  roots.sort();
+  let mut kept = Vec::new();
+  for root in roots {
+    if kept.iter().any(|earlier: &PathBuf| root.starts_with(earlier)) {
+      continue;
+    }
+    kept.push(root);
+  }
+  kept
+}
+
+/// Map `(device, inode)` to regular files under `roots` on `devices`.
+///
+/// Directories on any other device are not entered. Symlinks are not entered
+/// and are not indexed: the projection lists the link path itself, and the
+/// target is indexed when its directory is one of `roots`.
+#[must_use]
+pub(crate) fn inode_index(devices: &HashSet<u64>, roots: &[PathBuf]) -> HashMap<(u64, u64), Vec<PathBuf>> {
   let mut index = HashMap::new();
   if devices.is_empty() {
     return index;
   }
-  let mut pending = vec![PathBuf::from("/")];
+  let mut pending = Vec::new();
+  for root in roots {
+    let Ok(meta) = std::fs::symlink_metadata(root) else {
+      continue;
+    };
+    if !devices.contains(&meta.dev()) || meta.file_type().is_symlink() {
+      continue;
+    }
+    if meta.is_dir() {
+      pending.push(root.clone());
+      continue;
+    }
+    if meta.is_file() {
+      index.entry((meta.dev(), meta.ino())).or_default().push(root.clone());
+    }
+  }
   while let Some(dir) = pending.pop() {
     let Ok(entries) = std::fs::read_dir(&dir) else {
       continue;
@@ -173,7 +229,7 @@ pub(crate) fn inode_index(devices: &HashSet<u64>) -> HashMap<(u64, u64), Vec<Pat
 /// Paths in `index` that share `target`'s inode, excluding `target` itself.
 #[must_use]
 pub(crate) fn indexed_aliases(index: &HashMap<(u64, u64), Vec<PathBuf>>, target: &Path) -> Vec<PathBuf> {
-  let Ok(meta) = std::fs::symlink_metadata(target) else {
+  let Ok(meta) = std::fs::metadata(target) else {
     return Vec::new();
   };
   index
@@ -238,6 +294,14 @@ mod tests {
     let aliases = inode_aliases(root.path(), &real);
     assert!(aliases.contains(&hard));
     assert!(!aliases.iter().any(|path| path == &link));
+    let outside = tempfile::tempdir().unwrap();
+    let outside_hard = outside.path().join("hard.toml");
+    std::fs::hard_link(&real, &outside_hard).unwrap();
+    let meta = std::fs::metadata(&real).unwrap();
+    let index = inode_index(&HashSet::from([meta.dev()]), &[root.path().to_path_buf()]);
+    let names = index.get(&(meta.dev(), meta.ino())).unwrap();
+    assert!(names.contains(&real) && names.contains(&hard), "{names:?}");
+    assert!(!names.iter().any(|path| path.starts_with(outside.path())), "{names:?}");
     let forged = forged_bytes(&real);
     assert!(
       !forged
@@ -262,5 +326,29 @@ mod tests {
     assert!(files.iter().any(|path| path.ends_with(".fnox.local.toml")));
     assert!(files.iter().any(|path| path.ends_with("fnox.toml")));
     assert!(files.iter().any(|path| path == &age));
+  }
+
+  #[test]
+  fn a_symlinked_fnox_toml_projects_the_link_the_target_and_its_hard_links() {
+    let root = tempfile::tempdir().unwrap();
+    let vault = root.path().join("vault");
+    std::fs::create_dir(&vault).unwrap();
+    let real = vault.join("real.toml");
+    std::fs::write(&real, "# REAL_SECRET_VALUE\n").unwrap();
+    let link = root.path().join("fnox.toml");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let hard = vault.join("alias.toml");
+    std::fs::hard_link(&real, &hard).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::hard_link(&real, outside.path().join("alias.toml")).unwrap();
+    let files = projection_files(root.path()).unwrap();
+    assert!(files.iter().any(|path| path == &link), "{files:?}");
+    assert!(files.iter().any(|path| path == &real), "{files:?}");
+    let mut devices = HashSet::new();
+    devices.insert(std::fs::metadata(&real).unwrap().dev());
+    let index = inode_index(&devices, &scan_roots(root.path(), &files));
+    let aliases = indexed_aliases(&index, &link);
+    assert!(aliases.iter().any(|path| path == &hard), "{aliases:?}");
+    assert!(aliases.iter().all(|path| path.starts_with(root.path())), "{aliases:?}");
   }
 }

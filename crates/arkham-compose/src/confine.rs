@@ -757,11 +757,18 @@ impl CliCommand for AgentArgs {
   /// Returns an error when the workspace cannot be resolved, generated, or
   /// started, plus when the compose command fails. A failed `rm` teardown is
   /// reported too, because the stack the caller asked to stop is still up.
-  /// `--isolate bwrap` registers with the host daemon and launches under
-  /// bubblewrap or Landlock instead of compose.
+  /// `--isolate bwrap` registers the workspace with the host daemon and
+  /// launches under bubblewrap instead of compose.
   async fn run(self, _cli: &Cli, arkham_version: &str) -> Result<(), Self::Error> {
     if self.isolate == Isolate::Bwrap {
-      return crate::host::run_agent(self.write_profile, &self.command).await;
+      #[cfg(target_os = "linux")]
+      {
+        return crate::host::run_agent(self.write_profile, self.workspace.as_deref(), &self.command).await;
+      }
+      #[cfg(not(target_os = "linux"))]
+      {
+        return crate::host::run_agent(self.write_profile, self.workspace.as_deref(), &self.command);
+      }
     }
     let workspace = Workspace::resolve(self.workspace.as_deref())?;
     init_workspace(&workspace, resolve_backend(None)?, false, arkham_version).await?;

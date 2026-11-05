@@ -74,7 +74,7 @@ Linux only. One loopback proxy and a per-user control socket for host-confined a
 
 The whole lifecycle in one idempotent run: what `init` does, then `up`, then the configured shell (or `COMMAND`) in the agent. The stack keeps running when that exits, so the next call starts at the exec. `--rm` stops the stack instead: teardown runs after the shell or command exits, including when the terminal's interrupt ends it.
 
-`--isolate` defaults to `compose`. `--isolate bwrap` (Linux) does not start a stack. It requires a running `arkham daemon`, then runs `COMMAND` with decoy environment and forged secret files. `--write-profile` is `workspace-write` (the default), `read-only`, or `danger-full-access`. Stderr reports `enforcement: full` or `enforcement: partial`. With no daemon, the command starts nothing.
+`--isolate` defaults to `compose`. `--isolate bwrap` (Linux) does not start a stack. It requires a running `arkham daemon`, then runs `COMMAND` with decoy environment and forged secret files. `--write-profile` is `workspace-write` (the default), `read-only`, or `danger-full-access`. Stderr reports `runner: bwrap` and `enforcement: full` or `enforcement: partial`. With no daemon, or when bubblewrap cannot run the profile, the command starts nothing.
 
 ## `arkham up [WORKSPACE]`
 
