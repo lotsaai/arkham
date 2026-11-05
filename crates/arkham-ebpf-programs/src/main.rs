@@ -8,8 +8,9 @@
 //!    and not already loopback, the real destination is recorded under the
 //!    socket cookie and the destination rewritten to `127.0.0.1:<listener>`.
 //! 2. `capture_egress` fires as the redirected packet leaves the machine and
-//!    indexes the socket cookie by the client's local 4-tuple, which is what
-//!    arkham's listener later sees as its peer address.
+//!    indexes the socket cookie, plus the cgroup id `connect4` stored, by the
+//!    client's local 4-tuple. That tuple is what arkham's listener later sees
+//!    as its peer address.
 //! 3. `recvmsg4` rewrites the *source* address a connected UDP socket observes,
 //!    so replies that physically come from arkham's listener still look like
 //!    they came from the address the client connected to.
@@ -83,12 +84,17 @@ pub struct Config {
 /// verifier, where a variable-length map would cost a second lookup path.
 pub const MAX_BYPASS: usize = 8;
 
-/// Original destination recorded before the rewrite. Both fields keep the
-/// kernel's own encodings — `user_ip4` and `user_port` are network byte order —
-/// so `recvmsg4` can write them straight back into the context.
+/// Original destination recorded before the rewrite. The address fields keep
+/// the kernel's own encodings — `user_ip4` and `user_port` are network byte
+/// order — so `recvmsg4` can write them straight back into the context.
 ///
-/// `proto` is followed by explicit padding rather than `repr(C)`'s implicit
-/// padding, so the bytes userspace reads are the bytes the kernel wrote.
+/// `cgroup_id` is sampled in `connect()`, which runs in the connecting task.
+/// `capture_egress` copies that field. A later packet, including a softirq
+/// retransmit, must not replace it with whichever task happens to be current.
+///
+/// Padding is explicit. A `u64` after `proto` would otherwise sit at offset 16
+/// with four compiler-inserted bytes in between, and userspace would disagree
+/// about the size.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct OrigDst {
@@ -99,8 +105,10 @@ pub struct OrigDst {
   /// `IPPROTO_TCP` or `IPPROTO_UDP`. Kept so userspace can reject a flow whose
   /// socket has been reused for the other protocol.
   pub proto: u8,
-  /// Padding, always zero.
-  pub _pad: [u8; 3],
+  /// Padding, always zero. Seven bytes put `cgroup_id` at offset 16.
+  pub _pad: [u8; 7],
+  /// Cgroup id of the connecting task, from `bpf_get_current_cgroup_id`.
+  pub cgroup_id: u64,
 }
 
 /// Flow key: the client's local 4-tuple, which is the peer address arkham's
@@ -284,11 +292,15 @@ fn redirect(ctx: &SockAddrContext, listener_port: u32) -> i32 {
   if cookie == 0 {
     return 1;
   }
+  // SAFETY: querying the current cgroup id has no preconditions. This hook
+  // runs in the connecting task, which is the id the project registry keys.
+  let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
   let orig = OrigDst {
     ip,
     port,
     proto: protocol as u8,
-    _pad: [0; 3],
+    _pad: [0; 7],
+    cgroup_id,
   };
   if ORIG_DST.insert(cookie, orig, 0).is_err() {
     return 1;
@@ -379,8 +391,10 @@ pub fn recvmsg4(ctx: SockAddrContext) -> i32 {
 /// destination.
 ///
 /// Only flows that `connect4` actually redirected are recorded — hence the
-/// `ORIG_DST` presence check — so unconnected UDP (typical DNS) keeps its own
-/// addressing and is never touched.
+/// `ORIG_DST` lookup — so unconnected UDP (typical DNS) keeps its own
+/// addressing and is never touched. The cgroup id is copied from that record
+/// rather than sampled here: egress can run in softirq, where `current` is
+/// not the connecting task.
 #[cgroup_skb(egress)]
 pub fn capture_egress(ctx: SkBuffContext) -> i32 {
   if is_proxy() {
@@ -394,19 +408,23 @@ pub fn capture_egress(ctx: SkBuffContext) -> i32 {
   if cookie == 0 {
     return 1;
   }
-  // SAFETY: the presence check only reads the entry; the cookie is not
-  // dereferenced and no mutable borrow escapes.
-  let redirected = unsafe { ORIG_DST.get(cookie) }.is_some();
-  if !redirected {
+  // SAFETY: the entry is copied out before use. The cgroup id inside it was
+  // stored by `connect4`, so this insert does not sample `current`.
+  let Some(orig) = (unsafe { ORIG_DST.get(cookie) }) else {
     return 1;
-  }
+  };
   let key = FlowKey {
     ip: ctx.skb.local_ipv4(),
     port: ctx.skb.local_port() as u16,
     _pad: [0; 2],
   };
-  // SAFETY: querying the current cgroup id has no preconditions.
-  let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
-  let _ = FLOW.insert(key, FlowRecord { cookie, cgroup_id }, 0);
+  let _ = FLOW.insert(
+    key,
+    FlowRecord {
+      cookie,
+      cgroup_id: orig.cgroup_id,
+    },
+    0,
+  );
   1
 }
