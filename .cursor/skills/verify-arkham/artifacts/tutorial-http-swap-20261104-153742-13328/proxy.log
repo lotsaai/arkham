@@ -1,0 +1,6 @@
+  2026-11-04T23:37:42.619452Z  INFO arkham_fnox: rule resolved, label: "demo", env: DEMO_TOKEN, hosts: 1, value: "inline"
+    at crates/arkham-fnox/src/lib.rs:407 on main
+
+  2026-11-04T23:37:42.753331Z  INFO arkham: serving, listen: 127.0.0.1:56811, grants: 1
+    at src/main.rs:212 on main
+

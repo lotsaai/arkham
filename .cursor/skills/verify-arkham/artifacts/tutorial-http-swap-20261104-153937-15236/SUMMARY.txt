@@ -1,0 +1,10 @@
+feature: credential-swap
+entry: helpers/tutorial-http-swap.sh
+decoy: f92b2afa339693227aa209aac3eb48f9
+client_body: upstream saw: Bearer f92b2afa339693227aa209aac3eb48f9
+upstream_seen: Bearer real-secret-xxxxxxxxxxxxxxxxxxxx
+listen: 127.0.0.1:56959
+upstream: 127.0.0.1:56960
+arkham: /Users/ivan/github/lotsaai/arkham/target/debug/arkham
+work: /var/folders/nh/vvv2q4b10vzdgwkr8m4z_kq40000gn/T//arkham-verify-20261104-153937-15236.V7qDC0 (removed unless KEEP_WORK=1)
+result: PASS
