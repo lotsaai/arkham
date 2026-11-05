@@ -32,22 +32,47 @@ pub struct HandoffListener {
 /// reads getpeereid on macOS/BSD and `SO_PEERCRED` on Linux. This is not a
 /// TCP listener and not a shared secret.
 ///
-/// An existing file at `path` is removed first. The socket file is mode
-/// `0o600` after bind.
+/// If a live process already owns `path`, this fails instead of replacing
+/// it. A leftover socket file after a crash (nothing accepting) is replaced.
+/// The socket file is mode `0o600` after bind.
 ///
 /// # Errors
 ///
-/// Returns an error when the path cannot be replaced, bound, or chmod'd.
+/// Returns an error when the path cannot be bound or chmod'd, or when a
+/// live peer already owns the socket.
 pub async fn bind_handoff(path: impl AsRef<Path>, allowed_uid: u32) -> Result<HandoffListener, Error> {
   let path = path.as_ref();
-  match std::fs::remove_file(path) {
-    Ok(()) => {}
-    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+  let listener = match UnixListener::bind(path) {
+    Ok(listener) => listener,
+    Err(err) if err.kind() == io::ErrorKind::AddrInUse => bind_replacing_stale(path).await?,
     Err(err) => return Err(err.into()),
-  }
-  let listener = UnixListener::bind(path)?;
+  };
   std::fs::set_permissions(path, Permissions::from_mode(0o600))?;
   Ok(HandoffListener { listener, allowed_uid })
+}
+
+/// Replace a leftover socket that nothing is accepting, or fail if a live
+/// peer still owns the path.
+async fn bind_replacing_stale(path: &Path) -> Result<UnixListener, Error> {
+  match UnixStream::connect(path).await {
+    Ok(_live) => Err(
+      io::Error::new(
+        io::ErrorKind::AddrInUse,
+        format!("handoff socket {} is already in use", path.display()),
+      )
+      .into(),
+    ),
+    Err(err) if err.kind() == io::ErrorKind::ConnectionRefused => {
+      match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+      }
+      Ok(UnixListener::bind(path)?)
+    }
+    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(UnixListener::bind(path)?),
+    Err(err) => Err(err.into()),
+  }
 }
 
 /// Serve handoff connections until the listener stops.
@@ -250,6 +275,10 @@ where
   }
 }
 
+/// PROXY protocol v1 maximum header length, including CRLF.
+/// Matches rama-haproxy's private `MAX_LENGTH`.
+const MAX_HEADER_BYTES: usize = 107;
+
 async fn read_header_inner<G>(mut stream: G) -> Result<Handoff<G>, Error>
 where
   G: AsyncRead + Unpin,
@@ -258,11 +287,17 @@ where
   loop {
     match classify(&buf) {
       Prefix::Pending => {
-        // Socket read size, not a header limit. Classify runs on whatever
-        // this returns. A short rejected preamble has to leave the socket
-        // before the close, or the client sees a reset instead of EOF.
-        let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
+        if buf.len() >= MAX_HEADER_BYTES {
+          return Ok(Handoff::Close(CloseReason::Malformed));
+        }
+        let space = MAX_HEADER_BYTES - buf.len();
+        let mut chunk = [0u8; MAX_HEADER_BYTES];
+        let Some(dest) = chunk.get_mut(..space) else {
+          return Ok(Handoff::Close(CloseReason::Malformed));
+        };
+        // A short rejected preamble has to leave the socket before the
+        // close, or the client sees a reset instead of EOF.
+        let n = stream.read(dest).await?;
         if n == 0 {
           let reason = if buf.is_empty() {
             CloseReason::MissingHeader
@@ -271,7 +306,7 @@ where
           };
           return Ok(Handoff::Close(reason));
         }
-        let Some(got) = chunk.get(..n) else {
+        let Some(got) = dest.get(..n) else {
           return Ok(Handoff::Close(CloseReason::Malformed));
         };
         buf.extend_from_slice(got);
@@ -296,7 +331,7 @@ mod tests {
   use std::pin::Pin;
   use std::task::{Context, Poll};
 
-  use tokio::io::ReadBuf;
+  use tokio::io::{AsyncWriteExt as _, ReadBuf};
 
   use super::*;
 
@@ -394,5 +429,51 @@ mod tests {
     let mut cr_without_lf = vec![b'P'; too_long.len().saturating_add(1)];
     cr_without_lf.push(b'\r');
     assert_eq!(classify(&cr_without_lf), Prefix::Pending);
+  }
+
+  fn test_uid() -> u32 {
+    let (server, _client) = UnixStream::pair().unwrap();
+    server.peer_cred().unwrap().uid()
+  }
+
+  #[tokio::test]
+  async fn bind_handoff_does_not_steal_a_live_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("handoff.sock");
+    let first = bind_handoff(&path, test_uid()).await.unwrap();
+    let stolen = bind_handoff(&path, test_uid()).await;
+    assert!(stolen.is_err(), "a second bind must not take a live handoff socket");
+    UnixStream::connect(&path)
+      .await
+      .expect("the original listener must still own the socket path");
+    drop(first);
+  }
+
+  #[tokio::test]
+  async fn bind_handoff_replaces_a_stale_socket_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("handoff.sock");
+    let first = bind_handoff(&path, test_uid()).await.unwrap();
+    drop(first);
+    assert!(path.exists());
+    let second = bind_handoff(&path, test_uid())
+      .await
+      .expect("a leftover socket after the listener drops must be replaceable");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    drop(second);
+  }
+
+  #[tokio::test]
+  async fn oversized_header_ending_in_cr_without_lf_is_malformed() {
+    let (server, mut client) = UnixStream::pair().unwrap();
+    let mut payload = vec![b'P'; 200];
+    payload.push(b'\r');
+    client.write_all(&payload).await.unwrap();
+    let decided = read_header(server, Duration::from_secs(1)).await.unwrap();
+    assert!(
+      matches!(decided, Handoff::Close(CloseReason::Malformed)),
+      "an oversized header that ends in CR without LF must fail closed"
+    );
   }
 }
