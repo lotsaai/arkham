@@ -18,6 +18,7 @@ use arkham_pki::ca::{CertAuthority, load_or_generate};
 use arkham_proxy::{ProxyState, bind_explicit, serve};
 use confique::Config as _;
 use eyre::WrapErr as _;
+use rustix::process::getuid;
 use tokio::io::AsyncReadExt as _;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -102,8 +103,7 @@ async fn one_client(
   version: &str,
 ) -> eyre::Result<()> {
   let cred = stream.peer_cred()?;
-  // SAFETY: `getuid` takes no arguments and cannot fail.
-  let daemon_uid = unsafe { libc::getuid() };
+  let daemon_uid = getuid().as_raw();
   if !peer_uid_allowed(cred.uid(), daemon_uid) {
     reject(&mut stream, "control client is not the daemon user").await?;
     return Ok(());
