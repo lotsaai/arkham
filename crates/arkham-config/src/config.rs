@@ -806,16 +806,20 @@ fn global_config_path() -> Option<PathBuf> {
 /// command-line tools keep theirs.
 #[must_use]
 pub fn user_config_dirs() -> Vec<PathBuf> {
-  let mut roots: Vec<PathBuf> = dirs::config_dir().into_iter().collect();
-  #[cfg(target_os = "macos")]
-  if let Ok(xdg) = etcetera::base_strategy::Xdg::new() {
-    use etcetera::BaseStrategy as _;
-    let xdg = xdg.config_dir();
-    if !roots.contains(&xdg) {
-      roots.push(xdg);
-    }
-  }
-  roots
+  let platform = dirs::config_dir();
+  let xdg = xdg_config_dir().filter(|xdg| platform.as_ref() != Some(xdg));
+  platform.into_iter().chain(xdg).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn xdg_config_dir() -> Option<PathBuf> {
+  use etcetera::BaseStrategy as _;
+  etcetera::base_strategy::Xdg::new().ok().map(|xdg| xdg.config_dir())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn xdg_config_dir() -> Option<PathBuf> {
+  None
 }
 
 /// `relative` under the first per-user config root that holds it, else under
