@@ -37,7 +37,7 @@ include = ["~/.config/mise:ro", "../sibling-project"]
 | --- | --- |
 | `home` | `$HOME` inside the agent container. Defaults to `/home/eng`. Host paths under your home directory translate into this prefix; other paths mount at their own location. |
 | `shell` | Shell `arkham agent` runs in the container when no command is given. Defaults to `sh`. |
-| `include` | Extra host paths the agent service mounts. `~` expands; relative paths resolve against the workspace root. A trailing `:ro` or `:rw` sets the mount mode, `rw` by default. Every path must exist: generation stops rather than let docker mount an empty directory in its place. |
+| `include` | Extra host paths the agent service mounts. `~` expands; relative paths resolve against the workspace root. A trailing `:ro` or `:rw` sets the mount mode, `rw` by default. Every path must exist, and `/`, your home directory, or an ancestor of the workspace is refused: generation stops rather than mount a wider tree or an empty directory. |
 | `name` | Compose project name. Defaults to a slug of the workspace path. |
 | `profile` | Isolated tool-config namespace in `profiles/`. Unset mounts `__shared__`. |
 
@@ -157,6 +157,7 @@ The generated file is fully baked: image names, the agent's uid, and every mount
 
 - `no compose layers for ...` — run `arkham init` first, or create one of the layer files.
 - `[workspace] include ... does not exist` — fix or drop the entry. Docker would mount an empty directory in its place, so generation stops instead.
+- `[workspace] include ... widens the workspace` — the entry is `/`, your home directory, or an ancestor of the workspace. Point it at the directory you meant, such as `~/.config/mise` or a sibling project.
 - `warning: could not prepare …ca.pem` — `[proxy] ca_file` points at a container path. That is fine when you mount the CA yourself in one of the compose layers instead.
 - `arkham: not root and no passwordless sudo` — the entrypoint could not refresh the system store, so nothing in the agent trusts arkham. Run the agent service as root (`user: "0"` in one of your compose layers), give that user passwordless sudo, or bake the certificate into the image — see [how to trust the CA](trust-the-ca.md).
 - An inner container will not start, or podman inside the agent exits with nothing on stderr — its storage directory is not writable by the uid the agent runs as. That is why generation makes `<state-dir>/arkham/ws/<slug>/containers`; if a layer points the volume at your own directory or a named volume, `chown` it to that uid once. On Ubuntu, an inner container that dies on mount or networking also needs `apparmor=unconfined` in `security_opt`, which the generated file already sets.

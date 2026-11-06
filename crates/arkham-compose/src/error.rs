@@ -34,6 +34,12 @@ pub enum Error {
     /// Missing entry.
     entry: PathBuf,
   },
+  /// A `[workspace] include` entry would mount a wider tree than the project.
+  #[error("[workspace] include `{}` widens the workspace", entry.display())]
+  IncludeWidens {
+    /// Entry that was refused.
+    entry: PathBuf,
+  },
   /// The arkham config directory does not resolve.
   #[error("{detail}")]
   ConfigDir {
@@ -463,6 +469,7 @@ impl Error {
       | Self::Fnox(_)
       | Self::Pki(_)
       | Self::IncludeMissing { .. }
+      | Self::IncludeWidens { .. }
       | Self::ConfigDir { .. }
       | Self::GuestCa { .. }
       | Self::ReadFile { .. }

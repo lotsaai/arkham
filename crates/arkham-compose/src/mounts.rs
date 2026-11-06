@@ -172,14 +172,22 @@ impl Layout {
   ///
   /// # Errors
   ///
-  /// Returns an error when an include names a path that does not exist.
+  /// Returns an error when an include names a path that does not exist, or
+  /// when that path is `/`, the home directory, or an ancestor of the
+  /// workspace or the home directory.
   pub(crate) fn include_mounts(&self, includes: &[PathBuf]) -> Result<Vec<Mount>, Error> {
+    let workspace = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+    let home = self.host_home.as_deref().and_then(|path| std::fs::canonicalize(path).ok());
     let mut entries = vec![(self.root.clone(), false)];
     for entry in includes {
       let (path, ro) = split_mode(entry);
       let host = expand(&path, &self.root, self.host_home.as_deref());
       if !host.exists() {
         return Err(Error::IncludeMissing { entry: entry.clone() });
+      }
+      let canonical = std::fs::canonicalize(&host)?;
+      if include_widens(&canonical, &workspace, home.as_deref()) {
+        return Err(Error::IncludeWidens { entry: entry.clone() });
       }
       entries.push((host, ro));
     }
@@ -296,6 +304,21 @@ impl Layout {
   }
 }
 
+/// Whether `include` would replace the sandbox root, the home directory, or
+/// an ancestor of either. `include`, `workspace`, and `home` are canonical.
+fn include_widens(include: &Path, workspace: &Path, home: Option<&Path>) -> bool {
+  if include == Path::new("/") {
+    return true;
+  }
+  if home.is_some_and(|home| include == home) {
+    return true;
+  }
+  if workspace.starts_with(include) && include != workspace {
+    return true;
+  }
+  home.is_some_and(|home| home.starts_with(include) && include != home)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -341,7 +364,13 @@ mod tests {
     std::fs::create_dir_all(&sibling).unwrap();
     std::fs::create_dir_all(&mise).unwrap();
     let layout = Layout::new(&root, "/home/eng".to_string(), Some(home.clone()));
-    for entry in [PathBuf::from("/"), PathBuf::from("~"), PathBuf::from(".."), PathBuf::from("../.."), home.clone()] {
+    for entry in [
+      PathBuf::from("/"),
+      PathBuf::from("~"),
+      PathBuf::from(".."),
+      PathBuf::from("../.."),
+      home.clone(),
+    ] {
       let err = layout.include_mounts(std::slice::from_ref(&entry)).unwrap_err();
       assert!(err.to_string().contains("widens"), "{entry:?}: {err}");
     }
