@@ -697,7 +697,8 @@ mod tests {
     let target = base.join("proj");
     std::fs::create_dir_all(&parent).unwrap();
     std::fs::create_dir_all(&target).unwrap();
-    std::fs::write(target.join("fnox.toml"), "[providers]\n").unwrap();
+    std::fs::create_dir(target.join(".git")).unwrap();
+    std::fs::write(parent.join("fnox.toml"), "[providers]\n").unwrap();
     let link = parent.join("work");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 

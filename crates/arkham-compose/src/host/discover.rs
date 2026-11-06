@@ -7,7 +7,6 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::workspace_root;
-use arkham_config::is_fnox_config_name;
 
 #[cfg(target_os = "linux")]
 use crate::Error;
@@ -43,8 +42,10 @@ pub fn cgroup_is_confined(path: &str) -> bool {
 /// Resolve the project root for a wrapper that started in `start`.
 ///
 /// `start` is canonicalized before the walk, so a directory symlink is the
-/// target tree. The walk stops at the nearest registered root and never
-/// returns `/`. The result contains that canonical path.
+/// target tree. The project is the code-workspace root that contains that
+/// path. A registered root is the ceiling and the fallback when no marker
+/// is found. A fnox file does not choose the root. The result contains the
+/// canonical path and is never `/`.
 #[must_use]
 pub fn project_root(start: &Path, registered: &[PathBuf]) -> Option<PathBuf> {
   let canonical = canonicalize_dir(start).ok()?;
@@ -53,17 +54,11 @@ pub fn project_root(start: &Path, registered: &[PathBuf]) -> Option<PathBuf> {
   }
   let registered = canonical_roots(registered);
   let ceiling = nearest_registered(&canonical, &registered);
-  let found = nearest_fnox_dir(&canonical, ceiling.as_deref()).and_then(|marker| {
-    let resolved = workspace_root(&marker).unwrap_or_else(|| marker.clone());
-    root_containing(resolved, &canonical, ceiling.as_deref()).or_else(|| root_containing(marker, &canonical, ceiling.as_deref()))
-  });
-  found
+  let project = workspace_root(&canonical).and_then(|root| root_containing(root, &canonical, ceiling.as_deref()));
+  project
     .or(ceiling)
     .and_then(|chosen| root_containing(chosen, &canonical, None))
-    .or_else(|| {
-      let resolved = workspace_root(&canonical).unwrap_or_else(|| canonical.clone());
-      root_containing(resolved, &canonical, None).or_else(|| root_containing(canonical.clone(), &canonical, None))
-    })
+    .or_else(|| root_containing(canonical.clone(), &canonical, None))
 }
 
 #[cfg(target_os = "linux")]
@@ -112,51 +107,6 @@ fn root_containing(candidate: PathBuf, canonical: &Path, ceiling: Option<&Path>)
   canonical.starts_with(&resolved).then_some(resolved)
 }
 
-fn nearest_fnox_dir(start: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
-  let mut dir = Some(start.to_path_buf());
-  while let Some(current) = dir {
-    if current.as_path() == Path::new("/") {
-      return None;
-    }
-    if dir_has_fnox(&current) {
-      return Some(current);
-    }
-    if ceiling.is_some_and(|ceiling| current == ceiling) {
-      return None;
-    }
-    dir = current.parent().map(Path::to_path_buf);
-  }
-  None
-}
-
-fn dir_has_fnox(dir: &Path) -> bool {
-  let Ok(entries) = std::fs::read_dir(dir) else {
-    return false;
-  };
-  for entry in entries.flatten() {
-    let name = entry.file_name();
-    let Some(name) = name.to_str() else {
-      continue;
-    };
-    if is_fnox_config_name(name) {
-      return true;
-    }
-    if name == ".config" && entry.path().is_dir() && dir_has_fnox_shallow(&entry.path()) {
-      return true;
-    }
-  }
-  false
-}
-
-fn dir_has_fnox_shallow(dir: &Path) -> bool {
-  let Ok(entries) = std::fs::read_dir(dir) else {
-    return false;
-  };
-  entries
-    .flatten()
-    .any(|entry| entry.file_name().to_str().is_some_and(is_fnox_config_name))
-}
-
 fn nearest_registered(start: &Path, registered: &[PathBuf]) -> Option<PathBuf> {
   registered
     .iter()
@@ -196,20 +146,51 @@ mod tests {
   }
 
   #[test]
-  fn discovery_prefers_the_fnox_directory_then_a_registered_root() {
+  fn discovery_uses_the_project_marker_then_a_registered_root() {
     let root = tempfile::tempdir().unwrap();
     let root_path = root.path().canonicalize().unwrap();
     let project = root_path.join("work");
-    let nested = project.join("sub");
+    let nested = project.join("crate").join("src");
     std::fs::create_dir_all(&nested).unwrap();
-    std::fs::write(project.join("fnox.toml"), "[providers]\n").unwrap();
-    let found = project_root(&nested, &[]);
-    assert_eq!(found, Some(project));
+    std::fs::create_dir(project.join(".git")).unwrap();
+    assert_eq!(project_root(&nested, &[]), Some(project.clone()));
+
+    let cargo = root_path.join("cargo");
+    let member = cargo.join("member");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(cargo.join("Cargo.toml"), "[workspace]\nmembers = [\"member\"]\n").unwrap();
+    assert_eq!(project_root(&member, &[]), Some(cargo));
 
     let other = root_path.join("other");
     std::fs::create_dir_all(other.join("nested")).unwrap();
     let registered = vec![other.clone()];
     assert_eq!(project_root(&other.join("nested"), &registered), Some(other));
+  }
+
+  #[test]
+  fn a_fnox_file_does_not_move_the_project_root() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path().canonicalize().unwrap();
+    let project = base.join("repo");
+    let nested = project.join("crate").join("src");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(project.join(".git")).unwrap();
+    std::fs::write(project.join("crate").join("fnox.toml"), "[providers]\n").unwrap();
+    std::fs::write(base.join("fnox.toml"), "[providers]\n").unwrap();
+    assert_eq!(project_root(&nested, &[]), Some(project.clone()));
+
+    let outer = base.join("outer");
+    let inner = outer.join("proj").join("src");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::create_dir(outer.join("proj").join(".git")).unwrap();
+    std::fs::write(outer.join("fnox.toml"), "[providers]\n").unwrap();
+    assert_eq!(project_root(&inner, &[]), Some(outer.join("proj")));
+
+    let parent = base.join("app");
+    let child = parent.join("src");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(parent.join("fnox.toml"), "[providers]\n").unwrap();
+    assert_eq!(project_root(&child, &[]), Some(child));
   }
 
   #[test]
@@ -219,6 +200,7 @@ mod tests {
     let project = base_path.join("project");
     let nested = project.join("sub");
     std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(project.join(".git")).unwrap();
     std::fs::write(base_path.join("fnox.toml"), "secret = true\n").unwrap();
     assert_eq!(project_root(&nested, std::slice::from_ref(&project)), Some(project));
   }
@@ -231,7 +213,8 @@ mod tests {
     let outside = base.join("outside");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    std::fs::write(outside.join("fnox.toml"), "secret = true\n").unwrap();
+    std::fs::create_dir(project.join(".git")).unwrap();
+    std::fs::write(project.join("fnox.toml"), "[providers]\n").unwrap();
     let link = project.join("link");
     std::os::unix::fs::symlink(&outside, &link).unwrap();
     let found = project_root(&link, std::slice::from_ref(&project)).unwrap();
@@ -253,7 +236,9 @@ mod tests {
     let target = base.join("proj");
     std::fs::create_dir_all(&parent).unwrap();
     std::fs::create_dir_all(&target).unwrap();
-    std::fs::write(target.join("fnox.toml"), "[providers]\n").unwrap();
+    std::fs::create_dir(parent.join(".git")).unwrap();
+    std::fs::create_dir(target.join(".git")).unwrap();
+    std::fs::write(parent.join("fnox.toml"), "[providers]\n").unwrap();
     std::fs::write(parent.join("credentials"), "host-only\n").unwrap();
     let link = parent.join("work");
     std::os::unix::fs::symlink(&target, &link).unwrap();
