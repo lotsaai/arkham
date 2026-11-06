@@ -68,13 +68,19 @@ struct Daemon {
 
 impl Daemon {
   fn start(isolated: &Isolated) -> Self {
-    let mut child = isolated
-      .command(&["daemon"])
+    Self::start_with(isolated, &[])
+  }
+
+  fn start_with(isolated: &Isolated, extra: &[(&str, &str)]) -> Self {
+    let mut command = isolated.command(&["daemon"]);
+    command
       .env("ARKHAM_LISTEN", "127.0.0.1:0")
       .stdout(Stdio::null())
-      .stderr(Stdio::piped())
-      .spawn()
-      .unwrap();
+      .stderr(Stdio::piped());
+    for (key, value) in extra {
+      command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
     let mut stderr = child.stderr.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -120,6 +126,51 @@ fn wait_child(child: &mut Child, limit: Duration) -> std::process::ExitStatus {
     }
     std::thread::sleep(Duration::from_millis(50));
   }
+}
+
+#[test]
+fn the_sandbox_env_comes_from_the_agent() {
+  let isolated = Isolated::new();
+  let workspace = tempfile::tempdir().unwrap();
+  let root = workspace.path();
+  std::fs::create_dir_all(root.join(".config/arkham")).unwrap();
+  std::fs::write(
+    root.join(".config/arkham/config.toml"),
+    "[workspace]\npassthrough = [\"FROM_AGENT\", \"ONLY_DAEMON\"]\n",
+  )
+  .unwrap();
+  std::fs::write(root.join("fnox.toml"), "# workspace\n").unwrap();
+  let _daemon = Daemon::start_with(
+    &isolated,
+    &[
+      ("ONLY_DAEMON", "from-daemon"),
+      ("TERM", "daemon-term"),
+      ("FROM_AGENT", "from-daemon"),
+    ],
+  );
+  let output = isolated
+    .command(&[
+      "agent",
+      "--isolate",
+      "bwrap",
+      "--",
+      "sh",
+      "-c",
+      "printf 'TERM:%s\\nFROM:%s\\nONLY:%s\\n' \"$TERM\" \"$FROM_AGENT\" \"$ONLY_DAEMON\"",
+    ])
+    .current_dir(root)
+    .env("TERM", "agent-term")
+    .env("FROM_AGENT", "from-agent")
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(output.status.success(), "{stdout}{stderr}");
+  assert_eq!(line_of(&stdout, "TERM"), "agent-term", "{stdout}{stderr}");
+  assert_eq!(line_of(&stdout, "FROM"), "from-agent", "{stdout}{stderr}");
+  assert_eq!(line_of(&stdout, "ONLY"), "", "{stdout}{stderr}");
+  assert!(!stdout.contains("from-daemon"), "{stdout}");
+  assert!(!stdout.contains("daemon-term"), "{stdout}");
 }
 
 #[test]

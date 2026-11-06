@@ -3,7 +3,7 @@
 //! Grant fragments are parsed into the config the proxy keeps. They are not
 //! written where the agent can open them.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
@@ -39,6 +39,7 @@ struct RulesDoc {
 /// Prepare `root` into `scratch`.
 ///
 /// `ca_cert` is the certificate PEM only. The CA key stays with the daemon.
+/// `caller_env` is the agent process environment from the register request.
 ///
 /// # Errors
 ///
@@ -50,6 +51,7 @@ pub async fn prepare_session(
   profile: WriteProfile,
   ca_cert: &Path,
   version: &str,
+  caller_env: &BTreeMap<String, String>,
 ) -> Result<PreparedSession, Error> {
   let material = host_material(root, scratch, version).await?;
   let mut config = material.config;
@@ -97,13 +99,13 @@ pub async fn prepare_session(
   }
   let mut env = Vec::new();
   for name in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE"] {
-    if let Ok(value) = std::env::var(name) {
-      set_env(&mut env, name, value);
+    if let Some(value) = caller_env.get(name) {
+      set_env(&mut env, name, value.clone());
     }
   }
   for name in &material.passthrough {
-    if let Ok(value) = std::env::var(name) {
-      set_env(&mut env, name, value);
+    if let Some(value) = caller_env.get(name) {
+      set_env(&mut env, name, value.clone());
     }
   }
   for decoy in &material.decoys {
@@ -210,6 +212,7 @@ mod tests {
       WriteProfile::WorkspaceWrite,
       &scratch.path().join("ca.pem"),
       "test",
+      &BTreeMap::new(),
     )
     .await
     .unwrap();
@@ -223,5 +226,39 @@ mod tests {
     assert!(!prepared.rule_envs.contains("OTHER"));
     let rendered = format!("{:?}", prepared.plan);
     assert!(!rendered.contains("real-snapshot-value"));
+  }
+
+  #[tokio::test]
+  async fn the_plan_env_comes_from_the_caller_not_the_process() {
+    let root = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let config_dir = root.path().join(".config").join("arkham");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.toml"), "[workspace]\npassthrough = [\"FROM_AGENT\"]\n").unwrap();
+    std::fs::write(root.path().join("fnox.toml"), "# workspace\n").unwrap();
+    std::fs::write(scratch.path().join("ca.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
+    let mut caller = BTreeMap::new();
+    caller.insert("PATH".to_string(), "/from-agent/bin".to_string());
+    caller.insert("HOME".to_string(), "/from-agent/home".to_string());
+    caller.insert("TERM".to_string(), "agent-term".to_string());
+    caller.insert("FROM_AGENT".to_string(), "agent-value".to_string());
+    let prepared = prepare_session(
+      root.path(),
+      scratch.path(),
+      WriteProfile::WorkspaceWrite,
+      &scratch.path().join("ca.pem"),
+      "test",
+      &caller,
+    )
+    .await
+    .unwrap();
+    let env: BTreeMap<_, _> = prepared.plan.env.iter().cloned().collect();
+    let process_path = std::env::var("PATH").unwrap();
+    assert_ne!(process_path, "/from-agent/bin");
+    assert_eq!(env.get("PATH").map(String::as_str), Some("/from-agent/bin"));
+    assert_eq!(env.get("HOME").map(String::as_str), Some("/from-agent/home"));
+    assert_eq!(env.get("TERM").map(String::as_str), Some("agent-term"));
+    assert_eq!(env.get("FROM_AGENT").map(String::as_str), Some("agent-value"));
+    assert_ne!(env.get("PATH").map(String::as_str), Some(process_path.as_str()));
   }
 }

@@ -3,6 +3,7 @@
 //! The socket is the session. The message does not carry a session id or a
 //! pid: those come from the kernel's peer credentials.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use arkham_config::WriteProfile;
@@ -23,6 +24,9 @@ pub struct RegisterRequest {
   pub cwd: PathBuf,
   /// Write profile for this launch.
   pub profile: WriteProfile,
+  /// Environment of the agent process. The daemon copies the plan from this
+  /// map and never from its own process environment.
+  pub env: BTreeMap<String, String>,
 }
 
 /// What the daemon sends back. `plan` is present only when registration worked.

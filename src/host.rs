@@ -149,7 +149,7 @@ async fn one_client(
   std::fs::create_dir_all(&scratch)?;
   let cert = scratch.join("ca.pem");
   std::fs::write(&cert, ca.cert_pem())?;
-  let prepared = match prepare_session(&root, &scratch, request.profile, &cert, version).await {
+  let prepared = match prepare_session(&root, &scratch, request.profile, &cert, version, &request.env).await {
     Ok(prepared) => prepared,
     Err(err) => {
       let _ = std::fs::remove_dir_all(&scratch);
@@ -176,25 +176,41 @@ async fn one_client(
     plan: Some(prepared.plan),
     error: None,
   };
-  let bytes = encode_response(&response)?;
-  write_line(&mut stream, &bytes).await?;
-  let mut byte = [0u8; 1];
-  loop {
-    match stream.read(&mut byte).await {
-      Ok(0) | Err(_) => break,
-      Ok(_) => {}
+  let written = match encode_response(&response) {
+    Ok(bytes) => write_line(&mut stream, &bytes).await,
+    Err(err) => Err(err),
+  };
+  if written.is_ok() {
+    let mut byte = [0u8; 1];
+    loop {
+      match stream.read(&mut byte).await {
+        Ok(0) | Err(_) => break,
+        Ok(_) => {}
+      }
     }
   }
-  state.unregister_project(slot.id);
-  release_session(&slot.path);
+  drop_registration(state, slot.id, &slot.path, &root, &scratch, registered);
+  written?;
+  Ok(())
+}
+
+fn drop_registration(
+  state: &ProxyState,
+  cgroup_id: u64,
+  session: &std::path::Path,
+  root: &std::path::Path,
+  scratch: &std::path::Path,
+  registered: &Mutex<Vec<PathBuf>>,
+) {
+  state.unregister_project(cgroup_id);
+  release_session(session);
   {
     let mut roots = registered.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(position) = roots.iter().position(|path| path == &root) {
+    if let Some(position) = roots.iter().position(|path| path == root) {
       roots.remove(position);
     }
   }
-  let _ = std::fs::remove_dir_all(&scratch);
-  Ok(())
+  let _ = std::fs::remove_dir_all(scratch);
 }
 
 const REGISTRATION_FAILED: &str = "registration failed";
@@ -224,4 +240,135 @@ fn session_dir() -> eyre::Result<PathBuf> {
     eyre::bail!("daemon socket has no directory");
   };
   Ok(parent.join("sessions"))
+}
+
+#[cfg(test)]
+mod tests {
+  use std::os::unix::fs::PermissionsExt as _;
+  use std::os::unix::net::UnixStream as StdUnixStream;
+  use std::sync::{Mutex, PoisonError};
+
+  use arkham_config::config::ProxyCfg;
+  use arkham_config::grants::ResolvedConfig;
+  use arkham_pki::ca::CertAuthority;
+  use arkham_proxy::ProxyState;
+  use tokio::io::AsyncWriteExt as _;
+  use tokio::net::UnixStream;
+
+  use super::{host_cgroup, one_client, read_cgroup, release_session};
+
+  struct RestoreEnv {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+  }
+
+  impl RestoreEnv {
+    fn set(key: &'static str, value: &std::path::Path) -> Self {
+      let previous = std::env::var_os(key);
+      // SAFETY: the guard restores the previous value before the test returns,
+      // and this binary's other tests do not read the variable.
+      unsafe { std::env::set_var(key, value) };
+      Self { key, previous }
+    }
+  }
+
+  impl Drop for RestoreEnv {
+    fn drop(&mut self) {
+      // SAFETY: pairs with the set in `RestoreEnv::set`.
+      unsafe {
+        match self.previous.take() {
+          Some(value) => std::env::set_var(self.key, value),
+          None => std::env::remove_var(self.key),
+        }
+      }
+    }
+  }
+
+  struct ReleaseOwnSessions {
+    original: String,
+  }
+
+  impl Drop for ReleaseOwnSessions {
+    fn drop(&mut self) {
+      let marker = format!("{}-", std::process::id());
+      if let Ok(parent) = host_cgroup()
+        && let Ok(entries) = std::fs::read_dir(&parent)
+      {
+        for entry in entries.flatten() {
+          if entry.file_name().to_string_lossy().starts_with(&marker) {
+            release_session(&entry.path());
+          }
+        }
+      }
+      let original = std::path::Path::new("/sys/fs/cgroup").join(self.original.trim_start_matches('/'));
+      let _ = std::fs::write(original.join("cgroup.procs"), std::process::id().to_string());
+    }
+  }
+
+  #[tokio::test]
+  async fn a_failed_register_write_drops_the_session() {
+    let runtime = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _env = RestoreEnv::set("XDG_RUNTIME_DIR", runtime.path());
+    let original = read_cgroup(std::process::id()).unwrap();
+    let _release = ReleaseOwnSessions { original };
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("fnox.toml"), "# workspace\n").unwrap();
+    let ca = CertAuthority::generate().unwrap();
+    let state = ProxyState::new(
+      ResolvedConfig {
+        proxy: ProxyCfg {
+          listen: "127.0.0.1:0".parse().unwrap(),
+          handoff_socket: None,
+          handoff_uid: None,
+          ca_file: None,
+          ssh_host_key: None,
+          ssh_known_hosts: None,
+          root_certs: Vec::new(),
+          handshake_timeout_secs: 10,
+        },
+        grants: Vec::new(),
+        plugins: Vec::new(),
+      },
+      &ca,
+    )
+    .unwrap();
+    let registered = Mutex::new(Vec::new());
+    let (server, mut client) = std_pair();
+    let cwd = root.path().display().to_string();
+    let line = format!("{{\"cwd\":\"{cwd}\",\"profile\":\"workspace-write\",\"env\":{{}}}}\n");
+    client.write_all(line.as_bytes()).await.unwrap();
+    drop(client);
+    let err = one_client(server, &state, &ca, &registered, "test").await.unwrap_err();
+    let text = format!("{err:?}");
+    assert!(text.to_ascii_lowercase().contains("broken pipe"), "{text}");
+    assert!(registered.lock().unwrap_or_else(PoisonError::into_inner).is_empty(), "{text}");
+    let marker = format!("{}-", std::process::id());
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    assert!(!cgroup.contains(&marker), "client stayed in the session cgroup: {cgroup}");
+    let parent = host_cgroup().unwrap();
+    let leaked = std::fs::read_dir(&parent)
+      .unwrap()
+      .flatten()
+      .any(|entry| entry.file_name().to_string_lossy().starts_with(&marker));
+    assert!(!leaked, "session cgroup directory still exists under {}", parent.display());
+    let sessions = runtime.path().join("arkham").join("sessions");
+    if sessions.exists() {
+      let names: Vec<_> = std::fs::read_dir(&sessions)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+      assert!(names.is_empty(), "scratch left behind: {names:?}");
+    }
+  }
+
+  fn std_pair() -> (UnixStream, UnixStream) {
+    let (server, client) = StdUnixStream::pair().unwrap();
+    server.set_nonblocking(true).unwrap();
+    client.set_nonblocking(true).unwrap();
+    let server = UnixStream::from_std(server).unwrap();
+    let client = UnixStream::from_std(client).unwrap();
+    (server, client)
+  }
 }

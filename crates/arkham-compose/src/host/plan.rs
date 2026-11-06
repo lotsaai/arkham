@@ -17,6 +17,9 @@ use std::path::PathBuf;
 use arkham_config::WriteProfile;
 #[cfg(target_os = "linux")]
 use arkham_config::{FsPolicy, fs_policy};
+
+#[cfg(target_os = "linux")]
+use crate::Error;
 use serde::{Deserialize, Serialize};
 
 /// One bind the agent sees. `source` is the file the daemon wrote. `dest`
@@ -67,15 +70,23 @@ const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 /// Argv for `bwrap`, not including the `bwrap` program name.
 ///
 /// `/` is remounted read-only after the mounts are in place. Mounts created
-/// before that keep the flags they were given.
+/// before that keep the flags they were given. A workspace-write session
+/// gets a fresh tmpfs at `/tmp`. Host directories under `/tmp` are not
+/// mounted.
+///
+/// # Errors
+///
+/// Returns [`Error::SessionTmp`] when the workspace is `/tmp`, or when a
+/// bind source is a directory under the host `/tmp` other than the workspace.
 #[cfg(target_os = "linux")]
-#[must_use]
-pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Vec<OsString> {
+pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsString>, Error> {
+  reject_host_tmp(plan)?;
   let policy = fs_policy(plan.profile, &plan.workspace, Path::new(TEMP_DIR));
   let workspace_write = matches!(policy, FsPolicy::WorkspaceWrite { .. });
   let mut args = Vec::new();
   args.extend(["--tmpfs".into(), "/".into()]);
   let mut bound = Vec::new();
+  let mut anchors = Vec::new();
   push_host_entries(&mut args, &mut bound, matches!(policy, FsPolicy::Unrestricted));
   args.extend(["--dev".into(), "/dev".into(), "--proc".into(), "/proc".into()]);
   args.extend([
@@ -88,8 +99,7 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Vec<OsString> {
   ]);
   if workspace_write {
     args.extend(["--tmpfs".into(), TEMP_DIR.into()]);
-    bound.push(PathBuf::from(TEMP_DIR));
-    push_tmp_restores(&mut args, plan, &mut bound);
+    anchors.push(PathBuf::from(TEMP_DIR));
   }
   let workspace_flag = if workspace_write || matches!(policy, FsPolicy::Unrestricted) {
     "--bind"
@@ -97,21 +107,21 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Vec<OsString> {
     "--ro-bind"
   };
   let mut created = BTreeSet::new();
-  push_missing_parents(&mut args, &bound, &plan.workspace, &mut created);
+  push_missing_parents(&mut args, &bound, &anchors, &plan.workspace, &mut created);
   args.extend([workspace_flag.into(), plan.workspace.clone().into(), plan.workspace.clone().into()]);
   bound.push(plan.workspace.clone());
   for bind in &plan.binds {
     if bind.dest == plan.workspace {
       continue;
     }
-    push_missing_parents(&mut args, &bound, &bind.dest, &mut created);
+    push_missing_parents(&mut args, &bound, &anchors, &bind.dest, &mut created);
     let flag = bind_flag(plan.profile, bind.read_only);
     args.extend([flag.into(), bind.source.clone().into(), bind.dest.clone().into()]);
   }
   args.extend(["--dir".into(), "/arkham".into()]);
   args.extend(["--ro-bind".into(), plan.ca_host.clone().into(), plan.ca_dest.clone().into()]);
-  push_secret_masks(&mut args, plan, &bound);
-  push_program(&mut args, &bound, command, &mut created);
+  push_secret_masks(&mut args, plan, &bound, &anchors);
+  push_program(&mut args, &bound, &anchors, command, &mut created);
   args.extend(["--ro-bind".into(), CGROUP_MOUNT.into(), CGROUP_MOUNT.into()]);
   args.extend(["--remount-ro".into(), "/".into()]);
   args.extend(["--die-with-parent".into(), "--new-session".into(), "--clearenv".into()]);
@@ -125,7 +135,7 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Vec<OsString> {
   } else {
     args.extend(command.iter().cloned());
   }
-  args
+  Ok(args)
 }
 
 /// System directories the sandbox can see.
@@ -178,17 +188,17 @@ fn push_host_entries(args: &mut Vec<OsString>, bound: &mut Vec<PathBuf>, writabl
 /// refuses the mount. The created directories are empty, so siblings of the
 /// bound file are not part of the sandbox.
 #[cfg(target_os = "linux")]
-fn push_missing_parents(args: &mut Vec<OsString>, bound: &[PathBuf], dest: &Path, created: &mut BTreeSet<PathBuf>) {
+fn push_missing_parents(args: &mut Vec<OsString>, bound: &[PathBuf], anchors: &[PathBuf], dest: &Path, created: &mut BTreeSet<PathBuf>) {
   let Some(parent) = dest.parent() else {
     return;
   };
-  if parent == Path::new("/") || is_mounted(parent, bound) {
+  if parent == Path::new("/") || is_mounted(parent, bound, anchors) {
     return;
   }
   let mut chain = Vec::new();
   let mut cursor = Some(parent);
   while let Some(dir) = cursor {
-    if dir == Path::new("/") || is_mounted(dir, bound) || created.contains(dir) {
+    if dir == Path::new("/") || is_mounted(dir, bound, anchors) || created.contains(dir) {
       break;
     }
     chain.push(dir.to_path_buf());
@@ -201,8 +211,13 @@ fn push_missing_parents(args: &mut Vec<OsString>, bound: &[PathBuf], dest: &Path
   }
 }
 
+/// `anchors` are mounted exactly. A path under an anchor is not covered, so
+/// its parents are created empty inside that mount.
 #[cfg(target_os = "linux")]
-fn is_mounted(path: &Path, bound: &[PathBuf]) -> bool {
+fn is_mounted(path: &Path, bound: &[PathBuf], anchors: &[PathBuf]) -> bool {
+  if anchors.iter().any(|anchor| path == anchor) {
+    return true;
+  }
   bound.iter().any(|root| path == root || path.starts_with(root))
 }
 
@@ -213,17 +228,17 @@ fn is_mounted(path: &Path, bound: &[PathBuf]) -> bool {
 /// absent and must not be named: bubblewrap rejects a bind whose parent does
 /// not exist.
 #[cfg(target_os = "linux")]
-fn push_secret_masks(args: &mut Vec<OsString>, plan: &LaunchPlan, bound: &[PathBuf]) {
+fn push_secret_masks(args: &mut Vec<OsString>, plan: &LaunchPlan, bound: &[PathBuf], anchors: &[PathBuf]) {
   for path in ETC_SECRET_FILES {
-    mask_file(args, Path::new(path), bound);
+    mask_file(args, Path::new(path), bound, anchors);
   }
   for path in ETC_SECRET_DIRS {
     let path = Path::new(path);
-    if path.is_dir() && is_mounted(path, bound) {
+    if path.is_dir() && is_mounted(path, bound, anchors) {
       args.extend(["--tmpfs".into(), path.into()]);
     }
   }
-  mask_file(args, &plan.ca_host.with_extension("key"), bound);
+  mask_file(args, &plan.ca_host.with_extension("key"), bound, anchors);
 }
 
 /// Mount the absolute program the sandbox execs, when it is not already
@@ -232,64 +247,65 @@ fn push_secret_masks(args: &mut Vec<OsString>, plan: &LaunchPlan, bound: &[PathB
 /// The runner re-execs this binary to apply Landlock. Binding the file,
 /// not its parent tree, keeps the rest of that tree out of the sandbox.
 #[cfg(target_os = "linux")]
-fn push_program(args: &mut Vec<OsString>, bound: &[PathBuf], command: &[OsString], created: &mut BTreeSet<PathBuf>) {
+fn push_program(args: &mut Vec<OsString>, bound: &[PathBuf], anchors: &[PathBuf], command: &[OsString], created: &mut BTreeSet<PathBuf>) {
   let Some(program) = command.first() else {
     return;
   };
   let path = Path::new(program);
-  if !path.is_absolute() || !path.is_file() || is_mounted(path, bound) {
+  if !path.is_absolute() || !path.is_file() || is_mounted(path, bound, anchors) {
     return;
   }
-  push_missing_parents(args, bound, path, created);
+  push_missing_parents(args, bound, anchors, path, created);
   let program = path.as_os_str().to_os_string();
   args.extend(["--ro-bind".into(), program.clone(), program]);
 }
 
 #[cfg(target_os = "linux")]
-fn mask_file(args: &mut Vec<OsString>, path: &Path, bound: &[PathBuf]) {
+fn mask_file(args: &mut Vec<OsString>, path: &Path, bound: &[PathBuf], anchors: &[PathBuf]) {
   if !path.is_file() {
     return;
   }
   let Some(parent) = path.parent() else {
     return;
   };
-  if !is_mounted(parent, bound) {
+  if !is_mounted(parent, bound, anchors) {
     return;
   }
   args.extend(["--ro-bind".into(), "/dev/null".into(), path.into()]);
 }
 
-/// Put back directories under the workspace-write tmpfs that hold a projected file.
-///
-/// `--tmpfs /tmp` hides the host directory, including symlinks that point at
-/// a projected file. Binding each wiped top-level directory read-only keeps
-/// those links, and the per-file binds that follow replace the secret files.
 #[cfg(target_os = "linux")]
-fn push_tmp_restores(args: &mut Vec<OsString>, plan: &LaunchPlan, bound: &mut Vec<PathBuf>) {
-  let tmp = Path::new(TEMP_DIR);
-  let mut restored = BTreeSet::new();
-  let destinations = std::iter::once(plan.workspace.as_path()).chain(plan.binds.iter().map(|bind| bind.dest.as_path()));
-  for dest in destinations {
-    let Some(top) = tmp_tree(dest, tmp) else {
-      continue;
-    };
-    if top == plan.workspace || !restored.insert(top.clone()) {
-      continue;
-    }
-    bound.push(top.clone());
-    let path = top.into_os_string();
-    args.extend(["--ro-bind".into(), path.clone(), path]);
+fn reject_host_tmp(plan: &LaunchPlan) -> Result<(), Error> {
+  if plan.workspace == Path::new(TEMP_DIR) {
+    return Err(session_tmp_error());
   }
+  for bind in &plan.binds {
+    if host_tmp_directory(&bind.source, &plan.workspace) {
+      return Err(session_tmp_error());
+    }
+  }
+  Ok(())
 }
 
-/// `/tmp/<name>` for a path nested under the temp directory, when that
-/// directory exists on the host.
+/// A directory under the host `/tmp`, other than the workspace. A missing
+/// path fails closed. A regular file does not.
 #[cfg(target_os = "linux")]
-fn tmp_tree(dest: &Path, tmp: &Path) -> Option<PathBuf> {
-  let rest = dest.strip_prefix(tmp).ok()?;
-  let first = rest.components().next()?;
-  let top = tmp.join(first);
-  if top == dest || !top.is_dir() { None } else { Some(top) }
+fn host_tmp_directory(source: &Path, workspace: &Path) -> bool {
+  if source.as_os_str().is_empty() || source == workspace {
+    return false;
+  }
+  let tmp = Path::new(TEMP_DIR);
+  if source != tmp && !source.starts_with(tmp) {
+    return false;
+  }
+  !matches!(std::fs::symlink_metadata(source), Ok(meta) if meta.file_type().is_file())
+}
+
+#[cfg(target_os = "linux")]
+fn session_tmp_error() -> Error {
+  Error::SessionTmp {
+    source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "session tmp is not a private directory"),
+  }
 }
 
 #[cfg(target_os = "linux")]
@@ -328,6 +344,10 @@ mod tests {
     }
   }
 
+  fn argv(plan: &LaunchPlan, command: &[OsString]) -> Vec<OsString> {
+    bwrap_argv(plan, command).unwrap()
+  }
+
   fn joined(args: &[OsString]) -> String {
     args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>().join(" ")
   }
@@ -344,7 +364,7 @@ mod tests {
 
   #[test]
   fn workspace_write_matches_the_profile_and_omits_proxy_env() {
-    let args = bwrap_argv(&plan(WriteProfile::WorkspaceWrite), &["cargo".into(), "test".into()]);
+    let args = argv(&plan(WriteProfile::WorkspaceWrite), &["cargo".into(), "test".into()]);
     let text = joined(&args);
     assert!(has_pair(&args, "--tmpfs", "/"));
     assert!(has_pair(&args, "--remount-ro", "/"));
@@ -371,7 +391,7 @@ mod tests {
 
   #[test]
   fn read_only_drops_the_workspace_bind_and_the_tmpfs() {
-    let args = bwrap_argv(&plan(WriteProfile::ReadOnly), &[]);
+    let args = argv(&plan(WriteProfile::ReadOnly), &[]);
     let text = joined(&args);
     assert!(has_pair(&args, "--tmpfs", "/"));
     assert!(!has_pair(&args, "--tmpfs", "/tmp"));
@@ -383,7 +403,7 @@ mod tests {
 
   #[test]
   fn the_sandbox_drops_every_capability() {
-    let args = bwrap_argv(&plan(WriteProfile::WorkspaceWrite), &[]);
+    let args = argv(&plan(WriteProfile::WorkspaceWrite), &[]);
     let text = joined(&args);
     assert!(text.contains("--unshare-user"), "{text}");
     assert!(text.contains("--cap-drop ALL"), "{text}");
@@ -399,7 +419,7 @@ mod tests {
     std::fs::write(&key, "CA_KEY_MARKER\n").unwrap();
     let mut plan = plan(WriteProfile::WorkspaceWrite);
     plan.ca_host = ca;
-    let args = bwrap_argv(&plan, &[]);
+    let args = argv(&plan, &[]);
     assert!(!has_triple(&args, "--ro-bind", "/home", "/home"), "{}", joined(&args));
     assert!(!has_triple(&args, "--bind", "/home", "/home"), "{}", joined(&args));
     assert!(!has_triple(&args, "--ro-bind", "/root", "/root"), "{}", joined(&args));
@@ -443,16 +463,16 @@ mod tests {
       secret.display(),
       secret.display()
     );
-    let args = bwrap_argv(&plan, &["sh".into(), "-c".into(), script.into()]);
+    let args = argv(&plan, &["sh".into(), "-c".into(), script.into()]);
     let output = std::process::Command::new("sudo")
       .arg("-n")
       .arg("bwrap")
-      .args(args)
+      .args(&args)
       .output()
       .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}{stderr}");
+    assert!(output.status.success(), "{stdout}{stderr}\n{}", joined(&args));
     assert_ne!(line_of(&stdout, "UMOUNT"), "0", "{stdout}{stderr}");
     assert_ne!(line_of(&stdout, "REMOUNT"), "0", "{stdout}{stderr}");
     assert_eq!(line_of(&stdout, "CAP"), "0000000000000000", "{stdout}");
@@ -469,8 +489,67 @@ mod tests {
   }
 
   #[test]
+  fn a_nested_workspace_does_not_bind_the_host_tmp_parent() {
+    let parent = tempfile::tempdir().unwrap();
+    std::fs::write(parent.path().join("sibling-secret"), "SIBLING_SECRET\n").unwrap();
+    let project = parent.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let mut plan = plan(WriteProfile::WorkspaceWrite);
+    plan.workspace = project.clone();
+    plan.workdir = project.clone();
+    plan.binds.clear();
+    let ca = project.join("ca.pem");
+    std::fs::write(&ca, "CERT\n").unwrap();
+    plan.ca_host = ca;
+    let args = argv(&plan, &[]);
+    let parent_path = parent.path().as_os_str();
+    let sibling = parent.path().join("sibling-secret");
+    assert!(
+      !args
+        .windows(3)
+        .any(|window| (window[0] == "--ro-bind" || window[0] == "--bind") && window[1] == parent_path),
+      "host tmp parent was rebound\n{}",
+      joined(&args)
+    );
+    assert!(
+      !args
+        .windows(3)
+        .any(|window| (window[0] == "--ro-bind" || window[0] == "--bind") && window[1] == sibling.as_os_str()),
+      "sibling was a bind source\n{}",
+      joined(&args)
+    );
+    assert!(has_pair(&args, "--tmpfs", "/tmp"), "{}", joined(&args));
+    assert!(has_pair(&args, "--dir", parent.path().to_str().unwrap()), "{}", joined(&args));
+    assert!(
+      has_triple(&args, "--bind", project.to_str().unwrap(), project.to_str().unwrap()),
+      "{}",
+      joined(&args)
+    );
+    let script = format!("cat '{}'; echo CAT:$?", sibling.display());
+    let ran_args = argv(&plan, &["sh".into(), "-c".into(), script.into()]);
+    let ran = std::process::Command::new("sudo")
+      .arg("-n")
+      .arg("bwrap")
+      .args(&ran_args)
+      .output()
+      .unwrap();
+    let ran_out = String::from_utf8_lossy(&ran.stdout);
+    let ran_err = String::from_utf8_lossy(&ran.stderr);
+    assert!(ran.status.success(), "{ran_out}{ran_err}\n{}", joined(&ran_args));
+    assert!(!ran_out.contains("SIBLING_SECRET"), "{ran_out}");
+    assert_ne!(line_of(&ran_out, "CAT"), "0", "{ran_out}{ran_err}");
+    plan.binds.push(Bind {
+      source: parent.path().to_path_buf(),
+      dest: parent.path().to_path_buf(),
+      read_only: true,
+    });
+    let err = bwrap_argv(&plan, &[]).unwrap_err();
+    assert_eq!(err.registration_detail(), "session tmp is not a private directory");
+  }
+
+  #[test]
   fn danger_full_access_binds_host_entries_writable_and_keeps_secret_overlays() {
-    let args = bwrap_argv(&plan(WriteProfile::DangerFullAccess), &[]);
+    let args = argv(&plan(WriteProfile::DangerFullAccess), &[]);
     let text = joined(&args);
     assert!(text.starts_with("--tmpfs / "));
     assert!(!has_pair(&args, "--tmpfs", "/tmp"));
