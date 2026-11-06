@@ -62,17 +62,17 @@ pub const CA_DEST: &str = "/arkham/ca.pem";
 #[cfg(target_os = "linux")]
 pub const TEMP_DIR: &str = super::discover::PRIVATE_SESSION_ROOT;
 
-/// Cgroup mount the agent must not be able to write. A writable
-/// `cgroup.procs` would let the agent leave its session.
-#[cfg(target_os = "linux")]
-const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
-
 /// Argv for `bwrap`, not including the `bwrap` program name.
 ///
 /// `/` is remounted read-only after the mounts are in place. Mounts created
 /// before that keep the flags they were given. A workspace-write session
 /// gets a fresh tmpfs at `/tmp`. Host directories under `/tmp` are not
-/// mounted.
+/// mounted. The daemon has already moved this process into its session
+/// cgroup. `--unshare-cgroup` makes that cgroup the namespace root, and the
+/// host `/sys/fs/cgroup` tree is not mounted, so another session's cgroup
+/// is not a path in the sandbox. The launch probe runs this argv. A kernel
+/// that refuses the cgroup namespace fails the probe, and the agent does
+/// not start.
 ///
 /// # Errors
 ///
@@ -95,6 +95,7 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsStrin
     "--unshare-pid".into(),
     "--unshare-uts".into(),
     "--unshare-ipc".into(),
+    "--unshare-cgroup".into(),
     "--cap-drop".into(),
     "ALL".into(),
   ]);
@@ -129,7 +130,6 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsStrin
   if private_session && matches!(policy, FsPolicy::ReadOnly { .. }) {
     args.extend(["--remount-ro".into(), TEMP_DIR.into()]);
   }
-  args.extend(["--ro-bind".into(), CGROUP_MOUNT.into(), CGROUP_MOUNT.into()]);
   args.extend(["--remount-ro".into(), "/".into()]);
   args.extend(["--die-with-parent".into(), "--new-session".into(), "--clearenv".into()]);
   for (key, value) in &plan.env {
@@ -375,7 +375,7 @@ mod tests {
     assert!(!has_triple(&args, "--ro-bind", "/", "/"));
     assert!(!has_triple(&args, "--bind", "/", "/"));
     assert!(text.contains("--dev /dev --proc /proc"));
-    assert!(text.contains("--unshare-pid --unshare-uts --unshare-ipc"));
+    assert!(text.contains("--unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup"));
     assert!(has_pair(&args, "--tmpfs", "/tmp"));
     assert!(text.contains("--bind /work /work"));
     assert!(text.contains("--ro-bind /scratch/fnox.toml /work/fnox.toml"));
@@ -387,7 +387,7 @@ mod tests {
     assert!(text.contains("--chdir /work -- cargo test"));
     assert!(!text.contains("--unshare-net"));
     assert!(!text.to_ascii_lowercase().contains("http_proxy"));
-    assert!(text.contains("--ro-bind /sys/fs/cgroup /sys/fs/cgroup"));
+    assert!(!text.contains("/sys/fs/cgroup"));
     let dir = args.iter().position(|arg| arg == "--dir").unwrap();
     let remount = args.iter().position(|arg| arg == "--remount-ro").unwrap();
     assert!(dir < remount);
@@ -460,6 +460,14 @@ mod tests {
     std::thread::sleep(std::time::Duration::from_millis(400));
     let seen = host_cgroup_id(pid);
     assert_eq!(seen, slot.id, "sandbox cgroup id diverged from the session directory");
+    let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap();
+    let mut descendants = 0u32;
+    for child_pid in children.split_whitespace() {
+      let child_pid: u32 = child_pid.parse().unwrap();
+      assert_eq!(host_cgroup_id(child_pid), slot.id, "sandboxed command left the session cgroup");
+      descendants = descendants.saturating_add(1);
+    }
+    assert!(descendants > 0, "bwrap started no child in the session cgroup");
     let ran = child.wait();
     let stdout = String::from_utf8_lossy(&ran.stdout);
     let stderr = String::from_utf8_lossy(&ran.stderr);
@@ -720,6 +728,7 @@ mod tests {
     assert!(!has_pair(&args, "--tmpfs", "/tmp"));
     assert!(!has_triple(&args, "--bind", "/", "/"));
     assert!(text.contains("--ro-bind /scratch/fnox.toml /work/fnox.toml"));
-    assert!(text.contains("--ro-bind /sys/fs/cgroup /sys/fs/cgroup"));
+    assert!(text.contains("--unshare-cgroup"));
+    assert!(!text.contains("/sys/fs/cgroup"));
   }
 }
