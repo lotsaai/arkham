@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use arkham_config::config::workspace_root;
 use arkham_config::is_fnox_config_name;
 
+#[cfg(target_os = "linux")]
 use crate::Error;
 
 /// Field index of `starttime` in `/proc/<pid>/stat` after the `comm` field.
@@ -56,9 +57,16 @@ pub fn project_root(start: &Path, registered: &[PathBuf]) -> Option<PathBuf> {
     let resolved = workspace_root(&marker).unwrap_or_else(|| marker.clone());
     root_containing(resolved, &canonical, ceiling.as_deref()).or_else(|| root_containing(marker, &canonical, ceiling.as_deref()))
   });
-  found.or(ceiling).and_then(|chosen| root_containing(chosen, &canonical, None))
+  found
+    .or(ceiling)
+    .and_then(|chosen| root_containing(chosen, &canonical, None))
+    .or_else(|| {
+      let resolved = workspace_root(&canonical).unwrap_or_else(|| canonical.clone());
+      root_containing(resolved, &canonical, None).or_else(|| root_containing(canonical.clone(), &canonical, None))
+    })
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn canonical_workspace(workspace: Option<&Path>) -> Result<PathBuf, Error> {
   let path = match workspace {
     Some(path) if path.is_absolute() => path.to_path_buf(),
@@ -256,6 +264,15 @@ mod tests {
   }
 
   #[test]
+  fn a_directory_without_a_marker_enlists_itself() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path().canonicalize().unwrap();
+    let project = base.join("plain");
+    std::fs::create_dir(&project).unwrap();
+    assert_eq!(project_root(&project, &[]), Some(project));
+  }
+
+  #[test]
   fn a_symlink_with_no_project_marker_does_not_enlist_its_parent() {
     let base = tempfile::tempdir().unwrap();
     let base = base.path().canonicalize().unwrap();
@@ -266,7 +283,9 @@ mod tests {
     let link = parent.join("work");
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
-    assert_eq!(project_root(&link, &[]), None);
+    let found = project_root(&link, &[]).unwrap();
+    assert_eq!(found, target);
+    assert!(!found.starts_with(&parent), "enlisted {found:?} widens over {parent:?}");
   }
 
   #[test]
