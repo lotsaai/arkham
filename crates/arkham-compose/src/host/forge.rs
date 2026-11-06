@@ -18,8 +18,9 @@ const FORGED_KEY: &[u8] = b"ARKHAM-DECOY-KEY\n";
 /// every `import` or `age_key_file` those files name.
 ///
 /// The walk does not leave `workspace`. Directory symlinks are not entered.
-/// `/` is not a candidate. A symlinked config contributes the link path and
-/// its target file, not the target's sibling tree.
+/// `/` and the private session directory are not candidates. A symlinked
+/// config contributes the link path and its target file, not the target's
+/// sibling tree.
 ///
 /// # Errors
 ///
@@ -27,7 +28,7 @@ const FORGED_KEY: &[u8] = b"ARKHAM-DECOY-KEY\n";
 /// an unreadable import list would leave a secret file unprojected.
 pub(crate) fn projection_files(workspace: &Path) -> Result<Vec<PathBuf>, Error> {
   let mut out = Vec::new();
-  if workspace != Path::new("/") {
+  if workspace != Path::new("/") && !super::discover::is_private_session(workspace) {
     collect_tree(&mut out, workspace)?;
   }
   if let Some(global) = fnox_config_dir() {
@@ -189,7 +190,7 @@ pub(crate) fn forged_bytes(path: &Path) -> Vec<u8> {
 #[must_use]
 pub(crate) fn scan_roots(workspace: &Path, projected: &[PathBuf]) -> Vec<PathBuf> {
   let mut roots = Vec::new();
-  if workspace != Path::new("/") {
+  if workspace != Path::new("/") && !super::discover::is_private_session(workspace) {
     roots.push(workspace.to_path_buf());
   }
   if let Some(dir) = fnox_config_dir().filter(|dir| dir != Path::new("/")) {

@@ -499,7 +499,12 @@ fn apply_landlock(plan: &LaunchPlan) -> Result<(), Error> {
   match policy {
     FsPolicy::ReadOnly { sink } => ruleset = add_path(ruleset, &sink, all)?,
     FsPolicy::WorkspaceWrite { roots } => {
+      let mut seen = Vec::new();
       for root in &roots {
+        if seen.iter().any(|existing: &PathBuf| existing == root) {
+          continue;
+        }
+        seen.push(root.clone());
         ruleset = add_path(ruleset, root, all)?;
       }
     }
