@@ -68,7 +68,7 @@ pub async fn prepare_session(
   push_mounts(&mut binds, &material.guest, &material.workspace, true);
   let forged_dir = scratch.join("forged");
   std::fs::create_dir_all(&forged_dir)?;
-  let projected = projection_files(root)?;
+  let projected = projected_files(root, &material.mounts)?;
   let mut devices = std::collections::HashSet::new();
   for path in projected.iter().chain(binds.iter().map(|bind| &bind.dest)) {
     if let Ok(meta) = std::fs::metadata(path) {
@@ -160,6 +160,38 @@ fn merge_fragment(config: &mut arkham_config::config::AppConfig, grant: &Rewrite
     config.rules.insert(label, rule);
   }
   Ok(())
+}
+
+/// Secret files in the enlisted root and in every include tree.
+///
+/// The include walk uses the same projection as the root. A mount of the
+/// root itself is already covered. `/` is not a candidate.
+///
+/// # Errors
+///
+/// Returns an error when a discovered fnox file is not valid TOML.
+fn projected_files(root: &Path, mounts: &[Mount]) -> Result<Vec<PathBuf>, Error> {
+  let mut projected = projection_files(root)?;
+  let workspace = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+  for mount in mounts {
+    if mount.host == root || mount.host == workspace || mount.host == Path::new("/") {
+      continue;
+    }
+    let tree = std::fs::canonicalize(&mount.host)?;
+    if tree == workspace || tree == Path::new("/") || !tree.is_dir() {
+      continue;
+    }
+    for path in projection_files(&tree)? {
+      let dest = match path.strip_prefix(&tree) {
+        Ok(relative) if !relative.as_os_str().is_empty() => mount.container.join(relative),
+        _ => path,
+      };
+      if !projected.iter().any(|existing| existing == &dest) {
+        projected.push(dest);
+      }
+    }
+  }
+  Ok(projected)
 }
 
 fn push_mounts(binds: &mut Vec<Bind>, mounts: &[Mount], workspace: &Path, force_read_only: bool) {

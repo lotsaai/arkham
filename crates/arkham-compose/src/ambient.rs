@@ -14,7 +14,7 @@ use crate::git;
 use crate::jj;
 use crate::kube;
 use crate::nats;
-use crate::paths::{Mount, expand};
+use crate::paths::expand;
 use crate::rewrites::{RewriteCollector, RewriteOutputs};
 use crate::ssh;
 use crate::talos;
@@ -162,7 +162,8 @@ impl AmbientDeriver<'_> {
     }
   }
 
-  /// The full host jj config dir, mounted writable.
+  /// The jj user chain, written as a decoy twin. The real config directory
+  /// is not mounted.
   ///
   /// # Errors
   ///
@@ -172,18 +173,8 @@ impl AmbientDeriver<'_> {
       return Ok(());
     }
     let host_jj = jj::config_path().parent().map(Path::to_path_buf).unwrap_or_default();
-    if !host_jj.as_os_str().is_empty() {
-      if self.declared.iter().any(|path| path == &host_jj || path.starts_with(&host_jj)) {
-        return Ok(());
-      }
-      if host_jj.is_dir() {
-        self.collector.mounts.push(Mount {
-          host: host_jj,
-          container: PathBuf::from(format!("{}/.config/jj", self.home)),
-          ro: false,
-        });
-        return Ok(());
-      }
+    if !host_jj.as_os_str().is_empty() && self.declared.iter().any(|path| path == &host_jj || path.starts_with(&host_jj)) {
+      return Ok(());
     }
     if let Some(adapted) = jj::adapt(self.root) {
       let dest = format!("{}/.config/jj/config.toml", self.home);
@@ -455,7 +446,9 @@ mod tests {
     let marker = "JJ_REAL_TOKEN_9f3a";
     fs::write(jj_dir.join("config.toml"), format!("[user]\nname = '{marker}'\n")).unwrap();
     let work = tempdir().unwrap();
-    let saved: Vec<(&str, Option<OsString>)> = ["HOME", "XDG_CONFIG_HOME", "JJ_CONFIG"].map(|name| (name, env::var_os(name))).to_vec();
+    let saved: Vec<(&str, Option<OsString>)> = ["HOME", "XDG_CONFIG_HOME", "JJ_CONFIG"]
+      .map(|name| (name, env::var_os(name)))
+      .to_vec();
     unset_env("JJ_CONFIG");
     set_env("HOME", host.path());
     set_env("XDG_CONFIG_HOME", xdg.path());
@@ -480,9 +473,16 @@ mod tests {
       }
     }
     assert!(
-      outputs.mounts.iter().all(|mount| mount.host != jj_dir && !mount.host.starts_with(&jj_dir)),
+      outputs
+        .mounts
+        .iter()
+        .all(|mount| mount.host != jj_dir && !mount.host.starts_with(&jj_dir)),
       "real jj dir mounted: {:?}",
-      outputs.mounts.iter().map(|mount| mount.host.display().to_string()).collect::<Vec<_>>()
+      outputs
+        .mounts
+        .iter()
+        .map(|mount| mount.host.display().to_string())
+        .collect::<Vec<_>>()
     );
     let twin = outputs
       .mounts
