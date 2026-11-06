@@ -330,6 +330,8 @@ mod tests {
       ResolvedConfig {
         proxy: ProxyCfg {
           listen: "127.0.0.1:0".parse().unwrap(),
+          handoff_socket: None,
+          handoff_uid: None,
           ca_file: None,
           ssh_host_key: None,
           ssh_known_hosts: None,

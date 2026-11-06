@@ -3,6 +3,7 @@
 
 mod amqp;
 mod fixture;
+mod handoff;
 mod http;
 mod https;
 mod ldap;

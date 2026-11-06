@@ -110,6 +110,8 @@ mod tests {
     AppConfig {
       proxy: ProxyCfg {
         listen: "127.0.0.1:8080".parse().unwrap(),
+        handoff_socket: None,
+        handoff_uid: None,
         ca_file: None,
         ssh_host_key: None,
         ssh_known_hosts: None,

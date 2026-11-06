@@ -9,10 +9,10 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::WorkspaceBuild;
+use arkham_config::config::user_config_dirs;
 use arkham_config::config::{HostTlsCfg, RuleCfg};
 use arkham_config::grants::GuestTlsMode;
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
-use dirs::config_dir as dirs_config_dir;
 
 use crate::error::Error;
 use crate::paths::{Mount, covering, expand, translate};
@@ -264,14 +264,19 @@ impl Layout {
   }
 
   /// The fnox config directory fnox itself resolves: `FNOX_CONFIG_DIR`, else
-  /// `<config-dir>/fnox`.
+  /// the first existing `<config-dir>/fnox` (on macOS
+  /// `~/.config` is checked too).
   pub(crate) fn fnox_config_dir(&self) -> Option<PathBuf> {
     if let Some(dir) = env::var_os("FNOX_CONFIG_DIR") {
       return Some(PathBuf::from(dir));
     }
-    dirs_config_dir()
-      .or_else(|| self.host_home.as_deref().map(|home| home.join(".config")))
-      .map(|dir| dir.join("fnox"))
+    let candidates: Vec<PathBuf> = user_config_dirs().into_iter().map(|dir| dir.join("fnox")).collect();
+    candidates
+      .iter()
+      .find(|dir| dir.exists())
+      .or(candidates.first())
+      .cloned()
+      .or_else(|| self.host_home.as_deref().map(|home| home.join(".config").join("fnox")))
   }
 }
 

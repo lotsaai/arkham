@@ -39,6 +39,7 @@ mod connection;
 #[cfg(test)]
 mod e2e;
 mod error;
+mod handoff;
 mod identity;
 mod mint;
 mod transports;
@@ -61,6 +62,7 @@ type HttpsRelay = TlsMitmRelay<CachedBoringMitmCertIssuer<InMemoryBoringMitmCert
 
 pub use connection::TrustAnchorsError;
 pub use error::Error;
+pub use handoff::{HandoffListener, bind_handoff, serve_handoff};
 
 /// Shared proxy state: live config snapshot, boring MITM relays, and the
 /// issuance burst guard.
@@ -462,4 +464,20 @@ fn parse_authority(authority: &str, default_port: Option<u16>) -> Option<(String
   };
   let port = url.port().or(default_port)?;
   Some((host, port))
+}
+
+#[cfg(test)]
+mod bind_explicit_tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn bind_explicit_accepts_the_compose_wildcard() {
+    bind_explicit("0.0.0.0:0".parse().unwrap()).await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn bind_explicit_accepts_loopback() {
+    bind_explicit("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    bind_explicit("[::1]:0".parse().unwrap()).await.unwrap();
+  }
 }

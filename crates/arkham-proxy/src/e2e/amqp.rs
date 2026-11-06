@@ -7,7 +7,7 @@ use amq_protocol::types::FieldTable;
 use arkham_config::grants::AmqpScope;
 use fe2o3_amqp::acceptor::sasl_acceptor::SaslServerFrame;
 use fe2o3_amqp::acceptor::{ConnectionAcceptor, SaslAcceptor};
-use fe2o3_amqp::connection::{ConnectionHandle, OpenError};
+use fe2o3_amqp::connection::{ConnectionHandle, Error as AmqpConnectionError, OpenError};
 use fe2o3_amqp::sasl_profile::SaslProfile;
 use fe2o3_amqp_types::primitives::{Array, Binary, Symbol};
 use fe2o3_amqp_types::sasl::{SaslCode, SaslInit, SaslOutcome, SaslResponse};
@@ -289,6 +289,8 @@ fn mtls_grants(fake: &str, real: &str) -> Result<Vec<Grant>, Box<arkham_config::
   let cfg = AppConfig {
     proxy: ProxyCfg {
       listen: "127.0.0.1:8080".parse().unwrap(),
+      handoff_socket: None,
+      handoff_uid: None,
       ca_file: None,
       root_certs: Vec::new(),
       handshake_timeout_secs: 10,
@@ -396,7 +398,12 @@ async fn amqps_without_sni_mints_and_swaps_for_the_grant_host() {
       .sasl_acceptor(RecordPlain { seen: stub_seen })
       .build();
     let mut connection = broker.accept(tls).await.unwrap();
-    connection.close().await.unwrap();
+    // Both peers close after open. fe2o3_amqp returns RemoteClosed when the
+    // peer's Close arrives first while this side is still Opened.
+    match connection.close().await {
+      Ok(()) | Err(AmqpConnectionError::RemoteClosed) => {}
+      Err(err) => panic!("{err}"),
+    }
   });
   let (guest, client_end) = tokio::io::duplex(64 * 1024);
   let serve = tokio::spawn({
@@ -413,7 +420,10 @@ async fn amqps_without_sni_mints_and_swaps_for_the_grant_host() {
     .await
     .unwrap()
     .unwrap();
-  connection.close().await.unwrap();
+  match connection.close().await {
+    Ok(()) | Err(AmqpConnectionError::RemoteClosed) => {}
+    Err(err) => panic!("{err}"),
+  }
   tokio::time::timeout(Duration::from_secs(10), stub_task).await.unwrap().unwrap();
   assert_eq!(seen.lock().unwrap().as_deref(), Some(plain("svc", VALUE).as_slice()));
   serve.await.unwrap().unwrap();

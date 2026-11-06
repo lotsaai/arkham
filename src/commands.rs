@@ -9,7 +9,9 @@
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
-use crate::{ca_path, fwd, generation_registry, serve};
+#[cfg(target_os = "linux")]
+use crate::fwd;
+use crate::{ca_path, generation_registry, serve};
 use arkham_compose::rules_command;
 use arkham_config::ExposeSecret;
 use arkham_config::cli::{Cli, CliCommand, ProxyBackend};

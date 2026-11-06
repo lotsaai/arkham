@@ -319,6 +319,21 @@ pub struct ProxyCfg {
   #[config(default = "127.0.0.1:8080", env = "ARKHAM_LISTEN")]
   #[config(layer_attr(arg(long = "listen", help = "explicit-proxy listen address")))]
   pub listen: SocketAddr,
+  /// Unix-socket path for the authenticated NE/daemon PROXY handoff.
+  /// When unset, `<config-dir>/arkham/handoff.sock`.
+  #[config(env = "ARKHAM_HANDOFF_SOCKET")]
+  #[config(layer_attr(arg(
+    long = "handoff-socket",
+    help = "unix socket path for the NE/daemon PROXY handoff (default <config-dir>/arkham/handoff.sock)"
+  )))]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub handoff_socket: Option<PathBuf>,
+  /// Peer uid admitted on the handoff socket. When unset, this process's uid.
+  /// Only the Network Extension or daemon uid is admitted.
+  #[config(env = "ARKHAM_HANDOFF_UID")]
+  #[config(layer_attr(arg(long = "handoff-uid", help = "uid admitted on the handoff socket (default: this process)")))]
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub handoff_uid: Option<u32>,
   /// CA PEM path (default `/certs/ca.pem` when the generated stack mounted
   /// it there, else `<config-dir>/arkham/ca.pem`).
   #[config(env = "ARKHAM_CA_FILE")]
@@ -798,22 +813,43 @@ fn global_config_path() -> Option<PathBuf> {
   if let Ok(path) = env::var("ARKHAM_CONFIG") {
     return Some(PathBuf::from(path));
   }
-  let standard = dirs::config_dir().map(|dir| dir.join("arkham").join("config.toml"));
-  if let Some(path) = &standard
-    && path.exists()
-  {
-    return Some(path.clone());
-  }
-  #[cfg(target_os = "macos")]
-  {
-    if let Some(home) = dirs::home_dir() {
-      let path = home.join(".config").join("arkham").join("config.toml");
-      if path.exists() {
-        return Some(path);
-      }
-    }
-  }
-  standard
+  user_config_file(Path::new("arkham").join("config.toml"))
+}
+
+/// Per-user config roots in lookup order. macOS checks the platform
+/// directory, then the XDG one (`$XDG_CONFIG_HOME`, else `~/.config`), where
+/// command-line tools keep theirs.
+#[must_use]
+pub fn user_config_dirs() -> Vec<PathBuf> {
+  let platform = dirs::config_dir();
+  let xdg = xdg_config_dir().filter(|xdg| platform.as_ref() != Some(xdg));
+  platform.into_iter().chain(xdg).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn xdg_config_dir() -> Option<PathBuf> {
+  use etcetera::BaseStrategy as _;
+  etcetera::base_strategy::Xdg::new().ok().map(|xdg| xdg.config_dir())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn xdg_config_dir() -> Option<PathBuf> {
+  None
+}
+
+/// `relative` under the first per-user config root that holds it, else under
+/// the first root, so a file not yet created lands in the platform default.
+#[must_use]
+pub fn user_config_file(relative: impl AsRef<Path>) -> Option<PathBuf> {
+  let candidates: Vec<PathBuf> = user_config_dirs().iter().map(|root| root.join(relative.as_ref())).collect();
+  candidates.iter().find(|path| path.exists()).or_else(|| candidates.first()).cloned()
+}
+
+/// Per-user state root. Only the compose stack keeps state here; the macOS
+/// model keeps the agent's state in its own user account instead.
+#[must_use]
+pub fn user_state_dir() -> Option<PathBuf> {
+  dirs::state_dir()
 }
 
 /// Directory holding the global config file, and `rules.d` beside it.
@@ -1164,7 +1200,13 @@ mod tests {
   }
 
   fn scrub_env() {
-    for key in ["ARKHAM_CONFIG", "ARKHAM_LISTEN", "ARKHAM_CA_FILE"] {
+    for key in [
+      "ARKHAM_CONFIG",
+      "ARKHAM_LISTEN",
+      "ARKHAM_CA_FILE",
+      "ARKHAM_HANDOFF_SOCKET",
+      "ARKHAM_HANDOFF_UID",
+    ] {
       // SAFETY: test-only mutation, serialized by ENV_LOCK.
       unsafe { env::remove_var(key) };
     }

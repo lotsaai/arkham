@@ -61,6 +61,8 @@ pub(super) fn resolve_mtls_grants(env: &str, fake: &str, real: &str) -> Result<V
   let cfg = AppConfig {
     proxy: ProxyCfg {
       listen: "127.0.0.1:8080".parse().unwrap(),
+      handoff_socket: None,
+      handoff_uid: None,
       ca_file: None,
       ssh_host_key: None,
       ssh_known_hosts: None,
@@ -108,6 +110,8 @@ pub(super) fn test_state_with_budget(
       ResolvedConfig {
         proxy: arkham_config::config::ProxyCfg {
           listen: "127.0.0.1:0".parse().unwrap(),
+          handoff_socket: None,
+          handoff_uid: None,
           ca_file: None,
           ssh_host_key: None,
           ssh_known_hosts: None,

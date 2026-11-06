@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use arkham_config::Error as ConfigError;
 use arkham_config::cli::{Cli, CliCommand};
 use arkham_config::config::project_config_write_path;
+use arkham_config::config::user_state_dir;
 use clap::Args;
-use dirs::state_dir;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, to_string_pretty};
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
@@ -43,7 +43,7 @@ pub(crate) struct Claim {
 /// The global claim registry: `<state-dir>/arkham/exposed.json`, one entry per
 /// claimed host port. `None` when the state directory does not resolve.
 pub(crate) fn registry_file() -> Option<PathBuf> {
-  state_dir().map(|dir| dir.join("arkham").join("exposed.json"))
+  user_state_dir().map(|dir| dir.join("arkham").join("exposed.json"))
 }
 
 /// Read the claim registry; absent or unresolvable means no claims.

@@ -76,6 +76,8 @@ fn synthetic_config(names: &[String]) -> AppConfig {
   AppConfig {
     proxy: ProxyCfg {
       listen: SocketAddr::from(([127, 0, 0, 1], 8080)),
+      handoff_socket: None,
+      handoff_uid: None,
       ca_file: None,
       ssh_host_key: None,
       ssh_known_hosts: None,
