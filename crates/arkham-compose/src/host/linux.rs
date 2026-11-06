@@ -338,11 +338,7 @@ pub async fn agent(profile: WriteProfile, workspace: Option<&Path>, command: &[O
 }
 
 fn launch_cwd(workspace: Option<&Path>) -> Result<PathBuf, Error> {
-  match workspace {
-    Some(path) if path.is_absolute() => Ok(path.to_path_buf()),
-    Some(path) => Ok(std::env::current_dir()?.join(path)),
-    None => std::env::current_dir().map_err(Error::from),
-  }
+  super::discover::canonical_workspace(workspace)
 }
 
 fn trusted_socket(path: &Path) -> Result<(), Error> {
@@ -709,5 +705,11 @@ mod tests {
     assert_eq!(cwd, target);
     assert_eq!(crate::project_root(&cwd, &[]), Some(target.clone()));
     assert_eq!(crate::project_root(&link, &[]), Some(target));
+  }
+
+  #[test]
+  fn launch_cwd_without_a_workspace_is_the_canonical_current_directory() {
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+    assert_eq!(launch_cwd(None).unwrap(), cwd);
   }
 }
