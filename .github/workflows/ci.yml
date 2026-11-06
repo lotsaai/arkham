@@ -27,8 +27,18 @@ jobs:
 
       # nftables and bpftool are for the k3s task's failure dump
       # (`nft list ruleset`, `bpftool cgroup tree`), not for the build.
+      # linux-tools-generic is that bpftool package. Its metapackage sometimes
+      # publishes before the concrete kernel package is on the runner mirror,
+      # and a single install transaction then installs nothing. The build
+      # packages stay required. bpftool is installed when the mirror can.
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd mold nftables linux-tools-common linux-tools-generic bubblewrap
+        run: |-
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev zstd mold nftables linux-tools-common bubblewrap
+          if ! sudo apt-get install -y --no-install-recommends linux-tools-generic; then
+            echo "linux-tools-generic is not installable on this mirror"
+          fi
 
       # Pinned by hand to the LLVM major the pinned rustc ships. rustc is
       # NOT installed yet when this step runs, so probing `rustc -Vv` here
