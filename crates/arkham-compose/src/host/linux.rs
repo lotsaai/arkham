@@ -692,4 +692,22 @@ mod tests {
     let err = ensure_socket_dir().unwrap_err();
     assert_eq!(err.to_string(), "XDG_RUNTIME_DIR is unset or not private");
   }
+
+  #[test]
+  fn a_workspace_symlink_enlists_the_real_target() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path().canonicalize().unwrap();
+    let parent = base.join("home");
+    let target = base.join("proj");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("fnox.toml"), "[providers]\n").unwrap();
+    let link = parent.join("work");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let cwd = launch_cwd(Some(&link)).unwrap();
+    assert_eq!(cwd, target);
+    assert_eq!(crate::project_root(&cwd, &[]), Some(target.clone()));
+    assert_eq!(crate::project_root(&link, &[]), Some(target));
+  }
 }
