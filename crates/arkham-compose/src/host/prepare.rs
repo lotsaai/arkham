@@ -53,7 +53,17 @@ pub async fn prepare_session(
   version: &str,
   caller_env: &BTreeMap<String, String>,
 ) -> Result<PreparedSession, Error> {
-  let material = host_material(root, scratch, version).await?;
+  // A home directory is not a project. Prepare an empty tree so the host
+  // directory at the session path is not read, then use the private tmpfs.
+  let private = crate::host::discover::is_private_session(root);
+  let empty_root = scratch.join("empty");
+  let material_root = if private {
+    std::fs::create_dir_all(&empty_root)?;
+    empty_root.as_path()
+  } else {
+    root
+  };
+  let material = host_material(material_root, scratch, version).await?;
   let mut config = material.config;
   for grant in &material.grants {
     merge_fragment(&mut config, grant)?;
@@ -68,14 +78,14 @@ pub async fn prepare_session(
   push_mounts(&mut binds, &material.guest, &material.workspace, true);
   let forged_dir = scratch.join("forged");
   std::fs::create_dir_all(&forged_dir)?;
-  let projected = projected_files(root, &material.mounts)?;
+  let projected = projected_files(material_root, &material.mounts)?;
   let mut devices = std::collections::HashSet::new();
   for path in projected.iter().chain(binds.iter().map(|bind| &bind.dest)) {
     if let Ok(meta) = std::fs::metadata(path) {
       devices.insert(meta.dev());
     }
   }
-  let roots = crate::host::forge::scan_roots(root, &projected);
+  let roots = crate::host::forge::scan_roots(material_root, &projected);
   let inodes = inode_index(&devices, &roots);
   let mut index = 0u32;
   for path in projected {
@@ -117,14 +127,19 @@ pub async fn prepare_session(
   for name in ["SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE"] {
     set_env(&mut env, name, CA_DEST.to_string());
   }
+  let workspace = if private {
+    PathBuf::from(crate::host::discover::PRIVATE_SESSION_ROOT)
+  } else {
+    material.workspace
+  };
   let plan = LaunchPlan {
     profile,
-    workspace: material.workspace.clone(),
+    workspace: workspace.clone(),
     binds,
     ca_host: ca_cert.to_path_buf(),
     ca_dest: PathBuf::from(CA_DEST),
     env,
-    workdir: material.workspace,
+    workdir: workspace,
     shell: material.shell.unwrap_or_else(|| "sh".to_string()),
   };
   Ok(PreparedSession { resolved, plan, rule_envs })
@@ -293,6 +308,69 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn a_private_tmp_session_does_not_project_home_or_the_host_tmp() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    let marker = "HOME_PROJECT_SECRET_9f3a";
+    std::fs::write(home.join("fnox.toml"), format!("# {marker}\n")).unwrap();
+    std::fs::create_dir(home.join(".git")).unwrap();
+    let probe = PathBuf::from(format!("/tmp/arkham-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&probe).unwrap();
+    let host_fnox = probe.join("fnox.toml");
+    std::fs::write(&host_fnox, "# HOST_TMP_FNOX\n").unwrap();
+    let saved = std::env::var_os("HOME");
+    // SAFETY: test-only mutation of HOME. The previous value is restored before return.
+    unsafe {
+      std::env::set_var("HOME", &home);
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::write(scratch.path().join("ca.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
+    let prepared = prepare_session(
+      Path::new("/tmp"),
+      scratch.path(),
+      WriteProfile::WorkspaceWrite,
+      &scratch.path().join("ca.pem"),
+      "test",
+      &BTreeMap::new(),
+    )
+    .await;
+    // SAFETY: test-only restore of the HOME value captured above.
+    unsafe {
+      match saved {
+        Some(value) => std::env::set_var("HOME", value),
+        None => std::env::remove_var("HOME"),
+      }
+    }
+    let _ = std::fs::remove_dir_all(&probe);
+    let prepared = prepared.unwrap();
+    assert_eq!(prepared.plan.workspace, Path::new("/tmp"));
+    assert_eq!(prepared.plan.workdir, Path::new("/tmp"));
+    #[cfg(target_os = "linux")]
+    assert_private_session_argv(&prepared.plan, &home);
+    assert!(
+      prepared
+        .plan
+        .binds
+        .iter()
+        .all(|bind| { bind.source != home && !bind.source.starts_with(&home) && bind.dest != home && !bind.dest.starts_with(&home) }),
+      "home was bound\n{:?}",
+      prepared.plan.binds
+    );
+    assert!(
+      prepared.plan.binds.iter().all(|bind| {
+        bind.source != Path::new("/tmp")
+          && bind.dest != Path::new("/tmp")
+          && !bind.source.starts_with(&probe)
+          && !bind.dest.starts_with(&probe)
+      }),
+      "host tmp was projected\n{:?}",
+      prepared.plan.binds
+    );
+    let rendered = format!("{:?}", prepared.plan);
+    assert!(!rendered.contains(marker), "{rendered}");
+  }
+
+  #[tokio::test]
   async fn the_plan_env_comes_from_the_caller_not_the_process() {
     let root = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
@@ -324,5 +402,21 @@ mod tests {
     assert_eq!(env.get("TERM").map(String::as_str), Some("agent-term"));
     assert_eq!(env.get("FROM_AGENT").map(String::as_str), Some("agent-value"));
     assert_ne!(env.get("PATH").map(String::as_str), Some(process_path.as_str()));
+  }
+
+  #[cfg(target_os = "linux")]
+  fn assert_private_session_argv(plan: &crate::host::plan::LaunchPlan, home: &Path) {
+    let args = crate::host::plan::bwrap_argv(plan, &[]).unwrap();
+    assert!(
+      args.windows(2).any(|window| window[0] == "--chdir" && window[1] == "/tmp"),
+      "argv missing --chdir /tmp"
+    );
+    assert!(
+      !args.windows(3).any(|window| {
+        (window[0] == "--bind" || window[0] == "--ro-bind")
+          && (window[1] == "/tmp" || window[1] == home.as_os_str() || window[2] == home.as_os_str())
+      }),
+      "argv mounted home or host tmp"
+    );
   }
 }

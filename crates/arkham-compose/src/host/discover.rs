@@ -39,13 +39,21 @@ pub fn cgroup_is_confined(path: &str) -> bool {
   path.split('/').any(|part| part == "arkham-host")
 }
 
+/// Sandbox path used when the resolved project would be the user's home.
+///
+/// Bubblewrap mounts a fresh tmpfs here. The host directory of the same
+/// path is not a project and is not mounted.
+pub const PRIVATE_SESSION_ROOT: &str = "/tmp";
+
 /// Resolve the project root for a wrapper that started in `start`.
 ///
 /// `start` is canonicalized before the walk, so a directory symlink is the
 /// target tree. The project is the code-workspace root that contains that
 /// path. A registered root is the ceiling and the fallback when no marker
 /// is found. A fnox file does not choose the root. The result contains the
-/// canonical path and is never `/`.
+/// canonical path and is never `/`. When that root is the user's home
+/// directory, nothing from home is enlisted and the result is the private
+/// session directory.
 #[must_use]
 pub fn project_root(start: &Path, registered: &[PathBuf]) -> Option<PathBuf> {
   let canonical = canonicalize_dir(start).ok()?;
@@ -55,10 +63,30 @@ pub fn project_root(start: &Path, registered: &[PathBuf]) -> Option<PathBuf> {
   let registered = canonical_roots(registered);
   let ceiling = nearest_registered(&canonical, &registered);
   let project = workspace_root(&canonical).and_then(|root| root_containing(root, &canonical, ceiling.as_deref()));
-  project
+  let chosen = project
     .or(ceiling)
     .and_then(|chosen| root_containing(chosen, &canonical, None))
-    .or_else(|| root_containing(canonical.clone(), &canonical, None))
+    .or_else(|| root_containing(canonical.clone(), &canonical, None))?;
+  if is_user_home(&chosen) {
+    return Some(PathBuf::from(PRIVATE_SESSION_ROOT));
+  }
+  Some(chosen)
+}
+
+/// Whether `path` is the private session directory rather than a host project.
+#[must_use]
+pub(crate) fn is_private_session(path: &Path) -> bool {
+  path == Path::new(PRIVATE_SESSION_ROOT)
+}
+
+fn is_user_home(root: &Path) -> bool {
+  let Some(home) = dirs::home_dir() else {
+    return false;
+  };
+  let Ok(home) = std::fs::canonicalize(&home) else {
+    return false;
+  };
+  root == home
 }
 
 #[cfg(target_os = "linux")]
@@ -283,5 +311,80 @@ mod tests {
     std::os::unix::fs::symlink(base.join("missing"), &link).unwrap();
 
     assert_eq!(project_root(&link, &[]), None);
+  }
+
+  /// A start at the home directory, including through a symlink, enlists
+  /// nothing from that directory. The session workspace is the private `/tmp`.
+  #[test]
+  fn a_home_directory_is_not_enlisted_and_uses_the_private_tmp() {
+    let real = tempfile::tempdir().unwrap();
+    let real = real.path().canonicalize().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let elsewhere = elsewhere.path().canonicalize().unwrap();
+    let link = elsewhere.join("home");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let private_tmp = PathBuf::from("/tmp");
+
+    let home_env = HomeVar::set(&real);
+    let from_home = project_root(&real, &[]).unwrap();
+    let from_link = project_root(&link, &[]).unwrap();
+    assert_eq!(from_home, private_tmp);
+    assert_eq!(from_link, private_tmp);
+    assert_ne!(from_home, real);
+    drop(home_env);
+
+    let home_env = HomeVar::set(&link);
+    assert_eq!(project_root(&real, &[]).unwrap(), private_tmp);
+    drop(home_env);
+
+    std::fs::create_dir(real.join(".git")).unwrap();
+    let child = real.join("notes");
+    std::fs::create_dir(&child).unwrap();
+    let home_env = HomeVar::set(&real);
+    assert_eq!(project_root(&real, &[]).unwrap(), private_tmp);
+    assert_eq!(project_root(&child, std::slice::from_ref(&real)).unwrap(), private_tmp);
+    drop(home_env);
+  }
+
+  /// A project whose own marker sits under home stays that project.
+  #[test]
+  fn a_project_under_home_stays_that_project() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    let project = home.join("app");
+    let nested = project.join("src");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(project.join(".git")).unwrap();
+    let _home_env = HomeVar::set(&home);
+    assert_eq!(project_root(&nested, &[]), Some(project.clone()));
+    assert_eq!(project_root(&nested, std::slice::from_ref(&home)), Some(project));
+  }
+
+  /// Restore `HOME` when the test ends, including on panic.
+  struct HomeVar {
+    saved: Option<std::ffi::OsString>,
+  }
+
+  impl HomeVar {
+    fn set(path: &Path) -> Self {
+      let saved = std::env::var_os("HOME");
+      // SAFETY: test-only mutation of HOME. The previous value is restored on drop.
+      unsafe {
+        std::env::set_var("HOME", path);
+      };
+      Self { saved }
+    }
+  }
+
+  impl Drop for HomeVar {
+    fn drop(&mut self) {
+      // SAFETY: test-only restore of the HOME value captured in `set`.
+      unsafe {
+        match self.saved.take() {
+          Some(value) => std::env::set_var("HOME", value),
+          None => std::env::remove_var("HOME"),
+        }
+      }
+    }
   }
 }

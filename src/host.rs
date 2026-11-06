@@ -4,12 +4,12 @@
 //! and bind paths, and only then starts the agent.
 
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arkham_compose::{
-  RegisterResponse, cgroup_is_confined, decode_request, encode_response, ensure_socket_dir, host_cgroup, peer_uid_allowed, prepare_session,
-  project_root, read_cgroup, read_line, read_starttime, release_session, session_cgroup, write_line,
+  PRIVATE_SESSION_ROOT, RegisterResponse, cgroup_is_confined, decode_request, encode_response, ensure_socket_dir, host_cgroup,
+  peer_uid_allowed, prepare_session, project_root, read_cgroup, read_line, read_starttime, release_session, session_cgroup, write_line,
 };
 use arkham_config::config::ProxyCfg;
 use arkham_config::grants::ResolvedConfig;
@@ -171,7 +171,10 @@ async fn one_client(
     reject_logged(&mut stream, &err, REGISTRATION_FAILED).await?;
     return Ok(());
   }
-  registered.lock().unwrap_or_else(PoisonError::into_inner).push(root.clone());
+  // The private session directory is a tmpfs, not a project later sessions should inherit.
+  if root.as_path() != Path::new(PRIVATE_SESSION_ROOT) {
+    registered.lock().unwrap_or_else(PoisonError::into_inner).push(root.clone());
+  }
   let response = RegisterResponse {
     plan: Some(prepared.plan),
     error: None,

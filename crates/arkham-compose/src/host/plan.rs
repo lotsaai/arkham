@@ -60,7 +60,7 @@ pub const CA_DEST: &str = "/arkham/ca.pem";
 
 /// Temp directory the workspace-write profile passes to [`fs_policy`].
 #[cfg(target_os = "linux")]
-pub const TEMP_DIR: &str = "/tmp";
+pub const TEMP_DIR: &str = super::discover::PRIVATE_SESSION_ROOT;
 
 /// Cgroup mount the agent must not be able to write. A writable
 /// `cgroup.procs` would let the agent leave its session.
@@ -76,8 +76,9 @@ const CGROUP_MOUNT: &str = "/sys/fs/cgroup";
 ///
 /// # Errors
 ///
-/// Returns [`Error::SessionTmp`] when the workspace is `/tmp`, or when a
-/// bind source is a directory under the host `/tmp` other than the workspace.
+/// Returns [`Error::SessionTmp`] when a bind source is a directory under
+/// the host `/tmp`. A workspace of `/tmp` is the private session tmpfs and
+/// is not a host bind.
 #[cfg(target_os = "linux")]
 pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsString>, Error> {
   reject_host_tmp(plan)?;
@@ -97,7 +98,8 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsStrin
     "--cap-drop".into(),
     "ALL".into(),
   ]);
-  if workspace_write {
+  let private_session = plan.workspace == Path::new(TEMP_DIR);
+  if workspace_write || private_session {
     args.extend(["--tmpfs".into(), TEMP_DIR.into()]);
     anchors.push(PathBuf::from(TEMP_DIR));
   }
@@ -107,9 +109,11 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsStrin
     "--ro-bind"
   };
   let mut created = BTreeSet::new();
-  push_missing_parents(&mut args, &bound, &anchors, &plan.workspace, &mut created);
-  args.extend([workspace_flag.into(), plan.workspace.clone().into(), plan.workspace.clone().into()]);
-  bound.push(plan.workspace.clone());
+  if !private_session {
+    push_missing_parents(&mut args, &bound, &anchors, &plan.workspace, &mut created);
+    args.extend([workspace_flag.into(), plan.workspace.clone().into(), plan.workspace.clone().into()]);
+    bound.push(plan.workspace.clone());
+  }
   for bind in &plan.binds {
     if bind.dest == plan.workspace {
       continue;
@@ -122,6 +126,9 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsStrin
   args.extend(["--ro-bind".into(), plan.ca_host.clone().into(), plan.ca_dest.clone().into()]);
   push_secret_masks(&mut args, plan, &bound, &anchors);
   push_program(&mut args, &bound, &anchors, command, &mut created);
+  if private_session && matches!(policy, FsPolicy::ReadOnly { .. }) {
+    args.extend(["--remount-ro".into(), TEMP_DIR.into()]);
+  }
   args.extend(["--ro-bind".into(), CGROUP_MOUNT.into(), CGROUP_MOUNT.into()]);
   args.extend(["--remount-ro".into(), "/".into()]);
   args.extend(["--die-with-parent".into(), "--new-session".into(), "--clearenv".into()]);
@@ -276,9 +283,6 @@ fn mask_file(args: &mut Vec<OsString>, path: &Path, bound: &[PathBuf], anchors: 
 
 #[cfg(target_os = "linux")]
 fn reject_host_tmp(plan: &LaunchPlan) -> Result<(), Error> {
-  if plan.workspace == Path::new(TEMP_DIR) {
-    return Err(session_tmp_error());
-  }
   for bind in &plan.binds {
     if host_tmp_directory(&bind.source, &plan.workspace) {
       return Err(session_tmp_error());
@@ -291,7 +295,7 @@ fn reject_host_tmp(plan: &LaunchPlan) -> Result<(), Error> {
 /// path fails closed. A regular file does not.
 #[cfg(target_os = "linux")]
 fn host_tmp_directory(source: &Path, workspace: &Path) -> bool {
-  if source.as_os_str().is_empty() || source == workspace {
+  if source.as_os_str().is_empty() || (source == workspace && workspace != Path::new(TEMP_DIR)) {
     return false;
   }
   let tmp = Path::new(TEMP_DIR);
@@ -541,6 +545,61 @@ mod tests {
     plan.binds.push(Bind {
       source: parent.path().to_path_buf(),
       dest: parent.path().to_path_buf(),
+      read_only: true,
+    });
+    let err = bwrap_argv(&plan, &[]).unwrap_err();
+    assert_eq!(err.registration_detail(), "session tmp is not a private directory");
+  }
+
+  #[test]
+  fn a_private_tmp_workspace_is_the_session_tmpfs() {
+    let scratch = tempfile::tempdir().unwrap();
+    let ca = scratch.path().join("ca.pem");
+    std::fs::write(&ca, "CERT\n").unwrap();
+    let marker = PathBuf::from("/tmp/arkham-host-tmp-marker");
+    std::fs::write(&marker, "HOST_TMP_MARKER\n").unwrap();
+    let mut plan = plan(WriteProfile::WorkspaceWrite);
+    plan.workspace = PathBuf::from("/tmp");
+    plan.workdir = PathBuf::from("/tmp");
+    plan.binds.clear();
+    plan.ca_host = ca;
+    let args = argv(&plan, &[]);
+    assert!(has_pair(&args, "--tmpfs", "/tmp"), "{}", joined(&args));
+    assert!(has_pair(&args, "--chdir", "/tmp"), "{}", joined(&args));
+    assert!(!has_triple(&args, "--bind", "/tmp", "/tmp"), "{}", joined(&args));
+    assert!(!has_triple(&args, "--ro-bind", "/tmp", "/tmp"), "{}", joined(&args));
+    let script = "pwd; ls /tmp; touch /tmp/from-sandbox; echo TOUCH:$?";
+    let ran_args = argv(&plan, &["sh".into(), "-c".into(), script.into()]);
+    let ran = std::process::Command::new("sudo")
+      .arg("-n")
+      .arg("bwrap")
+      .args(&ran_args)
+      .output()
+      .unwrap();
+    let stdout = String::from_utf8_lossy(&ran.stdout);
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    assert!(ran.status.success(), "{stdout}{stderr}\n{}", joined(&ran_args));
+    assert!(stdout.contains("/tmp"), "{stdout}");
+    assert!(!stdout.contains("HOST_TMP_MARKER"), "{stdout}");
+    assert!(!Path::new("/tmp/from-sandbox").exists(), "sandbox write landed on the host tmp");
+    let _ = std::fs::remove_file(&marker);
+
+    plan.profile = WriteProfile::ReadOnly;
+    let args = argv(&plan, &[]);
+    assert!(has_pair(&args, "--tmpfs", "/tmp"), "{}", joined(&args));
+    assert!(has_pair(&args, "--remount-ro", "/tmp"), "{}", joined(&args));
+    assert!(!has_triple(&args, "--bind", "/tmp", "/tmp"), "{}", joined(&args));
+    assert!(!has_triple(&args, "--ro-bind", "/tmp", "/tmp"), "{}", joined(&args));
+
+    plan.profile = WriteProfile::DangerFullAccess;
+    let args = argv(&plan, &[]);
+    assert!(has_pair(&args, "--tmpfs", "/tmp"), "{}", joined(&args));
+    assert!(!has_triple(&args, "--bind", "/tmp", "/tmp"), "{}", joined(&args));
+
+    plan.profile = WriteProfile::WorkspaceWrite;
+    plan.binds.push(Bind {
+      source: scratch.path().to_path_buf(),
+      dest: scratch.path().to_path_buf(),
       read_only: true,
     });
     let err = bwrap_argv(&plan, &[]).unwrap_err();
