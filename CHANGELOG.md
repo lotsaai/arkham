@@ -1,8 +1,50 @@
+## [0.3.37] - 2026-11-06
+
+### 🚀 Features
+
+- *(macos)* Build arkham on macOS and update the local-confinement spec
+- *(serve)* Bind the Unix-socket PROXY handoff
+
+### 🐛 Bug Fixes
+
+- *(config)* Keep user_config_dirs free of a Linux-only unused mut
+- *(proxy)* Authenticate PROXY handoff over a Unix socket
+- *(proxy)* Reject a SO_PEERCRED length that does not fit
+- *(proxy)* Refuse non-loopback listen only for host backends
+- *(cursor)* Reference upstream pid directly in tutorial-http-swap cleanup
+- *(proxy)* Do not steal a live handoff socket or grow headers without bound
+
+### 📚 Documentation
+
+- *(cursor)* Record formal-verify-grant-host sync at 3c20783
+- *(cursor)* Point formal-verify-grant-host sync at 830be44
+
+### 🚜 Refactor
+
+- *(proxy)* Use tokio peer_cred for the handoff uid check
+- *(compose)* Read the uid through rustix
+
+### 🧪 Testing
+
+- *(proxy)* Accept RemoteClosed when both AMQP peers close after open
+- *(config)* Add formal grant-host oracle differential
+
+### ⚙️ Miscellaneous Tasks
+
+- Add a macOS job; rustfmt the cfg-gated imports
+- *(macos)* Scope the job to crates that build on macOS; spec the daemon and invariants
+- *(cursor)* Add verify-arkham and formal-verify-grant-host skills
+- *(cursor)* Drop verify-arkham tutorial run artifacts and ignore them
 ## [0.3.36] - 2026-11-05
 
 ### 🐛 Bug Fixes
 
 - *(kube)* Keep credential plugin output out of errors (#141)
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.36 [ci skip]
+- Release
 ## [0.3.35] - 2026-10-31
 
 ### 🚀 Features
