@@ -381,6 +381,8 @@ fn resolved_with(grants: Vec<Grant>) -> ResolvedConfig {
   ResolvedConfig {
     proxy: ProxyCfg {
       listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+      handoff_socket: None,
+      handoff_uid: None,
       ca_file: None,
       ssh_host_key: None,
       ssh_known_hosts: None,
