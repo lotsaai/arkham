@@ -3,10 +3,13 @@
 //! The cwd names a project. It does not authorize one. A session's project
 //! is fixed at registration.
 
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::workspace_root;
 use arkham_config::is_fnox_config_name;
+
+use crate::Error;
 
 /// Field index of `starttime` in `/proc/<pid>/stat` after the `comm` field.
 const STARTTIME_AFTER_COMM: usize = 19;
@@ -38,29 +41,67 @@ pub fn cgroup_is_confined(path: &str) -> bool {
 
 /// Resolve the project root for a wrapper that started in `start`.
 ///
-/// The walk stops at the nearest registered root and never returns `/`.
-/// A directory symlink is not entered, so a link cannot move the project
-/// onto its target. `None` means there is no project.
+/// `start` is canonicalized before the walk, so a directory symlink is the
+/// target tree. The walk stops at the nearest registered root and never
+/// returns `/`. The result contains that canonical path.
 #[must_use]
 pub fn project_root(start: &Path, registered: &[PathBuf]) -> Option<PathBuf> {
-  if start == Path::new("/") {
+  let canonical = canonicalize_dir(start).ok()?;
+  if canonical.as_path() == Path::new("/") {
     return None;
   }
-  let ceiling = nearest_registered(start, registered).filter(|root| root.as_path() != Path::new("/"));
-  let found = nearest_fnox_dir(start, ceiling.as_deref()).map(|marker| {
+  let registered = canonical_roots(registered);
+  let ceiling = nearest_registered(&canonical, &registered);
+  let found = nearest_fnox_dir(&canonical, ceiling.as_deref()).and_then(|marker| {
     let resolved = workspace_root(&marker).unwrap_or_else(|| marker.clone());
-    if resolved.as_path() != Path::new("/") && ceiling.as_ref().is_none_or(|limit| resolved.starts_with(limit)) {
-      resolved
-    } else {
-      marker
-    }
+    root_containing(resolved, &canonical, ceiling.as_deref()).or_else(|| root_containing(marker, &canonical, ceiling.as_deref()))
   });
-  let chosen = found.or(ceiling).or_else(|| {
-    let anchored = lexical_anchor(start);
-    let resolved = workspace_root(&anchored).unwrap_or(anchored);
-    (resolved.as_path() != Path::new("/")).then_some(resolved)
-  });
-  chosen.filter(|path| path.as_path() != Path::new("/"))
+  found.or(ceiling).and_then(|chosen| root_containing(chosen, &canonical, None))
+}
+
+pub(crate) fn canonical_workspace(workspace: Option<&Path>) -> Result<PathBuf, Error> {
+  let path = match workspace {
+    Some(path) if path.is_absolute() => path.to_path_buf(),
+    Some(path) => match std::env::current_dir() {
+      Ok(cwd) => cwd.join(path),
+      Err(source) => {
+        return Err(Error::ResolveWorkspace {
+          path: path.to_path_buf(),
+          source,
+        });
+      }
+    },
+    None => std::env::current_dir().map_err(|source| Error::ResolveWorkspace {
+      path: PathBuf::from("."),
+      source,
+    })?,
+  };
+  canonicalize_dir(&path).map_err(|source| Error::ResolveWorkspace { path, source })
+}
+
+fn canonicalize_dir(path: &Path) -> std::io::Result<PathBuf> {
+  let canonical = std::fs::canonicalize(path)?;
+  if canonical.is_dir() {
+    Ok(canonical)
+  } else {
+    Err(std::io::Error::new(ErrorKind::NotADirectory, "not a directory"))
+  }
+}
+
+fn canonical_roots(registered: &[PathBuf]) -> Vec<PathBuf> {
+  registered
+    .iter()
+    .filter_map(|root| canonicalize_dir(root).ok())
+    .filter(|root| root.as_path() != Path::new("/"))
+    .collect()
+}
+
+fn root_containing(candidate: PathBuf, canonical: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
+  let resolved = canonicalize_dir(&candidate).unwrap_or(candidate);
+  if resolved.as_path() == Path::new("/") || ceiling.is_some_and(|limit| !resolved.starts_with(limit)) {
+    return None;
+  }
+  canonical.starts_with(&resolved).then_some(resolved)
 }
 
 fn nearest_fnox_dir(start: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
@@ -68,10 +109,6 @@ fn nearest_fnox_dir(start: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
   while let Some(current) = dir {
     if current.as_path() == Path::new("/") {
       return None;
-    }
-    if is_dir_symlink(&current) {
-      dir = current.parent().map(Path::to_path_buf);
-      continue;
     }
     if dir_has_fnox(&current) {
       return Some(current);
@@ -82,26 +119,6 @@ fn nearest_fnox_dir(start: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
     dir = current.parent().map(Path::to_path_buf);
   }
   None
-}
-
-fn is_dir_symlink(path: &Path) -> bool {
-  std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
-}
-
-/// Directory that contains `start` after skipping directory symlinks.
-fn lexical_anchor(start: &Path) -> PathBuf {
-  let mut current = start.to_path_buf();
-  while current.as_path() != Path::new("/") && is_dir_symlink(&current) {
-    let Some(parent) = current.parent() else {
-      break;
-    };
-    current = parent.to_path_buf();
-  }
-  if current.as_path() == Path::new("/") {
-    start.to_path_buf()
-  } else {
-    current
-  }
 }
 
 fn dir_has_fnox(dir: &Path) -> bool {
@@ -173,14 +190,15 @@ mod tests {
   #[test]
   fn discovery_prefers_the_fnox_directory_then_a_registered_root() {
     let root = tempfile::tempdir().unwrap();
-    let project = root.path().join("work");
+    let root_path = root.path().canonicalize().unwrap();
+    let project = root_path.join("work");
     let nested = project.join("sub");
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(project.join("fnox.toml"), "[providers]\n").unwrap();
     let found = project_root(&nested, &[]);
     assert_eq!(found, Some(project));
 
-    let other = root.path().join("other");
+    let other = root_path.join("other");
     std::fs::create_dir_all(other.join("nested")).unwrap();
     let registered = vec![other.clone()];
     assert_eq!(project_root(&other.join("nested"), &registered), Some(other));
@@ -189,15 +207,16 @@ mod tests {
   #[test]
   fn a_fnox_file_above_the_registered_root_does_not_move_the_project() {
     let base = tempfile::tempdir().unwrap();
-    let project = base.path().join("project");
+    let base_path = base.path().canonicalize().unwrap();
+    let project = base_path.join("project");
     let nested = project.join("sub");
     std::fs::create_dir_all(&nested).unwrap();
-    std::fs::write(base.path().join("fnox.toml"), "secret = true\n").unwrap();
+    std::fs::write(base_path.join("fnox.toml"), "secret = true\n").unwrap();
     assert_eq!(project_root(&nested, std::slice::from_ref(&project)), Some(project));
   }
 
   #[test]
-  fn a_symlinked_directory_does_not_become_the_project() {
+  fn a_registered_root_does_not_pull_a_symlink_back_to_its_lexical_parent() {
     let base = tempfile::tempdir().unwrap();
     let base = base.path().canonicalize().unwrap();
     let project = base.join("project");
@@ -208,11 +227,9 @@ mod tests {
     let link = project.join("link");
     std::os::unix::fs::symlink(&outside, &link).unwrap();
     let found = project_root(&link, std::slice::from_ref(&project)).unwrap();
-    assert_eq!(found, project);
-    assert!(found.canonicalize().unwrap().starts_with(&project));
-    let unregistered = project_root(&link, &[]).unwrap();
-    assert_eq!(unregistered, project);
-    assert!(unregistered.canonicalize().unwrap().starts_with(&project));
+    assert_eq!(found, outside);
+    assert!(!found.starts_with(&project));
+    assert_eq!(project_root(&link, &[]), Some(outside));
   }
 
   #[test]
@@ -248,6 +265,18 @@ mod tests {
     std::fs::create_dir_all(&target).unwrap();
     let link = parent.join("work");
     std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    assert_eq!(project_root(&link, &[]), None);
+  }
+
+  #[test]
+  fn a_dangling_directory_symlink_does_not_enlist_its_parent() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path().canonicalize().unwrap();
+    let parent = base.join("home");
+    std::fs::create_dir_all(&parent).unwrap();
+    let link = parent.join("work");
+    std::os::unix::fs::symlink(base.join("missing"), &link).unwrap();
 
     assert_eq!(project_root(&link, &[]), None);
   }
