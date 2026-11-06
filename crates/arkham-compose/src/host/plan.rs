@@ -406,6 +406,112 @@ mod tests {
   }
 
   #[test]
+  fn a_sandbox_does_not_expose_another_sessions_cgroup() {
+    use std::io::Write as _;
+
+    for profile in [WriteProfile::ReadOnly, WriteProfile::WorkspaceWrite, WriteProfile::DangerFullAccess] {
+      let args = argv(&plan(profile), &[]);
+      assert!(
+        !args.windows(3).any(|window| {
+          (window[0] == "--bind" || window[0] == "--ro-bind") && (window[1] == "/sys/fs/cgroup" || window[2] == "/sys/fs/cgroup")
+        }),
+        "host cgroup tree is mounted\n{}",
+        joined(&args)
+      );
+      assert!(args.iter().any(|arg| arg == "--unshare-cgroup"), "{}", joined(&args));
+    }
+
+    let scratch = tempfile::tempdir().unwrap();
+    let ca = scratch.path().join("ca.pem");
+    std::fs::write(&ca, "CERT\n").unwrap();
+    let mut launched = plan(WriteProfile::WorkspaceWrite);
+    launched.workspace = PathBuf::from("/tmp");
+    launched.workdir = PathBuf::from("/tmp");
+    launched.binds.clear();
+    launched.ca_host = ca;
+    let parent = super::super::linux::host_cgroup().unwrap();
+    let sibling = parent.join(format!("other-session-{}", std::process::id()));
+    let _sibling = RemoveDir(sibling.clone());
+    std::fs::create_dir(&sibling).unwrap();
+    let script = format!(
+      "if [ -e '{}' ]; then echo SIBLING:visible; else echo SIBLING:hidden; fi; printf '%s\\n' \"PROC:$(tr '\\n' ' ' < /proc/self/cgroup)\"; sleep 1",
+      sibling.display()
+    );
+    let ran_args = argv(&launched, &["sh".into(), "-c".into(), script.into()]);
+    let mut child = StopChild(Some(
+      std::process::Command::new("sh")
+        .arg("-c")
+        .arg("read _; exec \"$@\"")
+        .arg("bwrap")
+        .arg("bwrap")
+        .args(&ran_args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap(),
+    ));
+    let pid = child.0.as_ref().unwrap().id();
+    let start = super::super::linux::read_starttime(pid).unwrap();
+    let slot = super::super::linux::session_cgroup(pid, start).unwrap();
+    let _session = ReleaseSession(slot.path.clone());
+    child.0.as_mut().unwrap().stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+    drop(child.0.as_mut().unwrap().stdin.take());
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let seen = host_cgroup_id(pid);
+    assert_eq!(seen, slot.id, "sandbox cgroup id diverged from the session directory");
+    let ran = child.wait();
+    let stdout = String::from_utf8_lossy(&ran.stdout);
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    assert!(ran.status.success(), "{stdout}{stderr}\n{}", joined(&ran_args));
+    assert_eq!(line_of(&stdout, "SIBLING"), "hidden", "{stdout}{stderr}");
+    assert_eq!(line_of(&stdout, "PROC").trim(), "0::/", "{stdout}{stderr}");
+  }
+
+  /// Inode `bpf_get_current_cgroup_id` reports: the host view of `/proc/<pid>/cgroup`.
+  fn host_cgroup_id(pid: u32) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    let own = text.lines().find_map(|line| line.strip_prefix("0::")).unwrap();
+    std::fs::metadata(Path::new("/sys/fs/cgroup").join(own.trim_start_matches('/')))
+      .unwrap()
+      .ino()
+  }
+
+  struct RemoveDir(PathBuf);
+
+  impl Drop for RemoveDir {
+    fn drop(&mut self) {
+      let _ = std::fs::remove_dir(&self.0);
+    }
+  }
+
+  struct ReleaseSession(PathBuf);
+
+  impl Drop for ReleaseSession {
+    fn drop(&mut self) {
+      super::super::linux::release_session(&self.0);
+    }
+  }
+
+  struct StopChild(Option<std::process::Child>);
+
+  impl StopChild {
+    fn wait(mut self) -> std::process::Output {
+      self.0.take().unwrap().wait_with_output().unwrap()
+    }
+  }
+
+  impl Drop for StopChild {
+    fn drop(&mut self) {
+      if let Some(child) = self.0.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+      }
+    }
+  }
+
+  #[test]
   fn the_sandbox_drops_every_capability() {
     let args = argv(&plan(WriteProfile::WorkspaceWrite), &[]);
     let text = joined(&args);
