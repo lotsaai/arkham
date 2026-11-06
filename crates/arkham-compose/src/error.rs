@@ -397,6 +397,13 @@ pub enum Error {
     #[source]
     source: TomlDeError,
   },
+  /// The session temp directory is missing or not private to this user.
+  #[error("session tmp is not a private directory")]
+  SessionTmp {
+    /// Why the directory was rejected.
+    #[source]
+    source: IoError,
+  },
   /// Landlock could not open a path it was asked to grant.
   #[cfg(target_os = "linux")]
   #[error("landlock path {path}", path = path.display())]
@@ -446,6 +453,7 @@ impl Error {
         | Self::NoStarttime { .. }
         | Self::NoCgroup { .. }
         | Self::HostLinuxOnly
+        | Self::SessionTmp { .. }
     )
   }
 
@@ -512,7 +520,8 @@ impl Error {
       | Self::ControlUnauthorized
       | Self::NoStarttime { .. }
       | Self::NoCgroup { .. }
-      | Self::HostLinuxOnly => "registration failed",
+      | Self::HostLinuxOnly
+      | Self::SessionTmp { .. } => "registration failed",
       #[cfg(target_os = "linux")]
       Self::LandlockPath { .. } | Self::Landlock { .. } | Self::LandlockIncomplete => "landlock did not enforce the profile",
     }
@@ -566,6 +575,14 @@ mod tests {
   #[test]
   fn a_private_runtime_failure_keeps_its_own_sentence() {
     assert_eq!(Error::RuntimeDir.registration_detail(), "XDG_RUNTIME_DIR is unset or not private");
+  }
+
+  #[test]
+  fn a_shared_session_tmp_keeps_its_own_sentence() {
+    let err = Error::SessionTmp {
+      source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "mode"),
+    };
+    assert_eq!(err.registration_detail(), "session tmp is not a private directory");
   }
 
   #[cfg(target_os = "linux")]

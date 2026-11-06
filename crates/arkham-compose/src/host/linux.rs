@@ -305,7 +305,8 @@ pub async fn agent(profile: WriteProfile, workspace: Option<&Path>, command: &[O
     return Err(Error::SocketOwner);
   }
   let cwd = launch_cwd(workspace)?;
-  let request = RegisterRequest { cwd, profile };
+  let env = std::env::vars().collect();
+  let request = RegisterRequest { cwd, profile, env };
   let bytes = serde_json::to_vec(&request).map_err(|source| Error::ControlMessage { source })?;
   write_line(&mut stream, &bytes).await?;
   let line = read_line(&mut stream).await?;
@@ -316,14 +317,15 @@ pub async fn agent(profile: WriteProfile, workspace: Option<&Path>, command: &[O
   let Some(plan) = response.plan else {
     return Err(Error::NoDaemon);
   };
+  let inner = sandboxed_command(&plan, command)?;
+  let argv = bwrap_argv(&plan, &inner)?;
   probe(&plan).await?;
   eprintln!("runner: bwrap");
   eprintln!("enforcement: full");
   let plan_file = plan_memfd(&plan)?;
   let plan_fd = plan_file.as_raw_fd();
-  let inner = sandboxed_command(&plan, command)?;
   let mut child_cmd = Command::new("bwrap");
-  child_cmd.args(insert_plan(bwrap_argv(&plan, &inner), plan_fd));
+  child_cmd.args(insert_plan(argv, plan_fd));
   // SAFETY: `pre_exec` runs in the forked child, before exec, and the closure
   // only calls `fcntl` on the memfd this process still owns. `fcntl` is
   // async-signal-safe, and the parent keeps the `File` until after `spawn`.
@@ -526,8 +528,11 @@ async fn probe(plan: &LaunchPlan) -> Result<(), Error> {
 }
 
 async fn probe_bwrap(plan: &LaunchPlan) -> bool {
+  let Ok(args) = bwrap_argv(plan, &[OsString::from("true")]) else {
+    return false;
+  };
   let Ok(status) = Command::new("bwrap")
-    .args(bwrap_argv(plan, &[OsString::from("true")]))
+    .args(args)
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::null())
     .status()
@@ -601,7 +606,7 @@ mod tests {
 
   #[test]
   fn the_plan_fd_is_inserted_before_the_root_is_remounted() {
-    let args = insert_plan(bwrap_argv(&sample_plan(), &[]), 7);
+    let args = insert_plan(bwrap_argv(&sample_plan(), &[]).unwrap(), 7);
     let data = args.iter().position(|arg| arg == "--ro-bind-data").unwrap();
     let remount = args.iter().position(|arg| arg == "--remount-ro").unwrap();
     assert!(data < remount);

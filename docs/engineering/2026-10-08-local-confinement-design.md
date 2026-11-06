@@ -117,7 +117,7 @@ bwrap \
   -- <shell-or-command>
 ```
 
-No `HTTP_PROXY` variables appear. Landlock adds read and write rules from the same profile inside the bubblewrap process. A ruleset the kernel does not fully enforce refuses to start the command. `danger-full-access` does not apply Landlock. `read-only` mode drops the workspace bind and the tmpfs.
+No `HTTP_PROXY` variables appear. The `/tmp` tmpfs is private to the session. Host directories under `/tmp` are not bind-mounted. Landlock adds read and write rules from the same profile inside the bubblewrap process. A ruleset the kernel does not fully enforce refuses to start the command. `danger-full-access` does not apply Landlock. `read-only` mode drops the workspace bind and the tmpfs.
 
 macOS emits SBPL from the shared writable roots as a second layer under the `arkham` user and the FUSE projection (see the macOS section):
 
