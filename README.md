@@ -113,6 +113,45 @@ Two runnable examples ship in the repository:
 - [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to secure with `arkham up`: one arkham container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
 - [integration](integration/README.md) — the compose demo behind `mise run demo`. The scenario table there is what the client asserts.
 
+## Linux host mode
+
+`arkham daemon` and `arkham agent --isolate bwrap` are the Linux host path. The container quickstart above is a different one.
+
+```mermaid
+flowchart TB
+  subgraph HOST["Host kernel, one network namespace, shared"]
+    direction TB
+    subgraph DCG["Daemon cgroup. The daemon process stays in this cgroup"]
+      subgraph DAEMON["arkham daemon, one process, your uid"]
+        SOCK["Unix control socket. Peer uid must be the daemon uid"]
+        PROXY["Proxy in this process. Capture listeners 127.0.0.1:15000 TCP and 127.0.0.1:15001 UDP. Also the explicit loopback listener. Holds the real credentials and substitutes them"]
+        EBPFU["eBPF userspace, aya, in this same process. Reads the BPF maps for the original destination and the cgroup id"]
+      end
+      subgraph ATTACH["arkham-host. The eBPF programs are attached here, once, and cover every session under it"]
+        subgraph SCG["pid-starttime, one directory per session"]
+          subgraph BWRAP["bubblewrap. user, pid, uts, ipc, and cgroup namespaces unshared. net shared with the host. tmpfs root. workspace-write and a home session get a private /tmp. The host /sys/fs/cgroup tree is not mounted"]
+            subgraph LL["Landlock, arkham --landlock-exec, then exec. Fully enforced or the command does not start. danger-full-access does not apply Landlock"]
+              AGENT["Agent process. Sees the project bind, forged fnox twins, config twins, the CA certificate, and decoy env"]
+            end
+          end
+        end
+      end
+    end
+    EBPFK["connect4, attached at arkham-host. TCP goes to 127.0.0.1:15000 and connected UDP to 127.0.0.1:15001. The real destination and cgroup id are stored. IPv6, loopback, and bypassed destinations are not rewritten"]
+    REAL["Real secret files and home config. Never mounted into the sandbox"]
+  end
+  UP["Upstream services"]
+  WRAP["arkham agent --isolate bwrap"] -->|register| SOCK
+  SOCK -->|"moves that pid into the session cgroup, then returns the plan"| SCG
+  AGENT -->|connect| EBPFK
+  EBPFK -->|redirected| PROXY
+  EBPFU -.->|"the cgroup id selects that session's grants"| PROXY
+  PROXY -->|"real credentials"| UP
+  REAL -.->|"the daemon reads these to build twins"| DAEMON
+```
+
+Filesystem isolation is bubblewrap plus Landlock. The network is shared with the host; captured TCP and connected UDP are redirected to the proxy, which alone holds the real credentials, and the cgroup id is how the proxy tells which session's grants apply. Discovery uses project markers, and fnox only decides which files get rewritten.
+
 ## Where the limits are
 
 arkham matches the request authority, not the path. An agent that hashes or signs the credential before sending defeats substitution, and the upstream rejects the request. A `*` grant host matches any destination. A client must trust arkham's CA to reach a granted HTTPS host. Transparent capture needs root and Linux; the `tproxy` backend needs `CAP_NET_ADMIN`, the `tun` backend a TUN device, and the `ebpf` backend `CAP_BPF` + `CAP_NET_ADMIN`, kernel 5.15, and IPv4. [The security model](docs/user/explanation/security-model.md) states each of these with its consequence.
