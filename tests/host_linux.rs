@@ -275,7 +275,7 @@ fn bwrap_hides_secret_files_and_proxy_env() {
   assert_eq!(line_of(&out, "SSL"), "/arkham/ca.pem");
   assert_eq!(line_of(&out, "NODE"), "/arkham/ca.pem");
   assert_eq!(line_of(&out, "REQ"), "/arkham/ca.pem");
-  assert!(line_of(&out, "CGROUP").contains("arkham-host"), "{out}");
+  assert_eq!(line_of(&out, "CGROUP").trim(), "0::/", "{out}");
   assert_ne!(line_of(&out, "OUTSIDE"), "0", "a path outside the workspace was writable");
   assert_ne!(line_of(&out, "WRITE"), "0", "the forged file accepted a write");
   assert_ne!(line_of(&out, "AGEWRITE"), "0", "the age file accepted a write");

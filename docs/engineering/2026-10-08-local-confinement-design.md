@@ -36,7 +36,7 @@ Renderers are per OS. Linux runs bubblewrap. Landlock adds restrictions inside t
 
 Each sandbox runs in its own cgroup. The eBPF programs (`arkham-ebpf-programs`: `connect4`, `recvmsg4`, `capture_egress`, `CONFIG` / `ORIG_DST` / `FLOW` maps) attach per cgroup, so flows arrive already attributed to a workspace. The userspace half hands accepted streams to `serve_transparent_stream`. No env vars, no proxy flags, no cooperation from the agent. Tools inside may set `HTTP_PROXY` to anything: the TCP connection itself is captured either way.
 
-The bwrap invocation keeps the filesystem shape from the compose inputs (workspace root and `include` entries with their ro flags, `file_mounts` and guest mounts read only, `tool_mounts` with their flags, fnox binds and grants mounts never entering) plus `--unshare-pid --unshare-uts --unshare-ipc --die-with-parent --new-session`, the CA as a read-only bind with trust env pointers, and decoy env values. `--unshare-net` stays off: the sandbox shares the host stack and eBPF sees its flows through cgroup membership.
+The bwrap invocation keeps the filesystem shape from the compose inputs (workspace root and `include` entries with their ro flags, `file_mounts` and guest mounts read only, `tool_mounts` with their flags, fnox binds and grants mounts never entering) plus `--unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup --die-with-parent --new-session`, the CA as a read-only bind with trust env pointers, and decoy env values. The host `/sys/fs/cgroup` tree is not mounted. The daemon moves the process into its session cgroup first, and `--unshare-cgroup` makes that cgroup the namespace root, so another session's cgroup is not a path in the sandbox. eBPF still attributes the flow with that session cgroup's real id, the kernfs inode. A probe that cannot create the cgroup namespace refuses to start the agent. `--unshare-net` stays off: the sandbox shares the host stack and eBPF sees its flows through cgroup membership.
 
 ## macOS: arkham user, FUSE projection, NetworkExtension dispatcher
 
@@ -103,7 +103,7 @@ Linux argv shape for `workspace-write`, before the `--` separator and the agent 
 bwrap \
   --ro-bind / / \
   --dev /dev --proc /proc \
-  --unshare-pid --unshare-uts --unshare-ipc \
+  --unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup \
   --tmpfs /tmp \
   --bind <workspace-root> <workspace-root> \
   --ro-bind <rewritten-file> <dest> ... \
