@@ -330,6 +330,33 @@ mod tests {
   }
 
   #[test]
+  fn an_include_of_root_home_or_an_ancestor_is_refused() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let root = base.join("mid").join("proj");
+    let sibling = base.join("mid").join("sibling");
+    let mise = home.join(".config").join("mise");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::create_dir_all(&mise).unwrap();
+    let layout = Layout::new(&root, "/home/eng".to_string(), Some(home.clone()));
+    for entry in [PathBuf::from("/"), PathBuf::from("~"), PathBuf::from(".."), PathBuf::from("../.."), home.clone()] {
+      let err = layout.include_mounts(std::slice::from_ref(&entry)).unwrap_err();
+      assert!(err.to_string().contains("widens"), "{entry:?}: {err}");
+    }
+    let link = root.join("escape");
+    std::os::unix::fs::symlink("/", &link).unwrap();
+    let err = layout.include_mounts(&[PathBuf::from("escape")]).unwrap_err();
+    assert!(err.to_string().contains("widens"), "{err}");
+    let mounts = layout
+      .include_mounts(&[PathBuf::from("../sibling"), PathBuf::from("~/.config/mise:ro")])
+      .unwrap();
+    assert!(mounts.iter().any(|mount| mount.host == sibling), "{mounts:?}");
+    assert!(mounts.iter().any(|mount| mount.host == mise && mount.ro), "{mounts:?}");
+  }
+
+  #[test]
   fn include_entries_split_their_mount_mode() {
     assert_eq!(split_mode(Path::new("~/.config/mise:ro")), (PathBuf::from("~/.config/mise"), true));
     assert_eq!(split_mode(Path::new("/data/cache:rw")), (PathBuf::from("/data/cache"), false));
