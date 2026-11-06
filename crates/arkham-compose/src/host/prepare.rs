@@ -229,6 +229,38 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn an_include_tree_projects_its_fnox_file() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path().canonicalize().unwrap();
+    let root = base.join("proj");
+    let sibling = base.join("sibling");
+    std::fs::create_dir_all(root.join(".config/arkham")).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    let marker = "REAL_INCLUDE_SECRET_9f3a";
+    let fnox = sibling.join("fnox.toml");
+    std::fs::write(&fnox, format!("# {marker}\n")).unwrap();
+    std::fs::write(root.join("fnox.toml"), "# workspace\n").unwrap();
+    std::fs::write(root.join(".config/arkham/config.toml"), "[workspace]\ninclude = [\"../sibling\"]\n").unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    std::fs::write(scratch.path().join("ca.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
+    let prepared = prepare_session(
+      &root,
+      scratch.path(),
+      WriteProfile::WorkspaceWrite,
+      &scratch.path().join("ca.pem"),
+      "test",
+      &BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    let bind = prepared.plan.binds.iter().find(|bind| bind.dest == fnox).unwrap();
+    assert_ne!(bind.source, fnox);
+    let forged = std::fs::read_to_string(&bind.source).unwrap();
+    assert!(!forged.contains(marker), "{forged}");
+    assert!(std::fs::read_to_string(&fnox).unwrap().contains(marker));
+  }
+
+  #[tokio::test]
   async fn the_plan_env_comes_from_the_caller_not_the_process() {
     let root = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
