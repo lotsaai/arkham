@@ -219,4 +219,36 @@ mod tests {
   fn the_filesystem_root_is_not_a_project() {
     assert!(project_root(std::path::Path::new("/"), &[]).is_none());
   }
+
+  #[test]
+  fn a_directory_symlink_with_fnox_in_the_target_enlists_the_target() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path().canonicalize().unwrap();
+    let parent = base.join("home");
+    let target = base.join("proj");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("fnox.toml"), "[providers]\n").unwrap();
+    std::fs::write(parent.join("credentials"), "host-only\n").unwrap();
+    let link = parent.join("work");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let found = project_root(&link, &[]).unwrap();
+    assert_eq!(found, target);
+    assert!(!found.starts_with(&parent), "enlisted {found:?} widens over {parent:?}");
+  }
+
+  #[test]
+  fn a_symlink_with_no_project_marker_does_not_enlist_its_parent() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path().canonicalize().unwrap();
+    let parent = base.join("home");
+    let target = base.join("empty");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    let link = parent.join("work");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    assert_eq!(project_root(&link, &[]), None);
+  }
 }
