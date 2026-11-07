@@ -1,4 +1,4 @@
-//! TCP leg: accept what the `connect4` hook redirected here and run it through
+//! TCP leg: accept what the connect hooks redirected here and run it through
 //! the shared substitution machinery.
 
 use std::net::SocketAddr;
@@ -12,18 +12,17 @@ use tokio::net::{TcpListener, TcpStream};
 
 /// Accept redirected connections forever.
 ///
-/// The listener is a plain loopback socket: `connect4` already rewrote the
+/// The listener is a plain loopback socket: the connect hook already rewrote the
 /// destination, so no `IP_TRANSPARENT` is involved. Each accepted connection's
 /// original destination is looked up and handed to [`serve_captured_stream`]
 /// exactly the way the TPROXY leg does — the SNI is the TLS identity, and for
 /// transparent capture there is no CONNECT authority to enforce.
 pub(crate) async fn serve(
-  port: u16,
+  listener: TcpListener,
   flows: FlowTables,
   state: Arc<ProxyState>,
   upstream_override: Option<SocketAddr>,
 ) -> Result<(), Error> {
-  let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
   loop {
     let (stream, peer) = listener.accept().await?;
     let flows = flows.clone();
@@ -84,9 +83,10 @@ fn live_cgroup(stream: &TcpStream, peer: SocketAddr) -> u64 {
 /// Inode of the established client socket whose local address is `client`
 /// and whose remote address is the listener `local`.
 fn established_inode(client: SocketAddr, local: SocketAddr) -> Option<u64> {
-  let client = proc_tcp_addr(client)?;
-  let local = proc_tcp_addr(local)?;
-  let text = std::fs::read_to_string("/proc/net/tcp").ok()?;
+  let path = if client.is_ipv4() { "/proc/net/tcp" } else { "/proc/net/tcp6" };
+  let client = proc_tcp_addr(client);
+  let local = proc_tcp_addr(local);
+  let text = std::fs::read_to_string(path).ok()?;
   for line in text.lines().skip(1) {
     let mut cols = line.split_whitespace();
     let _slot = cols.next()?;
@@ -102,13 +102,22 @@ fn established_inode(client: SocketAddr, local: SocketAddr) -> Option<u64> {
   None
 }
 
-/// `local_address` column of `/proc/net/tcp` for an IPv4 socket.
-fn proc_tcp_addr(addr: SocketAddr) -> Option<String> {
-  let std::net::IpAddr::V4(ip) = addr.ip() else {
-    return None;
+/// `local_address` column of `/proc/net/tcp` or `/proc/net/tcp6`.
+fn proc_tcp_addr(addr: SocketAddr) -> String {
+  let ip = match addr.ip() {
+    std::net::IpAddr::V4(ip) => format!("{:08X}", u32::from_ne_bytes(ip.octets())),
+    std::net::IpAddr::V6(ip) => {
+      let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = ip.octets();
+      format!(
+        "{:08X}{:08X}{:08X}{:08X}",
+        u32::from_ne_bytes([a, b, c, d]),
+        u32::from_ne_bytes([e, f, g, h]),
+        u32::from_ne_bytes([i, j, k, l]),
+        u32::from_ne_bytes([m, n, o, p]),
+      )
+    }
   };
-  let ip = u32::from(ip).swap_bytes();
-  Some(format!("{ip:08X}:{:04X}", addr.port()))
+  format!("{ip}:{:04X}", addr.port())
 }
 
 /// Process that holds a socket fd for `inode`.
@@ -141,18 +150,23 @@ mod tests {
 
   #[tokio::test]
   async fn the_accepted_peer_cgroup_is_the_connectors() {
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-    let connector = tokio::spawn(async move {
-      let _client = TcpStream::connect(addr).await.unwrap();
-      let _ = release_rx.await;
-    });
-    let (stream, peer) = listener.accept().await.unwrap();
-    let live = live_cgroup(&stream, peer);
-    assert_eq!(live, cgroup_id_of_pid(std::process::id()));
-    assert_ne!(live, 0);
-    drop(release_tx);
-    connector.await.unwrap();
+    for ip in [
+      std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+      std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+      let listener = TcpListener::bind((ip, 0)).await.unwrap();
+      let addr = listener.local_addr().unwrap();
+      let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+      let connector = tokio::spawn(async move {
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let _ = release_rx.await;
+      });
+      let (stream, peer) = listener.accept().await.unwrap();
+      let live = live_cgroup(&stream, peer);
+      assert_eq!(live, cgroup_id_of_pid(std::process::id()));
+      assert_ne!(live, 0);
+      drop(release_tx);
+      connector.await.unwrap();
+    }
   }
 }

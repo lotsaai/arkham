@@ -35,7 +35,7 @@ jobs:
         run: |-
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libudev-dev zstd mold nftables linux-tools-common bubblewrap
+          sudo apt-get install -y --no-install-recommends libudev-dev libcap2-bin zstd mold nftables linux-tools-common bubblewrap
           if ! sudo apt-get install -y --no-install-recommends linux-tools-generic; then
             echo "linux-tools-generic is not installable on this mirror"
           fi
@@ -132,9 +132,8 @@ jobs:
   # macOS has no compose stack, no capture backends and no integration
   # services, so this job checks that the workspace builds, lints clean and
   # passes the Rust tests there. Lint (hk) runs on Linux only; the platform
-  # specific part it would add here is clippy. arkham-ebpf, arkham-tproxy and
-  # arkham-tun are Linux capture backends (netlink, eBPF, TUN) and are only
-  # Linux dependencies of the binary, so they are excluded here.
+  # specific part it would add here is clippy. arkham-ebpf is a Linux
+  # dependency of the binary, so it is excluded here.
   macos:
     runs-on: macos-latest
     env:
@@ -156,10 +155,10 @@ jobs:
           key: aarch64-apple-darwin
 
       - name: Clippy
-        run: cargo clippy --locked --workspace --exclude arkham-ebpf-programs --exclude arkham-ebpf --exclude arkham-tproxy --exclude arkham-tun --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --exclude arkham-ebpf-programs --exclude arkham-ebpf --all-targets -- -D warnings
 
       - name: Test
         run: |-
           set -euo pipefail
           mise run build:plugins
-          ARKHAM_PLUGIN_FIXTURES="$PWD/target/plugins" cargo nextest run --locked --cargo-quiet --workspace --exclude arkham-ebpf-programs --exclude arkham-ebpf --exclude arkham-tproxy --exclude arkham-tun --status-level=slow
+          ARKHAM_PLUGIN_FIXTURES="$PWD/target/plugins" cargo nextest run --locked --cargo-quiet --workspace --exclude arkham-ebpf-programs --exclude arkham-ebpf --status-level=slow

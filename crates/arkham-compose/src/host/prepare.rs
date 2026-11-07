@@ -107,6 +107,7 @@ pub async fn prepare_session(
       });
     }
   }
+  let protected = protected_config_paths(material_root, &binds)?;
   let mut env = Vec::new();
   for name in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE"] {
     if let Some(value) = caller_env.get(name) {
@@ -136,6 +137,7 @@ pub async fn prepare_session(
     profile,
     workspace: workspace.clone(),
     binds,
+    protected,
     ca_host: ca_cert.to_path_buf(),
     ca_dest: PathBuf::from(CA_DEST),
     env,
@@ -143,6 +145,120 @@ pub async fn prepare_session(
     shell: material.shell.unwrap_or_else(|| "sh".to_string()),
   };
   Ok(PreparedSession { resolved, plan, rule_envs })
+}
+
+fn protected_config_paths(workspace: &Path, binds: &[Bind]) -> Result<Vec<PathBuf>, Error> {
+  let mut candidates = vec![workspace.join(".config/arkham"), workspace.join(".config/arkham.toml")];
+  if let Some(home) = dirs::home_dir() {
+    candidates.push(home.join(".config/arkham"));
+  }
+  candidates.extend(arkham_config::config::user_config_dirs().into_iter().map(|dir| dir.join("arkham")));
+  if let Some(path) = std::env::var_os("ARKHAM_CONFIG") {
+    candidates.push(PathBuf::from(path));
+  }
+  if let Some(path) = arkham_config::config::rules_dir() {
+    candidates.push(path);
+  }
+
+  let mut targets = BTreeSet::new();
+  let mut files = BTreeSet::new();
+  for candidate in candidates {
+    match std::fs::symlink_metadata(&candidate) {
+      Ok(_) => collect_protected(&candidate, &mut targets, &mut files)?,
+      Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+      Err(source) => return Err(source.into()),
+    }
+  }
+
+  let devices: std::collections::HashSet<u64> = files
+    .iter()
+    .map(std::fs::metadata)
+    .collect::<std::io::Result<Vec<_>>>()?
+    .into_iter()
+    .map(|meta| meta.dev())
+    .collect();
+  let mut roots = crate::host::forge::scan_roots(workspace, &files.iter().cloned().collect::<Vec<_>>());
+  for bind in binds {
+    roots.push(std::fs::canonicalize(&bind.source).unwrap_or_else(|_| bind.source.clone()));
+  }
+  #[cfg(target_os = "linux")]
+  for name in super::plan::SYSTEM_ROOTS {
+    if let Ok(path) = std::fs::canonicalize(Path::new("/").join(name)) {
+      roots.push(path);
+    }
+  }
+  #[cfg(target_os = "linux")]
+  if !devices.is_empty() {
+    let mounts = mounted_roots(&roots)?;
+    roots.extend(mounts);
+  }
+  let inodes = inode_index(&devices, &roots);
+  for file in &files {
+    targets.extend(indexed_aliases(&inodes, file));
+  }
+  let source_paths: Vec<_> = targets.iter().cloned().collect();
+  for bind in binds {
+    let source = std::fs::canonicalize(&bind.source).unwrap_or_else(|_| bind.source.clone());
+    for path in &source_paths {
+      if let Ok(relative) = path.strip_prefix(&source) {
+        targets.insert(bind.dest.join(relative));
+      }
+    }
+  }
+  Ok(targets.into_iter().collect())
+}
+
+#[cfg(target_os = "linux")]
+fn mounted_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
+  use std::os::unix::ffi::OsStringExt as _;
+
+  let mountinfo = std::fs::read("/proc/self/mountinfo")?;
+  let mut mounted = Vec::new();
+  for line in mountinfo.split(|byte| *byte == b'\n') {
+    let Some(encoded) = line.split(|byte| *byte == b' ').nth(4) else {
+      continue;
+    };
+    let mut path = Vec::with_capacity(encoded.len());
+    let mut bytes = encoded.iter().copied();
+    while let Some(byte) = bytes.next() {
+      if byte == b'\\' {
+        match (bytes.next(), bytes.next(), bytes.next()) {
+          (Some(b'0'), Some(b'4'), Some(b'0')) => path.push(b' '),
+          (Some(b'0'), Some(b'1'), Some(b'1')) => path.push(b'\t'),
+          (Some(b'0'), Some(b'1'), Some(b'2')) => path.push(b'\n'),
+          (Some(b'1'), Some(b'3'), Some(b'4')) => path.push(b'\\'),
+          _ => continue,
+        }
+      } else {
+        path.push(byte);
+      }
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_vec(path));
+    if roots.iter().any(|root| path.starts_with(root)) {
+      mounted.push(path);
+    }
+  }
+  Ok(mounted)
+}
+
+fn collect_protected(path: &Path, targets: &mut BTreeSet<PathBuf>, files: &mut BTreeSet<PathBuf>) -> Result<(), Error> {
+  let path = match std::fs::canonicalize(path) {
+    Ok(path) => path,
+    Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    Err(source) => return Err(source.into()),
+  };
+  if !targets.insert(path.clone()) {
+    return Ok(());
+  }
+  let metadata = std::fs::metadata(&path)?;
+  if metadata.is_dir() {
+    for entry in std::fs::read_dir(path)? {
+      collect_protected(&entry?.path(), targets, files)?;
+    }
+  } else if metadata.is_file() {
+    files.insert(path);
+  }
+  Ok(())
 }
 
 fn push_with_aliases(binds: &mut Vec<Bind>, inodes: &std::collections::HashMap<(u64, u64), Vec<PathBuf>>, source: PathBuf, dest: PathBuf) {
@@ -240,6 +356,43 @@ fn set_env(env: &mut Vec<(String, String)>, key: &str, value: String) {
 mod tests {
   use super::*;
 
+  #[test]
+  fn a_dangling_config_link_does_not_hide_existing_config_files() {
+    let root = tempfile::tempdir().unwrap();
+    let existing = root.path().join("config.toml");
+    std::fs::write(&existing, "# PRIVATE_CONTENT\n").unwrap();
+    std::os::unix::fs::symlink("missing.toml", root.path().join("dangling.toml")).unwrap();
+    let mut targets = BTreeSet::new();
+    let mut files = BTreeSet::new();
+    collect_protected(root.path(), &mut targets, &mut files).unwrap();
+    assert_eq!(files, BTreeSet::from([existing.canonicalize().unwrap()]));
+    assert!(!root.path().join("missing.toml").exists());
+  }
+
+  #[test]
+  fn symlink_targets_and_translated_hardlinks_are_protected() {
+    let base = tempfile::tempdir().unwrap();
+    let workspace = base.path().join("workspace");
+    let source = base.path().join("source");
+    let dest = base.path().join("destination");
+    std::fs::create_dir_all(workspace.join(".config")).unwrap();
+    std::fs::create_dir_all(workspace.join("real-config")).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    let config = workspace.join("real-config/config.toml");
+    std::fs::write(&config, "# PRIVATE_CONTENT\n").unwrap();
+    std::os::unix::fs::symlink("../real-config", workspace.join(".config/arkham")).unwrap();
+    std::fs::hard_link(&config, source.join("alias")).unwrap();
+    let binds = vec![Bind {
+      source,
+      dest: dest.clone(),
+      read_only: false,
+    }];
+    let protected = protected_config_paths(&workspace, &binds).unwrap();
+    assert!(protected.contains(&workspace.join("real-config")));
+    assert!(protected.contains(&config));
+    assert!(protected.contains(&dest.join("alias")));
+  }
+
   #[tokio::test]
   async fn the_rule_set_stays_at_the_snapshot_after_the_file_changes() {
     let root = tempfile::tempdir().unwrap();
@@ -319,9 +472,13 @@ mod tests {
     let host_fnox = probe.join("fnox.toml");
     std::fs::write(&host_fnox, "# HOST_TMP_FNOX\n").unwrap();
     let saved = std::env::var_os("HOME");
+    let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let saved_jj = std::env::var_os("JJ_CONFIG");
     // SAFETY: test-only mutation of HOME. The previous value is restored before return.
     unsafe {
       std::env::set_var("HOME", &home);
+      std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+      std::env::set_var("JJ_CONFIG", home.join(".jjconfig.toml"));
     };
     let scratch = tempfile::tempdir().unwrap();
     std::fs::write(scratch.path().join("ca.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
@@ -339,6 +496,14 @@ mod tests {
       match saved {
         Some(value) => std::env::set_var("HOME", value),
         None => std::env::remove_var("HOME"),
+      }
+      match saved_xdg {
+        Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+      }
+      match saved_jj {
+        Some(value) => std::env::set_var("JJ_CONFIG", value),
+        None => std::env::remove_var("JJ_CONFIG"),
       }
     }
     let _ = std::fs::remove_dir_all(&probe);

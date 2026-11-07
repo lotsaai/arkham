@@ -26,9 +26,8 @@ use tokio::net::{UnixListener, UnixStream};
 ///
 /// # Errors
 ///
-/// Returns an error when the listen address is not loopback, the control
-/// socket cannot be bound, or the CA cannot be loaded. Capture failure is
-/// logged and does not stop the daemon: the agent still holds decoys only.
+/// Returns an error when a listener, CA or capture backend cannot start.
+/// Capture failure stops the daemon rather than leaving sessions uncaptured.
 pub async fn run(version: &str) -> eyre::Result<()> {
   let proxy = ProxyCfg::builder().env().load().wrap_err("reading the listen address")?;
   require_loopback_listen(proxy.listen)?;
@@ -53,24 +52,30 @@ pub async fn run(version: &str) -> eyre::Result<()> {
   )?);
   let registered = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
   let explicit = bind_explicit(proxy.listen).await?;
-  let serve_state = Arc::clone(&state);
-  tokio::spawn(async move {
-    serve(explicit, serve_state).await;
-  });
+  let cgroup = host_cgroup()?;
   let capture_state = Arc::clone(&state);
-  tokio::spawn(async move {
-    match host_cgroup() {
-      Ok(cgroup) => {
-        if let Err(err) = arkham_ebpf::run_ebpf(capture_state, cgroup, Vec::new(), None).await {
-          tracing::error!(%err, "ebpf capture stopped");
-        }
+  let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+  crate::with_capture(
+    async move {
+      if ready_rx.await.is_err() {
+        // The capture task owns startup errors; with_capture reports its result.
+        return std::future::pending().await;
       }
-      Err(err) => tracing::error!(%err, "ebpf cgroup unavailable"),
-    }
-  });
-  tracing::info!(listen = %proxy.listen, socket = %socket_path.display(), "host daemon ready");
-  eprintln!("daemon: ready");
-  accept_loop(listener, state, ca, registered, version).await
+      tracing::info!(listen = %proxy.listen, socket = %socket_path.display(), "host daemon ready");
+      eprintln!("daemon: ready");
+      tokio::select! {
+        () = serve(explicit, Arc::clone(&state)) => Ok(()),
+        result = accept_loop(listener, state, ca, registered, version) => result,
+      }
+    },
+    "eBPF",
+    async move {
+      arkham_ebpf::run_ebpf(capture_state, cgroup, Vec::new(), None, Some(ready_tx))
+        .await
+        .map_err(eyre::Report::from)
+    },
+  )
+  .await
 }
 
 async fn accept_loop(

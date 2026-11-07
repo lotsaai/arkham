@@ -1,14 +1,6 @@
 name: arkham-integration
 
-# Transparent capture topology: the client container shares arkham's network
-# namespace (network_mode: service:arkham). arkham runs --proxy-backend tproxy and installs its
-# policy routing inside that shared netns, so every client connection is
-# captured without any proxy configuration on the client — LAN included.
-# arkham's marked upstream dials bypass the capture (fwmark rule).
-#
-# tproxy, not ebpf: the eBPF backend captures by cgroup membership, and a
-# compose service's cgroup path is not something this file can pin. Use
-# `ARKHAM_BACKEND=ebpf mise run demo:bwrap` for the same scenarios over eBPF.
+# The client shares arkham's network namespace and cgroup parent.
 
 # One value for smtp-direct and the client. Unset keeps the demo decoy.
 # An empty value skips the direct dial and the client SMTP scenario.
@@ -55,7 +47,9 @@ services:
       [
         "serve",
         "--proxy-backend",
-        "${ARKHAM_BACKEND:-tproxy}",
+        "ebpf",
+        "--ebpf-cgroup",
+        "enclosing",
         "--config",
         "/etc/arkham/arkham.toml",
       ]
@@ -70,11 +64,15 @@ services:
       # environment. No committed file carries a real value.
       ARKHAM_CONFIG: /arkham-config/config.toml
     stop_grace_period: 1s
+    cgroup: host
+    # Only the proxy needs host PID visibility to validate client socket owners.
+    pid: host
+    cgroup_parent: arkham-integration.slice
     cap_add:
       - NET_ADMIN
-    # The tun backend opens the host TUN device; harmless for the others.
-    devices:
-      - /dev/net/tun:/dev/net/tun
+      - BPF
+      - PERFMON
+      - SYS_PTRACE
     volumes:
       - ./out/arkham.toml:/etc/arkham/arkham.toml:ro
       - certs:/certs:ro
@@ -138,12 +136,13 @@ services:
   # half; the decoy never authenticates here. arkham dials it on the server
   # net, and its host key rides accept-new into arkham's known_hosts.
   sshd:
-    image: alpine:3.22
+    build:
+      context: ./sshd
     entrypoint:
       [
         "/bin/sh",
         "-c",
-        "apk add --no-cache openssh-server && ssh-keygen -A && adduser -D -s /bin/sh agent && sed -i '/^agent:/s/!/*/' /etc/shadow && mkdir -p /home/agent/.ssh && cp /certs/ssh/authorized_keys /home/agent/.ssh/authorized_keys && chown -R agent:agent /home/agent/.ssh && exec /usr/sbin/sshd -D -e -o Port=22 -o ListenAddress=0.0.0.0 -o PermitRootLogin=no -o PasswordAuthentication=no -o PubkeyAuthentication=yes -o StrictModes=no -o UsePAM=no -o AuthorizedKeysFile=.ssh/authorized_keys -o LogLevel=VERBOSE",
+        "ssh-keygen -A && adduser -D -s /bin/sh agent && sed -i '/^agent:/s/!/*/' /etc/shadow && mkdir -p /home/agent/.ssh && cp /certs/ssh/authorized_keys /home/agent/.ssh/authorized_keys && chown -R agent:agent /home/agent/.ssh && exec /usr/sbin/sshd -D -e -o Port=22 -o ListenAddress=0.0.0.0 -o PermitRootLogin=no -o PasswordAuthentication=no -o PubkeyAuthentication=yes -o StrictModes=no -o UsePAM=no -o AuthorizedKeysFile=.ssh/authorized_keys -o LogLevel=VERBOSE",
       ]
     healthcheck:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 22"]
@@ -313,7 +312,11 @@ services:
         fi
         wait "$$child"
     healthcheck:
-      test: ["CMD-SHELL", "dsconf localhost config get nsslapd-require-secure-binds | grep -q 'nsslapd-require-secure-binds: on'"]
+      test:
+        [
+          "CMD-SHELL",
+          "dsconf localhost config get nsslapd-require-secure-binds | grep -q 'nsslapd-require-secure-binds: on'",
+        ]
       interval: 5s
       timeout: 15s
       retries: 40
@@ -450,7 +453,11 @@ services:
       amqp:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "test -f \"$$AMQP_SPLICE_DIR/ready\" && command -v tcpflow >/dev/null"]
+      test:
+        [
+          "CMD-SHELL",
+          'test -f "$$AMQP_SPLICE_DIR/ready" && command -v tcpflow >/dev/null',
+        ]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -505,6 +512,7 @@ services:
     restart: "no"
 
   client:
+    cgroup_parent: arkham-integration.slice
     image: oven/bun:1
     working_dir: /srv
     # openssh-client first: scenario 8 is a plain `ssh` binary holding only

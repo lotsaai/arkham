@@ -913,7 +913,7 @@ fn a_landlock_failure_does_not_start_the_command() {
   let missing = dir.path().join("missing-workspace");
   let plan = dir.path().join("plan.json");
   let body = format!(
-    r#"{{"profile":"workspace-write","workspace":"{workspace}","binds":[],"ca_host":"{ca}","ca_dest":"/arkham/ca.pem","env":[],"workdir":"/tmp","shell":"sh"}}"#,
+    r#"{{"profile":"workspace-write","workspace":"{workspace}","binds":[],"protected":[],"ca_host":"{ca}","ca_dest":"/arkham/ca.pem","env":[],"workdir":"/tmp","shell":"sh"}}"#,
     workspace = missing.display(),
     ca = dir.path().join("ca.pem").display(),
   );
@@ -936,7 +936,7 @@ fn danger_full_access_starts_the_command() {
   let missing = dir.path().join("missing-workspace");
   let plan = dir.path().join("plan.json");
   let body = format!(
-    r#"{{"profile":"danger-full-access","workspace":"{workspace}","binds":[],"ca_host":"{ca}","ca_dest":"/arkham/ca.pem","env":[],"workdir":"/tmp","shell":"sh"}}"#,
+    r#"{{"profile":"danger-full-access","workspace":"{workspace}","binds":[],"protected":[],"ca_host":"{ca}","ca_dest":"/arkham/ca.pem","env":[],"workdir":"/tmp","shell":"sh"}}"#,
     workspace = missing.display(),
     ca = dir.path().join("ca.pem").display(),
   );
@@ -949,6 +949,128 @@ fn danger_full_access_starts_the_command() {
   let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(output.status.success(), "{stdout}{stderr}");
   assert!(stdout.contains("COMMAND_RAN"), "{stdout}{stderr}");
+}
+
+#[test]
+fn existing_arkham_configs_and_hardlinks_are_protected_in_writable_profiles() {
+  let isolated = Isolated::new();
+  let workspace = tempfile::tempdir().unwrap();
+  let root = workspace.path();
+  let config = root.join(".config");
+  let project = config.join("arkham");
+  let global = config.join("global/arkham");
+  std::fs::create_dir_all(&project).unwrap();
+  std::fs::create_dir_all(&global).unwrap();
+  std::fs::write(project.join("config.toml"), "# PROJECT_PRIVATE_CONTENT\n").unwrap();
+  std::fs::write(config.join("arkham.toml"), "# LEGACY_PRIVATE_CONTENT\n").unwrap();
+  std::fs::write(global.join("config.toml"), "# GLOBAL_PRIVATE_CONTENT\n").unwrap();
+  let custom = root.join("custom-global.toml");
+  std::fs::write(&custom, "# CUSTOM_PRIVATE_CONTENT\n").unwrap();
+  std::fs::hard_link(project.join("config.toml"), root.join("config-hardlink")).unwrap();
+  let xdg = config.join("global");
+  let _daemon = Daemon::start_with(
+    &isolated,
+    &[
+      ("XDG_CONFIG_HOME", xdg.to_str().unwrap()),
+      ("ARKHAM_CONFIG", custom.to_str().unwrap()),
+    ],
+  );
+  let script = r#"
+set -eu
+for file in .config/arkham/config.toml .config/arkham.toml .config/global/arkham/config.toml custom-global.toml config-hardlink; do
+  if cat "$file" 2>/dev/null | grep -q PRIVATE_CONTENT; then exit 11; fi
+  if (echo changed > "$file") 2>/dev/null; then exit 12; fi
+done
+if rm .config/arkham.toml 2>/dev/null; then exit 13; fi
+if mv .config/arkham .config/renamed-arkham 2>/dev/null; then exit 14; fi
+if mv .config .config-renamed 2>/dev/null; then exit 15; fi
+echo sibling > .config/unrelated.toml
+"#;
+  for profile in ["workspace-write", "danger-full-access"] {
+    let output = isolated
+      .command(&["agent", "--isolate", "bwrap", "--write-profile", profile, "--", "sh", "-c", script])
+      .current_dir(root)
+      .output()
+      .unwrap();
+    assert!(
+      output.status.success(),
+      "{profile}: stdout={} stderr={}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(config.join("unrelated.toml")).unwrap(), "sibling\n");
+    assert_eq!(
+      std::fs::read_to_string(project.join("config.toml")).unwrap(),
+      "# PROJECT_PRIVATE_CONTENT\n"
+    );
+    assert_eq!(
+      std::fs::read_to_string(config.join("arkham.toml")).unwrap(),
+      "# LEGACY_PRIVATE_CONTENT\n"
+    );
+    assert_eq!(
+      std::fs::read_to_string(global.join("config.toml")).unwrap(),
+      "# GLOBAL_PRIVATE_CONTENT\n"
+    );
+    assert_eq!(std::fs::read_to_string(&custom).unwrap(), "# CUSTOM_PRIVATE_CONTENT\n");
+  }
+}
+
+#[test]
+fn symlinked_arkham_config_contents_stay_hidden_after_replacement_attempts() {
+  let isolated = Isolated::new();
+  let workspace = tempfile::tempdir().unwrap();
+  let root = workspace.path();
+  let config = root.join(".config");
+  let real = root.join("real-config");
+  std::fs::create_dir_all(&config).unwrap();
+  std::fs::create_dir_all(&real).unwrap();
+  std::fs::write(real.join("config.toml"), "# PROJECT_PRIVATE_CONTENT\n").unwrap();
+  std::fs::write(root.join("real-legacy"), "# LEGACY_PRIVATE_CONTENT\n").unwrap();
+  std::os::unix::fs::symlink("../real-config", config.join("arkham")).unwrap();
+  std::os::unix::fs::symlink("../real-legacy", config.join("arkham.toml")).unwrap();
+  std::fs::hard_link(real.join("config.toml"), root.join("config-hardlink")).unwrap();
+  use std::os::unix::fs::MetadataExt as _;
+  let project_inode = std::fs::metadata(real.join("config.toml")).unwrap().ino();
+  let legacy_inode = std::fs::metadata(root.join("real-legacy")).unwrap().ino();
+  let _daemon = Daemon::start(&isolated);
+  let script = r#"
+set -eu
+for file in .config/arkham/config.toml .config/arkham.toml real-config/config.toml real-legacy config-hardlink; do
+  if cat "$file" 2>/dev/null | grep -q PRIVATE_CONTENT; then exit 11; fi
+  if (echo changed > "$file") 2>/dev/null; then exit 12; fi
+done
+if rm .config/arkham 2>/dev/null; then ln -s ../real-config .config/arkham; fi
+if rm .config/arkham.toml 2>/dev/null; then ln -s ../real-legacy .config/arkham.toml; fi
+for file in .config/arkham/config.toml .config/arkham.toml real-config/config.toml real-legacy config-hardlink; do
+  if cat "$file" 2>/dev/null | grep -q PRIVATE_CONTENT; then exit 13; fi
+  if (echo changed > "$file") 2>/dev/null; then exit 14; fi
+done
+echo sibling > .config/unrelated.toml
+"#;
+  for profile in ["workspace-write", "danger-full-access"] {
+    let output = isolated
+      .command(&["agent", "--isolate", "bwrap", "--write-profile", profile, "--", "sh", "-c", script])
+      .current_dir(root)
+      .output()
+      .unwrap();
+    assert!(
+      output.status.success(),
+      "{profile}: stdout={} stderr={}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+      std::fs::read_to_string(real.join("config.toml")).unwrap(),
+      "# PROJECT_PRIVATE_CONTENT\n"
+    );
+    assert_eq!(
+      std::fs::read_to_string(root.join("real-legacy")).unwrap(),
+      "# LEGACY_PRIVATE_CONTENT\n"
+    );
+    assert_eq!(std::fs::metadata(real.join("config.toml")).unwrap().ino(), project_inode);
+    assert_eq!(std::fs::metadata(root.join("real-legacy")).unwrap().ino(), legacy_inode);
+    assert_eq!(std::fs::read_to_string(config.join("unrelated.toml")).unwrap(), "sibling\n");
+  }
 }
 
 fn outside_hard_changed(path: &Path) -> bool {

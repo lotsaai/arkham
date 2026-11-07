@@ -1073,7 +1073,7 @@ async function amqpScenarios(scheme: "amqp" | "amqps", raw: string) {
 }
 
 function spliceFatal(why: string): never {
-  console.error(`FAIL grantless amqp 0-9-1 splices untouched: ${why}`);
+  console.error(`FAIL grantless amqp splice: ${why}`);
   process.exit(1);
 }
 
@@ -1106,7 +1106,7 @@ async function witnessFile(root: string, names: readonly string[], deadline: num
   throw new Error("amqp splice witness silent");
 }
 
-async function grantlessSplice(raw: string): Promise<boolean> {
+async function grantlessSplice(raw: string, version: "0-9-1" | "1.0"): Promise<boolean> {
   const port = Number(process.env.AMQP_SPLICE_PORT);
   const dir = process.env.AMQP_SPLICE_DIR ?? "";
   if (!port || dir === "") spliceFatal("amqp splice port or dir is missing");
@@ -1126,11 +1126,13 @@ async function grantlessSplice(raw: string): Promise<boolean> {
   const settle = () => {
     if (finished && pending === 0) resolveDone();
   };
-  // amqplib exposes no socket, so the bytes it sends are only visible here.
+  // Match the requested destination before eBPF redirects the socket to loopback.
   const original = Socket.prototype.connect;
   Socket.prototype.connect = function (this: Socket, ...args: unknown[]) {
+    const options = Array.isArray(args[0]) ? args[0][0] : args[0];
+    if (typeof options !== "object" || options === null || !("port" in options) || !("host" in options)
+      || options.port !== port || options.host !== url.hostname) return original.apply(this, args as never);
     this.prependListener("connect", () => {
-      if (this.remotePort !== port) return;
       pending += 1;
       const guestPort = this.localPort ?? 0;
       const sample = () => {
@@ -1142,7 +1144,12 @@ async function grantlessSplice(raw: string): Promise<boolean> {
         const copy = typeof data === "string"
           ? Buffer.from(data, typeof rest[0] === "string" ? rest[0] as BufferEncoding : "utf8")
           : Buffer.from(data);
-        sent.push(copy);
+        const last = rest.at(-1);
+        const callback = typeof last === "function" ? rest.pop() as (error?: Error | null) => void : undefined;
+        rest.push((error?: Error | null) => {
+          if (!error) sent.push(copy);
+          callback?.(error);
+        });
         sample();
         return write.call(this, data as never, ...(rest as []));
       } as typeof this.write;
@@ -1163,12 +1170,17 @@ async function grantlessSplice(raw: string): Promise<boolean> {
       spliceFatal(err instanceof Error ? err.message : String(err));
     });
     if (armed.name === "error") spliceFatal(armed.text.trim());
-    let refusal = "login succeeded";
-    try {
-      const conn = await amqplib.connect(url.toString(), { timeout: ATTEMPT_TIMEOUT_MS });
-      await conn.close();
-    } catch (err) {
-      refusal = err instanceof Error ? err.message : String(err);
+    let refusal: string;
+    if (version === "1.0") {
+      refusal = await amqp10Open(url.toString(), false, amqpParts(raw).password);
+    } else {
+      try {
+        const conn = await amqplib.connect(url.toString(), { timeout: ATTEMPT_TIMEOUT_MS });
+        await conn.close();
+        refusal = "login succeeded";
+      } catch (err) {
+        refusal = err instanceof Error ? err.message : String(err);
+      }
     }
     finished = true;
     settle();
@@ -1193,7 +1205,9 @@ async function grantlessSplice(raw: string): Promise<boolean> {
     if (!guestSent.equals(toBroker) || !guestRecv.equals(toClient)) {
       spliceFatal(`splice mismatch sent=${guestSent.length} toBroker=${toBroker.length} recv=${guestRecv.length} toClient=${toClient.length}`);
     }
-    if (!refusal.includes("403") || !/ACCESS.REFUSED/.test(refusal)) spliceFatal(`refusal: ${refusal}`);
+    if (version === "1.0" ? !refusal.includes("amqp:unauthorized-access") : !refusal.includes("403") || !/ACCESS.REFUSED/.test(refusal)) {
+      spliceFatal(`refusal: ${refusal}`);
+    }
     const pass = Buffer.from(amqpParts(raw).password);
     const plainAt = toBroker.indexOf("PLAIN");
     if (plainAt < 0 || toBroker.indexOf(pass) < plainAt || toBroker.includes(AMQP_REAL)) spliceFatal("Start-Ok decoy was rewritten");
@@ -1207,7 +1221,8 @@ async function grantlessSplice(raw: string): Promise<boolean> {
 
 if (AMQP_URL) {
   await amqpScenarios("amqp", AMQP_URL);
-  await retry("", "grantless amqp 0-9-1 splices untouched", () => grantlessSplice(AMQP_URL));
+  await once("", "grantless amqp 0-9-1 splices untouched", () => grantlessSplice(AMQP_URL, "0-9-1"));
+  await once("", "grantless amqp 1.0 splices untouched", () => grantlessSplice(AMQP_URL, "1.0"));
 } else {
   stage("amqp scenarios skipped: no AMQP_URL");
 }

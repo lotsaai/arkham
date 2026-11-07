@@ -33,8 +33,7 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
-# Transparent capture (tproxy, tun, ebpf) is compiled in unconditionally on
-# Linux; no cargo features are needed for it.
+# eBPF capture is compiled in unconditionally on Linux.
 # Container image build, inlined into the release pipeline (no separate trigger):
 # downloads the dist tarballs from the GitHub release this run just published.
 post-announce-jobs = ["./container"]

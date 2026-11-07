@@ -76,8 +76,6 @@ arkham-fnox = { path = "crates/arkham-fnox" }
 arkham-pki = { path = "crates/arkham-pki" }
 arkham-plugin = { path = "crates/arkham-plugin" }
 arkham-proxy = { path = "crates/arkham-proxy" }
-arkham-tproxy = { path = "crates/arkham-tproxy" }
-arkham-tun = { path = "crates/arkham-tun" }
 
 # One declaration per external dependency so versions cannot drift between
 # crates. rama tracks main deliberately: its 0.5 line is unpublished.
@@ -104,8 +102,6 @@ fe2o3-amqp = { version = "0.18.3", default-features = false, features = ["accept
 fe2o3-amqp-types = "0.18.0"
 fnox-core = "1.39"
 futures = "0.3"
-futures-sink = "0.3"
-futures-util = "0.3.34"
 gix-config = { version = "0.62", features = ["sha1"] }
 gix-discover = { version = "0.57", features = ["sha1"] }
 h2 = "0.4"
@@ -127,9 +123,6 @@ libc = "0.2"
 memchr = "2"
 miette = { version = "7", features = ["fancy"] }
 mimalloc = "0.1"
-netlink-packet-core = "0.9"
-netlink-packet-netfilter = "0.4"
-netlink-sys = "0.9"
 nkeys = "0.4.5"
 pem = "4"
 percent-encoding = "2.3"
@@ -143,7 +136,6 @@ rasn-ldap = "0.29.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 redis = { version = "1.7.1", default-features = false, features = ["tokio-comp"] }
 regex = "1"
-rtnetlink = "0.23.0"
 russh = { version = "0.56", default-features = false, features = ["aws-lc-rs"] }
 rustix = { version = "1.1.6", default-features = false, features = ["process"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
@@ -155,9 +147,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.11"
 shellexpand = "3"
-smoltcp = { version = "0.14", default-features = false, features = ["alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-dns", "socket-icmp", "socket-tcp", "socket-udp", "std"] }
 smtp-proto = "0.2.5"
-socket2 = "0.6"
 strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"
 thiserror = "2"
@@ -165,13 +155,11 @@ time = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "parking_lot", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-postgres = "0.7"
 tokio-rustls = "0.26"
-tokio-util = "0.7"
 toml = "1"
 toml_edit = { version = "0.25", features = ["serde"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tun = { version = "0.8", features = ["async"] }
 url = "2"
 validator = { version = "0.21", features = ["derive"] }
 wasmtime = { version = "50", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
@@ -197,8 +185,6 @@ tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 arkham-ebpf = { workspace = true }
-arkham-tproxy = { workspace = true }
-arkham-tun = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

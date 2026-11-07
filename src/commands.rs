@@ -33,23 +33,11 @@ pub struct ServeArgs {
   /// Proxy settings (CLI layer of the config overlay).
   #[command(flatten)]
   pub proxy: <ProxyCfg as Config>::Layer,
-  // Deployment-mode switch: CLI + env only, deliberately not a file key —
-  // both backends mutate host routes/nft rules and must be an explicit
-  // intention, not ambient configuration.
+  // Deployment mode is CLI + env only, not ambient file configuration.
   /// Capture traffic transparently with this backend, instead of only
   /// serving the explicit proxy alone.
   #[arg(long, env = "ARKHAM_PROXY_BACKEND", value_enum, default_value_t = ProxyBackend::None)]
   pub proxy_backend: ProxyBackend,
-  /// Allow unscoped TPROXY rules in the current (host) network namespace.
-  /// Without this, unscoped capture outside an isolated netns is refused:
-  /// the rules reroute every outbound TCP packet, and an unclean exit
-  /// leaves the machine without TCP egress until manually cleaned.
-  #[arg(
-    long,
-    env = "ARKHAM_TPROXY_ALLOW_ROOT_NETNS",
-    help = "allow unscoped TPROXY rules in the host network namespace (disposable machines only)"
-  )]
-  pub tproxy_allow_root_netns: bool,
   /// cgroup v2 directory whose member processes get captured by
   /// `--proxy-backend ebpf`. Required for that backend: there is deliberately
   /// no default, because defaulting to the root cgroup would capture every
@@ -372,10 +360,10 @@ mod tests {
 
   #[test]
   fn init_takes_the_backend_flag_and_the_workspace() {
-    let cli = ArkhamCli::try_parse_from(["arkham", "init", "--backend", "tproxy", "/srv/project"]).unwrap();
+    let cli = ArkhamCli::try_parse_from(["arkham", "init", "--backend", "ebpf", "/srv/project"]).unwrap();
     match cli.command {
       Some(Command::Init(args)) => {
-        assert_eq!(args.backend, Some(ProxyBackend::Tproxy));
+        assert_eq!(args.backend, Some(ProxyBackend::Ebpf));
         assert_eq!(args.workspace, Some(PathBuf::from("/srv/project")));
       }
       other => panic!("expected init, got {other:?}"),

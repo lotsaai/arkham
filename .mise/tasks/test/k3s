@@ -114,51 +114,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Capture suites scope themselves to TEST-NET-2 and a private cgroup, and
-# drop that state when the test task is joined. A killed run can still
-# leave it. Remove the known leftovers so this cluster is not started
-# behind a stale tproxy rule or capture route, and say so when that happens.
+# Remove cgroups left by an interrupted eBPF capture test.
 sweep_host_capture() {
-  local found=0 nft_out line pref cg flushed=0
-  if nft_out=$(run_privileged nft list tables 2>/dev/null); then
-    if printf '%s\n' "$nft_out" | grep -q 'arkham_tproxy'; then
-      echo "host capture residue: nft table inet arkham_tproxy" >&2
-      run_privileged nft delete table inet arkham_tproxy >&2 || echo "could not delete nft table inet arkham_tproxy" >&2
-      found=$((found + 1))
-    fi
-  else
-    echo "host capture state: nft tables not listed (no root, or nft is missing)" >&2
-  fi
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in
-      *"fwmark 0x88"*|*"lookup 100"|*"lookup 100 "*)
-        echo "host capture residue: ip rule: ${line}" >&2
-        pref=${line%%:*}
-        run_privileged ip rule del pref "$pref" >&2 || echo "could not delete ip rule pref ${pref}" >&2
-        found=$((found + 1))
-        case "$line" in
-          *"lookup 100"|*"lookup 100 "*)
-            if [ "$flushed" -eq 0 ]; then
-              run_privileged ip route flush table 100 >&2 || true
-              flushed=1
-            fi
-            ;;
-        esac
-        ;;
-    esac
-  done <<<"$(ip rule show 2>/dev/null || true)"
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in
-      198.51.100.*)
-        echo "host capture residue: route: ${line}" >&2
-        pref=${line%% *}
-        run_privileged ip route del "$pref" >&2 || echo "could not delete route ${pref}" >&2
-        found=$((found + 1))
-        ;;
-    esac
-  done <<<"$(ip route show 2>/dev/null || true)"
+  local found=0 cg
   while IFS= read -r cg; do
     [ -n "$cg" ] || continue
     echo "host capture residue: cgroup ${cg}" >&2
@@ -166,7 +124,7 @@ sweep_host_capture() {
     found=$((found + 1))
   done < <(compgen -G '/sys/fs/cgroup/arkham-test-*' || true)
   if [ "$found" -eq 0 ]; then
-    echo "host capture state: clean (no arkham_tproxy table, fwmark 0x88 or table-100 rule, 198.51.100 route, or arkham-test cgroup)"
+    echo "host capture state: clean (no arkham-test cgroup)"
   else
     echo "host capture state: interference, removed ${found} arkham leftover(s) before cluster create"
   fi
@@ -352,7 +310,7 @@ run_leg() {
   # The task exports KUBECONFIG as the cert file for kubectl. Init must see
   # this leg's source, which is already a declared rewrite, so ambient
   # discovery does not add the cert user on the same API server.
-  KUBECONFIG="$source" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
+  KUBECONFIG="$source" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend ebpf "$ws"
   shopt -s nullglob
   kubedirs=()
   for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
@@ -399,7 +357,7 @@ run_discovered() {
   mkdir -p "$ws/.config/arkham"
   printf '%s\n' '[workspace]' >"$ws/.config/arkham/config.toml"
   local statedir=$scratch/state-$name
-  KUBECONFIG="$kubeconfig" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend tproxy "$ws"
+  KUBECONFIG="$kubeconfig" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend ebpf "$ws"
   shopt -s nullglob
   local kubedirs=() decoys=()
   for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done

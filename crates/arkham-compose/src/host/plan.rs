@@ -43,6 +43,8 @@ pub struct LaunchPlan {
   pub workspace: PathBuf,
   /// Projected files and the mounts compose would have made.
   pub binds: Vec<Bind>,
+  /// Existing configuration paths and aliases hidden from the agent.
+  pub protected: Vec<PathBuf>,
   /// Certificate PEM, without the CA key.
   pub ca_host: PathBuf,
   /// Where the certificate is mounted.
@@ -122,11 +124,13 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsStrin
     push_missing_parents(&mut args, &bound, &anchors, &bind.dest, &mut created);
     let flag = bind_flag(plan.profile, bind.read_only);
     args.extend([flag.into(), bind.source.clone().into(), bind.dest.clone().into()]);
+    bound.push(bind.dest.clone());
   }
   args.extend(["--dir".into(), "/arkham".into()]);
   args.extend(["--ro-bind".into(), plan.ca_host.clone().into(), plan.ca_dest.clone().into()]);
-  push_secret_masks(&mut args, plan, &bound, &anchors);
   push_program(&mut args, &bound, &anchors, command, &mut created);
+  push_config_masks(&mut args, plan, &bound, &anchors);
+  push_secret_masks(&mut args, plan, &bound, &anchors);
   if private_session && matches!(policy, FsPolicy::ReadOnly { .. }) {
     args.extend(["--remount-ro".into(), TEMP_DIR.into()]);
   }
@@ -151,7 +155,7 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsStrin
 /// other top-level directory stay on the tmpfs, so a credential or the CA
 /// key that lives there is not a path the agent can open.
 #[cfg(target_os = "linux")]
-const SYSTEM_ROOTS: &[&str] = &["bin", "etc", "lib", "lib64", "opt", "sbin", "usr"];
+pub(super) const SYSTEM_ROOTS: &[&str] = &["bin", "etc", "lib", "lib64", "opt", "sbin", "usr"];
 
 /// Host files under `/etc` that stay hidden when `/etc` itself is mounted.
 #[cfg(target_os = "linux")]
@@ -226,6 +230,78 @@ fn is_mounted(path: &Path, bound: &[PathBuf], anchors: &[PathBuf]) -> bool {
     return true;
   }
   bound.iter().any(|root| path == root || path.starts_with(root))
+}
+
+#[cfg(target_os = "linux")]
+fn host_path<'a>(path: &'a Path, binds: &'a [Bind]) -> std::borrow::Cow<'a, Path> {
+  match binds
+    .iter()
+    .filter(|bind| path.starts_with(&bind.dest))
+    .max_by_key(|bind| bind.dest.components().count())
+  {
+    Some(bind) => match path.strip_prefix(&bind.dest) {
+      Ok(relative) => std::borrow::Cow::Owned(bind.source.join(relative)),
+      Err(_) => std::borrow::Cow::Borrowed(path),
+    },
+    None => std::borrow::Cow::Borrowed(path),
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn push_config_masks(args: &mut Vec<OsString>, plan: &LaunchPlan, bound: &[PathBuf], anchors: &[PathBuf]) {
+  let mut masked_dirs = Vec::new();
+  let mut targets = Vec::new();
+  for path in &plan.protected {
+    if !is_mounted(path, bound, anchors) || masked_dirs.iter().any(|dir: &PathBuf| path.starts_with(dir)) {
+      continue;
+    }
+    if host_path(path, &plan.binds).is_dir() {
+      masked_dirs.push(path.clone());
+    }
+    targets.push(path);
+  }
+
+  let mut parents = BTreeSet::new();
+  for target in &targets {
+    for parent in target.ancestors().skip(1) {
+      if !is_mounted(parent, bound, anchors) || bound.iter().any(|root| root == parent) {
+        break;
+      }
+      if host_path(parent, &plan.binds).is_dir() {
+        parents.insert(parent.to_path_buf());
+      }
+    }
+  }
+  for parent in &parents {
+    let read_only = plan
+      .binds
+      .iter()
+      .filter(|bind| parent.starts_with(&bind.dest))
+      .max_by_key(|bind| bind.dest.components().count())
+      .map_or(
+        !parent.starts_with(&plan.workspace) && plan.profile != WriteProfile::DangerFullAccess,
+        |bind| bind.read_only,
+      );
+    let flag = bind_flag(plan.profile, read_only);
+    args.extend([
+      flag.into(),
+      host_path(parent, &plan.binds).into_owned().into(),
+      parent.clone().into(),
+    ]);
+  }
+  for bind in &plan.binds {
+    if parents.iter().any(|parent| bind.dest.starts_with(parent)) {
+      let flag = bind_flag(plan.profile, bind.read_only);
+      args.extend([flag.into(), bind.source.clone().into(), bind.dest.clone().into()]);
+    }
+  }
+  for path in targets {
+    if host_path(path, &plan.binds).is_dir() {
+      args.extend(["--tmpfs".into(), path.clone().into(), "--remount-ro".into(), path.clone().into()]);
+    } else if host_path(path, &plan.binds).is_file() {
+      args.extend(["--ro-bind".into(), "/dev/null".into(), path.clone().into()]);
+    }
+  }
 }
 
 /// Hide host secret files that sit inside a directory the sandbox mounted.
@@ -340,6 +416,7 @@ mod tests {
         dest: PathBuf::from("/work/fnox.toml"),
         read_only: true,
       }],
+      protected: Vec::new(),
       ca_host: PathBuf::from("/scratch/ca.pem"),
       ca_dest: PathBuf::from(CA_DEST),
       env: vec![("SSL_CERT_FILE".into(), CA_DEST.into()), ("GITHUB_TOKEN".into(), "decoy".into())],
@@ -552,6 +629,48 @@ mod tests {
   }
 
   #[test]
+  fn translated_bind_masks_use_host_sources_and_sandbox_destinations() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let dest = root.path().join("destination");
+    std::fs::create_dir_all(source.join("inner")).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(source.join("inner/secret"), "PRIVATE_CONTENT").unwrap();
+    let mut plan = plan(WriteProfile::WorkspaceWrite);
+    plan.binds = vec![Bind {
+      source: source.clone(),
+      dest: dest.clone(),
+      read_only: false,
+    }];
+    plan.protected = vec![dest.join("inner/secret")];
+    let mut args = vec![
+      OsString::from("--unshare-user"),
+      OsString::from("--ro-bind"),
+      OsString::from("/"),
+      OsString::from("/"),
+      OsString::from("--bind"),
+      source.clone().into(),
+      dest.clone().into(),
+    ];
+    push_config_masks(&mut args, &plan, std::slice::from_ref(&dest), &[]);
+    let script = format!(
+      "if cat '{0}/inner/secret' 2>/dev/null | grep -q PRIVATE_CONTENT; then exit 1; fi; \
+       if rm '{0}/inner/secret' 2>/dev/null; then exit 2; fi; \
+       if mv '{0}/inner' '{0}/moved' 2>/dev/null; then exit 3; fi; \
+       echo sibling > '{0}/inner/unrelated'",
+      dest.display()
+    );
+    let output = std::process::Command::new("bwrap")
+      .args(args)
+      .args(["--", "sh", "-c", &script])
+      .output()
+      .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read_to_string(source.join("inner/secret")).unwrap(), "PRIVATE_CONTENT");
+    assert_eq!(std::fs::read_to_string(source.join("inner/unrelated")).unwrap(), "sibling\n");
+  }
+
+  #[test]
   fn a_privileged_sandbox_cannot_unmount_an_overlay() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("work");
@@ -570,6 +689,7 @@ mod tests {
         dest: secret.clone(),
         read_only: true,
       }],
+      protected: Vec::new(),
       ca_host: ca,
       ca_dest: PathBuf::from(CA_DEST),
       env: vec![("PATH".into(), "/usr/bin:/bin".into())],

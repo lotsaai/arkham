@@ -55,18 +55,11 @@ jobs:
         run: |
           # dist silently ignores build settings it does not recognize, and a
           # binary built without capture only fails at runtime, in production.
-          # Each marker is a static string that only exists when its backend is
-          # compiled in: the TUN device path (arkham-tun), the unscoped-capture
-          # guard message (arkham-tproxy), and the eBPF program name inside the
-          # embedded BPF object (arkham-ebpf-programs). The per-backend failure
-          # messages are runtime format strings ("{name} capture failed: ..."),
-          # so they never appear verbatim in the binary.
-          for marker in '/dev/net/tun' 'refusing to install unscoped TPROXY capture' 'capture_egress'; do
-            if ! grep -aq -- "$marker" ctx/arkham; then
-              echo "::error::ctx/arkham was built without transparent capture ($marker)"
-              exit 1
-            fi
-          done
+          # The program name is embedded in the eBPF object.
+          if ! grep -aq -- 'capture_egress' ctx/arkham; then
+            echo "::error::ctx/arkham was built without eBPF capture"
+            exit 1
+          fi
 
       - name: Set up buildx
         uses: docker/setup-buildx-action@v4

@@ -458,6 +458,9 @@ fn bypass_debug(bypass: &[(Ipv4Addr, u8)]) -> Vec<String> {
 /// means no runtime entries. Every applied list is logged, so a stale or
 /// surprising bypass is visible in arkham's own logs.
 ///
+/// `ready` receives a notification after all required listeners and capture
+/// hooks are installed, before traffic is served.
+///
 /// # Errors
 ///
 /// Fails when the embedded object cannot be loaded, the `CONFIG` map cannot be
@@ -470,12 +473,14 @@ pub async fn run_ebpf(
   cgroup: PathBuf,
   bypass: Vec<(Ipv4Addr, u8)>,
   bypass_file: Option<PathBuf>,
+  ready: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), Error> {
   run_ebpf_with(
     Options {
       cgroup: Some(cgroup),
       bypass,
       bypass_file,
+      ready,
       ..Options::default()
     },
     state,
@@ -495,6 +500,21 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> R
   // from the first connection; the watcher below picks up later rewrites.
   let file_initial = options.bypass_file.as_deref().map_or_else(Vec::new, read_bypass_file);
   let bypass = build_bypass(options.bypass.clone(), file_initial);
+  let tcp4 = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, tcp_port)).await?;
+  let udp4 = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, udp_port)).await?;
+  let tcp6 = match tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, tcp_port)).await {
+    Ok(listener) => Some(listener),
+    Err(err) if err.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+      tracing::info!("IPv6 is unsupported on this host; capturing IPv4 only");
+      None
+    }
+    Err(err) => return Err(err.into()),
+  };
+  let udp6 = if tcp6.is_some() {
+    Some(tokio::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, udp_port)).await?)
+  } else {
+    None
+  };
 
   let mut bpf = Ebpf::load(PROGRAMS).map_err(|err| Error::LoadPrograms { origin: err })?;
   configure(&mut bpf, tcp_port, udp_port, options.self_exclusion, &bypass).map_err(|err| Error::WriteConfigMap { origin: err.into() })?;
@@ -502,7 +522,7 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> R
   // `bpf` is held on the stack for as long as this task lives, so the programs
   // stay attached: dropping `Ebpf` detaches them and unloads them, which means
   // there is no kernel residue and nothing to clean up on exit.
-  attach(&mut bpf, &cgroup).map_err(|err| Error::AttachCgroup {
+  attach(&mut bpf, &cgroup, tcp6.is_some()).map_err(|err| Error::AttachCgroup {
     path: cgroup.clone(),
     origin: err.into(),
   })?;
@@ -525,21 +545,25 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> R
     udp_port,
     netns_cookie: own_netns_cookie(),
   });
-  // All three legs run for the life of the process; whichever fails first
-  // fails the backend, and `main` treats that as fatal because capture was
-  // requested. The watcher itself never fails — a bad file only means stale
-  // entries until the next poll — so in practice it runs forever.
-  if let Some(watch) = watcher {
-    tokio::select! {
-      result = tcp::serve(tcp_port, flow.clone(), state, options.upstream_override) => result,
-      result = udp::serve(udp_port, flow, options.upstream_override) => result,
-      result = watch.run(&mut bpf, bypass) => result,
+  let ipv6 = async {
+    match (tcp6, udp6) {
+      (Some(tcp), Some(udp)) => tokio::select! {
+        result = tcp::serve(tcp, flow.clone(), Arc::clone(&state), options.upstream_override) => result,
+        result = udp::serve(udp, flow.clone(), options.upstream_override) => result,
+      },
+      _ => std::future::pending().await,
     }
-  } else {
-    tokio::select! {
-      result = tcp::serve(tcp_port, flow.clone(), state, options.upstream_override) => result,
-      result = udp::serve(udp_port, flow, options.upstream_override) => result,
-    }
+  };
+  tokio::select! {
+    result = tcp::serve(tcp4, flow.clone(), Arc::clone(&state), options.upstream_override) => result,
+    result = udp::serve(udp4, flow.clone(), options.upstream_override) => result,
+    result = ipv6 => result,
+    result = async {
+      match watcher {
+        Some(watch) => watch.run(&mut bpf, bypass).await,
+        None => std::future::pending().await,
+      }
+    } => result,
   }
 }
 /// Write the loader-side configuration the programs read at runtime.
@@ -765,16 +789,16 @@ pub(crate) fn encode_port(port: u16) -> u32 {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OrigDst {
-  /// Destination address, in the kernel's `user_ip4` encoding.
-  pub ip: u32,
+  /// Destination address in the kernel's network-byte-order encoding.
+  pub ip: [u32; 4],
   /// Destination port, in the kernel's `user_port` encoding.
   pub port: u32,
   /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17).
   pub proto: u8,
-  /// Padding, mirroring `arkham-ebpf-programs::OrigDst`. Seven bytes put
-  /// `cgroup_id` at offset 16 with no compiler-inserted gap.
-  pub _pad: [u8; 7],
-  /// Cgroup id sampled by `connect4` in the connecting task.
+  /// Socket address family and explicit padding.
+  pub family: u8,
+  pub _pad: [u8; 10],
+  /// Cgroup id sampled in the connecting task.
   pub cgroup_id: u64,
 }
 
@@ -783,7 +807,18 @@ unsafe impl aya::Pod for OrigDst {}
 
 impl OrigDst {
   pub(crate) fn socket_addr(&self) -> SocketAddr {
-    SocketAddr::from((decode_addr(self.ip), decode_port(self.port)))
+    let [a, b, c, d] = self.ip;
+    let ip = if self.family == libc::AF_INET as u8 {
+      std::net::IpAddr::V4(decode_addr(a))
+    } else {
+      std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+        (u128::from(u32::from_be(a)) << 96)
+          | (u128::from(u32::from_be(b)) << 64)
+          | (u128::from(u32::from_be(c)) << 32)
+          | u128::from(u32::from_be(d)),
+      ))
+    };
+    SocketAddr::new(ip, decode_port(self.port))
   }
 }
 
@@ -795,12 +830,11 @@ impl OrigDst {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FlowKey {
   /// Local address, in the kernel's `skc_rcv_saddr` encoding.
-  pub ip: u32,
+  pub ip: [u32; 4],
   /// Local port, host byte order: the kernel stores `skc_num` unswapped.
   pub port: u16,
-  /// Padding, always zero. Explicit so the lookup key cannot differ from the
-  /// inserted one in bytes the kernel compares but Rust never writes.
-  pub _pad: [u8; 2],
+  /// Address family.
+  pub family: u16,
 }
 
 // SAFETY: `repr(C)`, integer fields only.
@@ -828,15 +862,27 @@ impl FlowKey {
   /// `accept()` or `recv_from()`. The hook records the client's local 4-tuple,
   /// and for a loopback redirect that is exactly the address the server leg
   /// sees as its peer.
-  pub(crate) fn from_peer(peer: SocketAddr) -> Option<Self> {
-    let std::net::IpAddr::V4(ip) = peer.ip() else {
-      return None;
+  pub(crate) fn from_peer(peer: SocketAddr) -> Self {
+    let (ip, family) = match peer.ip() {
+      std::net::IpAddr::V4(ip) => ([encode_addr(ip), 0, 0, 0], libc::AF_INET as u16),
+      std::net::IpAddr::V6(ip) => {
+        let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = ip.octets();
+        (
+          [
+            u32::from_ne_bytes([a, b, c, d]),
+            u32::from_ne_bytes([e, f, g, h]),
+            u32::from_ne_bytes([i, j, k, l]),
+            u32::from_ne_bytes([m, n, o, p]),
+          ],
+          libc::AF_INET6 as u16,
+        )
+      }
     };
-    Some(Self {
-      ip: encode_addr(ip),
+    Self {
+      ip,
       port: peer.port(),
-      _pad: [0; 2],
-    })
+      family,
+    }
   }
 }
 
@@ -844,7 +890,7 @@ impl FlowKey {
 ///
 /// The links live inside the loaded object, so keeping `bpf` alive keeps the
 /// programs attached; there are no handles to hold here.
-fn attach(bpf: &mut Ebpf, cgroup: &std::path::Path) -> Result<(), Error> {
+fn attach(bpf: &mut Ebpf, cgroup: &std::path::Path, ipv6: bool) -> Result<(), Error> {
   let file = File::open(cgroup).map_err(|err| Error::OpenCgroup {
     path: cgroup.to_path_buf(),
     origin: err,
@@ -852,6 +898,10 @@ fn attach(bpf: &mut Ebpf, cgroup: &std::path::Path) -> Result<(), Error> {
   let mode = CgroupAttachMode::Single;
   attach_sock_addr(bpf, "connect4", &file, mode)?;
   attach_sock_addr(bpf, "recvmsg4", &file, mode)?;
+  if ipv6 {
+    attach_sock_addr(bpf, "connect6", &file, mode)?;
+    attach_sock_addr(bpf, "recvmsg6", &file, mode)?;
+  }
   attach_cgroup_sock(bpf, "release_flow", &file, mode)?;
   let program: &mut CgroupSkb = bpf
     .program_mut("capture_egress")
@@ -1000,10 +1050,11 @@ mod tests {
   #[test]
   fn rewritten_destination_decodes_to_loopback() {
     let orig = OrigDst {
-      ip: encode_addr(Ipv4Addr::LOCALHOST),
+      ip: [encode_addr(Ipv4Addr::LOCALHOST), 0, 0, 0],
       port: encode_port(TCP_LISTEN_PORT),
       proto: 6,
-      _pad: [0; 7],
+      family: libc::AF_INET as u8,
+      _pad: [0; 10],
       cgroup_id: 0,
     };
     assert_eq!(orig.socket_addr(), SocketAddr::from(([127, 0, 0, 1], TCP_LISTEN_PORT)));
@@ -1014,18 +1065,25 @@ mod tests {
   #[test]
   fn flow_key_matches_the_peer_address() {
     let peer = SocketAddr::from(([93, 184, 216, 34], 54321));
-    let key = FlowKey::from_peer(peer).expect("v4 peer");
-    assert_eq!(decode_addr(key.ip), Ipv4Addr::new(93, 184, 216, 34));
+    let key = FlowKey::from_peer(peer);
+    assert_eq!(decode_addr(key.ip[0]), Ipv4Addr::new(93, 184, 216, 34));
     assert_eq!(key.port, 54321);
   }
 
-  /// An IPv6 peer must be reported as unkeyable rather than silently keyed on
-  /// a truncated address: the capture hooks are `connect4`/`recvmsg4` only, so
-  /// no IPv6 flow ever carries an `OrigDst` to look up.
   #[test]
-  fn flow_key_rejects_ipv6() {
-    let peer = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 443));
-    assert!(FlowKey::from_peer(peer).is_none());
+  fn ipv6_flow_key_and_destination_keep_all_address_bytes() {
+    let peer: SocketAddr = "[2001:db8:1234:5678:9abc:def0:1122:3344]:443".parse().unwrap();
+    let key = FlowKey::from_peer(peer);
+    let orig = OrigDst {
+      ip: key.ip,
+      port: encode_port(peer.port()),
+      proto: 6,
+      family: libc::AF_INET6 as u8,
+      _pad: [0; 10],
+      cgroup_id: 1,
+    };
+    assert_eq!(orig.socket_addr(), peer);
+    assert_eq!(key.family, libc::AF_INET6 as u16);
   }
 
   /// The map keys and values cross the kernel boundary as raw bytes, so their
@@ -1035,27 +1093,25 @@ mod tests {
   fn map_layouts_are_fully_specified() {
     use std::mem::{align_of, offset_of, size_of};
 
-    // 4 + 2 + 2 explicit padding: no room left for compiler-inserted bytes.
-    assert_eq!(size_of::<FlowKey>(), 8);
+    assert_eq!(size_of::<FlowKey>(), 20);
     assert_eq!(align_of::<FlowKey>(), 4);
     assert_eq!(offset_of!(FlowKey, ip), 0);
-    assert_eq!(offset_of!(FlowKey, port), 4);
-    assert_eq!(offset_of!(FlowKey, _pad), 6);
+    assert_eq!(offset_of!(FlowKey, port), 16);
+    assert_eq!(offset_of!(FlowKey, family), 18);
 
     assert_eq!(size_of::<FlowRecord>(), 16);
     assert_eq!(align_of::<FlowRecord>(), 8);
     assert_eq!(offset_of!(FlowRecord, cookie), 0);
     assert_eq!(offset_of!(FlowRecord, cgroup_id), 8);
 
-    // 4 + 4 + 1 + 7 explicit padding + 8. Alignment is 8, and the pad reaches
-    // that boundary so the compiler inserts nothing.
-    assert_eq!(size_of::<OrigDst>(), 24);
+    assert_eq!(size_of::<OrigDst>(), 40);
     assert_eq!(align_of::<OrigDst>(), 8);
     assert_eq!(offset_of!(OrigDst, ip), 0);
-    assert_eq!(offset_of!(OrigDst, port), 4);
-    assert_eq!(offset_of!(OrigDst, proto), 8);
-    assert_eq!(offset_of!(OrigDst, _pad), 9);
-    assert_eq!(offset_of!(OrigDst, cgroup_id), 16);
+    assert_eq!(offset_of!(OrigDst, port), 16);
+    assert_eq!(offset_of!(OrigDst, proto), 20);
+    assert_eq!(offset_of!(OrigDst, family), 21);
+    assert_eq!(offset_of!(OrigDst, _pad), 22);
+    assert_eq!(offset_of!(OrigDst, cgroup_id), 32);
     assert_eq!(size_of::<Config>(), 80);
     assert_eq!(align_of::<Config>(), 8);
     assert_eq!(offset_of!(Config, proxy_pid), 0);
@@ -1220,7 +1276,7 @@ mod tests {
 
     // Every attachment point must be present: a rename that drifted from
     // `attach()` would otherwise only fail on a root-only run.
-    for name in ["connect4", "recvmsg4", "capture_egress", "release_flow"] {
+    for name in ["connect4", "recvmsg4", "connect6", "recvmsg6", "capture_egress", "release_flow"] {
       assert!(obj.programs.contains_key(name), "program `{name}` missing from the object");
     }
   }

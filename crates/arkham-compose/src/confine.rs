@@ -328,13 +328,7 @@ pub(crate) fn rules_warning(rules: &BTreeMap<String, RuleCfg>, derivable: &[Stri
 /// read back — a regeneration must not silently switch how traffic is
 /// captured just because this run did not name a backend.
 pub(crate) fn generated_backend(compose: &str) -> Option<ProxyBackend> {
-  [
-    ("ebpf", ProxyBackend::Ebpf),
-    ("tun", ProxyBackend::Tun),
-    ("tproxy", ProxyBackend::Tproxy),
-  ]
-  .into_iter()
-  .find_map(|(name, backend)| compose.contains(&format!("\"--proxy-backend\", \"{name}\"")).then_some(backend))
+  compose.contains("\"--proxy-backend\", \"ebpf\"").then_some(ProxyBackend::Ebpf)
 }
 
 /// Generate the workspace stack when it is absent, and rewrite it when the
@@ -1034,7 +1028,7 @@ mod tests {
     set_env(key, "0.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let yaml = Stack {
       fnox: FnoxBinds::resolve(None, None),
-      ..test_stack(ProxyBackend::Tproxy)
+      ..test_stack(ProxyBackend::Ebpf)
     }
     .render();
     assert!(!yaml.contains("${"), "no environment interpolation survives generation: {yaml}");
@@ -1148,7 +1142,7 @@ mod tests {
   fn workspace_init_names_the_agent_images_init_script() {
     let yaml = Stack {
       init: Some("/usr/local/bin/devagent-entrypoint".to_string()),
-      ..test_stack(ProxyBackend::Tproxy)
+      ..test_stack(ProxyBackend::Ebpf)
     }
     .render();
     assert!(
@@ -1166,7 +1160,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     {
-      assert_eq!(resolve_backend(Some(ProxyBackend::Tun)).unwrap(), ProxyBackend::Tun);
+      assert_eq!(resolve_backend(Some(ProxyBackend::Ebpf)).unwrap(), ProxyBackend::Ebpf);
       let err = resolve_backend(Some(ProxyBackend::None)).unwrap_err();
       assert!(err.to_string().contains("none"), "{err:?}");
     }
@@ -1242,7 +1236,7 @@ mod tests {
     let _pin = GenerationPin::enter(root.path(), home.path(), xdg.path(), state.path());
     write_workspace_config(root.path(), "[workspace]\nname = \"kept\"\n");
     let workspace = Workspace::new(root.path());
-    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-a").await.unwrap();
+    init_workspace(&workspace, ProxyBackend::Ebpf, true, "0.0.0-a").await.unwrap();
     let compose = compose_path(root.path());
     let body = std::fs::read_to_string(&compose).unwrap();
     let file = std::fs::File::options().write(true).open(&compose).unwrap();
@@ -1251,7 +1245,7 @@ mod tests {
     drop(file);
     let config = root.path().join(".config").join("arkham").join("config.toml");
     std::fs::write(&config, "[workspace]\nname = \"kept\"\n# comment only\n").unwrap();
-    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-a").await.unwrap();
+    init_workspace(&workspace, ProxyBackend::Ebpf, true, "0.0.0-a").await.unwrap();
     assert_eq!(std::fs::read_to_string(&compose).unwrap(), body);
     assert_eq!(std::fs::metadata(&compose).unwrap().modified().unwrap(), stamp);
     assert!(!workspace.state_dir().join("config.digest").exists());
@@ -1273,24 +1267,24 @@ mod tests {
     std::fs::write(root.path().join("notes.txt"), "plain\n").unwrap();
     write_workspace_config(root.path(), "[workspace]\nname = \"kept\"\n");
     let workspace = Workspace::new(root.path());
-    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-a").await.unwrap();
+    init_workspace(&workspace, ProxyBackend::Ebpf, true, "0.0.0-a").await.unwrap();
     let compose = compose_path(root.path());
     let first = std::fs::read_to_string(&compose).unwrap();
     assert!(first.contains("ghcr.io/lotsaai/arkham:0.0.0-a"), "{first}");
-    assert!(first.contains("\"--proxy-backend\", \"tun\""), "{first}");
+    assert!(first.contains("\"--proxy-backend\", \"ebpf\""), "{first}");
     assert!(first.contains("name: kept"), "{first}");
     assert!(first.contains("GITHUB_TOKEN:"), "{first}");
     assert!(!first.contains("ghp_named_"), "{first}");
     assert!(!workspace.state_dir().join("config.digest").exists());
 
-    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-b").await.unwrap();
+    init_workspace(&workspace, ProxyBackend::Ebpf, true, "0.0.0-b").await.unwrap();
     let versioned = std::fs::read_to_string(&compose).unwrap();
     assert_ne!(versioned, first);
     assert!(versioned.contains("ghcr.io/lotsaai/arkham:0.0.0-b"), "{versioned}");
-    assert!(versioned.contains("\"--proxy-backend\", \"tun\""), "{versioned}");
+    assert!(versioned.contains("\"--proxy-backend\", \"ebpf\""), "{versioned}");
 
     write_workspace_config(root.path(), "[workspace]\nname = \"renamed\"\n");
-    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-b").await.unwrap();
+    init_workspace(&workspace, ProxyBackend::Ebpf, true, "0.0.0-b").await.unwrap();
     let renamed = std::fs::read_to_string(&compose).unwrap();
     assert!(renamed.contains("name: renamed"), "{renamed}");
     assert!(!renamed.contains("name: kept"), "{renamed}");
@@ -1302,7 +1296,7 @@ mod tests {
       "[names.GITHUB_TOKEN]\npattern = \"ghp_named_{hex:32}\"\n",
     )
     .unwrap();
-    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-b").await.unwrap();
+    init_workspace(&workspace, ProxyBackend::Ebpf, true, "0.0.0-b").await.unwrap();
     let patterned = std::fs::read_to_string(&compose).unwrap();
     assert!(patterned.contains("ghp_named_"), "{patterned}");
 
@@ -1310,20 +1304,15 @@ mod tests {
       root.path(),
       "[workspace]\nname = \"renamed\"\n\n[[workspace.file_rewrite]]\nsource = \"notes.txt\"\ndest = \"/opt/rewritten.txt\"\n",
     );
-    init_workspace(&workspace, ProxyBackend::Tun, true, "0.0.0-b").await.unwrap();
+    init_workspace(&workspace, ProxyBackend::Ebpf, true, "0.0.0-b").await.unwrap();
     let rewritten = std::fs::read_to_string(&compose).unwrap();
     assert!(rewritten.contains("/opt/rewritten.txt"), "{rewritten}");
-
-    init_workspace(&workspace, ProxyBackend::Ebpf, true, "0.0.0-b").await.unwrap();
-    let ebpf = std::fs::read_to_string(&compose).unwrap();
-    assert!(ebpf.contains("\"--proxy-backend\", \"ebpf\""), "{ebpf}");
-    assert!(!ebpf.contains("\"--proxy-backend\", \"tun\""), "{ebpf}");
 
     write_workspace_config(
       root.path(),
       "[workspace]\nname = \"renamed\"\ninit = \"/bin/from-config\"\n\n[[workspace.file_rewrite]]\nsource = \"notes.txt\"\ndest = \"/opt/rewritten.txt\"\n",
     );
-    init_workspace(&workspace, ProxyBackend::Tproxy, false, "0.0.0-b").await.unwrap();
+    init_workspace(&workspace, ProxyBackend::None, false, "0.0.0-b").await.unwrap();
     let preserved = std::fs::read_to_string(&compose).unwrap();
     assert!(preserved.contains("ARKHAM_INIT: \"/bin/from-config\""), "{preserved}");
     assert!(preserved.contains("\"--proxy-backend\", \"ebpf\""), "{preserved}");
@@ -1335,12 +1324,7 @@ mod tests {
   /// fallback.
   #[test]
   fn the_generated_stack_reports_its_backend() {
-    assert_eq!(
-      generated_backend("      command: [\"serve\", \"--proxy-backend\", \"tun\"]\n"),
-      Some(ProxyBackend::Tun)
-    );
     assert_eq!(generated_backend("\"--proxy-backend\", \"ebpf\""), Some(ProxyBackend::Ebpf));
-    assert_eq!(generated_backend("\"--proxy-backend\", \"tproxy\""), Some(ProxyBackend::Tproxy));
     assert_eq!(
       generated_backend("command: [\"serve\"]\n"),
       None,

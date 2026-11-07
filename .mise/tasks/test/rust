@@ -8,6 +8,20 @@ cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
+metadata_dir="$proj_dir/target/nextest"
+mkdir -p "$metadata_dir"
+cargo metadata --locked --format-version 1 > "$metadata_dir/cargo-metadata.json"
+cargo nextest list --locked --cargo-quiet --workspace --exclude arkham-ebpf-programs \
+  --list-type binaries-only --message-format json > "$metadata_dir/binaries-metadata.json"
+if [[ "$(uname -s)" == Linux ]]; then
+  daemon_bin="$(jq -r .target_directory "$metadata_dir/cargo-metadata.json")/debug/arkham"
+  sudo -n setcap cap_bpf,cap_net_admin,cap_perfmon=ep "$daemon_bin"
+  trap 'sudo -n setcap -r "$daemon_bin"' EXIT
+fi
+
 # `ARKHAM_PLUGIN_FIXTURES` activates the plugin_e2e_ tests (built by the
 # build:plugins dependency); without it each prints a skip line and passes.
-ARKHAM_PLUGIN_FIXTURES="$proj_dir/target/plugins" cargo nextest run --locked --cargo-quiet --workspace --exclude arkham-ebpf-programs --show-progress=bar --status-level=slow "$@"
+ARKHAM_PLUGIN_FIXTURES="$proj_dir/target/plugins" cargo nextest run \
+  --cargo-metadata "$metadata_dir/cargo-metadata.json" \
+  --binaries-metadata "$metadata_dir/binaries-metadata.json" \
+  --show-progress=bar --status-level=slow "$@"

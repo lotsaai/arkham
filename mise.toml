@@ -29,6 +29,7 @@ cargo-dist = "latest"
 mold = { version = "latest", os = ["linux"] }
 k3d = "latest"
 "cargo:cargo-outdated" = "latest"
+kubectl = "latest"
 
 [[tools.rust]]
 version = "stable"

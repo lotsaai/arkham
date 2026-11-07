@@ -32,25 +32,33 @@ pub(crate) struct Flow {
   last_active: Instant,
 }
 
-/// Client address → flow.
-pub(crate) type FlowTable = DashMap<SocketAddr, Arc<Mutex<Flow>>>;
+/// Client address and socket cookie → flow.
+pub(crate) type FlowTable = DashMap<(SocketAddr, u64), Arc<Mutex<Flow>>>;
 
 /// Relay captured datagrams for `port` until the listener fails.
-pub(crate) async fn serve(port: u16, flows: FlowTables, upstream_override: Option<SocketAddr>) -> Result<(), Error> {
-  let listener = Arc::new(UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?);
+pub(crate) async fn serve(listener: UdpSocket, flows: FlowTables, upstream_override: Option<SocketAddr>) -> Result<(), Error> {
+  let listener = Arc::new(listener);
   // `DashMap` because the janitor sweeps concurrently with the receive loop;
   // entries are short-lived and few (one per client).
   let table: Arc<FlowTable> = Arc::new(DashMap::new());
-  tokio::spawn(janitor(Arc::clone(&table)));
+  let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+  let mut tasks = tokio::task::JoinSet::new();
 
   let mut buf = vec![0u8; MAX_DATAGRAM];
   loop {
-    let (len, client) = listener.recv_from(&mut buf).await?;
+    let (len, client) = tokio::select! {
+      result = listener.recv_from(&mut buf) => result?,
+      _ = tasks.join_next(), if !tasks.is_empty() => continue,
+      _ = interval.tick() => {
+        sweep(&table, Instant::now());
+        continue;
+      }
+    };
     let payload = buf[..len].to_vec();
     let flows = flows.clone();
     let listener = Arc::clone(&listener);
     let table = Arc::clone(&table);
-    tokio::spawn(async move {
+    tasks.spawn(async move {
       if let Err(err) = one(&payload, client, &flows, &listener, &table, upstream_override).await {
         tracing::debug!(%client, ?err, "ebpf udp datagram failed");
       }
@@ -67,26 +75,28 @@ async fn one(
   table: &FlowTable,
   upstream_override: Option<SocketAddr>,
 ) -> Result<(), Error> {
-  let flow = if let Some(existing) = table.get(&client) {
+  let Some(captured) = flows.original(client, PROTO_UDP)? else {
+    tracing::debug!(%client, "no recorded destination for captured udp flow; dropping");
+    return Ok(());
+  };
+  let key = (client, captured.cookie);
+  let flow = if let Some(existing) = table.get(&key) {
     Arc::clone(existing.value())
   } else {
-    // First datagram for this client: resolve where it was really going.
-    // Without a recorded destination the socket was not redirected, so
-    // passing the datagram anywhere would misroute it; drop it.
-    let Some(captured) = flows.original(client, PROTO_UDP)? else {
-      tracing::debug!(%client, "no recorded destination for captured udp flow; dropping");
-      return Ok(());
-    };
     let dst = upstream_override.unwrap_or(captured.destination);
-    let upstream = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    let bind = if dst.is_ipv4() {
+      std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+      std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+    };
+    let upstream = UdpSocket::bind((bind, 0)).await?;
     upstream.connect(dst).await?;
     let flow = Arc::new(Mutex::new(Flow {
       upstream,
       dst,
       last_active: Instant::now(),
     }));
-    table.insert(client, Arc::clone(&flow));
-    flow
+    Arc::clone(table.entry(key).or_insert(flow).value())
   };
 
   // Hold the lock across send+recv so replies stay paired with their request;
@@ -111,15 +121,6 @@ async fn one(
       Ok(())
     }
     Err(_elapsed) => Ok(()),
-  }
-}
-
-/// Retire flows that have gone quiet, so a long-lived arkham does not accumulate
-/// one socket per client it has ever seen.
-async fn janitor(table: Arc<FlowTable>) {
-  loop {
-    tokio::time::sleep(SWEEP_INTERVAL).await;
-    sweep(&table, Instant::now());
   }
 }
 
@@ -168,8 +169,8 @@ mod tests {
   #[tokio::test]
   async fn janitor_sweeps_idle_flows_only() {
     let table: FlowTable = DashMap::new();
-    let idle = "198.51.100.1:53".parse().expect("addr");
-    let busy = "198.51.100.2:53".parse().expect("addr");
+    let idle = ("198.51.100.1:53".parse().expect("addr"), 1);
+    let busy = (idle.0, 2);
     table.insert(idle, flow_at("198.51.100.1:53", idle_now()).await);
     table.insert(busy, flow_at("198.51.100.2:53", Instant::now()).await);
 
@@ -184,7 +185,7 @@ mod tests {
   #[tokio::test]
   async fn janitor_spares_locked_flows() {
     let table: FlowTable = DashMap::new();
-    let client = "198.51.100.3:53".parse().expect("addr");
+    let client = ("198.51.100.3:53".parse().expect("addr"), 3);
     let flow = flow_at("198.51.100.3:53", idle_now()).await;
     table.insert(client, Arc::clone(&flow));
 
@@ -200,7 +201,7 @@ mod tests {
   async fn janitor_boundary_is_exclusive() {
     let table: FlowTable = DashMap::new();
     let now = Instant::now();
-    let at_limit = "198.51.100.4:53".parse().expect("addr");
+    let at_limit = ("198.51.100.4:53".parse().expect("addr"), 4);
     table.insert(
       at_limit,
       flow_at("198.51.100.4:53", now.checked_sub(FLOW_IDLE).expect("clock is past the limit")).await,

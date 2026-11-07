@@ -227,14 +227,23 @@ async fn stop_capture(capture: JoinHandle<Result<(), Error>>) {
 /// remaps arkham's own dial to a loopback stub.
 #[tokio::test]
 #[ignore = "needs root (bpf syscall, cgroup writes)"]
-#[expect(clippy::too_many_lines, reason = "linear live-test script, split would obscure the flow")]
 async fn ebpf_live_tcp_mitm_substitutes() {
+  tcp_mitm(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))).await;
+}
+
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes)"]
+async fn ebpf_live_ipv6_tcp_mitm_substitutes() {
+  tcp_mitm("2001:db8::7".parse().unwrap()).await;
+}
+
+#[expect(clippy::too_many_lines, reason = "linear live-test script, split would obscure the flow")]
+async fn tcp_mitm(dst: std::net::IpAddr) {
   use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
   const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
   const SNI: &str = "testebpf.invalid";
-  const DST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
 
   let _live = LIVE_LOCK.lock().await;
 
@@ -311,7 +320,7 @@ async fn ebpf_live_tcp_mitm_substitutes() {
 
   let tcp = match tokio::time::timeout(
     Duration::from_secs(10),
-    tokio::net::TcpStream::connect(SocketAddr::from((DST, stub_port))),
+    tokio::net::TcpStream::connect(SocketAddr::new(dst, stub_port)),
   )
   .await
   {
@@ -526,8 +535,16 @@ async fn ebpf_live_cgroup_selects_the_project() {
 #[tokio::test]
 #[ignore = "needs root (bpf syscall, cgroup writes)"]
 async fn ebpf_live_udp_relay_roundtrip() {
-  const DST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 8);
+  udp_roundtrip(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8))).await;
+}
 
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes)"]
+async fn ebpf_live_ipv6_udp_relay_roundtrip() {
+  udp_roundtrip("2001:db8::8".parse().unwrap()).await;
+}
+
+async fn udp_roundtrip(dst: std::net::IpAddr) {
   let _live = LIVE_LOCK.lock().await;
 
   arkham_pki::ca::install_crypto_provider();
@@ -558,17 +575,22 @@ async fn ebpf_live_udp_relay_roundtrip() {
   // Connected socket: only `connect()`ed UDP is captured at all, so this is the
   // shape the backend supports. An unconnected `sendto` would never be
   // redirected, which is why DNS is documented as untouched.
-  let client = tokio::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-    .await
-    .unwrap();
-  client.connect(SocketAddr::from((DST, stub_port))).await.unwrap();
+  let bind = if dst.is_ipv4() {
+    std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+  } else {
+    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+  };
+  let client = tokio::net::UdpSocket::bind((bind, 0)).await.unwrap();
+  let destination = SocketAddr::new(dst, stub_port);
+  client.connect(destination).await.unwrap();
 
   client.send(b"probe").await.unwrap();
   let mut reply = [0u8; 2048];
-  let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut reply))
+  let (n, source) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut reply))
     .await
-    .expect("relay reply within 5s; a timeout here usually means recvmsg4 did not restore the source")
+    .expect("relay reply within 5s")
     .unwrap();
+  assert_eq!(source, destination);
   assert_eq!(&reply[..n], b"echo:probe");
   stop_capture(capture).await;
 }
@@ -583,9 +605,17 @@ async fn ebpf_live_udp_relay_roundtrip() {
 #[tokio::test]
 #[ignore = "needs root (bpf syscall, cgroup writes)"]
 async fn ebpf_live_ungranted_tcp_splices_byte_identical() {
-  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+  tcp_splice(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))).await;
+}
 
-  const DST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 9);
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes)"]
+async fn ebpf_live_ipv6_ungranted_tcp_splices_byte_identical() {
+  tcp_splice("2001:db8::9".parse().unwrap()).await;
+}
+
+async fn tcp_splice(dst: std::net::IpAddr) {
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
   const SENTINEL: &[u8] = b"plain-splice-sentinel";
 
   let _live = LIVE_LOCK.lock().await;
@@ -621,7 +651,7 @@ async fn ebpf_live_ungranted_tcp_splices_byte_identical() {
 
   let mut conn = tokio::time::timeout(
     Duration::from_secs(10),
-    tokio::net::TcpStream::connect(SocketAddr::from((DST, stub_port))),
+    tokio::net::TcpStream::connect(SocketAddr::new(dst, stub_port)),
   )
   .await
   .expect("captured connect within 10s")

@@ -16,27 +16,16 @@ Serve the proxy.
 | --- | --- | --- |
 | `--listen <ADDR>` | `ARKHAM_LISTEN` | Explicit-proxy listen address. Default `127.0.0.1:8080`. |
 | `--ca-file <PATH>` | `ARKHAM_CA_FILE` | CA PEM path (certificate followed by key). Default `/certs/ca.pem` when the generated stack mounted it there, else `<config-dir>/arkham/ca.pem`. |
-| `--proxy-backend <BACKEND>` | `ARKHAM_PROXY_BACKEND` | Transparent capture backend: `none` (default, explicit listener only), `tun`, `tproxy`, or `ebpf`. Linux only; every backend is compiled in, so no build flags are needed. |
-| `--tproxy-allow-root-netns` | `ARKHAM_TPROXY_ALLOW_ROOT_NETNS` | With `--proxy-backend tproxy`, allow unscoped capture rules in the host network namespace. Disposable machines only. |
+| `--proxy-backend <BACKEND>` | `ARKHAM_PROXY_BACKEND` | Transparent capture backend: `none` (default, explicit listener only) or `ebpf` (Linux only). |
 | `--ebpf-cgroup <PATH>` | `ARKHAM_EBPF_CGROUP` | With `--proxy-backend ebpf`, the cgroup v2 directory whose member processes get captured, or the literal `enclosing` for the cgroup this process's own cgroup lives under (what a compose stack with one `cgroup_parent` per service uses). Required for that backend; otherwise arkham itself must live outside the named cgroup. |
 | `--ebpf-bypass <CIDR>` | `ARKHAM_EBPF_BYPASS` | With `--proxy-backend ebpf`, extra CIDRs that are never captured. Repeat the flag, or separate values with commas. Linux only. |
 | `--ebpf-bypass-file <PATH>` | `ARKHAM_EBPF_BYPASS_FILE` | With `--proxy-backend ebpf`, a file of bypass CIDRs, one per line, re-read while capture runs. |
 
-`--proxy-backend`, `--tproxy-allow-root-netns`, `--ebpf-cgroup`, `--ebpf-bypass`, and `--ebpf-bypass-file` are CLI and environment only, deliberately absent from config files. Capture mutates host routes, nft rules, and kernel programs, so enabling it is an explicit act, not ambient configuration.
+The eBPF backend uses cgroup v2 socket hooks to redirect traffic to arkham's loopback listeners. Connected UDP is relayed unchanged. Unconnected `sendto` traffic such as typical DNS is not captured. The process owns the attachment handles, so exit detaches the programs without leaving netfilter or routing state.
 
-What each backend does:
+The kernel floor for `ebpf` is 5.15. It captures IPv4 and IPv6. Hosts without IPv6 support run IPv4-only and log that once; IPv6 listener or hook failures on a capable host stop startup. Capture is scoped to arkham's own network namespace. Containers the agent spawns with separate network namespaces are left alone, while egress through the agent's namespace stays captured. Loopback and configured bypass destinations are excluded.
 
-| Backend | Mechanism | UDP |
-| --- | --- | --- |
-| `tproxy` | nftables rules and policy routes hand TCP to an `IP_TRANSPARENT` listener. Needs `CAP_NET_ADMIN`. | Passes through untouched, except QUIC on `:443`, which is dropped so HTTP/3 clients fall back to TCP. |
-| `tun` | A TUN device plus an in-process TCP/IP stack. Needs root. | Relayed inside arkham: DNS to the system resolver, QUIC dropped, other flows to their original destination. |
-| `ebpf` | cgroup v2 socket hooks (`connect4`, `recvmsg4`, and an egress hook) rewrite destinations to arkham's loopback listeners. No netfilter, no policy routes, no `IP_TRANSPARENT`. Needs `CAP_BPF` + `CAP_NET_ADMIN`, and a cgroup holding the workload with arkham outside it. | Connected UDP only (what a `connect()`ed socket sends) is relayed unchanged. Unconnected `sendto` traffic such as typical DNS is never captured. |
-
-All three are peers: same interception contract (a captured connection's destination is its identity), different mechanism. `tun` is the one to reach for when you need the UDP path handled; `tproxy` when you want the kernel to terminate TCP with nftables you can inspect; `ebpf` when you want no netfilter rules on the host and are scoping capture by cgroup rather than by network namespace. The eBPF backend's attach handles are owned by the process, so exit detaches the programs and leaves no host state behind.
-
-Kernel floor for `ebpf` is 5.15, and it is IPv4-only. Capture is scoped to arkham's own network namespace: containers the agent spawns — inner compose stacks, podman — carry their own namespaces and are left alone, while egress through the agent's namespace stays captured.
-
-The listener binds before any capture side effect, so a bad listen address fails before routes, nft rules, or kernel programs touch the host. A failed capture leg ends the process rather than silently serving explicit-proxy only.
+The listener binds before capture attaches kernel programs. A failed capture leg ends the process rather than silently serving explicit-proxy only.
 
 ## `arkham fake <ENV> [--pattern <PATTERN>]`
 
@@ -62,9 +51,9 @@ Print a reference config. Each setting appears with its default and its doc comm
 
 Curate an `oauth2` registry fragment from a saved discovery or OpenAPI document. `from-oidc` maps `token_endpoint` and `grant_types_supported`; `from-openapi` maps every `type: oauth2` security scheme and reports `openIdConnect` schemes as skipped. Both print a complete `[providers.<slug>]` TOML fragment to stdout for review and placement in `rules.d`; they never fetch, never write files, and never touch the bundled table. See [the registry reference](registry.md).
 
-## `arkham init [--backend <BACKEND>] [WORKSPACE]`
+## `arkham init [WORKSPACE]`
 
-Generate the workspace stack: the CA and the agent entrypoint when they are missing, and `<state-dir>/arkham/ws/<slug>/compose.yml`. That compose file is generated state. Overrides go in `~/.config/arkham/compose.yaml` or `<workspace>/.config/arkham/compose.yaml`. Rules are not written anywhere: they derive at serve time from fnox declarations the registry knows, and config holds overrides only. An existing stack is rewritten when the rendered file would change and left untouched when it matches. `--backend` picks the capture backend (`ebpf` by default, Linux only). A named backend is part of the render and replaces the file when the output differs. An unnamed backend keeps the one already rendered. Prints a warning when no rule is in play, since then nothing would be substituted.
+Generate the workspace stack: the CA and the agent entrypoint when they are missing, and `<state-dir>/arkham/ws/<slug>/compose.yml`. That compose file is generated state. Overrides go in `~/.config/arkham/compose.yaml` or `<workspace>/.config/arkham/compose.yaml`. Rules derive at serve time from fnox declarations the registry knows, and config holds overrides only. An existing stack is rewritten when the rendered file would change and left untouched when it matches. Prints a warning when no rule is in play.
 
 ## `arkham daemon`
 

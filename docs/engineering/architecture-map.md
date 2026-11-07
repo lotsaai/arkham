@@ -14,8 +14,6 @@ Written from `origin/main` @ `ebd9578`. The TLS-leg sections were updated when `
 | `arkham-plugin` | Wasm (wasmtime component) HTTP rewrite hooks | 708 (496) | `RewriteHook` lib.rs:72; `Registry` lib.rs:154; `Registry::select` lib.rs:298 |
 | `arkham-pki` | CA, leaf/client-pair minting, SSH keys | 766 (495) | `CertAuthority` ca.rs:30; `generate_domain_cert` ca.rs:129; `boring_pair` ca.rs:140; `generate_domain_pair` ca.rs:365; `SshKey` ssh.rs:23 |
 | `arkham-fnox` | Resolves real secret values from fnox | 1095 (785) | `FnoxSource` lib.rs:24; `resolve` lib.rs:437 |
-| `arkham-tun` | Userspace TUN capture. Feeds `serve_transparent_stream`. | 1217 (996) | `run_tun` tun.rs:46; call at tun.rs:224 |
-| `arkham-tproxy` | nftables TPROXY capture. Feeds `serve_transparent_stream`. | 1049 (759) | `run_tproxy` tproxy.rs:56; call at tproxy.rs:204 |
 | `arkham-ebpf` | cgroup sock_addr eBPF redirect capture | 1406 (883); `live.rs` is `#[cfg(test)]` (lib.rs:873) and excluded | `run_ebpf` lib.rs:459; call at tcp.rs:56 |
 | `arkham-ebpf-programs` | BPF programs (bpf target only) | 398 (214) | main.rs |
 
@@ -215,7 +213,7 @@ flowchart TD
   B -->|CONNECT, no grant| SP[dial_marked + copy_bidirectional lib.rs:300-309]
   B -->|CONNECT| C[serve_connect_stream lib.rs:331]
   B -->|absolute http://| F[forward_arm lib.rs:394 → http_pair → relay_guarded]
-  T[tun.rs:224 / tproxy.rs:204 / ebpf tcp.rs:56] --> D[serve_transparent_stream lib.rs:367]
+  T[ebpf tcp.rs:56] --> D[serve_transparent_stream lib.rs:367]
   C --> E[identity::expect identity.rs:111<br/>grants → Expect]
   D --> E
   E --> S[Expect::serve identity.rs:154]

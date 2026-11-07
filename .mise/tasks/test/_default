@@ -10,8 +10,6 @@ cd "$proj_dir" || exit 1
 
 mise run --force test:rust "$@"
 mise run --force test:ssh "$@"
-mise run --force test:tun --use-sudo "$@"
-mise run --force test:tproxy --use-sudo "$@"
 mise run --force test:ebpf --use-sudo "$@"
 mise run --force test:k3s "$@"
 mise run --force test:talos "$@"

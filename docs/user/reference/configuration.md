@@ -307,9 +307,8 @@ An entry overrides a built-in path for that name or adds a name the table does n
 | `ARKHAM_LISTEN` | Sets `[proxy] listen`. |
 | `ARKHAM_CA_FILE` | Sets `[proxy] ca_file`. |
 | `ARKHAM_CONFIG` | Sets the global config file path. |
-| `ARKHAM_PROXY_BACKEND` | Same as `--proxy-backend`. CLI and environment only. |
-| `ARKHAM_TPROXY_ALLOW_ROOT_NETNS` | Same as `--tproxy-allow-root-netns`. |
-| `ARKHAM_EBPF_CGROUP` | Same as `--ebpf-cgroup`. CLI and environment only. |
+| `ARKHAM_PROXY_BACKEND` | Same as `--proxy-backend`. |
+| `ARKHAM_EBPF_CGROUP` | Same as `--ebpf-cgroup`. |
 
 ## Validation
 

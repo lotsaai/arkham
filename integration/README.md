@@ -1,31 +1,27 @@
 # Integration demo (transparent capture)
 
-Runs the real container image (runtime-only `Dockerfile`, prebuilt
-binary) in the deployment shape arkham exists for: the
-client container shares arkham's network namespace and knows nothing about
-any proxy. arkham runs `serve --proxy-backend tproxy` and installs its nft rules and
-policy routing inside the shared netns, so every client connection is
-captured on the way out.
-
-This demo pins `tproxy` because the eBPF backend captures by cgroup
-membership, and a compose service's cgroup path is not something the demo
-can fix. For the same scenarios over eBPF, run the docker-free
-[bwrap demo](bwrap/README.md) with `ARKHAM_BACKEND=ebpf`.
+The demo runs the real container image with a client that shares arkham's
+network namespace and does not configure a proxy. arkham uses eBPF capture
+for the client cgroup. For a docker-free demo, see the
+[bwrap demo](bwrap/README.md).
 
 Topology:
 
 - `client` — `network_mode: service:arkham`; talks to `api` by plain
   hostname:port. Holds only the deterministic fake (`arkham fake GH_TOKEN`).
-- `arkham` — legs on the default bridge and the `server` network;
-  `cap_add: NET_ADMIN` for the TPROXY listener, nft rules, and policy
-  routes (all self-installed over netlink — the runtime image ships no
-  `nft`/`ip`). Marked upstream dials bypass capture (fwmark rule).
+- `arkham` — connected to the default bridge and the `server` network.
+  It attaches eBPF programs to the shared `arkham-integration.slice` cgroup
+  with the host cgroup and PID namespaces and `BPF`, `PERFMON`, `NET_ADMIN`,
+  and `SYS_PTRACE` capabilities. Host PID access and `SYS_PTRACE` let the
+  proxy validate client socket owners and remain subject to security review.
+  The client keeps its private PID namespace.
 - `api` — bun server on `server` only, static IP `10.202.0.20`,
   validates only the real token.
 - `db` — real PostgreSQL 17 (Alpine) on `server` only, static IP
   `10.202.0.30`, TLS with a demo-CA leaf, validates only the real password.
-- `server` subnet is RFC1918 on purpose: arkham captures LAN traffic too
-  (the capture routes are default-route-only), and this demo proves it.
+- `sshd` — OpenSSH on `server` only, static IP `10.202.0.40`. Its image
+  installs the server during the Compose build, not at container startup.
+- `server` subnet is RFC1918 on purpose. The demo exercises captured LAN traffic.
 
 | # | Client does | Grant | Passes when |
 | --- | ------------- | ------- | ------------- |
@@ -63,8 +59,8 @@ Topology:
 | 34 | Same client binds, then `startTLS` with a client certificate, then binds, on port 3391. A second connection omits the certificate | `[rules.ldap_mtls]`: `guest_tls_mode = mtls`; fake `ldap://` on 3391; real string is the cleartext LDAP URL | the cleartext bind is `confidentialityRequired` (code 13). The certified handshake completes and the decoy bind succeeds. Without a certificate the protected bind does not succeed, and the error text does not contain the real password |
 
 Scenario 3's grant host is the literal destination IP because raw TCP
-capture has no SNI — the destination address is the identity
-(`crates/arkham-tproxy/src/tproxy.rs` `tproxy_conn_task`). Scenario 5 is the fail-closed control: without a grant
+capture has no SNI. The destination address is the identity.
+Scenario 5 is the fail-closed control: without a grant
 arkham splices TLS byte-identical, so no secret can leak and the server
 refuses the fake.
 Scenario 6's entry is a real

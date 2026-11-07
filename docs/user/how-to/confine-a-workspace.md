@@ -129,7 +129,7 @@ Node and Python's `requests` read their own bundle instead of the system store, 
 ## 5. Generate, start, enter, stop
 
 ```sh
-arkham init             # CA, entrypoint, and the stack (--backend picks the capture backend; ebpf by default)
+arkham init             # CA, entrypoint, and the stack
 arkham up               # start it
 arkham logs -f          # the stack's logs (--tail N, --no-log-prefix, --workspace PATH, service names as for docker compose)
 arkham agent            # init, up, and the shell in one idempotent command
@@ -147,7 +147,7 @@ arkham down             # stop it
 
 ## What the generated stack does
 
-The arkham service runs `serve --proxy-backend <backend>`, `ebpf` unless `arkham init --backend` picked another, so the agent container, which shares arkham's network namespace, has every outbound connection captured with no proxy setting and no way around the proxy. Under `ebpf` both services carry the same `cgroup_parent`, and arkham attaches with `--ebpf-cgroup enclosing` — the cgroup its own cgroup lives under, resolved from `/proc/self/cgroup`, because the daemon places that parent relative to its own cgroup root; it also carries `cgroup: host` and the `BPF`/`PERFMON` capabilities, and the agent's inner containers land in the same cgroup. Under `tun` both services need `/dev/net/tun`. It holds the CA (`ARKHAM_CA_FILE=/certs/ca.pem`) and resolves the real values itself: your fnox config directory is mounted read-only at `/root/.config/fnox`, arkham's own fnox files at `/root/.config/arkham`, and every provider credential — including an age-encrypted secret, decrypted with the key inside the mounted fnox config — resolves from fnox inside the container, the way `fnox exec` would. The environment that started the stack is never a credential source.
+The arkham service runs `serve --proxy-backend ebpf`. The agent container shares arkham's network namespace, so supported traffic is captured without proxy settings, subject to capture exclusions. Both services carry the same `cgroup_parent`, and arkham attaches with `--ebpf-cgroup enclosing`, resolved from `/proc/self/cgroup`. The proxy uses the host PID and cgroup namespaces with `BPF`, `PERFMON`, `NET_ADMIN`, and `SYS_PTRACE` capabilities. The agent retains its private PID namespace. The service holds the CA (`ARKHAM_CA_FILE=/certs/ca.pem`) and resolves real values from fnox inside the container. Your fnox config directory is mounted read-only at `/root/.config/fnox`, and arkham's own fnox files at `/root/.config/arkham`. The environment that started the stack is never a credential source.
 
 The agent service holds only decoys, one environment variable per rule, and runs behind your entrypoint. It mounts the same workspace paths plus the profile mounts from step 3. It runs a container runtime of its own, so it carries what that needs: unconfined seccomp, systempaths and apparmor, `SYS_CHROOT`/`AUDIT_WRITE`/`NET_ADMIN`/`SETUID`/`SETGID`/`SYS_ADMIN`, and `/dev/net/tun`. Its storage is a directory under this workspace's state, made at generation time and mounted at `{home}/.local/share/containers`. `systempaths=unconfined` is a podman option — under docker, drop it from `security_opt`.
 

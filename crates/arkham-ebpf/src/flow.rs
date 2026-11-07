@@ -62,9 +62,7 @@ impl FlowTables {
   /// on the other protocol's entry, and dialing that destination would
   /// misroute the connection.
   pub(crate) fn original(&self, peer: SocketAddr, proto: u8) -> Result<Option<CapturedFlow>, Error> {
-    let Some(key) = FlowKey::from_peer(peer) else {
-      return Ok(None);
-    };
+    let key = FlowKey::from_peer(peer);
     let record = match self.flows.get(&key, 0) {
       Ok(record) => record,
       // A missing key is the ordinary "not captured" case, not an error.
@@ -73,6 +71,7 @@ impl FlowTables {
     };
     match self.orig.get(&record.cookie, 0) {
       Ok(orig) if orig.proto == proto => Ok(Some(CapturedFlow {
+        cookie: record.cookie,
         destination: orig.socket_addr(),
         cgroup_id: record.cgroup_id,
       })),
@@ -101,6 +100,7 @@ pub(crate) fn retained_cgroup(recorded: u64, live: u64) -> Option<u64> {
 
 /// A redirected flow: where the client was going, and which cgroup it ran in.
 pub(crate) struct CapturedFlow {
+  pub cookie: u64,
   /// Original destination, before the hook rewrote it.
   pub destination: SocketAddr,
   /// Cgroup id of the connecting process.

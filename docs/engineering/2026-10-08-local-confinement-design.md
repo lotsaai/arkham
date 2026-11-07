@@ -1,5 +1,7 @@
 # Local confinement without containers: full plan
 
+This design records the repository state at the time it was written. The Linux TPROXY and TUN backends have since been removed.
+
 Scope captured here: a local execution backend for `arkham agent` that confines the agent on the host with OS primitives instead of a container. Transparent traffic capture is the mechanism on all three OSes. Nothing about networking is imposed on the sandbox: no `HTTP_PROXY` or `HTTPS_PROXY` variables, no proxy flags, no cooperation from agent tooling. Those variables belong to the tools now, and the space only gets more crowded. The platform routes traffic into arkham whether the sandbox knows or not. Explicit proxy remains as a fallback and debug path only. This plan covers Linux, macOS, and Windows end to end. No track is parked.
 
 ## Constraints
@@ -34,7 +36,9 @@ Renderers are per OS. Linux runs bubblewrap. Landlock adds restrictions inside t
 
 ## Linux: eBPF capture with cgroup attribution
 
-Each sandbox runs in its own cgroup. The eBPF programs (`arkham-ebpf-programs`: `connect4`, `recvmsg4`, `capture_egress`, `CONFIG` / `ORIG_DST` / `FLOW` maps) attach per cgroup, so flows arrive already attributed to a workspace. The userspace half hands accepted streams to `serve_transparent_stream`. No env vars, no proxy flags, no cooperation from the agent. Tools inside may set `HTTP_PROXY` to anything: the TCP connection itself is captured either way.
+Each sandbox runs in its own cgroup below `arkham-host`. The daemon attaches the eBPF programs once at `arkham-host`, covering its descendants. `connect4` and `connect6` record the original destination and session cgroup identity before redirecting TCP and connected UDP. `capture_egress` indexes redirected flows, `recvmsg4` and `recvmsg6` restore UDP reply sources, and `release_flow` removes closed-socket records. Userspace hands accepted TCP streams to `serve_captured_stream`, which selects the session's project snapshot. Capture excludes loopback, foreign network namespaces and configured bypass destinations. IPv6-capable hosts require both IPv6 hooks and listeners. Hosts without IPv6 support run IPv4-only and log the missing capability once.
+
+The host acceptance tests run serially because each daemon uses the same capture ports. On Linux, `mise run test:rust` builds the suite, gives the daemon binary `CAP_BPF`, `CAP_NET_ADMIN` and `CAP_PERFMON`, then runs the prebuilt tests. The task removes those file capabilities on exit. It requires non-interactive sudo and `setcap`. A capture startup failure must stop the daemon before it accepts a session or reports readiness.
 
 The bwrap invocation keeps the filesystem shape from the compose inputs (workspace root and `include` entries with their ro flags, `file_mounts` and guest mounts read only, `tool_mounts` with their flags, fnox binds and grants mounts never entering) plus `--unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup --die-with-parent --new-session`, the CA as a read-only bind with trust env pointers, and decoy env values. The host `/sys/fs/cgroup` tree is not mounted. The daemon moves the process into its session cgroup first, and `--unshare-cgroup` makes that cgroup the namespace root, so another session's cgroup is not a path in the sandbox. eBPF still attributes the flow with that session cgroup's real id, the kernfs inode. A probe that cannot create the cgroup namespace refuses to start the agent. `--unshare-net` stays off: the sandbox shares the host stack and eBPF sees its flows through cgroup membership.
 

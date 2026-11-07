@@ -4,3 +4,10 @@ retries = 3
 [profile.default.slow-timeout]
 period = "30s"
 terminate-after = 1
+
+[test-groups.host-daemon]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(host_linux)'
+test-group = 'host-daemon'

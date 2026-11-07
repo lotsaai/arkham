@@ -570,6 +570,7 @@ mod tests {
       profile: WriteProfile::ReadOnly,
       workspace: PathBuf::from("/work"),
       binds: Vec::new(),
+      protected: Vec::new(),
       ca_host: PathBuf::from("/scratch/ca.pem"),
       ca_dest: PathBuf::from("/arkham/ca.pem"),
       env: Vec::new(),

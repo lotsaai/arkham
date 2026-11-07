@@ -4,9 +4,9 @@ Give your coding agent fake credentials that work. arkham is a secure agent envi
 
 A leaked prompt, a pasted log, or a dependency that phones home carries the decoy. The upstream rejects it everywhere except the grant. The real value appears on the wire only to a host you named.
 
-One command drops you into that environment. `arkham agent` starts the stack and opens a shell in a container that holds only decoys. Every connection is captured transparently, so there is no proxy setting to find and no way around the proxy.
+One command drops you into that environment. `arkham agent` starts the stack and opens a shell in a container that holds only decoys. Supported traffic is captured transparently without proxy settings, subject to capture exclusions.
 
-Underneath sits a grant-scoped proxy. A workload can also point its proxy settings at arkham, or arkham can capture its traffic with `--proxy-backend` (`tproxy`, `tun`, or `ebpf`). On a grant match arkham terminates TLS with a per-domain leaf signed by its own CA and swaps the decoy for the real value in headers, basic auth, and bodies, over HTTP/1 and HTTP/2. On the response it swaps real values back to decoys. Every other connection is spliced byte for byte with the real upstream certificate untouched.
+Underneath sits a grant-scoped proxy. A workload can also point its proxy settings at arkham, or on Linux arkham can capture its traffic with `--proxy-backend ebpf`. On a grant match arkham terminates TLS with a per-domain leaf signed by its own CA and swaps the decoy for the real value in headers, basic auth, and bodies, over HTTP/1 and HTTP/2. On the response it swaps real values back to decoys. Every other connection is spliced byte for byte with the real upstream certificate untouched.
 
 ## Protocols
 
@@ -46,7 +46,7 @@ Or download a tarball from [the releases page](https://github.com/casualjim/arkh
 docker run --rm ghcr.io/lotsaai/arkham:latest fake GH_TOKEN
 ```
 
-**From source**: clone, then build with a recent stable Rust toolchain (the crate uses edition 2024; all three Linux capture backends compile in unconditionally):
+**From source**: clone, then build with a recent stable Rust toolchain (the crate uses edition 2024):
 
 ```sh
 git clone https://github.com/casualjim/arkham
@@ -124,7 +124,7 @@ flowchart TB
     subgraph DCG["Daemon cgroup. The daemon process stays in this cgroup"]
       subgraph DAEMON["arkham daemon, one process, your uid"]
         SOCK["Unix control socket. Peer uid must be the daemon uid"]
-        PROXY["Proxy in this process. Capture listeners 127.0.0.1:15000 TCP and 127.0.0.1:15001 UDP. Also the explicit loopback listener. Holds the real credentials and substitutes them"]
+        PROXY["Proxy in this process. Capture listeners 127.0.0.1 and ::1, TCP :15000 and UDP :15001. Also the explicit loopback listener. Holds the real credentials and substitutes them"]
         EBPFU["eBPF userspace, aya, in this same process. Reads the BPF maps for the original destination and the cgroup id"]
       end
       subgraph ATTACH["arkham-host. The eBPF programs are attached here, once, and cover every session under it"]
@@ -137,7 +137,7 @@ flowchart TB
         end
       end
     end
-    EBPFK["connect4, attached at arkham-host. TCP goes to 127.0.0.1:15000 and connected UDP to 127.0.0.1:15001. The real destination and cgroup id are stored. IPv6, loopback, and bypassed destinations are not rewritten"]
+    EBPFK["connect4 and connect6, attached at arkham-host. TCP goes to :15000 and connected UDP to :15001 on the matching loopback address. The real destination and cgroup id are stored. Loopback, foreign network namespaces, and bypassed destinations are not rewritten"]
     REAL["Real secret files and home config. Never mounted into the sandbox"]
   end
   UP["Upstream services"]
@@ -152,9 +152,11 @@ flowchart TB
 
 Filesystem isolation is bubblewrap plus Landlock. The network is shared with the host; captured TCP and connected UDP are redirected to the proxy, which alone holds the real credentials, and the cgroup id is how the proxy tells which session's grants apply. Discovery uses project markers, and fnox only decides which files get rewritten.
 
+Host sessions hide the contents of Arkham config that exists at launch, including discovered hard-link aliases. Unrelated project `.config` files remain usable. Missing config paths are not reserved, and an existing symlink entry can still be replaced even though its original target stays masked.
+
 ## Where the limits are
 
-arkham matches the request authority, not the path. An agent that hashes or signs the credential before sending defeats substitution, and the upstream rejects the request. A `*` grant host matches any destination. A client must trust arkham's CA to reach a granted HTTPS host. Transparent capture needs root and Linux; the `tproxy` backend needs `CAP_NET_ADMIN`, the `tun` backend a TUN device, and the `ebpf` backend `CAP_BPF` + `CAP_NET_ADMIN`, kernel 5.15, and IPv4. [The security model](docs/user/explanation/security-model.md) states each of these with its consequence.
+arkham matches the request authority, not the path. An agent that hashes or signs the credential before sending defeats substitution, and the upstream rejects the request. A `*` grant host matches any destination. A client must trust arkham's CA to reach a granted HTTPS host. Transparent capture requires Linux, kernel 5.15, `CAP_BPF`, and `CAP_NET_ADMIN`. The eBPF backend captures IPv4 and IPv6; hosts without IPv6 support run IPv4-only. [The security model](docs/user/explanation/security-model.md) states the capture boundaries and their consequences.
 
 ## Contributing
 
