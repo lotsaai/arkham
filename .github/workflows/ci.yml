@@ -27,8 +27,18 @@ jobs:
 
       # nftables and bpftool are for the k3s task's failure dump
       # (`nft list ruleset`, `bpftool cgroup tree`), not for the build.
+      # linux-tools-generic is that bpftool package. Its metapackage sometimes
+      # publishes before the concrete kernel package is on the runner mirror,
+      # and a single install transaction then installs nothing. The build
+      # packages stay required. bpftool is installed when the mirror can.
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev zstd mold nftables linux-tools-common linux-tools-generic
+        run: |-
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev zstd mold nftables linux-tools-common bubblewrap
+          if ! sudo apt-get install -y --no-install-recommends linux-tools-generic; then
+            echo "linux-tools-generic is not installable on this mirror"
+          fi
 
       # Pinned by hand to the LLVM major the pinned rustc ships. rustc is
       # NOT installed yet when this step runs, so probing `rustc -Vv` here
@@ -70,7 +80,38 @@ jobs:
         run: mise check
 
       - name: Buld & Test
-        run: mise build
+        run: |-
+          set -euxo pipefail
+          # Ubuntu 24.04 denies unprivileged user namespaces unless this is
+          # off or an AppArmor profile grants them. Bubblewrap needs one for
+          # --unshare-pid. Leave a loaded bwrap profile in place.
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          # The daemon creates arkham-host under this process's cgroup.
+          # GitHub-hosted runners own that directory as root, so mkdir
+          # returns EACCES. A child cgroup owned by the job user is enough.
+          rel="$(awk -F: '$1 == 0 { print $3 }' /proc/self/cgroup)"
+          base="/sys/fs/cgroup${rel}"
+          if ! mkdir "${base}/arkham-ci-probe" 2>/dev/null; then
+            delegate="${base}/arkham-ci"
+            sudo mkdir -p "$delegate"
+            echo $$ | sudo tee "$delegate/cgroup.procs" >/dev/null
+            sudo chown -R "$(id -u):$(id -g)" "$delegate"
+            base="$delegate"
+          else
+            rmdir "${base}/arkham-ci-probe"
+          fi
+          probe="${base}/arkham-ci-probe"
+          mkdir "$probe"
+          echo $$ > "$probe/cgroup.procs"
+          echo $$ > "$base/cgroup.procs"
+          rmdir "$probe"
+          timeout 20 bwrap --unshare-user --unshare-pid --die-with-parent --bind / / --dev /dev --proc /proc -- true
+          mise build
 
       # test:ssh tears the stack down before this step runs, after writing
       # /tmp/arkham-integration-compose.log. The live `compose logs` call

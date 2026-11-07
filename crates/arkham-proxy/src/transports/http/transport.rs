@@ -49,6 +49,7 @@ impl Transport for HttpsTransport {
       port,
       host,
       initial,
+      cgroup_id,
       ..
     } = params;
     let budget = Duration::from_secs(snapshot.proxy.handshake_timeout_secs);
@@ -97,23 +98,15 @@ impl Transport for HttpsTransport {
     }
     let bridge = BridgeIo(guest_io, GuestIo::bare(upstream));
     let pump = SubstitutionService {
-      snapshot: state.snapshot(),
+      snapshot: Arc::new(snapshot.clone()),
       identity,
       port,
-      plugins: Arc::clone(&state.plugins),
-      mint: Some(state.mint_store()),
+      plugins: state.plugins_for(cgroup_id),
+      mint: Some(state.mint_for(cgroup_id)),
     };
-    // Entries naming `root_cert` ride their own relay extending the global
-    // egress trust; the map was built from this same config, so a miss is
-    // a bug, failed closed.
-    let relay = match &scope.root_cert {
-      None => state.relay.clone(),
-      Some(path) => state
-        .extra_relays
-        .get(path)
-        .cloned()
-        .ok_or_else(|| Error::UnknownTrustBundle { path: path.clone() })?,
-    };
+    // Entries naming `root_cert` ride the relay built for this flow's
+    // project. A miss is a bundle the project never loaded.
+    let relay = state.relay_for(cgroup_id, scope.root_cert.as_deref())?;
     let relay = TlsMitmRelayService::new(relay, pump);
     match parsed {
       Some(hello) => relay
@@ -149,6 +142,7 @@ impl Transport for HttpTransport {
       port,
       raw_host,
       initial,
+      cgroup_id,
       ..
     } = params;
     let budget = Duration::from_secs(snapshot.proxy.handshake_timeout_secs);
@@ -164,8 +158,8 @@ impl Transport for HttpTransport {
       grants: &snapshot.grants,
       host: if named { &head_host } else { raw_host },
       port: if named { head_port } else { port },
-      plugins: &state.plugins,
-      mint: Some(state.mint_store()),
+      plugins: state.plugins_for(cgroup_id),
+      mint: Some(state.mint_for(cgroup_id)),
     };
     if named {
       let (mut downstream_machine, mut upstream_machine) = http_pair(&ctx);
@@ -210,7 +204,7 @@ where
       grants: &self.snapshot.grants,
       host: &self.identity,
       port: self.port,
-      plugins: &self.plugins,
+      plugins: Arc::clone(&self.plugins),
       mint: self.mint.clone(),
     };
     // The relay handshook the upstream leg before the guest's, and answered

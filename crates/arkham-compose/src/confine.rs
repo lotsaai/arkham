@@ -17,6 +17,7 @@ use crate::stack::{current_uid, generate_stack};
 use crate::workspace::Workspace;
 use arkham_config::cli::{Cli, CliCommand, ProxyBackend};
 use arkham_config::config::{AppConfig, RuleCfg, WorkspaceBuild, config_dir, user_config_dirs};
+use arkham_config::{Isolate, WriteProfile};
 use arkham_pki::ca::load_or_generate;
 use clap::Args;
 use dirs::home_dir;
@@ -712,6 +713,13 @@ pub struct AgentArgs {
   /// arguments after `--`.
   #[arg(last = true)]
   pub command: Vec<OsString>,
+  /// Confinement backend. `compose` is the default. `bwrap` is the Linux
+  /// host backend.
+  #[arg(long, value_enum, default_value_t = Isolate::Compose)]
+  pub isolate: Isolate,
+  /// Filesystem write profile for the host backend.
+  #[arg(long, value_enum, default_value_t = WriteProfile::WorkspaceWrite)]
+  pub write_profile: WriteProfile,
 }
 
 /// `arkham init [--backend <backend>] [workspace]`: write the support files, a
@@ -749,7 +757,19 @@ impl CliCommand for AgentArgs {
   /// Returns an error when the workspace cannot be resolved, generated, or
   /// started, plus when the compose command fails. A failed `rm` teardown is
   /// reported too, because the stack the caller asked to stop is still up.
+  /// `--isolate bwrap` registers the workspace with the host daemon and
+  /// launches under bubblewrap instead of compose.
   async fn run(self, _cli: &Cli, arkham_version: &str) -> Result<(), Self::Error> {
+    if self.isolate == Isolate::Bwrap {
+      #[cfg(target_os = "linux")]
+      {
+        return crate::host::run_agent(self.write_profile, self.workspace.as_deref(), &self.command).await;
+      }
+      #[cfg(not(target_os = "linux"))]
+      {
+        return crate::host::run_agent(self.write_profile, self.workspace.as_deref(), &self.command);
+      }
+    }
     let workspace = Workspace::resolve(self.workspace.as_deref())?;
     init_workspace(&workspace, resolve_backend(None)?, false, arkham_version).await?;
     up_workspace(&workspace, self.build).await?;

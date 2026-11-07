@@ -396,4 +396,7 @@ pub enum Error {
     /// Missing bundle path.
     path: PathBuf,
   },
+  /// A project was registered at cgroup id zero.
+  #[error("cgroup id zero is not a project")]
+  ProjectCgroup,
 }

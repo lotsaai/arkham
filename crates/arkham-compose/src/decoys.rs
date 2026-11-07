@@ -92,6 +92,19 @@ impl Selection {
     })
   }
 
+  /// Load the selection for `root`, discovering fnox from that directory
+  /// rather than from the process cwd.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error when the registry or the fnox source cannot be opened.
+  pub(crate) fn load_from(root: &Path) -> Result<Self, Error> {
+    Ok(Self {
+      fnox: FnoxSource::open_from(root)?,
+      registry: generation_registry(Some(root))?,
+    })
+  }
+
   /// Select every fnox-declared name the registry knows, with its decoy.
   pub(crate) fn select(&self) -> Vec<Decoy> {
     selected_envs(self.fnox.as_ref(), &self.registry)

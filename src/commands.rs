@@ -317,6 +317,26 @@ impl CliCommand for FwdArgs {
   }
 }
 
+/// Arguments for the host daemon.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DaemonArgs;
+
+impl CliCommand for DaemonArgs {
+  type Error = Report;
+  /// Serves the shared host proxy and the control socket.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error on non-Linux hosts, when the listen address is not
+  /// loopback, or when the daemon cannot bind its socket.
+  async fn run(self, _cli: &Cli, arkham_version: &str) -> Result<(), Self::Error> {
+    #[cfg(not(target_os = "linux"))]
+    bail!("the host daemon runs on Linux, not this arkham {arkham_version} build");
+    #[cfg(target_os = "linux")]
+    crate::host::run(arkham_version).await
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

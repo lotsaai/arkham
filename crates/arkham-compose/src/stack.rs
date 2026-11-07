@@ -22,6 +22,42 @@ use crate::profiles::{ProfileRoots, profile_mounts};
 use crate::rewrites::{RewriteInputs, write_rewrites};
 use crate::workspace::Workspace;
 
+/// Where rewritten paths are expressed.
+enum HomeMode {
+  /// Container home from the workspace config. Compose generation.
+  Container,
+  /// Host home, so bind destinations are host paths. `scratch` holds forged files.
+  Host { scratch: PathBuf },
+}
+
+/// What a host session needs from the compose pipeline, without a rendered stack.
+pub(crate) struct HostMaterial {
+  /// Workspace config, before grant fragments are merged.
+  pub config: AppConfig,
+  /// Fnox source discovered from the project root.
+  pub fnox: Option<arkham_fnox::FnoxSource>,
+  /// Registry joined against that source.
+  pub registry: arkham_config::registry::Registry,
+  /// Decoy env values.
+  pub decoys: Vec<Decoy>,
+  /// Adapter grants, real fragments still in memory.
+  pub grants: Vec<RewriteAdapted>,
+  /// Include mounts, workspace root included.
+  pub mounts: Vec<Mount>,
+  /// Rewritten file mounts.
+  pub file_mounts: Vec<Mount>,
+  /// Tool profile mounts.
+  pub tool_mounts: Vec<Mount>,
+  /// Guest identity mounts.
+  pub guest: Vec<Mount>,
+  /// Names copied through from the operator environment.
+  pub passthrough: Vec<String>,
+  /// Configured shell, when one is set.
+  pub shell: Option<String>,
+  /// Workspace root.
+  pub workspace: PathBuf,
+}
+
 /// Fixed port the generated stack renders as `ARKHAM_LISTEN` instead of the
 /// `127.0.0.1:8080` default: the explicit proxy is loopback-bound in the
 /// shared netns, and 8080 is the port dev servers default to — squatted on.
@@ -78,16 +114,29 @@ impl<'a> StackBuilder<'a> {
   ///
   /// Returns an error when the registry or config fails to load, when value
   /// resolution fails, or when a path fails to expand.
-  async fn resolve(root: &'a Path, backend: ProxyBackend, version: &'a str) -> Result<Self, Error> {
+  async fn resolve(root: &'a Path, backend: ProxyBackend, version: &'a str, home_mode: HomeMode) -> Result<Self, Error> {
     let workspace = Workspace::new(root);
     let config = workspace.config()?;
-    let selection = workspace.selection()?;
-    let raw_home = config.workspace.container_home().to_string();
+    let host_paths = matches!(home_mode, HomeMode::Host { .. });
+    let selection = if host_paths {
+      Selection::load_from(root)?
+    } else {
+      workspace.selection()?
+    };
+    let host = home_dir();
+    let raw_home = if host_paths {
+      host.clone().ok_or(Error::NoHome)?.to_string_lossy().into_owned()
+    } else {
+      config.workspace.container_home().to_string()
+    };
     let referenced = config.workspace.referenced_variables(&[raw_home.as_str()]);
     let env = resolution_env(&selection.registry, selection.fnox.as_ref(), &referenced).await?;
     let expander = build_expander(env.clone());
     let home = expand_value(&expander, &raw_home)?;
-    let layout = Layout::new(root, home, home_dir());
+    let mut layout = Layout::new(root, home, host);
+    if let HomeMode::Host { scratch } = home_mode {
+      layout = layout.with_scratch(scratch);
+    }
     let includes: Vec<PathBuf> = config
       .workspace
       .include
@@ -309,7 +358,7 @@ impl<'a> StackBuilder<'a> {
 /// resolution, rewrites, ambient derivation, grant state, profiles, guest
 /// identities, or the agent build.
 pub(crate) async fn generate_stack(root: &Path, backend: ProxyBackend, arkham_version: &str) -> Result<String, Error> {
-  let stack = StackBuilder::resolve(root, backend, arkham_version)
+  let stack = StackBuilder::resolve(root, backend, arkham_version, HomeMode::Container)
     .await?
     .secrets()?
     .rewrites()
@@ -321,6 +370,46 @@ pub(crate) async fn generate_stack(root: &Path, backend: ProxyBackend, arkham_ve
     .guest_identities()?
     .stack()?;
   Ok(stack.render())
+}
+
+/// Run the compose steps a host session shares, and stop before grant files
+/// and the rendered stack. Real grant fragments stay in memory.
+///
+/// # Errors
+///
+/// Returns whatever step fails: config, discovery, rewrites, ambient
+/// derivation, profiles, or guest identities.
+pub(crate) async fn host_material(root: &Path, scratch: &Path, version: &str) -> Result<HostMaterial, Error> {
+  let built = StackBuilder::resolve(
+    root,
+    ProxyBackend::None,
+    version,
+    HomeMode::Host {
+      scratch: scratch.to_path_buf(),
+    },
+  )
+  .await?
+  .secrets()?
+  .rewrites()
+  .await?
+  .ambient()
+  .await?
+  .profiles()?
+  .guest_identities()?;
+  Ok(HostMaterial {
+    passthrough: built.config.workspace.passthrough.clone(),
+    shell: built.config.workspace.shell.clone(),
+    workspace: root.to_path_buf(),
+    config: built.config,
+    fnox: built.selection.fnox,
+    registry: built.selection.registry,
+    decoys: built.decoys,
+    grants: built.grants,
+    mounts: built.mounts,
+    file_mounts: built.file_mounts,
+    tool_mounts: built.tool_mounts,
+    guest: built.guest,
+  })
 }
 
 /// The process's user id, from the kernel: the same value `id -u` prints,

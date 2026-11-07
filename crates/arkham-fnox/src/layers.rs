@@ -68,9 +68,10 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<Config> {
   Ok(config)
 }
 
-fn load_with_recursion<P: AsRef<Path>>(_start_path: P, include_local_sync: bool) -> Result<Config> {
-  // Start from current working directory and search upwards
-  let current_dir = env::current_dir().map_err(|e| FnoxError::Config(format!("Failed to get current directory: {e}")))?;
+fn load_with_recursion<P: AsRef<Path>>(start_path: P, include_local_sync: bool) -> Result<Config> {
+  // Search upwards from the caller's start, not from the process cwd. The
+  // host daemon's cwd is not the project it is preparing.
+  let current_dir = start_path.as_ref().to_path_buf();
 
   let requested_profiles = Config::get_profiles(&[]);
   let mut profiles = requested_profiles.clone();
@@ -267,9 +268,20 @@ fn load_global() -> Result<(Config, bool)> {
   }
 }
 
-/// Load the chain fnox discovers, plus arkham's own level.
+/// Load the chain fnox discovers from the process cwd, plus arkham's own level.
 pub(crate) fn discover() -> Result<Config> {
-  load_with_recursion("fnox.toml", true)
+  let current_dir = env::current_dir().map_err(|err| FnoxError::Config(format!("Failed to get current directory: {err}")))?;
+  load_with_recursion(&current_dir, true)
+}
+
+/// Load the chain fnox discovers starting at `start`, plus arkham's own level.
+pub(crate) fn discover_from(start: &Path) -> Result<Config> {
+  let start = if start.is_dir() {
+    start.to_path_buf()
+  } else {
+    start.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf)
+  };
+  load_with_recursion(&start, true)
 }
 
 /// Arkham's level filenames in read order. The plain file first, then the

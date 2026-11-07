@@ -73,11 +73,11 @@ async fn one(
     // First datagram for this client: resolve where it was really going.
     // Without a recorded destination the socket was not redirected, so
     // passing the datagram anywhere would misroute it; drop it.
-    let Some(dst) = flows.original(client, PROTO_UDP)? else {
+    let Some(captured) = flows.original(client, PROTO_UDP)? else {
       tracing::debug!(%client, "no recorded destination for captured udp flow; dropping");
       return Ok(());
     };
-    let dst = upstream_override.unwrap_or(dst);
+    let dst = upstream_override.unwrap_or(captured.destination);
     let upstream = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     upstream.connect(dst).await?;
     let flow = Arc::new(Mutex::new(Flow {

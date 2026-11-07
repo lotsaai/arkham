@@ -172,6 +172,7 @@ mod tests {
           host: Some("localhost"),
           raw_host: "localhost",
           initial: &[0x16, 0x03, 0x01],
+          cgroup_id: 0,
         },
         scope: &scope,
       })

@@ -12,7 +12,7 @@ use arkham_proxy::ProxyState;
 use aya::{
   Ebpf,
   maps::{Array, MapData},
-  programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr},
+  programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSock, CgroupSockAddr},
 };
 use std::fs::File;
 use std::io::ErrorKind;
@@ -158,8 +158,17 @@ impl SelfExclusion {
 /// the cgroup id has no namespace of its own. `0` means it could not be
 /// determined, leaving the pid as the only guard.
 fn own_cgroup_id() -> u64 {
+  cgroup_id_of_pid(std::process::id())
+}
+
+/// Cgroup id of `pid`, as `bpf_get_current_cgroup_id` reports it for a
+/// process still in that cgroup. `0` means the id could not be read.
+pub(crate) fn cgroup_id_of_pid(pid: u32) -> u64 {
   use std::os::unix::fs::MetadataExt as _;
-  let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") else {
+  if pid == 0 {
+    return 0;
+  }
+  let Ok(content) = std::fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
     return 0;
   };
   let Some(own) = own_cgroup_path(&content) else {
@@ -762,11 +771,14 @@ pub(crate) struct OrigDst {
   pub port: u32,
   /// `IPPROTO_TCP` (6) or `IPPROTO_UDP` (17).
   pub proto: u8,
-  /// Padding, mirroring `arkham-ebpf-programs::OrigDst`.
-  pub _pad: [u8; 3],
+  /// Padding, mirroring `arkham-ebpf-programs::OrigDst`. Seven bytes put
+  /// `cgroup_id` at offset 16 with no compiler-inserted gap.
+  pub _pad: [u8; 7],
+  /// Cgroup id sampled by `connect4` in the connecting task.
+  pub cgroup_id: u64,
 }
 
-// SAFETY: `repr(C)`, integer fields only.
+// SAFETY: `repr(C)`, integer fields only, every padding byte explicit.
 unsafe impl aya::Pod for OrigDst {}
 
 impl OrigDst {
@@ -793,6 +805,23 @@ pub(crate) struct FlowKey {
 
 // SAFETY: `repr(C)`, integer fields only.
 unsafe impl aya::Pod for FlowKey {}
+
+/// Value of the `FLOW` map: the socket cookie and the connecting cgroup.
+///
+/// Duplicated from `arkham-ebpf-programs::FlowRecord`. The programs crate
+/// cannot export a type the host links against.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FlowRecord {
+  /// Socket cookie, the key into `ORIG_DST`.
+  pub cookie: u64,
+  /// Cgroup id of the process that connected. Zero when the kernel reported
+  /// none.
+  pub cgroup_id: u64,
+}
+
+// SAFETY: `repr(C)`, two `u64` fields, no padding.
+unsafe impl aya::Pod for FlowRecord {}
 
 impl FlowKey {
   /// Key for a connection whose peer address is `peer`, as reported by
@@ -823,6 +852,7 @@ fn attach(bpf: &mut Ebpf, cgroup: &std::path::Path) -> Result<(), Error> {
   let mode = CgroupAttachMode::Single;
   attach_sock_addr(bpf, "connect4", &file, mode)?;
   attach_sock_addr(bpf, "recvmsg4", &file, mode)?;
+  attach_cgroup_sock(bpf, "release_flow", &file, mode)?;
   let program: &mut CgroupSkb = bpf
     .program_mut("capture_egress")
     .ok_or_else(|| Error::ProgramMissing {
@@ -843,6 +873,29 @@ fn attach(bpf: &mut Ebpf, cgroup: &std::path::Path) -> Result<(), Error> {
       name: "capture_egress".to_string(),
       origin: err,
     })?;
+  Ok(())
+}
+
+/// Load and attach one `cgroup_sock` program.
+///
+/// `sock_release` uses this type. The attach type comes from the section name.
+fn attach_cgroup_sock(bpf: &mut Ebpf, name: &str, cgroup: &File, mode: CgroupAttachMode) -> Result<(), Error> {
+  let program: &mut CgroupSock = bpf
+    .program_mut(name)
+    .ok_or_else(|| Error::ProgramMissing { name: name.to_string() })?
+    .try_into()
+    .map_err(|err| Error::UnexpectedProgramType {
+      name: name.to_string(),
+      origin: err,
+    })?;
+  program.load().map_err(|err| Error::LoadProgram {
+    name: name.to_string(),
+    origin: err,
+  })?;
+  program.attach(cgroup, mode).map_err(|err| Error::AttachProgram {
+    name: name.to_string(),
+    origin: err,
+  })?;
   Ok(())
 }
 
@@ -950,7 +1003,8 @@ mod tests {
       ip: encode_addr(Ipv4Addr::LOCALHOST),
       port: encode_port(TCP_LISTEN_PORT),
       proto: 6,
-      _pad: [0; 3],
+      _pad: [0; 7],
+      cgroup_id: 0,
     };
     assert_eq!(orig.socket_addr(), SocketAddr::from(([127, 0, 0, 1], TCP_LISTEN_PORT)));
   }
@@ -988,11 +1042,20 @@ mod tests {
     assert_eq!(offset_of!(FlowKey, port), 4);
     assert_eq!(offset_of!(FlowKey, _pad), 6);
 
-    assert_eq!(size_of::<OrigDst>(), 12);
+    assert_eq!(size_of::<FlowRecord>(), 16);
+    assert_eq!(align_of::<FlowRecord>(), 8);
+    assert_eq!(offset_of!(FlowRecord, cookie), 0);
+    assert_eq!(offset_of!(FlowRecord, cgroup_id), 8);
+
+    // 4 + 4 + 1 + 7 explicit padding + 8. Alignment is 8, and the pad reaches
+    // that boundary so the compiler inserts nothing.
+    assert_eq!(size_of::<OrigDst>(), 24);
+    assert_eq!(align_of::<OrigDst>(), 8);
     assert_eq!(offset_of!(OrigDst, ip), 0);
     assert_eq!(offset_of!(OrigDst, port), 4);
     assert_eq!(offset_of!(OrigDst, proto), 8);
     assert_eq!(offset_of!(OrigDst, _pad), 9);
+    assert_eq!(offset_of!(OrigDst, cgroup_id), 16);
     assert_eq!(size_of::<Config>(), 80);
     assert_eq!(align_of::<Config>(), 8);
     assert_eq!(offset_of!(Config, proxy_pid), 0);
@@ -1155,9 +1218,9 @@ mod tests {
       .relocate_calls(&text_sections)
       .expect("every call must resolve; an unresolved helper extern is the usual cause");
 
-    // All three attachment points must be present: a rename that drifted from
+    // Every attachment point must be present: a rename that drifted from
     // `attach()` would otherwise only fail on a root-only run.
-    for name in ["connect4", "recvmsg4", "capture_egress"] {
+    for name in ["connect4", "recvmsg4", "capture_egress", "release_flow"] {
       assert!(obj.programs.contains_key(name), "program `{name}` missing from the object");
     }
   }
