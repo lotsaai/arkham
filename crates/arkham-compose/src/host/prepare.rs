@@ -372,9 +372,10 @@ mod tests {
   #[test]
   fn symlink_targets_and_translated_hardlinks_are_protected() {
     let base = tempfile::tempdir().unwrap();
-    let workspace = base.path().join("workspace");
-    let source = base.path().join("source");
-    let dest = base.path().join("destination");
+    let base_path = base.path().canonicalize().unwrap();
+    let workspace = base_path.join("workspace");
+    let source = base_path.join("source");
+    let dest = base_path.join("destination");
     std::fs::create_dir_all(workspace.join(".config")).unwrap();
     std::fs::create_dir_all(workspace.join("real-config")).unwrap();
     std::fs::create_dir_all(&source).unwrap();
