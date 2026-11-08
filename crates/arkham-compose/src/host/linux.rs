@@ -1,9 +1,8 @@
 //! Linux launcher. Bubblewrap is the only runner. Landlock adds restrictions
 //! inside that sandbox and never starts a process of its own.
 //!
-//! This module also owns the session cgroup. The daemon calls it before
-//! handing the plan back. The start time is read again after the process is
-//! moved, and the cgroup path has to name the session directory.
+//! This module also owns the session cgroup. The wrapper joins itself and
+//! waits for the daemon to authenticate placement before launching.
 
 use std::ffi::OsString;
 use std::io::{Seek as _, Write as _};
@@ -31,69 +30,75 @@ pub struct SessionSlot {
   pub path: PathBuf,
   /// Inode of `path`.
   pub id: u64,
+  pidfd: PidFd,
+  pid: u32,
+  starttime: u64,
 }
 
-/// Create `arkham-host/<pid>-<starttime>` under this process's cgroup and
-/// move `pid` into it.
-///
-/// A pidfd is opened before the directory exists. After the pid is written,
-/// that fd must still name the process and `/proc/<pid>/stat` must still
-/// show `starttime`. A mismatch moves the process back when it entered the
-/// session, removes the directory, and returns [`Error::SessionReused`].
-/// A pid that is already gone does not leave a directory.
+/// Create an empty session cgroup for the authenticated control peer.
 ///
 /// # Errors
 ///
-/// Returns [`Error::SessionCgroup`] when the directory cannot be created or
-/// the process cannot be moved, and [`Error::SessionReused`] when the
-/// process is gone or its identity does not match the directory.
-pub fn create_session(pid: u32, starttime: u64) -> Result<SessionSlot, Error> {
+/// Returns an error when the peer has exited or the cgroup cannot be created.
+pub fn session_cgroup(pid: u32, starttime: u64) -> Result<SessionSlot, Error> {
   let pidfd = PidFd::open(pid)?;
   if !identity_holds(&pidfd, pid, starttime)? {
     return Err(Error::SessionReused);
   }
-  let parent = host_cgroup()?;
-  let path = parent.join(format!("{pid}-{starttime}"));
+  let path = host_cgroup()?.join(format!("{pid}-{starttime}"));
   std::fs::create_dir(&path).map_err(|source| session_cgroup_io(&path, source))?;
-  let placed = place_session(&pidfd, pid, starttime, &path);
-  if placed.is_err() {
-    undo_session(&path, pid);
-  }
-  placed
-}
-
-fn place_session(pidfd: &PidFd, pid: u32, starttime: u64, path: &Path) -> Result<SessionSlot, Error> {
-  if !identity_holds(pidfd, pid, starttime)? {
-    return Err(Error::SessionReused);
-  }
-  std::fs::write(path.join("cgroup.procs"), pid.to_string()).map_err(|source| session_cgroup_io(path, source))?;
-  if !identity_holds(pidfd, pid, starttime)? || !placement_holds(pid, starttime, path)? {
-    return Err(Error::SessionReused);
-  }
-  let id = std::fs::metadata(path).map_err(|source| session_cgroup_io(path, source))?.ino();
+  let id = match std::fs::metadata(&path) {
+    Ok(meta) => meta.ino(),
+    Err(source) => {
+      let _ = std::fs::remove_dir(&path);
+      return Err(session_cgroup_io(&path, source));
+    }
+  };
   Ok(SessionSlot {
-    path: path.to_path_buf(),
+    path,
     id,
+    pidfd,
+    pid,
+    starttime,
   })
 }
 
-/// A pidfd held across the cgroup write so a recycled pid cannot enter.
+impl SessionSlot {
+  /// Confirm the original peer placed itself in this cgroup.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if the peer exited or its identity or placement changed.
+  pub fn confirm(&self) -> Result<(), Error> {
+    if identity_holds(&self.pidfd, self.pid, self.starttime)?
+      && placement_holds(self.pid, self.starttime, &self.path)?
+      && identity_holds(&self.pidfd, self.pid, self.starttime)?
+    {
+      Ok(())
+    } else {
+      Err(Error::SessionReused)
+    }
+  }
+}
+
+/// Stable handle used to authenticate the peer during activation.
+#[derive(Debug)]
 struct PidFd(i32);
 
 impl PidFd {
   fn open(pid: u32) -> Result<Self, Error> {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
+    let Ok(target) = libc::pid_t::try_from(pid) else {
       return Err(Error::SessionReused);
     };
-    // SAFETY: `pidfd_open` takes a pid and a flags word. A negative return is
-    // an error and is not stored.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+    // SAFETY: pidfd_open accepts a process id and a zero flags word.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, target, 0u32) };
     if fd < 0 {
       let err = std::io::Error::last_os_error();
-      if err.raw_os_error() == Some(libc::ESRCH) {
-        return Err(Error::SessionReused);
-      }
-      return Err(err.into());
+      return if err.raw_os_error() == Some(libc::ESRCH) {
+        Err(Error::SessionReused)
+      } else {
+        Err(err.into())
+      };
     }
     let Ok(fd) = i32::try_from(fd) else {
       return Err(Error::SessionReused);
@@ -112,7 +117,7 @@ impl PidFd {
 impl Drop for PidFd {
   fn drop(&mut self) {
     if self.0 >= 0 {
-      // SAFETY: the descriptor came from `pidfd_open` and is closed once.
+      // SAFETY: the descriptor came from pidfd_open and is closed once.
       unsafe { libc::close(self.0) };
     }
   }
@@ -142,20 +147,10 @@ fn placement_holds(pid: u32, starttime: u64, session: &Path) -> Result<bool, Err
     return Ok(false);
   }
   let cgroup = read_cgroup(pid)?;
-  let Some(name) = session.file_name().and_then(|name| name.to_str()) else {
-    return Ok(false);
-  };
-  Ok(cgroup.split('/').any(|part| part == name))
-}
-
-fn undo_session(path: &Path, pid: u32) {
-  let entered = path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-    std::fs::read_to_string(format!("/proc/{pid}/cgroup")).is_ok_and(|text| text.split(['/', '\n']).any(|part| part == name))
-  });
-  if entered && let Some(parent) = path.parent() {
-    let _ = std::fs::write(parent.join("cgroup.procs"), pid.to_string());
-  }
-  let _ = std::fs::remove_dir(path);
+  let actual = Path::new("/sys/fs/cgroup").join(cgroup.trim_start_matches('/'));
+  let actual = std::fs::metadata(actual)?;
+  let expected = std::fs::metadata(session)?;
+  Ok(actual.dev() == expected.dev() && actual.ino() == expected.ino())
 }
 
 /// Directory sessions are created under. Capture attaches here.
@@ -171,16 +166,29 @@ pub fn host_cgroup() -> Result<PathBuf, Error> {
   Ok(parent)
 }
 
-/// Move any remaining members to the parent and remove `path`.
-pub fn release_session(path: &Path) {
-  if let Some(parent) = path.parent()
-    && let Ok(procs) = std::fs::read_to_string(path.join("cgroup.procs"))
-  {
-    for pid in procs.split_whitespace() {
-      let _ = std::fs::write(parent.join("cgroup.procs"), pid);
+/// Kill remaining members and wait until the cgroup can be removed.
+///
+/// # Errors
+///
+/// Returns an error if the cgroup cannot be killed or removed.
+pub async fn release_session(path: &Path) -> Result<(), Error> {
+  match std::fs::remove_dir(path) {
+    Ok(()) => return Ok(()),
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    Err(err) if err.raw_os_error() == Some(libc::EBUSY) => {}
+    Err(source) => return Err(session_cgroup_io(path, source)),
+  }
+  std::fs::write(path.join("cgroup.kill"), "1").map_err(|source| session_cgroup_io(path, source))?;
+  loop {
+    match std::fs::remove_dir(path) {
+      Ok(()) => return Ok(()),
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+      Err(err) if err.raw_os_error() == Some(libc::EBUSY) => {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+      }
+      Err(source) => return Err(session_cgroup_io(path, source)),
     }
   }
-  let _ = std::fs::remove_dir(path);
 }
 
 /// `starttime` for `pid`.
@@ -305,17 +313,41 @@ pub async fn agent(profile: WriteProfile, workspace: Option<&Path>, command: &[O
     return Err(Error::SocketOwner);
   }
   let cwd = launch_cwd(workspace)?;
-  let env = std::env::vars().collect();
+  let env = std::env::vars_os()
+    .map(|(key, value)| {
+      let Ok(key) = key.into_string() else {
+        return Err(Error::NonUnicodeEnvironment);
+      };
+      let Ok(value) = value.into_string() else {
+        return Err(Error::NonUnicodeEnvironment);
+      };
+      Ok((key, value))
+    })
+    .collect::<Result<_, Error>>()?;
   let request = RegisterRequest { cwd, profile, env };
   let bytes = serde_json::to_vec(&request).map_err(|source| Error::ControlMessage { source })?;
   write_line(&mut stream, &bytes).await?;
   let line = read_line(&mut stream).await?;
   let response: RegisterResponse = serde_json::from_slice(&line).map_err(|source| Error::ControlMessage { source })?;
-  if let Some(detail) = response.error {
-    return Err(Error::DaemonRejected { detail });
-  }
-  let Some(plan) = response.plan else {
-    return Err(Error::NoDaemon);
+  let cgroup = match response {
+    RegisterResponse::Join { cgroup } => cgroup,
+    RegisterResponse::Rejected { error } => return Err(Error::DaemonRejected { detail: error }),
+    RegisterResponse::Ready { .. } => return Err(Error::NoDaemon),
+  };
+  let original = read_cgroup(std::process::id())?;
+  let original = Path::new("/sys/fs/cgroup")
+    .join(original.trim_start_matches('/'))
+    .join("cgroup.procs");
+  let restore = std::fs::OpenOptions::new().write(true).open(original)?;
+  std::fs::write(cgroup.join("cgroup.procs"), "0").map_err(|source| session_cgroup_io(&cgroup, source))?;
+  let mut placement = SelfPlacement(Some(restore));
+  write_line(&mut stream, b"activate").await?;
+  let line = read_line(&mut stream).await?;
+  let response: RegisterResponse = serde_json::from_slice(&line).map_err(|source| Error::ControlMessage { source })?;
+  let plan = match response {
+    RegisterResponse::Ready { plan } => plan,
+    RegisterResponse::Rejected { error } => return Err(Error::DaemonRejected { detail: error }),
+    RegisterResponse::Join { .. } => return Err(Error::NoDaemon),
   };
   let inner = sandboxed_command(&plan, command)?;
   let argv = bwrap_argv(&plan, &inner)?;
@@ -333,8 +365,27 @@ pub async fn agent(profile: WriteProfile, workspace: Option<&Path>, command: &[O
   let mut child = child_cmd.spawn()?;
   drop(plan_file);
   let status = child.wait().await?;
+  placement.restore()?;
   drop(stream);
   std::process::exit(status.code().unwrap_or(1));
+}
+
+struct SelfPlacement(Option<std::fs::File>);
+
+impl SelfPlacement {
+  fn restore(&mut self) -> Result<(), Error> {
+    if let Some(file) = &mut self.0 {
+      file.write_all(b"0")?;
+      self.0 = None;
+    }
+    Ok(())
+  }
+}
+
+impl Drop for SelfPlacement {
+  fn drop(&mut self) {
+    let _ = self.restore();
+  }
 }
 
 fn launch_cwd(workspace: Option<&Path>) -> Result<PathBuf, Error> {
@@ -493,12 +544,10 @@ fn apply_landlock(plan: &LaunchPlan) -> Result<(), Error> {
     .create()
     .map_err(|source| Error::Landlock { source })?;
   ruleset = add_path(ruleset, Path::new("/"), read)?;
-  // `/` is read-only. Shells still open `/dev/null` for writing, and the
-  // read-only profile's sink is that same device.
-  ruleset = add_path(ruleset, Path::new("/dev/null"), AccessFs::from_file(abi))?;
   match policy {
-    FsPolicy::ReadOnly { sink } => ruleset = add_path(ruleset, &sink, all)?,
+    FsPolicy::ReadOnly { sink } => ruleset = add_path(ruleset, &sink, AccessFs::from_file(abi))?,
     FsPolicy::WorkspaceWrite { roots } => {
+      ruleset = add_path(ruleset, Path::new("/dev/null"), AccessFs::from_file(abi))?;
       let mut seen = Vec::new();
       for root in &roots {
         if seen.iter().any(|existing: &PathBuf| existing == root) {
@@ -550,15 +599,6 @@ fn command_or_shell(command: &[OsString], plan: &LaunchPlan) -> Vec<OsString> {
   } else {
     command.to_vec()
   }
-}
-
-/// Re-export so the binary can name the slot without reaching into this file's private helpers.
-///
-/// # Errors
-///
-/// Returns the same errors as [`create_session`].
-pub fn session_cgroup(pid: u32, starttime: u64) -> Result<SessionSlot, Error> {
-  create_session(pid, starttime)
 }
 
 #[cfg(test)]
@@ -633,43 +673,70 @@ mod tests {
 
   #[test]
   fn create_session_refuses_a_pid_whose_start_time_does_not_match() {
-    let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-    let mut child = Kill(child);
-    let pid = child.0.id();
+    let pid = std::process::id();
     let start = read_starttime(pid).unwrap();
-    let err = create_session(pid, start.wrapping_add(1)).unwrap_err();
+    let err = session_cgroup(pid, start.wrapping_add(1)).unwrap_err();
     assert!(matches!(err, Error::SessionReused), "{err:?}");
-    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
-    assert!(!cgroup.contains("arkham-host"), "{cgroup}");
-    let _ = child.0.kill();
   }
 
-  #[test]
-  fn a_confirmed_session_names_its_directory_and_a_stale_start_time_does_not() {
+  #[tokio::test]
+  async fn an_unplaced_peer_is_not_migrated_or_activated() {
+    let pid = std::process::id();
+    let before = read_cgroup(pid).unwrap();
+    let start = read_starttime(pid).unwrap();
+    let slot = session_cgroup(pid, start).unwrap();
+    assert!(matches!(slot.confirm(), Err(Error::SessionReused)));
+    release_session(&slot.path).await.unwrap();
+    assert_eq!(read_cgroup(pid).unwrap(), before);
+  }
+
+  #[tokio::test]
+  async fn a_live_unplaced_process_is_never_migrated() {
     let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
     let mut child = Kill(child);
     let pid = child.0.id();
+    let before = read_cgroup(pid).unwrap();
     let start = read_starttime(pid).unwrap();
-    let slot = create_session(pid, start).unwrap();
-    assert!(placement_holds(pid, start, &slot.path).unwrap());
-    assert!(!placement_holds(pid, start.wrapping_add(1), &slot.path).unwrap());
-    release_session(&slot.path);
-    assert!(!placement_holds(pid, start, &slot.path).unwrap());
-    let _ = child.0.kill();
+    let slot = session_cgroup(pid, start).unwrap();
+    assert!(matches!(slot.confirm(), Err(Error::SessionReused)));
+    release_session(&slot.path).await.unwrap();
+    assert_eq!(read_cgroup(pid).unwrap(), before);
+    assert!(child.0.try_wait().unwrap().is_none());
   }
 
-  #[test]
-  fn a_dead_pid_does_not_leave_a_session_cgroup() {
-    let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
-    let mut child = Kill(child);
-    let pid = child.0.id();
-    let start = read_starttime(pid).unwrap();
-    let parent = host_cgroup().unwrap();
-    let path = parent.join(format!("{pid}-{start}"));
-    let _ = child.0.kill();
-    let _ = child.0.wait();
-    let err = create_session(pid, start).unwrap_err();
-    assert!(!path.exists(), "left {path:?} after {err:?}");
+  #[tokio::test]
+  async fn releasing_a_session_kills_its_members_without_moving_other_processes() {
+    use std::io::BufRead as _;
+
+    let pid = std::process::id();
+    let slot = session_cgroup(pid, read_starttime(pid).unwrap()).unwrap();
+    let mut unrelated = Kill(
+      std::process::Command::new("cat")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap(),
+    );
+    let before = read_cgroup(unrelated.0.id()).unwrap();
+    let mut member = Kill(
+      std::process::Command::new("sh")
+        .arg("-c")
+        .arg("printf 0 > \"$1/cgroup.procs\" || exit 1; echo ready; read done")
+        .arg("member")
+        .arg(&slot.path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap(),
+    );
+    let mut line = String::new();
+    std::io::BufReader::new(member.0.stdout.take().unwrap())
+      .read_line(&mut line)
+      .unwrap();
+    assert_eq!(line, "ready\n");
+    release_session(&slot.path).await.unwrap();
+    assert!(!member.0.wait().unwrap().success());
+    assert!(unrelated.0.try_wait().unwrap().is_none());
+    assert_eq!(read_cgroup(unrelated.0.id()).unwrap(), before);
   }
 
   #[test]

@@ -15,7 +15,7 @@ mod linux;
 
 pub use discover::{PRIVATE_SESSION_ROOT, cgroup_is_confined, parse_starttime, peer_uid_allowed, project_root};
 pub use plan::LaunchPlan;
-pub use prepare::{PreparedSession, prepare_session};
+pub use prepare::{CaPaths, PreparedSession, prepare_session};
 pub use protocol::{RegisterRequest, RegisterResponse, daemon_socket_path, decode_request, encode_response, read_line, write_line};
 
 /// Register `workspace` (or the current directory) and launch. On a non-Linux

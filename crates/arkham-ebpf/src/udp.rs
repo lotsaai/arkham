@@ -10,12 +10,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aya::maps::{MapData, RingBuf};
 use dashmap::DashMap;
+use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 use crate::Error;
-use crate::flow::{FlowTables, PROTO_UDP};
+use crate::flow::{CapturedFlow, PROTO_UDP};
+use crate::{FlowKey, OrigDst};
 
 /// Drop a flow after this long with no traffic in either direction.
 pub(crate) const FLOW_IDLE: Duration = Duration::from_secs(60);
@@ -35,50 +38,127 @@ pub(crate) struct Flow {
 /// Client address and socket cookie → flow.
 pub(crate) type FlowTable = DashMap<(SocketAddr, u64), Arc<Mutex<Flow>>>;
 
-/// Relay captured datagrams for `port` until the listener fails.
-pub(crate) async fn serve(listener: UdpSocket, flows: FlowTables, upstream_override: Option<SocketAddr>) -> Result<(), Error> {
-  let listener = Arc::new(listener);
-  // `DashMap` because the janitor sweeps concurrently with the receive loop;
-  // entries are short-lived and few (one per client).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UdpPacketHeader {
+  cookie: u64,
+  orig: OrigDst,
+  key: FlowKey,
+  packet_len: u32,
+  gso_size: u32,
+  _pad: [u8; 4],
+}
+
+const _: () = {
+  assert!(std::mem::size_of::<UdpPacketHeader>() == 80);
+  assert!(std::mem::offset_of!(UdpPacketHeader, orig) == 8);
+  assert!(std::mem::offset_of!(UdpPacketHeader, key) == 48);
+  assert!(std::mem::offset_of!(UdpPacketHeader, packet_len) == 68);
+  assert!(std::mem::offset_of!(UdpPacketHeader, gso_size) == 72);
+  assert!(std::mem::offset_of!(UdpPacketHeader, _pad) == 76);
+};
+
+fn decode_packet(record: &[u8]) -> Option<(UdpPacketHeader, &[u8])> {
+  let size = std::mem::size_of::<UdpPacketHeader>();
+  let bytes = record.get(..size)?;
+  // SAFETY: the header contains only integer fields, and the slice has its full size.
+  let header = unsafe { bytes.as_ptr().cast::<UdpPacketHeader>().read_unaligned() };
+  if header.orig.proto != PROTO_UDP || !matches!(header.orig.family, 2 | 10) || header.key.family != u16::from(header.orig.family) {
+    return None;
+  }
+  let packet = record.get(size..size.checked_add(header.packet_len as usize)?)?;
+  let parsed = etherparse::SlicedPacket::from_ip(packet).ok()?;
+  let etherparse::TransportSlice::Udp(udp) = parsed.transport.as_ref()? else {
+    return None;
+  };
+  let payload = if header.gso_size == 0 {
+    udp.payload()
+  } else {
+    parsed.ip_payload()?.payload.get(8..)?
+  };
+  Some((header, payload))
+}
+
+async fn drain(listener: Arc<UdpSocket>) -> Result<(), Error> {
+  let mut buf = [0; 1];
+  loop {
+    listener.recv_from(&mut buf).await?;
+  }
+}
+
+pub(crate) async fn serve(
+  listener4: UdpSocket,
+  listener6: Option<UdpSocket>,
+  mut ring: AsyncFd<RingBuf<MapData>>,
+  upstream_override: Option<SocketAddr>,
+) -> Result<(), Error> {
+  let listener4 = Arc::new(listener4);
+  let listener6 = listener6.map(Arc::new);
   let table: Arc<FlowTable> = Arc::new(DashMap::new());
   let mut interval = tokio::time::interval(SWEEP_INTERVAL);
   let mut tasks = tokio::task::JoinSet::new();
-
-  let mut buf = vec![0u8; MAX_DATAGRAM];
+  let drain4 = drain(Arc::clone(&listener4));
+  let drain6 = async {
+    match &listener6 {
+      Some(listener) => drain(Arc::clone(listener)).await,
+      None => std::future::pending().await,
+    }
+  };
+  tokio::pin!(drain4, drain6);
   loop {
-    let (len, client) = tokio::select! {
-      result = listener.recv_from(&mut buf) => result?,
-      _ = tasks.join_next(), if !tasks.is_empty() => continue,
-      _ = interval.tick() => {
-        sweep(&table, Instant::now());
-        continue;
+    tokio::select! {
+      result = &mut drain4 => return result,
+      result = &mut drain6 => return result,
+      result = ring.readable_mut() => {
+        let mut guard = result?;
+        while let Some(item) = guard.get_inner_mut().next() {
+          let Some((header, payload)) = decode_packet(&item) else {
+            tracing::warn!("invalid captured udp packet");
+            continue;
+          };
+          let peer = OrigDst {
+            ip: header.key.ip,
+            port: u32::from(header.key.port.to_be()),
+            proto: PROTO_UDP,
+            family: header.orig.family,
+            _pad: [0; 10],
+            cgroup_id: 0,
+          }.socket_addr();
+          let listener = if peer.is_ipv4() {
+            Arc::clone(&listener4)
+          } else if let Some(listener) = &listener6 {
+            Arc::clone(listener)
+          } else {
+            continue;
+          };
+          let segment = if header.gso_size == 0 { payload.len().max(1) } else { header.gso_size as usize };
+          let payload = payload.to_vec();
+          let table = Arc::clone(&table);
+          tasks.spawn(async move {
+            let captured = CapturedFlow { cookie: header.cookie, destination: header.orig.socket_addr(), cgroup_id: header.orig.cgroup_id };
+            if let Err(err) = one(&payload, segment, peer, captured, &listener, &table, upstream_override).await {
+              tracing::debug!(%peer, ?err, "ebpf udp datagram failed");
+            }
+          });
+        }
+        guard.clear_ready();
       }
-    };
-    let payload = buf[..len].to_vec();
-    let flows = flows.clone();
-    let listener = Arc::clone(&listener);
-    let table = Arc::clone(&table);
-    tasks.spawn(async move {
-      if let Err(err) = one(&payload, client, &flows, &listener, &table, upstream_override).await {
-        tracing::debug!(%client, ?err, "ebpf udp datagram failed");
-      }
-    });
+      _ = tasks.join_next(), if !tasks.is_empty() => {}
+      _ = interval.tick() => sweep(&table, Instant::now()),
+    }
   }
 }
 
 /// One client datagram: forward it upstream, creating the flow on first use.
 async fn one(
   payload: &[u8],
+  segment: usize,
   client: SocketAddr,
-  flows: &FlowTables,
+  captured: CapturedFlow,
   listener: &UdpSocket,
   table: &FlowTable,
   upstream_override: Option<SocketAddr>,
 ) -> Result<(), Error> {
-  let Some(captured) = flows.original(client, PROTO_UDP)? else {
-    tracing::debug!(%client, "no recorded destination for captured udp flow; dropping");
-    return Ok(());
-  };
   let key = (client, captured.cookie);
   let flow = if let Some(existing) = table.get(&key) {
     Arc::clone(existing.value())
@@ -102,26 +182,33 @@ async fn one(
   // Hold the lock across send+recv so replies stay paired with their request;
   // one task per datagram, so this serializes only that client's flow.
   let mut flow = flow.lock().await;
-  flow.upstream.send(payload).await?;
+  if payload.is_empty() {
+    flow.upstream.send(payload).await?;
+  } else {
+    for chunk in payload.chunks(segment) {
+      flow.upstream.send(chunk).await?;
+    }
+  }
   flow.last_active = Instant::now();
 
   let mut reply = vec![0u8; MAX_DATAGRAM];
-  match tokio::time::timeout(FLOW_IDLE, flow.upstream.recv(&mut reply)).await {
-    Ok(Ok(len)) => {
-      flow.last_active = Instant::now();
-      // Replies leave from the relay's port, which is what the client is
-      // connected to; `recvmsg4` makes the kernel report the original source.
-      listener.send_to(&reply[..len], client).await?;
-      Ok(())
+  for _ in 0..payload.len().div_ceil(segment).max(1) {
+    match tokio::time::timeout(FLOW_IDLE, flow.upstream.recv(&mut reply)).await {
+      Ok(Ok(len)) => {
+        flow.last_active = Instant::now();
+        let bytes = reply
+          .get(..len)
+          .ok_or_else(|| std::io::Error::other("udp reply exceeds receive buffer"))?;
+        listener.send_to(bytes, client).await?;
+      }
+      Ok(Err(err)) => {
+        tracing::debug!(%client, %flow.dst, ?err, "udp upstream recv failed");
+        break;
+      }
+      Err(_elapsed) => break,
     }
-    // A timeout or a recv error is not a relay failure: the client may simply
-    // be done, and the janitor will retire the flow.
-    Ok(Err(err)) => {
-      tracing::debug!(%client, %flow.dst, ?err, "udp upstream recv failed");
-      Ok(())
-    }
-    Err(_elapsed) => Ok(()),
   }
+  Ok(())
 }
 
 /// Drop every flow idle for longer than [`FLOW_IDLE`].

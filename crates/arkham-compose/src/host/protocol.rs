@@ -29,15 +29,25 @@ pub struct RegisterRequest {
   pub env: BTreeMap<String, String>,
 }
 
-/// What the daemon sends back. `plan` is present only when registration worked.
+/// The daemon's response at each step of session activation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterResponse {
-  /// Launch plan. Absent when `error` is set.
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub plan: Option<LaunchPlan>,
-  /// Why registration failed, when it did.
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub error: Option<String>,
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum RegisterResponse {
+  /// The wrapper must join this cgroup before requesting activation.
+  Join {
+    /// Empty session cgroup.
+    cgroup: PathBuf,
+  },
+  /// The peer is placed and capture is active.
+  Ready {
+    /// Launch plan.
+    plan: LaunchPlan,
+  },
+  /// Registration or activation was rejected.
+  Rejected {
+    /// Safe explanation for the wrapper.
+    error: String,
+  },
 }
 
 /// Path of the daemon socket, `$XDG_RUNTIME_DIR/arkham/daemon.sock`.

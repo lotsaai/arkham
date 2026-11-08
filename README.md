@@ -125,7 +125,7 @@ flowchart TB
       subgraph DAEMON["arkham daemon, one process, your uid"]
         SOCK["Unix control socket. Peer uid must be the daemon uid"]
         PROXY["Proxy in this process. Capture listeners 127.0.0.1 and ::1, TCP :15000 and UDP :15001. Also the explicit loopback listener. Holds the real credentials and substitutes them"]
-        EBPFU["eBPF userspace, aya, in this same process. Reads the BPF maps for the original destination and the cgroup id"]
+        EBPFU["eBPF userspace in this process. Resolves captured destinations and session identity"]
       end
       subgraph ATTACH["arkham-host. The eBPF programs are attached here, once, and cover every session under it"]
         subgraph SCG["pid-starttime, one directory per session"]
@@ -142,7 +142,7 @@ flowchart TB
   end
   UP["Upstream services"]
   WRAP["arkham agent --isolate bwrap"] -->|register| SOCK
-  SOCK -->|"moves that pid into the session cgroup, then returns the plan"| SCG
+  SOCK -->|"registers the session; the wrapper joins its cgroup before the agent starts"| SCG
   AGENT -->|connect| EBPFK
   EBPFK -->|redirected| PROXY
   EBPFU -.->|"the cgroup id selects that session's grants"| PROXY
@@ -152,7 +152,7 @@ flowchart TB
 
 Filesystem isolation is bubblewrap plus Landlock. The network is shared with the host; captured TCP and connected UDP are redirected to the proxy, which alone holds the real credentials, and the cgroup id is how the proxy tells which session's grants apply. Discovery uses project markers, and fnox only decides which files get rewritten.
 
-Host sessions hide the contents of Arkham config that exists at launch, including discovered hard-link aliases. Unrelated project `.config` files remain usable. Missing config paths are not reserved, and an existing symlink entry can still be replaced even though its original target stays masked.
+Host sessions hide the configured CA private key and the contents of Arkham config that exists at launch, including discovered hard-link aliases. Unrelated project `.config` files remain usable. Missing config paths are not reserved, and an existing symlink entry can still be replaced even though its original target stays masked.
 
 ## Where the limits are
 

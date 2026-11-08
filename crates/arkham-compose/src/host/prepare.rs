@@ -30,6 +30,15 @@ pub struct PreparedSession {
   pub rule_envs: BTreeSet<String>,
 }
 
+/// Public trust anchor and the daemon's private source bundle.
+#[derive(Debug, Clone, Copy)]
+pub struct CaPaths<'a> {
+  /// Certificate-only PEM passed into the sandbox.
+  pub cert: &'a Path,
+  /// Daemon CA bundle whose contents must stay hidden.
+  pub source: &'a Path,
+}
+
 #[derive(Deserialize)]
 struct RulesDoc {
   #[serde(default)]
@@ -38,7 +47,7 @@ struct RulesDoc {
 
 /// Prepare `root` into `scratch`.
 ///
-/// `ca_cert` is the certificate PEM only. The CA key stays with the daemon.
+/// `ca` separates the public certificate from the sensitive daemon source.
 /// `caller_env` is the agent process environment from the register request.
 ///
 /// # Errors
@@ -49,7 +58,7 @@ pub async fn prepare_session(
   root: &Path,
   scratch: &Path,
   profile: WriteProfile,
-  ca_cert: &Path,
+  ca: CaPaths<'_>,
   version: &str,
   caller_env: &BTreeMap<String, String>,
 ) -> Result<PreparedSession, Error> {
@@ -107,7 +116,7 @@ pub async fn prepare_session(
       });
     }
   }
-  let config_masks = protected_config_paths(material_root, &binds)?;
+  let config_masks = protected_config_paths(material_root, &binds, ca.source)?;
   let mut env = Vec::new();
   for name in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE"] {
     if let Some(value) = caller_env.get(name) {
@@ -138,7 +147,7 @@ pub async fn prepare_session(
     workspace: workspace.clone(),
     binds,
     protected: config_masks,
-    ca_host: ca_cert.to_path_buf(),
+    ca_host: ca.cert.to_path_buf(),
     ca_dest: PathBuf::from(CA_DEST),
     env,
     workdir: workspace,
@@ -147,8 +156,13 @@ pub async fn prepare_session(
   Ok(PreparedSession { resolved, plan, rule_envs })
 }
 
-fn protected_config_paths(workspace: &Path, binds: &[Bind]) -> Result<Vec<PathBuf>, Error> {
-  let mut candidates = vec![workspace.join(".config/arkham"), workspace.join(".config/arkham.toml")];
+fn protected_config_paths(workspace: &Path, binds: &[Bind], ca_source: &Path) -> Result<Vec<PathBuf>, Error> {
+  let mut candidates = vec![
+    workspace.join(".config/arkham"),
+    workspace.join(".config/arkham.toml"),
+    ca_source.to_path_buf(),
+    ca_source.with_extension("key"),
+  ];
   if let Some(home) = dirs::home_dir() {
     candidates.push(home.join(".config/arkham"));
   }
@@ -548,10 +562,52 @@ mod tests {
       dest: dest.clone(),
       read_only: false,
     }];
-    let protected = protected_config_paths(&workspace, &binds).unwrap();
+    let protected = protected_config_paths(&workspace, &binds, &workspace.join("missing-ca")).unwrap();
     assert!(protected.contains(&workspace.join("real-config")));
     assert!(protected.contains(&config));
     assert!(protected.contains(&dest.join("alias")));
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn a_remapped_ca_bundle_and_hardlink_are_hidden_from_the_sandbox() {
+    let base = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+    let workspace = base.path().join("workspace");
+    let source = base.path().join("source");
+    let dest = workspace.join("mounted");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::create_dir(&source).unwrap();
+    let bundle = source.join("bundle.pem");
+    std::fs::write(&bundle, "PRIVATE_CA_MARKER\n").unwrap();
+    std::fs::hard_link(&bundle, source.join("alias.pem")).unwrap();
+    let cert = base.path().join("public.pem");
+    std::fs::write(&cert, "PUBLIC_CERTIFICATE\n").unwrap();
+    let binds = vec![Bind {
+      source,
+      dest: dest.clone(),
+      read_only: true,
+    }];
+    let protected = protected_config_paths(&workspace, &binds, &bundle).unwrap();
+    let plan = LaunchPlan {
+      profile: WriteProfile::ReadOnly,
+      workspace: workspace.clone(),
+      binds,
+      protected,
+      ca_host: cert,
+      ca_dest: PathBuf::from(CA_DEST),
+      env: Vec::new(),
+      workdir: workspace,
+      shell: "sh".into(),
+    };
+    let script = format!(
+      "if cat '{0}/bundle.pem' '{0}/alias.pem' 2>/dev/null | grep -q PRIVATE_CA_MARKER; then exit 1; fi; grep -q PUBLIC_CERTIFICATE /arkham/ca.pem",
+      dest.display()
+    );
+    let command = vec!["sh".into(), "-c".into(), script.into()];
+    let args = super::super::plan::bwrap_argv(&plan, &command).unwrap();
+    let output = std::process::Command::new("bwrap").args(args).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read_to_string(bundle).unwrap(), "PRIVATE_CA_MARKER\n");
   }
 
   #[tokio::test]
@@ -571,7 +627,10 @@ mod tests {
       root.path(),
       scratch.path(),
       WriteProfile::WorkspaceWrite,
-      &scratch.path().join("ca.pem"),
+      CaPaths {
+        cert: &scratch.path().join("ca.pem"),
+        source: &root.path().join("missing-ca"),
+      },
       "test",
       &BTreeMap::new(),
     )
@@ -608,7 +667,10 @@ mod tests {
       &root,
       scratch.path(),
       WriteProfile::WorkspaceWrite,
-      &scratch.path().join("ca.pem"),
+      CaPaths {
+        cert: &scratch.path().join("ca.pem"),
+        source: &root.join("missing-ca"),
+      },
       "test",
       &BTreeMap::new(),
     )
@@ -647,7 +709,10 @@ mod tests {
       Path::new("/tmp"),
       scratch.path(),
       WriteProfile::WorkspaceWrite,
-      &scratch.path().join("ca.pem"),
+      CaPaths {
+        cert: &scratch.path().join("ca.pem"),
+        source: &scratch.path().join("missing-ca"),
+      },
       "test",
       &BTreeMap::new(),
     )
@@ -714,7 +779,10 @@ mod tests {
       root.path(),
       scratch.path(),
       WriteProfile::WorkspaceWrite,
-      &scratch.path().join("ca.pem"),
+      CaPaths {
+        cert: &scratch.path().join("ca.pem"),
+        source: &root.path().join("missing-ca"),
+      },
       "test",
       &caller,
     )

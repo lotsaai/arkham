@@ -338,6 +338,9 @@ pub enum Error {
   /// The host wrapper found no daemon socket.
   #[error("no host daemon is running")]
   NoDaemon,
+  /// An inherited environment entry cannot be represented in the control protocol.
+  #[error("agent environment contains non-Unicode data")]
+  NonUnicodeEnvironment,
   /// `--isolate bwrap` was asked for on a system other than Linux.
   #[error("the host backend runs on Linux")]
   HostLinuxOnly,
@@ -347,8 +350,8 @@ pub enum Error {
   /// The pid's start time changed, or the process is not in the session cgroup.
   #[error("session identity changed before the cgroup was confirmed")]
   SessionReused,
-  /// The process cgroup does not allow a session child to be created.
-  #[error("session cgroup {} cannot be created: {source}", path.display())]
+  /// A session cgroup operation failed.
+  #[error("session cgroup {}: {source}", path.display())]
   SessionCgroup {
     /// Directory that could not be created or written.
     path: PathBuf,
@@ -523,6 +526,7 @@ impl Error {
       | Self::RuntimeDir
       | Self::SocketOwner
       | Self::NoDaemon
+      | Self::NonUnicodeEnvironment
       | Self::AlreadyConfined
       | Self::ControlUnauthorized
       | Self::NoStarttime { .. }

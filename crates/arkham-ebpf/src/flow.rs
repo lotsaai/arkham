@@ -17,10 +17,9 @@ pub(crate) const PROTO_TCP: u8 = 6;
 /// `IPPROTO_UDP`, matching the programs.
 pub(crate) const PROTO_UDP: u8 = 17;
 
-/// Read-only views of the two capture maps.
+/// Read-only views of the TCP capture maps.
 ///
-/// `MapData` is reference-counted, so cloning the tables shares the same maps
-/// rather than copying anything; the TCP and UDP legs each hold one.
+/// `MapData` is reference-counted, so cloning the tables shares the maps.
 ///
 /// The programs declare these maps as `LRU_HASH`, but aya exposes LRU and plain
 /// hash maps through the same userspace type: the distinction only affects
@@ -57,10 +56,7 @@ impl FlowTables {
   /// the egress hook recorded. `None` means the flow was never redirected (or
   /// the LRU entry aged out); callers close quietly rather than guess.
   ///
-  /// The `proto` check matters because the hook's key carries no protocol:
-  /// were a TCP and a UDP socket to share a local port, the lookup could land
-  /// on the other protocol's entry, and dialing that destination would
-  /// misroute the connection.
+  /// The protocol check rejects an entry that does not belong to this leg.
   pub(crate) fn original(&self, peer: SocketAddr, proto: u8) -> Result<Option<CapturedFlow>, Error> {
     let key = FlowKey::from_peer(peer);
     let record = match self.flows.get(&key, 0) {

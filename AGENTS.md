@@ -29,7 +29,7 @@ Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates
 | `arkham-proxy` | MITM relay and substitution engines | `arkham-config`, `arkham-pki`, `arkham-plugin`; external `amq-protocol`, `base64`, `bytes`, `fe2o3-amqp-types`, `rama`, `rasn`, `rasn-ldap`, `rustls`, `rustls-native-certs`, `tokio-rustls`, `httparse`, `httlib-hpack`, `nkeys`, `pgwire`, `russh`, `secrecy`, `serde_amqp`, `serde_json`, `smtp-proto`, `strum`, `url`, `tracing`, `thiserror` |
 | `arkham-plugin` | WASM rewrite-guest host | `arkham-config`; external `wasmtime`, `wasmtime-wasi`, `tracing`, `thiserror` |
 | `arkham-compose` | Stack generation and confinement | `arkham-config`, `arkham-fnox`, `arkham-pki`; external `base64`, `clap`, `dirs`, `gix-config`, `gix-discover`, `landlock` (Linux only), `libc`, `regex`, `secrecy`, `serde`, `serde_yaml`, `shellexpand`, `toml`, `toml_edit`, `tracing`, `url`, `xpanda`, `tokio`, `thiserror` |
-| `arkham-ebpf` | eBPF capture backend (userspace half) | `arkham-config`, `arkham-proxy`; external `aya`, `dashmap`, `libc`, `tokio`, `tracing`, `thiserror` (`aya-build` build-dep only) |
+| `arkham-ebpf` | eBPF capture backend (userspace half) | `arkham-config`, `arkham-proxy`; external `aya`, `dashmap`, `etherparse`, `libc`, `tokio`, `tracing`, `thiserror` (`aya-build` build-dep only) |
 | `arkham-ebpf-programs` | Kernel-side BPF programs | No workspace crates, no host crates; `aya-ebpf` only |
 
 ### Dependency Rules (STRICT)

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use arkham_compose::{
-  PRIVATE_SESSION_ROOT, RegisterResponse, cgroup_is_confined, decode_request, encode_response, ensure_socket_dir, host_cgroup,
+  CaPaths, PRIVATE_SESSION_ROOT, RegisterResponse, cgroup_is_confined, decode_request, encode_response, ensure_socket_dir, host_cgroup,
   peer_uid_allowed, prepare_session, project_root, read_cgroup, read_line, read_starttime, release_session, session_cgroup, write_line,
 };
 use arkham_config::config::ProxyCfg;
@@ -65,7 +65,7 @@ pub async fn run(version: &str) -> eyre::Result<()> {
       eprintln!("daemon: ready");
       tokio::select! {
         () = serve(explicit, Arc::clone(&state)) => Ok(()),
-        result = accept_loop(listener, state, ca, registered, version) => result,
+        result = accept_loop(listener, state, ca, ca_file, registered, version) => result,
       }
     },
     "eBPF",
@@ -82,6 +82,7 @@ async fn accept_loop(
   listener: UnixListener,
   state: Arc<ProxyState>,
   ca: Arc<CertAuthority>,
+  ca_file: PathBuf,
   registered: Arc<Mutex<Vec<PathBuf>>>,
   version: &str,
 ) -> eyre::Result<()> {
@@ -90,10 +91,11 @@ async fn accept_loop(
     let (stream, _) = listener.accept().await?;
     let state = Arc::clone(&state);
     let ca = Arc::clone(&ca);
+    let ca_file = ca_file.clone();
     let registered = Arc::clone(&registered);
     let version = version.clone();
     tokio::spawn(async move {
-      if let Err(err) = one_client(stream, &state, &ca, &registered, &version).await {
+      if let Err(err) = one_client(stream, &state, &ca, &ca_file, &registered, &version).await {
         tracing::debug!(%err, "session ended");
       }
     });
@@ -104,6 +106,7 @@ async fn one_client(
   mut stream: UnixStream,
   state: &ProxyState,
   ca: &CertAuthority,
+  ca_file: &Path,
   registered: &Mutex<Vec<PathBuf>>,
   version: &str,
 ) -> eyre::Result<()> {
@@ -153,8 +156,23 @@ async fn one_client(
   let scratch = session_dir()?.join(format!("{pid}-{started}"));
   std::fs::create_dir_all(&scratch)?;
   let cert = scratch.join("ca.pem");
-  std::fs::write(&cert, ca.cert_pem())?;
-  let prepared = match prepare_session(&root, &scratch, request.profile, &cert, version, &request.env).await {
+  if let Err(err) = std::fs::write(&cert, ca.cert_pem()) {
+    let _ = std::fs::remove_dir_all(&scratch);
+    return Err(err.into());
+  }
+  let prepared = match prepare_session(
+    &root,
+    &scratch,
+    request.profile,
+    CaPaths {
+      cert: &cert,
+      source: ca_file,
+    },
+    version,
+    &request.env,
+  )
+  .await
+  {
     Ok(prepared) => prepared,
     Err(err) => {
       let _ = std::fs::remove_dir_all(&scratch);
@@ -171,7 +189,7 @@ async fn one_client(
     }
   };
   if let Err(err) = state.register_project(slot.id, prepared.resolved, ca) {
-    release_session(&slot.path);
+    release_session(&slot.path).await?;
     let _ = std::fs::remove_dir_all(&scratch);
     reject_logged(&mut stream, &err, REGISTRATION_FAILED).await?;
     return Ok(());
@@ -180,38 +198,47 @@ async fn one_client(
   if root.as_path() != Path::new(PRIVATE_SESSION_ROOT) {
     registered.lock().unwrap_or_else(PoisonError::into_inner).push(root.clone());
   }
-  let response = RegisterResponse {
-    plan: Some(prepared.plan),
-    error: None,
-  };
-  let written = match encode_response(&response) {
-    Ok(bytes) => write_line(&mut stream, &bytes).await,
-    Err(err) => Err(err),
-  };
-  if written.is_ok() {
-    let mut byte = [0u8; 1];
-    loop {
-      match stream.read(&mut byte).await {
-        Ok(0) | Err(_) => break,
-        Ok(_) => {}
-      }
-    }
-  }
-  drop_registration(state, slot.id, &slot.path, &root, &scratch, registered);
-  written?;
+  let result = activate_session(&mut stream, &slot, prepared.plan).await;
+  drop_registration(state, slot.id, &slot.path, &root, &scratch, registered).await?;
+  result?;
   Ok(())
 }
 
-fn drop_registration(
+async fn activate_session(
+  stream: &mut UnixStream,
+  slot: &arkham_compose::SessionSlot,
+  plan: arkham_compose::LaunchPlan,
+) -> eyre::Result<()> {
+  let response = RegisterResponse::Join { cgroup: slot.path.clone() };
+  let bytes = encode_response(&response)?;
+  write_line(stream, &bytes).await?;
+  if read_line(stream).await? != b"activate" {
+    eyre::bail!("invalid session activation");
+  }
+  if let Err(err) = slot.confirm() {
+    reject_logged(stream, &err, &wrapper_detail(&err)).await?;
+    return Err(err.into());
+  }
+  let response = RegisterResponse::Ready { plan };
+  write_line(stream, &encode_response(&response)?).await?;
+  let mut byte = [0u8; 1];
+  while matches!(stream.read(&mut byte).await, Ok(n) if n > 0) {}
+  Ok(())
+}
+
+async fn drop_registration(
   state: &ProxyState,
   cgroup_id: u64,
   session: &std::path::Path,
   root: &std::path::Path,
   scratch: &std::path::Path,
   registered: &Mutex<Vec<PathBuf>>,
-) {
+) -> eyre::Result<()> {
+  release_session(session).await.map_err(|err| {
+    tracing::error!(%err, "session cleanup failed; capture remains registered");
+    err
+  })?;
   state.unregister_project(cgroup_id);
-  release_session(session);
   {
     let mut roots = registered.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(position) = roots.iter().position(|path| path == root) {
@@ -219,6 +246,7 @@ fn drop_registration(
     }
   }
   let _ = std::fs::remove_dir_all(scratch);
+  Ok(())
 }
 
 const REGISTRATION_FAILED: &str = "registration failed";
@@ -233,10 +261,7 @@ async fn reject_logged(stream: &mut UnixStream, err: &impl std::fmt::Debug, deta
 }
 
 async fn reject(stream: &mut UnixStream, detail: impl Into<String>) -> eyre::Result<()> {
-  let response = RegisterResponse {
-    plan: None,
-    error: Some(detail.into()),
-  };
+  let response = RegisterResponse::Rejected { error: detail.into() };
   let bytes = encode_response(&response)?;
   write_line(stream, &bytes).await?;
   Ok(())
@@ -263,7 +288,7 @@ mod tests {
   use tokio::io::AsyncWriteExt as _;
   use tokio::net::UnixStream;
 
-  use super::{host_cgroup, one_client, read_cgroup, release_session};
+  use super::{host_cgroup, one_client};
 
   struct RestoreEnv {
     key: &'static str,
@@ -292,34 +317,11 @@ mod tests {
     }
   }
 
-  struct ReleaseOwnSessions {
-    original: String,
-  }
-
-  impl Drop for ReleaseOwnSessions {
-    fn drop(&mut self) {
-      let marker = format!("{}-", std::process::id());
-      if let Ok(parent) = host_cgroup()
-        && let Ok(entries) = std::fs::read_dir(&parent)
-      {
-        for entry in entries.flatten() {
-          if entry.file_name().to_string_lossy().starts_with(&marker) {
-            release_session(&entry.path());
-          }
-        }
-      }
-      let original = std::path::Path::new("/sys/fs/cgroup").join(self.original.trim_start_matches('/'));
-      let _ = std::fs::write(original.join("cgroup.procs"), std::process::id().to_string());
-    }
-  }
-
   #[tokio::test]
   async fn a_failed_register_write_drops_the_session() {
     let runtime = tempfile::tempdir().unwrap();
     std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let _env = RestoreEnv::set("XDG_RUNTIME_DIR", runtime.path());
-    let original = read_cgroup(std::process::id()).unwrap();
-    let _release = ReleaseOwnSessions { original };
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("fnox.toml"), "# workspace\n").unwrap();
     let ca = CertAuthority::generate().unwrap();
@@ -347,7 +349,9 @@ mod tests {
     let line = format!("{{\"cwd\":\"{cwd}\",\"profile\":\"workspace-write\",\"env\":{{}}}}\n");
     client.write_all(line.as_bytes()).await.unwrap();
     drop(client);
-    let err = one_client(server, &state, &ca, &registered, "test").await.unwrap_err();
+    let err = one_client(server, &state, &ca, &root.path().join("missing-ca"), &registered, "test")
+      .await
+      .unwrap_err();
     let text = format!("{err:?}");
     assert!(text.to_ascii_lowercase().contains("broken pipe"), "{text}");
     assert!(registered.lock().unwrap_or_else(PoisonError::into_inner).is_empty(), "{text}");

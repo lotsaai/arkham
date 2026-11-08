@@ -80,8 +80,8 @@ fn live_cgroup(stream: &TcpStream, peer: SocketAddr) -> u64 {
   cgroup_id_of_pid(pid)
 }
 
-/// Inode of the established client socket whose local address is `client`
-/// and whose remote address is the listener `local`.
+/// Inode of the connected or write-half-closed client socket whose local
+/// address is `client` and whose remote address is the listener `local`.
 fn established_inode(client: SocketAddr, local: SocketAddr) -> Option<u64> {
   let path = if client.is_ipv4() { "/proc/net/tcp" } else { "/proc/net/tcp6" };
   let client = proc_tcp_addr(client);
@@ -93,7 +93,7 @@ fn established_inode(client: SocketAddr, local: SocketAddr) -> Option<u64> {
     let loc = cols.next()?;
     let rem = cols.next()?;
     let state = cols.next()?;
-    if !loc.eq_ignore_ascii_case(&client) || !rem.eq_ignore_ascii_case(&local) || state != "01" {
+    if !loc.eq_ignore_ascii_case(&client) || !rem.eq_ignore_ascii_case(&local) || !matches!(state, "01" | "04" | "05") {
       continue;
     }
     // tx, tr, retrnsmt, uid, timeout, then inode.
@@ -167,6 +167,31 @@ mod tests {
       assert_ne!(live, 0);
       drop(release_tx);
       connector.await.unwrap();
+    }
+  }
+
+  #[tokio::test]
+  async fn write_half_closed_client_remains_attributable() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    for ip in [
+      std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+      std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    ] {
+      let listener = TcpListener::bind((ip, 0)).await.unwrap();
+      let mut client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+      client.write_all(b"request").await.unwrap();
+      client.shutdown().await.unwrap();
+      let (mut server, peer) = listener.accept().await.unwrap();
+      let mut request = Vec::new();
+      server.read_to_end(&mut request).await.unwrap();
+      assert_eq!(request, b"request");
+      assert_eq!(live_cgroup(&server, peer), cgroup_id_of_pid(std::process::id()));
+      assert_ne!(live_cgroup(&server, peer), 0);
+      server.write_all(b"reply").await.unwrap();
+      let mut reply = [0; 5];
+      client.read_exact(&mut reply).await.unwrap();
+      assert_eq!(&reply, b"reply");
     }
   }
 }

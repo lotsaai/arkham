@@ -69,8 +69,8 @@ pub const TEMP_DIR: &str = super::discover::PRIVATE_SESSION_ROOT;
 /// `/` is remounted read-only after the mounts are in place. Mounts created
 /// before that keep the flags they were given. A workspace-write session
 /// gets a fresh tmpfs at `/tmp`. Host directories under `/tmp` are not
-/// mounted. The daemon has already moved this process into its session
-/// cgroup. `--unshare-cgroup` makes that cgroup the namespace root, and the
+/// mounted. The wrapper has joined its session cgroup before launch.
+/// `--unshare-cgroup` makes that cgroup the namespace root, and the
 /// host `/sys/fs/cgroup` tree is not mounted, so another session's cgroup
 /// is not a path in the sandbox. The launch probe runs this argv. A kernel
 /// that refuses the cgroup namespace fails the probe, and the agent does
@@ -130,7 +130,7 @@ pub fn bwrap_argv(plan: &LaunchPlan, command: &[OsString]) -> Result<Vec<OsStrin
   args.extend(["--ro-bind".into(), plan.ca_host.clone().into(), plan.ca_dest.clone().into()]);
   push_program(&mut args, &bound, &anchors, command, &mut created);
   push_config_masks(&mut args, plan, &bound, &anchors);
-  push_secret_masks(&mut args, plan, &bound, &anchors);
+  push_secret_masks(&mut args, &bound, &anchors);
   if private_session && matches!(policy, FsPolicy::ReadOnly { .. }) {
     args.extend(["--remount-ro".into(), TEMP_DIR.into()]);
   }
@@ -306,12 +306,9 @@ fn push_config_masks(args: &mut Vec<OsString>, plan: &LaunchPlan, bound: &[PathB
 
 /// Hide host secret files that sit inside a directory the sandbox mounted.
 ///
-/// `/etc` is one of those directories. The CA key beside the certificate is
-/// too, when its directory was mounted. A key outside every mount is already
-/// absent and must not be named: bubblewrap rejects a bind whose parent does
-/// not exist.
+/// `/etc` is one of those directories.
 #[cfg(target_os = "linux")]
-fn push_secret_masks(args: &mut Vec<OsString>, plan: &LaunchPlan, bound: &[PathBuf], anchors: &[PathBuf]) {
+fn push_secret_masks(args: &mut Vec<OsString>, bound: &[PathBuf], anchors: &[PathBuf]) {
   for path in ETC_SECRET_FILES {
     mask_file(args, Path::new(path), bound, anchors);
   }
@@ -321,7 +318,6 @@ fn push_secret_masks(args: &mut Vec<OsString>, plan: &LaunchPlan, bound: &[PathB
       args.extend(["--tmpfs".into(), path.into()]);
     }
   }
-  mask_file(args, &plan.ca_host.with_extension("key"), bound, anchors);
 }
 
 /// Mount the absolute program the sandbox execs, when it is not already
@@ -518,7 +514,7 @@ mod tests {
     let mut child = StopChild(Some(
       std::process::Command::new("sh")
         .arg("-c")
-        .arg("read _; exec \"$@\"")
+        .arg("read group; printf 0 > \"$group/cgroup.procs\" || exit 1; exec \"$@\"")
         .arg("bwrap")
         .arg("bwrap")
         .args(&ran_args)
@@ -529,10 +525,11 @@ mod tests {
         .unwrap(),
     ));
     let pid = child.0.as_ref().unwrap().id();
-    let start = super::super::linux::read_starttime(pid).unwrap();
-    let slot = super::super::linux::session_cgroup(pid, start).unwrap();
+    let owner = std::process::id();
+    let start = super::super::linux::read_starttime(owner).unwrap();
+    let slot = super::super::linux::session_cgroup(owner, start).unwrap();
     let _session = ReleaseSession(slot.path.clone());
-    child.0.as_mut().unwrap().stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+    writeln!(child.0.as_mut().unwrap().stdin.as_mut().unwrap(), "{}", slot.path.display()).unwrap();
     drop(child.0.as_mut().unwrap().stdin.take());
     std::thread::sleep(std::time::Duration::from_millis(400));
     let seen = host_cgroup_id(pid);
@@ -575,7 +572,7 @@ mod tests {
 
   impl Drop for ReleaseSession {
     fn drop(&mut self) {
-      super::super::linux::release_session(&self.0);
+      let _ = std::fs::remove_dir(&self.0);
     }
   }
 

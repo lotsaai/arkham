@@ -6,8 +6,8 @@
 //!
 //! 1. `connect4` and `connect6` record the destination under the socket cookie
 //!    and rewrite it to the corresponding loopback listener.
-//! 2. `capture_egress` indexes the socket cookie and connecting cgroup by the
-//!    client's local address and port, which the listener sees as its peer.
+//! 2. `capture_egress` indexes TCP by the client's local address and port.
+//!    For UDP it publishes each packet and its socket identity together.
 //! 3. `recvmsg4` and `recvmsg6` rewrite the *source* address a connected UDP socket observes,
 //!    so replies that physically come from arkham's listener still look like
 //!    they came from the address the client connected to.
@@ -17,11 +17,7 @@
 //! No netfilter, no policy routes, no `IP_TRANSPARENT`: the kernel's own socket
 //! address rewrite is the whole mechanism.
 //!
-//! Indexing lives in `capture_egress` rather than a `sock_ops` program because
-//! `bpf_sock_ops` has no UDP opcode — the kernel's `BPF_SOCK_OPS_*` enum
-//! contains only TCP callbacks, so connected UDP would never be indexed. Egress
-//! sees every protocol, and runs after the socket's source port has been
-//! autobound, which is exactly when the 4-tuple is final.
+//! Egress runs after the socket's source port has been autobound.
 
 #![no_std]
 #![no_main]
@@ -30,7 +26,7 @@ use aya_ebpf::{
   EbpfContext as _,
   helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_netns_cookie, bpf_get_socket_cookie},
   macros::{cgroup_skb, cgroup_sock, cgroup_sock_addr, map},
-  maps::{Array, LruHashMap},
+  maps::{Array, LruHashMap, RingBuf},
   programs::{SkBuffContext, SockAddrContext, SockContext},
 };
 
@@ -174,6 +170,96 @@ static FLOW: LruHashMap<FlowKey, FlowRecord> = LruHashMap::with_max_entries(MAX_
 /// The egress hook records the key under the cookie it already holds.
 #[map]
 static COOKIE_FLOW: LruHashMap<u64, FlowKey> = LruHashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UdpPacketHeader {
+  cookie: u64,
+  orig: OrigDst,
+  key: FlowKey,
+  packet_len: u32,
+  gso_size: u32,
+  _pad: [u8; 4],
+}
+
+const _: () = {
+  assert!(core::mem::size_of::<UdpPacketHeader>() == 80);
+  assert!(core::mem::offset_of!(UdpPacketHeader, orig) == 8);
+  assert!(core::mem::offset_of!(UdpPacketHeader, key) == 48);
+  assert!(core::mem::offset_of!(UdpPacketHeader, packet_len) == 68);
+  assert!(core::mem::offset_of!(UdpPacketHeader, gso_size) == 72);
+  assert!(core::mem::offset_of!(UdpPacketHeader, _pad) == 76);
+};
+
+#[map]
+static UDP_PACKETS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+#[inline(always)]
+fn udp_packet<const SIZE: usize>(ctx: &SkBuffContext, header: &UdpPacketHeader) -> bool {
+  let Some(mut entry) = UDP_PACKETS.reserve_bytes(SIZE, 0) else {
+    return false;
+  };
+  let header_size = core::mem::size_of::<UdpPacketHeader>();
+  let Some(end) = header_size.checked_add(header.packet_len as usize) else {
+    entry.discard(0);
+    return false;
+  };
+  let Some(packet) = entry.get_mut(header_size..end) else {
+    entry.discard(0);
+    return false;
+  };
+  // SAFETY: packet is a reservation range of exactly packet_len bytes.
+  if unsafe { aya_ebpf::helpers::bpf_skb_load_bytes(ctx.as_ptr(), 0, packet.as_mut_ptr().cast(), header.packet_len) } != 0 {
+    entry.discard(0);
+    return false;
+  }
+  // SAFETY: the reservation is aligned and large enough for this initialized header.
+  unsafe { entry.as_mut_ptr().cast::<UdpPacketHeader>().write(*header) };
+  entry.submit(0);
+  true
+}
+
+#[inline(always)]
+fn emit_udp(ctx: &SkBuffContext, cookie: u64, orig: OrigDst, key: FlowKey) -> bool {
+  let packet_len = ctx.skb.len();
+  if packet_len == 0 {
+    return false;
+  }
+  // SAFETY: the kernel supplies a live skb context.
+  let gso_size = unsafe { (*ctx.skb.skb).gso_size };
+  let header = UdpPacketHeader {
+    cookie,
+    orig,
+    key,
+    packet_len,
+    gso_size,
+    _pad: [0; 4],
+  };
+  let len = packet_len as usize + core::mem::size_of::<UdpPacketHeader>();
+  if len <= 256 {
+    udp_packet::<256>(ctx, &header)
+  } else if len <= 512 {
+    udp_packet::<512>(ctx, &header)
+  } else if len <= 1024 {
+    udp_packet::<1024>(ctx, &header)
+  } else if len <= 2048 {
+    udp_packet::<2048>(ctx, &header)
+  } else if len <= 4096 {
+    udp_packet::<4096>(ctx, &header)
+  } else if len <= 8192 {
+    udp_packet::<8192>(ctx, &header)
+  } else if len <= 16384 {
+    udp_packet::<16384>(ctx, &header)
+  } else if len <= 32768 {
+    udp_packet::<32768>(ctx, &header)
+  } else if len <= 65536 {
+    udp_packet::<65536>(ctx, &header)
+  } else if len <= 131072 {
+    udp_packet::<131072>(ctx, &header)
+  } else {
+    false
+  }
+}
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -437,9 +523,8 @@ fn recvmsg<const FAMILY: u32>(ctx: SockAddrContext) -> i32 {
   1
 }
 
-/// `capture_egress`: index the redirected flow by the client's local 4-tuple,
-/// so userspace can resolve an accepted connection back to its original
-/// destination.
+/// `capture_egress`: index TCP flows and publish UDP packets with their socket
+/// identity and original destination before the socket can close.
 ///
 /// Only flows that `connect4` actually redirected are recorded — hence the
 /// `ORIG_DST` lookup — so unconnected UDP (typical DNS) keeps its own
@@ -481,6 +566,9 @@ pub fn capture_egress(ctx: SkBuffContext) -> i32 {
     port: ctx.skb.local_port() as u16,
     family: family as u16,
   };
+  if orig.proto == IPPROTO_UDP as u8 {
+    return i32::from(emit_udp(&ctx, cookie, *orig, key));
+  }
   let _ = COOKIE_FLOW.insert(cookie, key, 0);
   let _ = FLOW.insert(
     key,

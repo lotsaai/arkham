@@ -30,7 +30,7 @@ pub use decoys::rules_command;
 pub use error::Error;
 pub use expose::ExposeArgs;
 pub use host::{
-  LaunchPlan, PRIVATE_SESSION_ROOT, PreparedSession, RegisterRequest, RegisterResponse, cgroup_is_confined, daemon_socket_path,
+  CaPaths, LaunchPlan, PRIVATE_SESSION_ROOT, PreparedSession, RegisterRequest, RegisterResponse, cgroup_is_confined, daemon_socket_path,
   decode_request, encode_response, parse_starttime, peer_uid_allowed, prepare_session, project_root, read_line, write_line,
 };
 #[cfg(target_os = "linux")]

@@ -174,6 +174,133 @@ fn the_sandbox_env_comes_from_the_agent() {
 }
 
 #[test]
+fn non_unicode_agent_environment_fails_without_exposing_its_value() {
+  use std::os::unix::ffi::OsStringExt as _;
+  let isolated = Isolated::new();
+  let workspace = tempfile::tempdir().unwrap();
+  std::fs::write(workspace.path().join("fnox.toml"), "# workspace\n").unwrap();
+  let _daemon = Daemon::start(&isolated);
+  let value = std::ffi::OsString::from_vec(b"PRIVATE_ENV_MARKER\xff".to_vec());
+  let output = isolated
+    .command(&["agent", "--isolate", "bwrap", "--", "echo", "COMMAND_RAN"])
+    .env("NON_UNICODE", value)
+    .current_dir(workspace.path())
+    .output()
+    .unwrap();
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(!output.status.success(), "{stdout}{stderr}");
+  assert!(stderr.contains("agent environment contains non-Unicode data"), "{stderr}");
+  assert!(!stderr.contains("panicked") && !stderr.contains("PRIVATE_ENV_MARKER"), "{stderr}");
+  assert!(!stdout.contains("COMMAND_RAN"), "{stdout}");
+}
+
+#[test]
+fn custom_ca_bundle_and_key_aliases_are_hidden_in_every_profile() {
+  let mut isolated = Isolated::new();
+  let base = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+  let root = base.path().join("project");
+  let include = base.path().join("included");
+  std::fs::create_dir_all(root.join(".config/arkham")).unwrap();
+  std::fs::create_dir_all(&include).unwrap();
+  std::fs::write(root.join("fnox.toml"), "# workspace\n").unwrap();
+  std::fs::write(
+    root.join(".config/arkham/config.toml"),
+    "[workspace]\ninclude = [\"../included\"]\n",
+  )
+  .unwrap();
+  isolated.ca_file = include.join("custom.pem");
+  let _daemon = Daemon::start(&isolated);
+  std::fs::hard_link(&isolated.ca_file, root.join("bundle-hard")).unwrap();
+  std::fs::hard_link(include.join("custom.key"), root.join("key-hard")).unwrap();
+  std::os::unix::fs::symlink(&isolated.ca_file, root.join("bundle-link")).unwrap();
+  let script = format!(
+    "set -eu\nfor file in bundle-hard bundle-link key-hard '{}/custom.pem' '{}/custom.key'; do\n  if cat \"$file\" 2>/dev/null | grep -q 'PRIVATE KEY'; then exit 41; fi\ndone\ngrep -q 'BEGIN CERTIFICATE' /arkham/ca.pem\nopenssl x509 -in /arkham/ca.pem -noout\nif grep -q 'PRIVATE KEY' /arkham/ca.pem; then exit 42; fi\n",
+    include.display(),
+    include.display()
+  );
+  for profile in ["read-only", "workspace-write", "danger-full-access"] {
+    let output = isolated
+      .command(&["agent", "--isolate", "bwrap", "--write-profile", profile, "--", "sh", "-c", &script])
+      .current_dir(&root)
+      .output()
+      .unwrap();
+    assert!(
+      output.status.success(),
+      "{profile}: stdout={} stderr={}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    );
+  }
+}
+
+#[test]
+fn activation_without_self_placement_is_rejected() {
+  use std::io::BufRead as _;
+  use std::os::unix::net::UnixStream;
+
+  let isolated = Isolated::new();
+  let workspace = tempfile::tempdir().unwrap();
+  std::fs::write(workspace.path().join("fnox.toml"), "# workspace\n").unwrap();
+  let _daemon = Daemon::start(&isolated);
+  let before = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+  let mut stream = UnixStream::connect(isolated.runtime.path().join("arkham/daemon.sock")).unwrap();
+  let request = serde_json::json!({ "cwd": workspace.path(), "profile": "workspace-write", "env": {} });
+  writeln!(stream, "{request}").unwrap();
+  let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+  let mut response = String::new();
+  reader.read_line(&mut response).unwrap();
+  let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+  assert_eq!(response["type"], "join");
+  assert!(response["cgroup"].is_string(), "{response}");
+  assert!(response["plan"].is_null(), "{response}");
+  writeln!(stream, "activate").unwrap();
+  let mut response = String::new();
+  reader.read_line(&mut response).unwrap();
+  let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+  assert_eq!(response["type"], "rejected");
+  assert!(response["error"].is_string(), "{response}");
+  assert_eq!(std::fs::read_to_string("/proc/self/cgroup").unwrap(), before);
+}
+
+#[test]
+fn a_wrapper_never_starts_the_command_without_activation_acknowledgement() {
+  use std::io::BufRead as _;
+  use std::os::unix::net::UnixListener;
+
+  let isolated = Isolated::new();
+  let workspace = tempfile::tempdir().unwrap();
+  let socket_dir = isolated.runtime.path().join("arkham");
+  std::fs::create_dir(&socket_dir).unwrap();
+  let listener = UnixListener::bind(socket_dir.join("daemon.sock")).unwrap();
+  std::fs::set_permissions(socket_dir.join("daemon.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
+  let cgroup = isolated.runtime.path().join("fake-cgroup");
+  std::fs::create_dir(&cgroup).unwrap();
+  std::fs::write(cgroup.join("cgroup.procs"), "").unwrap();
+  let root = workspace.path().to_path_buf();
+  let marker = root.join("command-ran");
+  let server = std::thread::spawn(move || {
+    let (mut stream, _) = listener.accept().unwrap();
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let response = serde_json::json!({ "type": "join", "cgroup": cgroup });
+    writeln!(stream, "{response}").unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(line, "activate\n");
+  });
+  let output = isolated
+    .command(&["agent", "--isolate", "bwrap", "--", "touch", marker.to_str().unwrap()])
+    .current_dir(workspace.path())
+    .output()
+    .unwrap();
+  server.join().unwrap();
+  assert!(!output.status.success(), "{output:?}");
+  assert!(!marker.exists(), "command ran before daemon activation");
+}
+
+#[test]
 fn agent_refuses_to_start_without_a_daemon() {
   let isolated = Isolated::new();
   let marker = isolated.runtime.path().join("marker");

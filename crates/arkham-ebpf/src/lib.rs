@@ -504,7 +504,7 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> R
   let udp4 = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, udp_port)).await?;
   let tcp6 = match tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, tcp_port)).await {
     Ok(listener) => Some(listener),
-    Err(err) if err.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+    Err(err) if ipv6_unavailable(&err, || std::fs::read_to_string("/proc/sys/net/ipv6/conf/lo/disable_ipv6")) => {
       tracing::info!("IPv6 is unsupported on this host; capturing IPv4 only");
       None
     }
@@ -518,6 +518,14 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> R
 
   let mut bpf = Ebpf::load(PROGRAMS).map_err(|err| Error::LoadPrograms { origin: err })?;
   configure(&mut bpf, tcp_port, udp_port, options.self_exclusion, &bypass).map_err(|err| Error::WriteConfigMap { origin: err.into() })?;
+  let map = bpf.take_map("UDP_PACKETS").ok_or(Error::MapMissing { name: "UDP_PACKETS" })?;
+  let ring = aya::maps::RingBuf::try_from(map).map_err(|origin| Error::UnexpectedMapType {
+    name: "UDP_PACKETS",
+    origin,
+  })?;
+  // SAFETY: the ring owns its map fd; the consumer only advances ring positions.
+  let ring =
+    unsafe { tokio::io::unix::AsyncFd::register_with_interest(ring, tokio::io::Interest::READABLE) }.map_err(std::io::Error::from)?;
 
   // `bpf` is held on the stack for as long as this task lives, so the programs
   // stay attached: dropping `Ebpf` detaches them and unloads them, which means
@@ -546,17 +554,14 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> R
     netns_cookie: own_netns_cookie(),
   });
   let ipv6 = async {
-    match (tcp6, udp6) {
-      (Some(tcp), Some(udp)) => tokio::select! {
-        result = tcp::serve(tcp, flow.clone(), Arc::clone(&state), options.upstream_override) => result,
-        result = udp::serve(udp, flow.clone(), options.upstream_override) => result,
-      },
-      _ => std::future::pending().await,
+    match tcp6 {
+      Some(tcp) => tcp::serve(tcp, flow.clone(), Arc::clone(&state), options.upstream_override).await,
+      None => std::future::pending().await,
     }
   };
   tokio::select! {
     result = tcp::serve(tcp4, flow.clone(), Arc::clone(&state), options.upstream_override) => result,
-    result = udp::serve(udp4, flow.clone(), options.upstream_override) => result,
+    result = udp::serve(udp4, udp6, ring, options.upstream_override) => result,
     result = ipv6 => result,
     result = async {
       match watcher {
@@ -564,6 +569,14 @@ pub(crate) async fn run_ebpf_with(options: Options, state: Arc<ProxyState>) -> R
         None => std::future::pending().await,
       }
     } => result,
+  }
+}
+
+fn ipv6_unavailable(err: &std::io::Error, read_disable_ipv6: impl FnOnce() -> std::io::Result<String>) -> bool {
+  match err.raw_os_error() {
+    Some(libc::EAFNOSUPPORT) => true,
+    Some(libc::EADDRNOTAVAIL) => read_disable_ipv6().is_ok_and(|value| value.trim() == "1"),
+    _ => false,
   }
 }
 /// Write the loader-side configuration the programs read at runtime.
@@ -986,6 +999,18 @@ mod live;
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn ipv6_bind_falls_back_only_when_unavailable() {
+    let error = |code| std::io::Error::from_raw_os_error(code);
+    assert!(ipv6_unavailable(&error(libc::EAFNOSUPPORT), || unreachable!()));
+    assert!(ipv6_unavailable(&error(libc::EADDRNOTAVAIL), || Ok("1\n".into())));
+    assert!(!ipv6_unavailable(&error(libc::EADDRNOTAVAIL), || Ok("0\n".into())));
+    assert!(!ipv6_unavailable(&error(libc::EADDRNOTAVAIL), || Err(
+      std::io::ErrorKind::PermissionDenied.into()
+    )));
+    assert!(!ipv6_unavailable(&error(libc::EADDRINUSE), || Ok("1\n".into())));
+  }
 
   /// The stack hands arkham `--ebpf-cgroup enclosing` instead of a host path:
   /// the docker daemon resolves `cgroup_parent` relative to its own cgroup

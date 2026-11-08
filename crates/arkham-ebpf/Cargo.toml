@@ -11,6 +11,7 @@ publish = false
 aya = { workspace = true }
 dashmap = { workspace = true }
 thiserror = { workspace = true }
+etherparse = { workspace = true }
 arkham-proxy = { workspace = true }
 libc = { workspace = true }
 tokio = { workspace = true }

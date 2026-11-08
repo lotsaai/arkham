@@ -8,13 +8,51 @@ cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
+cargo_args=()
+build_args=()
+run_args=()
+while (($#)); do
+  case "$1" in
+    --)
+      run_args+=("$@")
+      break
+      ;;
+    -F|--features|--manifest-path|--config|-Z)
+      cargo_args+=("$1" "${2?build option requires a value}")
+      shift
+      ;;
+    -F?*|-Z?*|--features=*|--manifest-path=*|--config=*|--frozen|--locked|--offline|--all-features|--no-default-features)
+      cargo_args+=("$1")
+      ;;
+    -p|--package|--exclude|--bin|--example|--test|--bench|--build-jobs|--cargo-profile|--target|--target-dir|--cargo-message-format)
+      build_args+=("$1" "${2?build option requires a value}")
+      shift
+      ;;
+    -p?*|--package=*|--exclude=*|--bin=*|--example=*|--test=*|--bench=*|--build-jobs=*|--cargo-profile=*|--target=*|--target-dir=*|--cargo-message-format=*|\
+    --workspace|--all|--lib|--bins|--examples|--tests|--benches|--all-targets|-r|--release|--unit-graph|--timings|--timings=*|\
+    --cargo-quiet|--cargo-verbose|--ignore-rust-version|--future-incompat-report)
+      build_args+=("$1")
+      ;;
+    *)
+      run_args+=("$1")
+      ;;
+  esac
+  shift
+done
+
 metadata_dir="$proj_dir/target/nextest"
 mkdir -p "$metadata_dir"
-cargo metadata --locked --format-version 1 > "$metadata_dir/cargo-metadata.json"
+cargo metadata --locked --format-version 1 "${cargo_args[@]}" > "$metadata_dir/cargo-metadata.json"
 cargo nextest list --locked --cargo-quiet --workspace --exclude arkham-ebpf-programs \
-  --list-type binaries-only --message-format json > "$metadata_dir/binaries-metadata.json"
+  "${cargo_args[@]}" "${build_args[@]}" --list-type binaries-only --message-format json \
+  | jq -e 'select(has("rust-build-meta"))' > "$metadata_dir/binaries-metadata.json"
 if [[ "$(uname -s)" == Linux ]]; then
-  daemon_bin="$(jq -r .target_directory "$metadata_dir/cargo-metadata.json")/debug/arkham"
+  daemon_bin="$(jq -er '
+    .["rust-build-meta"] as $build
+    | [$build["non-test-binaries"][][] | select(.name == "arkham" and .kind == "bin-exe") | .path]
+    | unique | if length == 1 then $build["target-directory"] + "/" + .[0]
+      else error("expected one arkham executable") end
+  ' "$metadata_dir/binaries-metadata.json")"
   sudo -n setcap cap_bpf,cap_net_admin,cap_perfmon=ep "$daemon_bin"
   trap 'sudo -n setcap -r "$daemon_bin"' EXIT
 fi
@@ -24,4 +62,4 @@ fi
 ARKHAM_PLUGIN_FIXTURES="$proj_dir/target/plugins" cargo nextest run \
   --cargo-metadata "$metadata_dir/cargo-metadata.json" \
   --binaries-metadata "$metadata_dir/binaries-metadata.json" \
-  --show-progress=bar --status-level=slow "$@"
+  --show-progress=bar --status-level=slow "${run_args[@]}"

@@ -557,12 +557,14 @@ async fn udp_roundtrip(dst: std::net::IpAddr) {
     .unwrap();
   let stub_addr = stub.local_addr().unwrap();
   let stub_port = stub_addr.port();
+  let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
   tokio::spawn(async move {
-    let mut buf = [0u8; 2048];
+    let mut buf = vec![0u8; 65_535];
     loop {
       let Ok((n, from)) = stub.recv_from(&mut buf).await else {
         return;
       };
+      let _ = observed_tx.send(buf[..n].to_vec());
       let mut reply = b"echo:".to_vec();
       reply.extend_from_slice(&buf[..n]);
       let _ = stub.send_to(&reply, from).await;
@@ -592,6 +594,68 @@ async fn udp_roundtrip(dst: std::net::IpAddr) {
     .unwrap();
   assert_eq!(source, destination);
   assert_eq!(&reply[..n], b"echo:probe");
+  assert_eq!(observed_rx.recv().await.unwrap(), b"probe");
+
+  // Neither socket can be serviced until this current-thread test yields.
+  let closed = std::net::UdpSocket::bind((bind, 0)).unwrap();
+  closed.connect(destination).unwrap();
+  let reused = closed.local_addr().unwrap();
+  closed.send(b"closed").unwrap();
+  drop(closed);
+  let replacement = std::net::UdpSocket::bind(reused).unwrap();
+  replacement.send_to(b"uncaptured", (bind, crate::UDP_LISTEN_PORT)).unwrap();
+  drop(replacement);
+  assert_eq!(
+    tokio::time::timeout(Duration::from_secs(5), observed_rx.recv())
+      .await
+      .unwrap()
+      .unwrap(),
+    b"closed"
+  );
+  tokio::time::timeout(Duration::from_millis(200), observed_rx.recv())
+    .await
+    .unwrap_err();
+
+  let large = std::net::UdpSocket::bind((bind, 0)).unwrap();
+  large.connect(destination).unwrap();
+  let boundary = vec![0x5a; 65_507];
+  large.send(&boundary).unwrap();
+  drop(large);
+  assert_eq!(
+    tokio::time::timeout(Duration::from_secs(5), observed_rx.recv())
+      .await
+      .unwrap()
+      .unwrap(),
+    boundary
+  );
+
+  let segmented = std::net::UdpSocket::bind((bind, 0)).unwrap();
+  segmented.connect(destination).unwrap();
+  let segment_size: libc::c_int = 400;
+  // SAFETY: the option points to a live integer and its exact length.
+  let result = unsafe {
+    use std::os::fd::AsRawFd as _;
+    libc::setsockopt(
+      segmented.as_raw_fd(),
+      libc::IPPROTO_UDP,
+      libc::UDP_SEGMENT,
+      (&raw const segment_size).cast(),
+      libc::socklen_t::try_from(std::mem::size_of_val(&segment_size)).unwrap(),
+    )
+  };
+  assert_eq!(result, 0, "UDP_SEGMENT: {}", std::io::Error::last_os_error());
+  let payload = [vec![1; 400], vec![2; 400], vec![3; 200]].concat();
+  segmented.send(&payload).unwrap();
+  drop(segmented);
+  for expected in [vec![1; 400], vec![2; 400], vec![3; 200]] {
+    assert_eq!(
+      tokio::time::timeout(Duration::from_secs(5), observed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap(),
+      expected
+    );
+  }
   stop_capture(capture).await;
 }
 
@@ -605,16 +669,18 @@ async fn udp_roundtrip(dst: std::net::IpAddr) {
 #[tokio::test]
 #[ignore = "needs root (bpf syscall, cgroup writes)"]
 async fn ebpf_live_ungranted_tcp_splices_byte_identical() {
-  tcp_splice(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))).await;
+  tcp_splice(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), false).await;
+  tcp_splice(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), true).await;
 }
 
 #[tokio::test]
 #[ignore = "needs root (bpf syscall, cgroup writes)"]
 async fn ebpf_live_ipv6_ungranted_tcp_splices_byte_identical() {
-  tcp_splice("2001:db8::9".parse().unwrap()).await;
+  tcp_splice("2001:db8::9".parse().unwrap(), false).await;
+  tcp_splice("2001:db8::9".parse().unwrap(), true).await;
 }
 
-async fn tcp_splice(dst: std::net::IpAddr) {
+async fn tcp_splice(dst: std::net::IpAddr, half_close: bool) {
   use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
   const SENTINEL: &[u8] = b"plain-splice-sentinel";
 
@@ -657,6 +723,9 @@ async fn tcp_splice(dst: std::net::IpAddr) {
   .expect("captured connect within 10s")
   .expect("connect4 must have redirected this to arkham's listener");
   conn.write_all(SENTINEL).await.unwrap();
+  if half_close {
+    conn.shutdown().await.unwrap();
+  }
   let mut echoed = vec![0u8; SENTINEL.len()];
   let _ = tokio::time::timeout(Duration::from_secs(10), conn.read_exact(&mut echoed))
     .await

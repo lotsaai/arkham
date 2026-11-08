@@ -97,6 +97,7 @@ confique = { version = "0.4", features = ["toml"] }
 dashmap = "6"
 dirs = "7"
 etcetera = "0.11"
+etherparse = "0.19"
 eyre = "0.6"
 fe2o3-amqp = { version = "0.18.3", default-features = false, features = ["acceptor"] }
 fe2o3-amqp-types = "0.18.0"
@@ -187,6 +188,7 @@ tracing-subscriber = { workspace = true }
 arkham-ebpf = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]
