@@ -462,7 +462,7 @@ fn a_peer_with_the_wrong_uid_gets_no_plan() {
       "nobody",
       "python3",
       "-c",
-      "import socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\ns.settimeout(5)\ns.connect(sys.argv[1])\ns.sendall(b'{\"cwd\":\"/tmp\",\"profile\":\"workspace-write\"}\\n')\nsys.stdout.buffer.write(s.recv(65536))\n",
+      "import socket,sys\ns=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\ns.settimeout(5)\ns.connect(sys.argv[1])\ntry:\n s.sendall(b'{\"cwd\":\"/tmp\",\"profile\":\"workspace-write\"}\\n')\n sys.stdout.buffer.write(s.recv(65536))\nexcept (BrokenPipeError, ConnectionResetError):\n pass\n",
       sock.to_str().unwrap(),
     ])
     .output()

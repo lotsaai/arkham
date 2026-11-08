@@ -219,13 +219,15 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   if !listen_addr.ip().is_loopback() {
     tracing::warn!(listen = %listen_addr, "listening on a non-loopback address: anyone reaching this port can trigger real-secret substitution");
   }
-  tracing::info!(
-    listen = %listen_addr,
-    handoff = %handoff_path.display(),
-    uid = handoff_uid,
-    grants = grant_count,
-    "serving"
-  );
+  let announce = || {
+    tracing::info!(
+      listen = %listen_addr,
+      handoff = %handoff_path.display(),
+      uid = handoff_uid,
+      grants = grant_count,
+      "serving"
+    );
+  };
   #[cfg(target_os = "linux")]
   if args.proxy_backend == ProxyBackend::Ebpf {
     let cgroup = args
@@ -235,20 +237,27 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     let capture = std::sync::Arc::clone(&state);
     let bypass = args.ebpf_bypass.clone();
     let bypass_file = args.ebpf_bypass_file.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     return with_capture(
       async move {
+        if ready_rx.await.is_err() {
+          // The capture task owns startup errors; with_capture reports its result.
+          return std::future::pending().await;
+        }
+        announce();
         serve_explicit_and_handoff(listener, handoff, state).await;
         Ok(())
       },
       "eBPF",
       async move {
-        arkham_ebpf::run_ebpf(capture, cgroup, bypass, bypass_file, None)
+        arkham_ebpf::run_ebpf(capture, cgroup, bypass, bypass_file, Some(ready_tx))
           .await
           .map_err(eyre::Report::from)
       },
     )
     .await;
   }
+  announce();
   serve_explicit_and_handoff(listener, handoff, state).await;
   Ok(())
 }

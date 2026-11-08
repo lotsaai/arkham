@@ -25,7 +25,7 @@ The eBPF backend uses cgroup v2 socket hooks to redirect traffic to arkham's loo
 
 The kernel floor for `ebpf` is 5.15. It captures IPv4 and IPv6. Hosts without IPv6 support run IPv4-only and log that once; IPv6 listener or hook failures on a capable host stop startup. Capture is scoped to arkham's own network namespace. Containers the agent spawns with separate network namespaces are left alone, while egress through the agent's namespace stays captured. Loopback and configured bypass destinations are excluded.
 
-The listener binds before capture attaches kernel programs. A failed capture leg ends the process rather than silently serving explicit-proxy only.
+With `--proxy-backend ebpf`, the `serving` log appears only after capture is active. A failed capture leg ends the process.
 
 ## `arkham fake <ENV> [--pattern <PATTERN>]`
 
@@ -57,7 +57,7 @@ Generate the workspace stack: the CA and the agent entrypoint when they are miss
 
 ## `arkham daemon`
 
-Linux only. One loopback proxy and a per-user control socket for host-confined agents. A non-loopback `ARKHAM_LISTEN` is refused, and a second daemon exits when one is already listening. Prints `daemon: ready` on stderr once the socket is bound.
+Linux only. One loopback proxy and a per-user control socket for host-confined agents. A non-loopback `ARKHAM_LISTEN` is refused, and a second daemon exits when one is already listening. Prints `daemon: ready` on stderr once the socket is bound and capture is active.
 
 ## `arkham agent [WORKSPACE] [--rm] [--isolate <compose|bwrap>] [--write-profile <PROFILE>] [-- <COMMAND>...]`
 

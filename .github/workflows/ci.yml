@@ -119,14 +119,13 @@ jobs:
       - name: Dump integration compose logs
         if: failure()
         run: |-
-          set +e
           if [ -f /tmp/arkham-integration-compose.log ]; then
             cat /tmp/arkham-integration-compose.log
           fi
           if [ -f integration/.env ]; then
             docker compose -f integration/compose.yaml --env-file integration/.env logs --no-color
           else
-            docker compose -f integration/compose.yaml logs --no-color
+            echo "Integration not initialized; no live compose logs available."
           fi
 
   # macOS has no compose stack, no capture backends and no integration

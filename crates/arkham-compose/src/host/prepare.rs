@@ -170,6 +170,7 @@ fn protected_config_paths(workspace: &Path, binds: &[Bind]) -> Result<Vec<PathBu
     }
   }
 
+  #[cfg(not(target_os = "linux"))]
   let devices: std::collections::HashSet<u64> = files
     .iter()
     .map(std::fs::metadata)
@@ -188,13 +189,22 @@ fn protected_config_paths(workspace: &Path, binds: &[Bind]) -> Result<Vec<PathBu
     }
   }
   #[cfg(target_os = "linux")]
-  if !devices.is_empty() {
-    let mounts = mounted_roots(&roots)?;
-    roots.extend(mounts);
+  if !files.is_empty() {
+    let mounts = mounted_roots()?;
+    let mounted = mounts
+      .iter()
+      .filter(|mount| roots.iter().any(|root| mount.mountpoint.starts_with(root)))
+      .map(|mount| mount.mountpoint.clone())
+      .collect::<Vec<_>>();
+    roots.extend(mounted);
+    targets.extend(protected_aliases(&files, &roots, &mounts)?);
   }
-  let inodes = inode_index(&devices, &roots);
-  for file in &files {
-    targets.extend(indexed_aliases(&inodes, file));
+  #[cfg(not(target_os = "linux"))]
+  {
+    let inodes = inode_index(&devices, &roots);
+    for file in &files {
+      targets.extend(indexed_aliases(&inodes, file));
+    }
   }
   let source_paths: Vec<_> = targets.iter().cloned().collect();
   for bind in binds {
@@ -209,15 +219,10 @@ fn protected_config_paths(workspace: &Path, binds: &[Bind]) -> Result<Vec<PathBu
 }
 
 #[cfg(target_os = "linux")]
-fn mounted_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
+fn mounted_roots() -> Result<Vec<ConfigMount>, Error> {
   use std::os::unix::ffi::OsStringExt as _;
 
-  let mountinfo = std::fs::read("/proc/self/mountinfo")?;
-  let mut mounted = Vec::new();
-  for line in mountinfo.split(|byte| *byte == b'\n') {
-    let Some(encoded) = line.split(|byte| *byte == b' ').nth(4) else {
-      continue;
-    };
+  fn decode(encoded: &[u8]) -> PathBuf {
     let mut path = Vec::with_capacity(encoded.len());
     let mut bytes = encoded.iter().copied();
     while let Some(byte) = bytes.next() {
@@ -233,12 +238,145 @@ fn mounted_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
         path.push(byte);
       }
     }
-    let path = PathBuf::from(std::ffi::OsString::from_vec(path));
-    if roots.iter().any(|root| path.starts_with(root)) {
-      mounted.push(path);
+    PathBuf::from(std::ffi::OsString::from_vec(path))
+  }
+
+  let mountinfo = std::fs::read("/proc/self/mountinfo")?;
+  let mut mounted = Vec::new();
+  for line in mountinfo.split(|byte| *byte == b'\n') {
+    let mut fields = line.split(|byte| *byte == b' ');
+    if let (Some(id), Some(device), Some(root), Some(mountpoint)) = (fields.next(), fields.nth(1), fields.next(), fields.next()) {
+      mounted.push(ConfigMount {
+        id: id.to_vec(),
+        device: device.to_vec(),
+        root: decode(root),
+        mountpoint: decode(mountpoint),
+      });
     }
   }
   Ok(mounted)
+}
+
+#[cfg(target_os = "linux")]
+struct ConfigMount {
+  id: Vec<u8>,
+  device: Vec<u8>,
+  root: PathBuf,
+  mountpoint: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+struct ConfigInode {
+  links: u64,
+  names: std::collections::HashMap<(Vec<u8>, PathBuf), PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+impl ConfigInode {
+  fn complete(&self) -> bool {
+    usize::try_from(self.links).is_ok_and(|links| self.names.len() >= links)
+  }
+}
+
+// Count backing names rather than visible paths: file and directory bind mounts
+// can expose the same directory entry more than once without increasing nlink.
+#[cfg(target_os = "linux")]
+fn protected_aliases(files: &BTreeSet<PathBuf>, roots: &[PathBuf], mounts: &[ConfigMount]) -> Result<BTreeSet<PathBuf>, Error> {
+  use std::collections::{HashMap, HashSet};
+  use std::os::fd::AsRawFd as _;
+  use std::os::unix::fs::OpenOptionsExt as _;
+
+  let mut names: HashMap<(u64, u64), ConfigInode> = HashMap::new();
+  for file in files {
+    let meta = std::fs::metadata(file)?;
+    names.entry((meta.dev(), meta.ino())).or_insert_with(|| ConfigInode {
+      links: meta.nlink(),
+      names: HashMap::new(),
+    });
+  }
+  let devices: HashSet<_> = names.keys().map(|(device, _)| *device).collect();
+  let mut paths = BTreeSet::new();
+  let record = |path: &Path, meta: &std::fs::Metadata, names: &mut HashMap<_, ConfigInode>| -> Result<(), Error> {
+    if let Some(target) = names.get_mut(&(meta.dev(), meta.ino())) {
+      let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_PATH).open(path)?;
+      let actual = file.metadata()?;
+      if (actual.dev(), actual.ino()) != (meta.dev(), meta.ino()) {
+        return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
+      }
+      let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+      let id = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+      for mount in mounts.iter().filter(|mount| mount.id == id.as_bytes()) {
+        if let Ok(relative) = path.strip_prefix(&mount.mountpoint) {
+          target
+            .names
+            .entry((mount.device.clone(), mount.root.join(relative)))
+            .or_insert_with(|| path.to_path_buf());
+        }
+      }
+    }
+    Ok(())
+  };
+  for file in files {
+    record(file, &std::fs::metadata(file)?, &mut names)?;
+  }
+  let complete = |names: &HashMap<_, ConfigInode>| names.values().all(ConfigInode::complete);
+  let mut visited = HashSet::new();
+  for root in roots {
+    if complete(&names) {
+      break;
+    }
+    let mut pending = vec![root.clone()];
+    while let Some(path) = pending.pop() {
+      if visited.contains(&path) {
+        continue;
+      }
+      let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        continue;
+      };
+      if !devices.contains(&meta.dev()) || meta.file_type().is_symlink() {
+        continue;
+      }
+      if meta.is_dir() {
+        visited.insert(path.clone());
+        let Ok(entries) = std::fs::read_dir(path) else {
+          continue;
+        };
+        pending.extend(entries.flatten().map(|entry| entry.path()));
+      } else if meta.is_file() {
+        if names.contains_key(&(meta.dev(), meta.ino())) {
+          paths.insert(path.clone());
+        }
+        record(&path, &meta, &mut names)?;
+        if complete(&names) {
+          break;
+        }
+      }
+    }
+  }
+  for ((device, inode), target) in names {
+    for ((mount_device, backing), path) in target.names {
+      paths.insert(path);
+      for mount in mounts.iter().filter(|mount| mount.device == mount_device) {
+        let Ok(relative) = backing.strip_prefix(&mount.root) else {
+          continue;
+        };
+        let alias = if relative.as_os_str().is_empty() {
+          mount.mountpoint.clone()
+        } else {
+          mount.mountpoint.join(relative)
+        };
+        if roots.iter().any(|root| alias.starts_with(root))
+          && std::fs::metadata(&alias).is_ok_and(|meta| meta.dev() == device && meta.ino() == inode)
+        {
+          paths.insert(alias);
+        }
+      }
+    }
+  }
+  Ok(paths)
 }
 
 fn collect_protected(path: &Path, targets: &mut BTreeSet<PathBuf>, files: &mut BTreeSet<PathBuf>) -> Result<(), Error> {
@@ -355,6 +493,28 @@ fn set_env(env: &mut Vec<(String, String)>, key: &str, value: String) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn hardlinks_are_found_across_overlapping_roots() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let original = root.join("original");
+    std::fs::write(&original, "secret").unwrap();
+    let mounts = mounted_roots().unwrap();
+    let files = BTreeSet::from([original.clone()]);
+    let aliases = protected_aliases(&files, std::slice::from_ref(&root), &mounts).unwrap();
+    assert!(aliases.contains(&original));
+
+    let nested = root.join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let hardlink = nested.join("hardlink");
+    std::fs::hard_link(&original, &hardlink).unwrap();
+    let roots = vec![root.clone(), nested, root];
+    let aliases = protected_aliases(&files, &roots, &mounts).unwrap();
+    assert!(aliases.contains(&original));
+    assert!(aliases.contains(&hardlink));
+  }
 
   #[test]
   fn a_dangling_config_link_does_not_hide_existing_config_files() {
