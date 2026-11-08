@@ -107,13 +107,13 @@ fn proc_tcp_addr(addr: SocketAddr) -> String {
   let ip = match addr.ip() {
     std::net::IpAddr::V4(ip) => format!("{:08X}", u32::from_ne_bytes(ip.octets())),
     std::net::IpAddr::V6(ip) => {
-      let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = ip.octets();
+      let [a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, d0, d1, d2, d3] = ip.octets();
       format!(
         "{:08X}{:08X}{:08X}{:08X}",
-        u32::from_ne_bytes([a, b, c, d]),
-        u32::from_ne_bytes([e, f, g, h]),
-        u32::from_ne_bytes([i, j, k, l]),
-        u32::from_ne_bytes([m, n, o, p]),
+        u32::from_ne_bytes([a0, a1, a2, a3]),
+        u32::from_ne_bytes([b0, b1, b2, b3]),
+        u32::from_ne_bytes([c0, c1, c2, c3]),
+        u32::from_ne_bytes([d0, d1, d2, d3]),
       )
     }
   };

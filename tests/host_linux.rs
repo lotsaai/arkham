@@ -1017,6 +1017,7 @@ echo sibling > .config/unrelated.toml
 
 #[test]
 fn symlinked_arkham_config_contents_stay_hidden_after_replacement_attempts() {
+  use std::os::unix::fs::MetadataExt as _;
   let isolated = Isolated::new();
   let workspace = tempfile::tempdir().unwrap();
   let root = workspace.path();
@@ -1029,7 +1030,6 @@ fn symlinked_arkham_config_contents_stay_hidden_after_replacement_attempts() {
   std::os::unix::fs::symlink("../real-config", config.join("arkham")).unwrap();
   std::os::unix::fs::symlink("../real-legacy", config.join("arkham.toml")).unwrap();
   std::fs::hard_link(real.join("config.toml"), root.join("config-hardlink")).unwrap();
-  use std::os::unix::fs::MetadataExt as _;
   let project_inode = std::fs::metadata(real.join("config.toml")).unwrap().ino();
   let legacy_inode = std::fs::metadata(root.join("real-legacy")).unwrap().ino();
   let _daemon = Daemon::start(&isolated);

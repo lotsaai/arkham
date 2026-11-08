@@ -107,7 +107,7 @@ pub async fn prepare_session(
       });
     }
   }
-  let protected = protected_config_paths(material_root, &binds)?;
+  let config_masks = protected_config_paths(material_root, &binds)?;
   let mut env = Vec::new();
   for name in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE"] {
     if let Some(value) = caller_env.get(name) {
@@ -137,7 +137,7 @@ pub async fn prepare_session(
     profile,
     workspace: workspace.clone(),
     binds,
-    protected,
+    protected: config_masks,
     ca_host: ca_cert.to_path_buf(),
     ca_dest: PathBuf::from(CA_DEST),
     env,
@@ -227,7 +227,7 @@ fn mounted_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, Error> {
           (Some(b'0'), Some(b'1'), Some(b'1')) => path.push(b'\t'),
           (Some(b'0'), Some(b'1'), Some(b'2')) => path.push(b'\n'),
           (Some(b'1'), Some(b'3'), Some(b'4')) => path.push(b'\\'),
-          _ => continue,
+          _ => {}
         }
       } else {
         path.push(byte);

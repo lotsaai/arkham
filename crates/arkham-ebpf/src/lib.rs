@@ -805,10 +805,17 @@ pub(crate) struct OrigDst {
 // SAFETY: `repr(C)`, integer fields only, every padding byte explicit.
 unsafe impl aya::Pod for OrigDst {}
 
+const IPV4_FAMILY: u8 = 2;
+const IPV6_FAMILY: u8 = 10;
+const _: () = {
+  assert!(IPV4_FAMILY as i32 == libc::AF_INET);
+  assert!(IPV6_FAMILY as i32 == libc::AF_INET6);
+};
+
 impl OrigDst {
   pub(crate) fn socket_addr(&self) -> SocketAddr {
     let [a, b, c, d] = self.ip;
-    let ip = if self.family == libc::AF_INET as u8 {
+    let ip = if self.family == IPV4_FAMILY {
       std::net::IpAddr::V4(decode_addr(a))
     } else {
       std::net::IpAddr::V6(std::net::Ipv6Addr::from(
@@ -864,17 +871,17 @@ impl FlowKey {
   /// sees as its peer.
   pub(crate) fn from_peer(peer: SocketAddr) -> Self {
     let (ip, family) = match peer.ip() {
-      std::net::IpAddr::V4(ip) => ([encode_addr(ip), 0, 0, 0], libc::AF_INET as u16),
+      std::net::IpAddr::V4(ip) => ([encode_addr(ip), 0, 0, 0], u16::from(IPV4_FAMILY)),
       std::net::IpAddr::V6(ip) => {
-        let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = ip.octets();
+        let [a0, a1, a2, a3, b0, b1, b2, b3, c0, c1, c2, c3, d0, d1, d2, d3] = ip.octets();
         (
           [
-            u32::from_ne_bytes([a, b, c, d]),
-            u32::from_ne_bytes([e, f, g, h]),
-            u32::from_ne_bytes([i, j, k, l]),
-            u32::from_ne_bytes([m, n, o, p]),
+            u32::from_ne_bytes([a0, a1, a2, a3]),
+            u32::from_ne_bytes([b0, b1, b2, b3]),
+            u32::from_ne_bytes([c0, c1, c2, c3]),
+            u32::from_ne_bytes([d0, d1, d2, d3]),
           ],
-          libc::AF_INET6 as u16,
+          u16::from(IPV6_FAMILY),
         )
       }
     };
@@ -1053,7 +1060,7 @@ mod tests {
       ip: [encode_addr(Ipv4Addr::LOCALHOST), 0, 0, 0],
       port: encode_port(TCP_LISTEN_PORT),
       proto: 6,
-      family: libc::AF_INET as u8,
+      family: IPV4_FAMILY,
       _pad: [0; 10],
       cgroup_id: 0,
     };
@@ -1078,12 +1085,12 @@ mod tests {
       ip: key.ip,
       port: encode_port(peer.port()),
       proto: 6,
-      family: libc::AF_INET6 as u8,
+      family: IPV6_FAMILY,
       _pad: [0; 10],
       cgroup_id: 1,
     };
     assert_eq!(orig.socket_addr(), peer);
-    assert_eq!(key.family, libc::AF_INET6 as u16);
+    assert_eq!(key.family, u16::from(IPV6_FAMILY));
   }
 
   /// The map keys and values cross the kernel boundary as raw bytes, so their
