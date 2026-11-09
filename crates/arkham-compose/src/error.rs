@@ -9,6 +9,7 @@ use arkham_fnox::Error as FnoxError;
 use kube_client::config::KubeconfigError;
 use serde_json::Error as JsonError;
 use serde_yaml::Error as YamlError;
+use toml::de::Error as TomlDeError;
 use toml::ser::Error as TomlSerializeError;
 use toml_edit::TomlError;
 
@@ -31,6 +32,12 @@ pub enum Error {
   #[error("[workspace] include `{}` does not exist; docker would mount an empty directory in its place", entry.display())]
   IncludeMissing {
     /// Missing entry.
+    entry: PathBuf,
+  },
+  /// A `[workspace] include` entry would mount a wider tree than the project.
+  #[error("[workspace] include `{}` widens the workspace", entry.display())]
+  IncludeWidens {
+    /// Entry that was refused.
     entry: PathBuf,
   },
   /// The arkham config directory does not resolve.
@@ -328,6 +335,208 @@ pub enum Error {
   /// `expose` without a port or `--list` names nothing to do.
   #[error("`arkham expose` needs a container port or `--list`")]
   ExposeNoPort,
+  /// The host wrapper found no daemon socket.
+  #[error("no host daemon is running")]
+  NoDaemon,
+  /// An inherited environment entry cannot be represented in the control protocol.
+  #[error("agent environment contains non-Unicode data")]
+  NonUnicodeEnvironment,
+  /// `--isolate bwrap` was asked for on a system other than Linux.
+  #[error("the host backend runs on Linux")]
+  HostLinuxOnly,
+  /// Host path translation needs a home directory.
+  #[error("home directory is unset")]
+  NoHome,
+  /// The pid's start time changed, or the process is not in the session cgroup.
+  #[error("session identity changed before the cgroup was confirmed")]
+  SessionReused,
+  /// A session cgroup operation failed.
+  #[error("session cgroup {}: {source}", path.display())]
+  SessionCgroup {
+    /// Directory that could not be created or written.
+    path: PathBuf,
+    /// Underlying I/O failure.
+    #[source]
+    source: IoError,
+  },
+  /// A socket path or a directory created for it is not owned by this user.
+  #[error("daemon socket is not owned by this user")]
+  SocketOwner,
+  /// `$XDG_RUNTIME_DIR` is unset, missing, or not private to this user.
+  #[error("XDG_RUNTIME_DIR is unset or not private")]
+  RuntimeDir,
+  /// `/proc/<pid>/stat` did not contain a start time.
+  #[error("process {pid} has no start time")]
+  NoStarttime {
+    /// Process id that could not be identified.
+    pid: u32,
+  },
+  /// `/proc/<pid>/cgroup` had no cgroup v2 line.
+  #[error("process {pid} has no cgroup")]
+  NoCgroup {
+    /// Process id whose cgroup could not be read.
+    pid: u32,
+  },
+  /// The daemon sent a rejection.
+  #[error("daemon rejected the session: {detail}")]
+  DaemonRejected {
+    /// Message the daemon sent.
+    detail: String,
+  },
+  /// The control client is a different user from the daemon.
+  #[error("control client is not the daemon user")]
+  ControlUnauthorized,
+  /// The peer is already inside a daemon cgroup.
+  #[error("a confined process cannot register")]
+  AlreadyConfined,
+  /// A control message exceeded the cap or was not the expected JSON.
+  #[error("control message is not valid")]
+  ControlMessage {
+    /// Why the message was rejected.
+    #[source]
+    source: JsonError,
+  },
+  /// A control message was larger than the cap, or the socket closed mid-read.
+  #[error("control message exceeds 1 MiB or ended early")]
+  ControlLimit,
+  /// A grant fragment does not parse as rules.
+  #[error("grant fragment does not parse")]
+  FragmentParse {
+    /// Underlying parse failure.
+    #[source]
+    source: TomlDeError,
+  },
+  /// The session temp directory is missing or not private to this user.
+  #[error("session tmp is not a private directory")]
+  SessionTmp {
+    /// Why the directory was rejected.
+    #[source]
+    source: IoError,
+  },
+  /// Landlock could not open a path it was asked to grant.
+  #[cfg(target_os = "linux")]
+  #[error("landlock path {path}", path = path.display())]
+  LandlockPath {
+    /// Path that could not be opened.
+    path: PathBuf,
+    /// Underlying open failure.
+    #[source]
+    source: landlock::PathFdError,
+  },
+  /// Landlock rejected the ruleset.
+  #[cfg(target_os = "linux")]
+  #[error("landlock restriction failed")]
+  Landlock {
+    /// Underlying ruleset failure.
+    #[source]
+    source: landlock::RulesetError,
+  },
+  /// Landlock applied nothing, or only part of the ruleset.
+  #[cfg(target_os = "linux")]
+  #[error("landlock did not enforce the profile")]
+  LandlockIncomplete,
+}
+
+impl Error {
+  /// Text a wrapper may print.
+  ///
+  /// Original paths and secret material stay in the operator log.
+  #[must_use]
+  pub fn registration_detail(&self) -> String {
+    if self.registration_keeps_display() {
+      return self.to_string();
+    }
+    self.registration_summary().to_string()
+  }
+
+  fn registration_keeps_display(&self) -> bool {
+    matches!(
+      self,
+      Self::SessionCgroup { .. }
+        | Self::SessionReused
+        | Self::RuntimeDir
+        | Self::SocketOwner
+        | Self::NoDaemon
+        | Self::AlreadyConfined
+        | Self::ControlUnauthorized
+        | Self::NoStarttime { .. }
+        | Self::NoCgroup { .. }
+        | Self::HostLinuxOnly
+        | Self::SessionTmp { .. }
+    )
+  }
+
+  fn registration_summary(&self) -> &'static str {
+    match self {
+      Self::Config(_)
+      | Self::Fnox(_)
+      | Self::Pki(_)
+      | Self::IncludeMissing { .. }
+      | Self::IncludeWidens { .. }
+      | Self::ConfigDir { .. }
+      | Self::GuestCa { .. }
+      | Self::ReadFile { .. }
+      | Self::ExpandValue { .. }
+      | Self::SecretNoValue { .. }
+      | Self::PassthroughOverlapRule { .. }
+      | Self::PassthroughOverlapDecoy { .. }
+      | Self::EmptyImage
+      | Self::BuildDockerfileMissing { .. }
+      | Self::BuildContextMissing { .. }
+      | Self::BuildNotConfigured
+      | Self::RewriteNoValue { .. }
+      | Self::RewriteNoDecoy { .. }
+      | Self::RewriteDestNotAbsolute { .. }
+      | Self::RewriteWithEnvs { .. }
+      | Self::Kubeconfig { .. }
+      | Self::RewriteYaml { .. }
+      | Self::RewriteInvalid { .. }
+      | Self::SourceInvalid { .. }
+      | Self::MiseParse { .. }
+      | Self::ResolveWorkspace { .. }
+      | Self::ToolNameInvalid { .. }
+      | Self::ToolConfigNotAbsolute { .. }
+      | Self::ExposeConfigParse { .. }
+      | Self::ExposeConfigType { .. }
+      | Self::FragmentParse { .. } => "configuration could not be read",
+      Self::Io(_)
+      | Self::WriteFile { .. }
+      | Self::RemoveFile { .. }
+      | Self::CreateDir { .. }
+      | Self::SerializeFragment { .. }
+      | Self::SerializeDecoy { .. }
+      | Self::SerializeExpose { .. }
+      | Self::ChmodFile { .. } => "session files could not be prepared",
+      Self::NatsDecoy
+      | Self::LinuxOnly
+      | Self::BackendNone
+      | Self::NoComposeLayers { .. }
+      | Self::SpawnCompose { .. }
+      | Self::ComposeFailed { .. }
+      | Self::ExposeRegistry { .. }
+      | Self::ExposeInUse { .. }
+      | Self::ExposeVerify { .. }
+      | Self::ExposeNoPort
+      | Self::NoHome
+      | Self::DaemonRejected { .. }
+      | Self::ControlMessage { .. }
+      | Self::ControlLimit
+      | Self::SessionCgroup { .. }
+      | Self::SessionReused
+      | Self::RuntimeDir
+      | Self::SocketOwner
+      | Self::NoDaemon
+      | Self::NonUnicodeEnvironment
+      | Self::AlreadyConfined
+      | Self::ControlUnauthorized
+      | Self::NoStarttime { .. }
+      | Self::NoCgroup { .. }
+      | Self::HostLinuxOnly
+      | Self::SessionTmp { .. } => "registration failed",
+      #[cfg(target_os = "linux")]
+      Self::LandlockPath { .. } | Self::Landlock { .. } | Self::LandlockIncomplete => "landlock did not enforce the profile",
+    }
+  }
 }
 
 impl From<ConfigError> for Error {
@@ -339,5 +548,60 @@ impl From<ConfigError> for Error {
 impl From<FnoxError> for Error {
   fn from(source: FnoxError) -> Self {
     Self::Fnox(Box::new(source))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn a_fragment_parse_failure_names_neither_the_file_nor_the_secret() {
+    let source = toml::from_str::<toml::Value>("MARKER_SECRET [").unwrap_err();
+    let err = Error::FragmentParse { source };
+    let text = err.registration_detail();
+    assert_eq!(text, "configuration could not be read");
+    assert!(!text.contains("MARKER_SECRET"));
+  }
+
+  #[test]
+  fn a_missing_secret_name_does_not_reach_the_wrapper() {
+    let err = Error::SecretNoValue {
+      name: "MARKER_SECRET".to_string(),
+    };
+    assert_eq!(err.registration_detail(), "configuration could not be read");
+  }
+
+  #[test]
+  fn a_cgroup_denial_keeps_the_directory_and_the_os_error() {
+    let err = Error::SessionCgroup {
+      path: PathBuf::from("/sys/fs/cgroup/arkham-host"),
+      source: std::io::Error::from_raw_os_error(13),
+    };
+    let text = err.registration_detail();
+    assert!(text.contains("/sys/fs/cgroup/arkham-host"), "{text}");
+    assert!(text.to_ascii_lowercase().contains("permission denied"), "{text}");
+  }
+
+  #[test]
+  fn a_private_runtime_failure_keeps_its_own_sentence() {
+    assert_eq!(Error::RuntimeDir.registration_detail(), "XDG_RUNTIME_DIR is unset or not private");
+  }
+
+  #[test]
+  fn a_shared_session_tmp_keeps_its_own_sentence() {
+    let err = Error::SessionTmp {
+      source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "mode"),
+    };
+    assert_eq!(err.registration_detail(), "session tmp is not a private directory");
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn a_landlock_failure_names_neither_a_path_nor_a_weaker_mode() {
+    assert_eq!(
+      Error::LandlockIncomplete.registration_detail(),
+      "landlock did not enforce the profile"
+    );
   }
 }

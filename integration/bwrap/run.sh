@@ -4,9 +4,6 @@
 # The client runs under bwrap (filesystem-sandboxed) while sharing the
 # netns, so it is captured like any proxy-unaware workload.
 #
-# Set ARKHAM_BACKEND=ebpf to capture with the cgroup eBPF backend instead of
-# TPROXY; the scenarios asserted are identical either way.
-#
 # Requires: sudo (netns, veth, host nft), iproute2, nft, openssl, bun, curl, bwrap.
 # Run: mise run demo:bwrap (builds as you, escalates only this script)
 set -euo pipefail
@@ -21,11 +18,7 @@ API_IP=10.99.0.20
 GW_IP=10.99.0.1
 REAL=ghp_deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 NAT_TABLE=arkham_bwrap_nat
-# `tproxy` (default) or `ebpf`. Both capture kernel-side; eBPF needs its
-# workload in a cgroup and uses no netfilter at all.
-BACKEND=${ARKHAM_BACKEND:-tproxy}
-# cgroup the client is placed in when BACKEND=ebpf. arkham itself stays in the
-# root cgroup, so its own upstream dials are never captured.
+# arkham stays outside the client's cgroup, so its upstream dials bypass capture.
 EBPF_CGROUP=/sys/fs/cgroup/arkham-bwrap
 
 fail() {
@@ -34,10 +27,6 @@ fail() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "run as root (sudo)"
-case "$BACKEND" in
-tproxy | ebpf) ;;
-*) fail "ARKHAM_BACKEND must be tproxy or ebpf, got '$BACKEND'" ;;
-esac
 for tool in ip nft openssl bun curl bwrap; do
   command -v "$tool" >/dev/null || fail "missing tool: $tool"
 done
@@ -55,8 +44,6 @@ cleanup() {
   rm -rf "$work"
   ip netns del "$NS" 2>/dev/null || true
   nft delete table inet "$NAT_TABLE" 2>/dev/null || true
-  # Only the ebpf backend creates this; the client is gone by now, so the
-  # empty cgroup can be removed.
   rmdir "$EBPF_CGROUP" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -122,30 +109,15 @@ sandbox() {
 }
 export -f sandbox
 
-case "$BACKEND" in
-tproxy)
-  # arkham with kernel TPROXY inside the same namespace.
-  ip netns exec "$NS" RUST_LOG=info "$binary" serve --proxy-backend tproxy --config "$work/arkham.toml" >"$work/arkham.log" 2>&1 &
-  client() { ip netns exec "$NS" sandbox "$@"; }
-  ;;
-ebpf)
-  # cgroup holding only the client. Membership is what scopes capture: arkham
-  # itself stays in the root cgroup, so its upstream dials are never
-  # redirected back into it.
-  mkdir -p "$EBPF_CGROUP"
-  ip netns exec "$NS" RUST_LOG=info "$binary" serve --proxy-backend ebpf --ebpf-cgroup "$EBPF_CGROUP" --config "$work/arkham.toml" >"$work/arkham.log" 2>&1 &
-  # The client migrates itself before exec'ing the sandbox, so bwrap and
-  # everything it spawns are captured. `$BASHPID` is this child shell's pid;
-  # it must be read by the child, so the script is passed with the cgroup as
-  # a positional argument rather than interpolated here. SC2016 is that
-  # intent, not an oversight.
-  # shellcheck disable=SC2016
-  client() {
-    ip netns exec "$NS" bash -c 'echo "$BASHPID" >"$1/cgroup.procs"; shift; sandbox "$@"' arkham-client "$EBPF_CGROUP" "$@"
-  }
-  ;;
-esac
+mkdir -p "$EBPF_CGROUP"
+ip netns exec "$NS" env RUST_LOG=info "$binary" serve --proxy-backend ebpf --ebpf-cgroup "$EBPF_CGROUP" --config "$work/arkham.toml" >"$work/arkham.log" 2>&1 &
 arkham_pid=$!
+
+# The child joins the capture cgroup before starting bwrap.
+# shellcheck disable=SC2016
+client() {
+  ip netns exec "$NS" bash -c 'echo "$BASHPID" >"$1/cgroup.procs"; shift; sandbox "$@"' arkham-client "$EBPF_CGROUP" "$@"
+}
 
 wait_port() {
   for _ in $(seq 1 50); do

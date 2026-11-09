@@ -1,6 +1,6 @@
 # cargo-audit gate policy. Vulnerabilities fail `mise run format`; entries
-# below are accepted debt, each with the blocker that keeps it pinned. Delete
-# an entry the moment its blocker moves.
+# below are accepted debt. `mise run audit` rejects entries that no longer
+# match an advisory affecting Cargo.lock.
 [advisories]
 ignore = [
   # aws-smithy-http-client 1.5.0 (the whole aws-sdk chain under fnox-core
@@ -40,13 +40,6 @@ ignore = [
   "RUSTSEC-2026-0346",
   "RUSTSEC-2026-0349",
 
-  # webpki-roots 0.26.11 is a semver shim that re-exports webpki-roots 1.x,
-  # and Cargo.lock resolves that to 1.0.11, which already removes the
-  # distrusted emSign ECC Root CA - G3. Only the shim's version number
-  # matches; no distrusted root ships. Delete if the shim stops resolving
-  # to >=1.0.10.
-  "RUSTSEC-2026-0381",
-
   # crypto-bigint 0.5.5 timing side channels. Patched only in >=0.7.6.
   # fnox-core 1.39.0 -> age 0.12.1 / aws-sigv4 1.6.3, and
   # russh 0.56.0 -> internal-russh-forked-ssh-key 0.6.16.
@@ -63,4 +56,9 @@ ignore = [
   # Marvin attack on rsa. No fixed release exists upstream.
   # fnox-core 1.39.0 -> age 0.12.1 -> rsa 0.9.10.
   "RUSTSEC-2023-0071",
+
+  # shortcut: fnox bundles affected SQLite/SQLCipher; remove once its
+  # dependency chain is patched. A crafted local database/WAL pair can
+  # disclose process memory.
+  "RUSTSEC-2026-0459",
 ]

@@ -38,21 +38,12 @@ pub trait CliCommand {
   fn run(self, cli: &Cli, arkham_version: &str) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
-/// Transparent capture backend. All three are peers: same interception contract
-/// (the destination is the identity), different mechanism and different UDP
-/// behaviour.
+/// Proxy capture mode.
 #[derive(ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ProxyBackend {
   /// Explicit listener only; no transparent capture.
   #[default]
   None,
-  /// Userspace: a TUN device plus an in-process TCP/IP stack, which also
-  /// relays UDP (DNS to the system resolver, QUIC dropped). Needs root.
-  Tun,
-  /// Kernel: nftables rules and policy routes hand TCP to an
-  /// `IP_TRANSPARENT` listener; UDP passes through untouched. Needs
-  /// `CAP_NET_ADMIN`.
-  Tproxy,
   /// Kernel: cgroup socket hooks rewrite destinations to loopback
   /// listeners; captures TCP and connected UDP (relay only). Needs
   /// `CAP_BPF` + `CAP_NET_ADMIN`, and a cgroup holding the workload with

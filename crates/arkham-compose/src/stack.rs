@@ -22,6 +22,42 @@ use crate::profiles::{ProfileRoots, profile_mounts};
 use crate::rewrites::{RewriteInputs, write_rewrites};
 use crate::workspace::Workspace;
 
+/// Where rewritten paths are expressed.
+enum HomeMode {
+  /// Container home from the workspace config. Compose generation.
+  Container,
+  /// Host home, so bind destinations are host paths. `scratch` holds forged files.
+  Host { scratch: PathBuf },
+}
+
+/// What a host session needs from the compose pipeline, without a rendered stack.
+pub(crate) struct HostMaterial {
+  /// Workspace config, before grant fragments are merged.
+  pub config: AppConfig,
+  /// Fnox source discovered from the project root.
+  pub fnox: Option<arkham_fnox::FnoxSource>,
+  /// Registry joined against that source.
+  pub registry: arkham_config::registry::Registry,
+  /// Decoy env values.
+  pub decoys: Vec<Decoy>,
+  /// Adapter grants, real fragments still in memory.
+  pub grants: Vec<RewriteAdapted>,
+  /// Include mounts, workspace root included.
+  pub mounts: Vec<Mount>,
+  /// Rewritten file mounts.
+  pub file_mounts: Vec<Mount>,
+  /// Tool profile mounts.
+  pub tool_mounts: Vec<Mount>,
+  /// Guest identity mounts.
+  pub guest: Vec<Mount>,
+  /// Names copied through from the operator environment.
+  pub passthrough: Vec<String>,
+  /// Configured shell, when one is set.
+  pub shell: Option<String>,
+  /// Workspace root.
+  pub workspace: PathBuf,
+}
+
 /// Fixed port the generated stack renders as `ARKHAM_LISTEN` instead of the
 /// `127.0.0.1:8080` default: the explicit proxy is loopback-bound in the
 /// shared netns, and 8080 is the port dev servers default to — squatted on.
@@ -78,16 +114,29 @@ impl<'a> StackBuilder<'a> {
   ///
   /// Returns an error when the registry or config fails to load, when value
   /// resolution fails, or when a path fails to expand.
-  async fn resolve(root: &'a Path, backend: ProxyBackend, version: &'a str) -> Result<Self, Error> {
+  async fn resolve(root: &'a Path, backend: ProxyBackend, version: &'a str, home_mode: HomeMode) -> Result<Self, Error> {
     let workspace = Workspace::new(root);
     let config = workspace.config()?;
-    let selection = workspace.selection()?;
-    let raw_home = config.workspace.container_home().to_string();
+    let host_paths = matches!(home_mode, HomeMode::Host { .. });
+    let selection = if host_paths {
+      Selection::load_from(root)?
+    } else {
+      workspace.selection()?
+    };
+    let host = home_dir();
+    let raw_home = if host_paths {
+      host.clone().ok_or(Error::NoHome)?.to_string_lossy().into_owned()
+    } else {
+      config.workspace.container_home().to_string()
+    };
     let referenced = config.workspace.referenced_variables(&[raw_home.as_str()]);
     let env = resolution_env(&selection.registry, selection.fnox.as_ref(), &referenced).await?;
     let expander = build_expander(env.clone());
     let home = expand_value(&expander, &raw_home)?;
-    let layout = Layout::new(root, home, home_dir());
+    let mut layout = Layout::new(root, home, host);
+    if let HomeMode::Host { scratch } = home_mode {
+      layout = layout.with_scratch(scratch);
+    }
     let includes: Vec<PathBuf> = config
       .workspace
       .include
@@ -309,7 +358,7 @@ impl<'a> StackBuilder<'a> {
 /// resolution, rewrites, ambient derivation, grant state, profiles, guest
 /// identities, or the agent build.
 pub(crate) async fn generate_stack(root: &Path, backend: ProxyBackend, arkham_version: &str) -> Result<String, Error> {
-  let stack = StackBuilder::resolve(root, backend, arkham_version)
+  let stack = StackBuilder::resolve(root, backend, arkham_version, HomeMode::Container)
     .await?
     .secrets()?
     .rewrites()
@@ -321,6 +370,46 @@ pub(crate) async fn generate_stack(root: &Path, backend: ProxyBackend, arkham_ve
     .guest_identities()?
     .stack()?;
   Ok(stack.render())
+}
+
+/// Run the compose steps a host session shares, and stop before grant files
+/// and the rendered stack. Real grant fragments stay in memory.
+///
+/// # Errors
+///
+/// Returns whatever step fails: config, discovery, rewrites, ambient
+/// derivation, profiles, or guest identities.
+pub(crate) async fn host_material(root: &Path, scratch: &Path, version: &str) -> Result<HostMaterial, Error> {
+  let built = StackBuilder::resolve(
+    root,
+    ProxyBackend::None,
+    version,
+    HomeMode::Host {
+      scratch: scratch.to_path_buf(),
+    },
+  )
+  .await?
+  .secrets()?
+  .rewrites()
+  .await?
+  .ambient()
+  .await?
+  .profiles()?
+  .guest_identities()?;
+  Ok(HostMaterial {
+    passthrough: built.config.workspace.passthrough.clone(),
+    shell: built.config.workspace.shell.clone(),
+    workspace: root.to_path_buf(),
+    config: built.config,
+    fnox: built.selection.fnox,
+    registry: built.selection.registry,
+    decoys: built.decoys,
+    grants: built.grants,
+    mounts: built.mounts,
+    file_mounts: built.file_mounts,
+    tool_mounts: built.tool_mounts,
+    guest: built.guest,
+  })
 }
 
 /// The process's user id, from the kernel: the same value `id -u` prints,
@@ -427,20 +516,16 @@ impl Stack {
     match backend {
       ProxyBackend::Ebpf => (
         "[\"serve\", \"--proxy-backend\", \"ebpf\", \"--ebpf-cgroup\", \"enclosing\"]".to_string(),
-        &["BPF", "PERFMON"],
+        &["BPF", "PERFMON", "SYS_PTRACE"],
         // Both services carry the same `cgroup_parent`, so docker creates that
         // cgroup as part of arkham's own start and arkham attaches to it by
         // resolving its parent from `/proc/self/cgroup`: the daemon resolves the
         // parent relative to its own cgroup root, which is why no host path is
         // written down here.
-        format!("    cgroup: host\n    cgroup_parent: arkham-{project}.slice\n"),
+        // The proxy needs host PID visibility and ptrace access to identify
+        // socket owners in the guest's separate PID namespace.
+        format!("    cgroup: host\n    pid: host\n    cgroup_parent: arkham-{project}.slice\n"),
       ),
-      ProxyBackend::Tun => (
-        "[\"serve\", \"--proxy-backend\", \"tun\"]".to_string(),
-        &[],
-        "    devices: [/dev/net/tun]\n".to_string(),
-      ),
-      ProxyBackend::Tproxy => ("[\"serve\", \"--proxy-backend\", \"tproxy\"]".to_string(), &[], String::new()),
       // `arkham init` rejects `none`; rendered anyway so this match is exhaustive.
       ProxyBackend::None => ("[\"serve\"]".to_string(), &[], String::new()),
     }
@@ -600,7 +685,7 @@ impl Stack {
        \x20   cgroup_parent: arkham-{}.slice\n",
         self.project
       ),
-      ProxyBackend::Tun | ProxyBackend::Tproxy | ProxyBackend::None => String::new(),
+      ProxyBackend::None => String::new(),
     };
     let caps = std::iter::once("SYS_CHROOT")
       .chain(["AUDIT_WRITE", "NET_ADMIN", "SETUID", "SETGID", "SYS_ADMIN"])
@@ -869,7 +954,7 @@ mod tests {
 
   #[test]
   fn the_agent_service_carries_what_inner_containers_need() {
-    let yaml = test_stack(ProxyBackend::Tproxy).render();
+    let yaml = test_stack(ProxyBackend::Ebpf).render();
     for expected in [
       "image: ghcr.io/casualjim/devagent:26.04",
       "security_opt: [seccomp=unconfined, systempaths=unconfined, apparmor=unconfined]",
@@ -899,7 +984,7 @@ mod tests {
 
   #[test]
   fn workspace_image_overrides_the_agent_image() {
-    let mut stack = test_stack(ProxyBackend::Tproxy);
+    let mut stack = test_stack(ProxyBackend::Ebpf);
     stack.agent.image = "ghcr.io/example/devenv:1.0".to_string();
     let yaml = stack.render();
     assert!(yaml.contains("image: ghcr.io/example/devenv:1.0"), "{yaml}");
@@ -908,7 +993,7 @@ mod tests {
 
   #[test]
   fn agent_build_renders_context_and_dockerfile() {
-    let mut stack = test_stack(ProxyBackend::Tproxy);
+    let mut stack = test_stack(ProxyBackend::Ebpf);
     let build = AgentBuild {
       context: PathBuf::from("/ws/docker"),
       dockerfile: PathBuf::from("/ws/docker/Dockerfile.agent"),
@@ -923,7 +1008,7 @@ mod tests {
 
   #[test]
   fn default_agent_service_has_no_build_section() {
-    let yaml = test_stack(ProxyBackend::Tproxy).render();
+    let yaml = test_stack(ProxyBackend::Ebpf).render();
     assert!(!yaml.contains("\n    build:\n"), "{yaml}");
   }
 
@@ -966,7 +1051,7 @@ mod tests {
 
   #[test]
   fn workspace_devices_and_caps_append_to_the_agent_builtin_set() {
-    let mut stack = test_stack(ProxyBackend::Tproxy);
+    let mut stack = test_stack(ProxyBackend::Ebpf);
     stack.agent.devices = vec!["/dev/kvm".to_string()];
     stack.agent.cap_add = vec!["SYS_PTRACE".to_string()];
     let yaml = stack.render();
@@ -983,7 +1068,7 @@ mod tests {
     // wrong depth is a hard failure, not a cosmetic one. In these literals a
     // `\`-continued line drops its leading whitespace while the first line
     // keeps it.
-    let yaml = test_stack(ProxyBackend::Tproxy).render();
+    let yaml = test_stack(ProxyBackend::Ebpf).render();
     for expected in [
       "\n    cap_add:\n      - NET_ADMIN\n",
       "\n    stop_grace_period: 1s\n",
@@ -1005,7 +1090,7 @@ mod tests {
     let yaml = Stack {
       agent: agent_paths("/home/eng/github/arkham"),
       mounts: mounts.clone(),
-      ..test_stack(ProxyBackend::Tproxy)
+      ..test_stack(ProxyBackend::Ebpf)
     }
     .render();
     assert!(yaml.contains("name: arkham\nservices:"), "{yaml}");
@@ -1034,29 +1119,19 @@ mod tests {
   }
 
   #[test]
-  fn each_backend_shapes_the_serve_command_and_its_host_wiring() {
+  fn ebpf_shapes_the_serve_command_and_its_host_wiring() {
     let render = |backend| test_stack(backend).render();
-
-    let tproxy = render(ProxyBackend::Tproxy);
-    assert!(tproxy.contains("command: [\"serve\", \"--proxy-backend\", \"tproxy\"]"), "{tproxy}");
-    assert_eq!(
-      tproxy.matches("/dev/net/tun").count(),
-      1,
-      "only the agent service asks for the tun device: {tproxy}"
-    );
-    assert!(!tproxy.contains("cgroup"), "{tproxy}");
-
-    let tun = render(ProxyBackend::Tun);
-    assert!(tun.contains("command: [\"serve\", \"--proxy-backend\", \"tun\"]"), "{tun}");
-    assert_eq!(tun.matches("/dev/net/tun").count(), 2, "arkham needs the tun device too: {tun}");
-    assert!(!tun.contains("--ebpf-cgroup"), "{tun}");
 
     let ebpf = render(ProxyBackend::Ebpf);
     assert!(
       ebpf.contains("command: [\"serve\", \"--proxy-backend\", \"ebpf\", \"--ebpf-cgroup\", \"enclosing\"]"),
       "{ebpf}"
     );
-    for expected in ["    cgroup: host\n", "      - BPF\n      - PERFMON\n"] {
+    for expected in [
+      "    cgroup: host\n",
+      "    pid: host\n",
+      "      - BPF\n      - PERFMON\n      - SYS_PTRACE\n",
+    ] {
       assert!(ebpf.contains(expected), "missing {expected:?}:\n{ebpf}");
     }
     assert_eq!(
@@ -1064,14 +1139,17 @@ mod tests {
       2,
       "both services carry the shared cgroup, so docker creates it as arkham starts: {ebpf}"
     );
+    let arkham = &ebpf[..ebpf.find("\n  agent:\n").unwrap()];
+    let agent = &ebpf[ebpf.find("\n  agent:\n").unwrap()..ebpf.find("\n  fwd:\n").unwrap()];
+    assert!(arkham.contains("\n    pid: host\n"), "the proxy must see guest processes: {arkham}");
+    assert!(!agent.contains("\n    pid:"), "the guest keeps its own PID namespace: {agent}");
+    assert!(!agent.contains("SYS_PTRACE"), "ptrace is confined to the proxy: {agent}");
     assert_eq!(ebpf.matches("/dev/net/tun").count(), 1, "ebpf needs no tun device: {ebpf}");
     assert_eq!(
       ebpf.matches("ARKHAM_EBPF_BYPASS_FILE: /arkham/ebpf-bypass\n").count(),
       2,
       "arkham reads and the agent writes the same shared bypass file: {ebpf}"
     );
-    assert!(!tun.contains("ARKHAM_EBPF_BYPASS_FILE"), "{tun}");
-    assert!(!tproxy.contains("ARKHAM_EBPF_BYPASS_FILE"), "{tproxy}");
   }
 
   #[test]
@@ -1090,7 +1168,7 @@ mod tests {
   fn workspace_ports_render_as_stable_host_bindings() {
     let yaml = Stack {
       ports: vec![3000, 5432],
-      ..test_stack(ProxyBackend::Tproxy)
+      ..test_stack(ProxyBackend::Ebpf)
     }
     .render();
     let arkham_block = &yaml[..yaml.find("\n  agent:\n").unwrap()];
@@ -1113,7 +1191,7 @@ mod tests {
       2,
       "exactly the declared ports, nothing else: {arkham_block}"
     );
-    let empty = test_stack(ProxyBackend::Tproxy).render();
+    let empty = test_stack(ProxyBackend::Ebpf).render();
     assert!(!empty.contains("ports:"), "no ports key without declared ports: {empty}");
   }
 
@@ -1124,7 +1202,7 @@ mod tests {
       expose: vec![ExposeMap { port: 5173, host: 5174 }],
       networks: vec!["headroom_default".to_string()],
       extra_hosts: vec!["host.docker.internal:host-gateway".to_string()],
-      ..test_stack(ProxyBackend::Tproxy)
+      ..test_stack(ProxyBackend::Ebpf)
     }
     .render();
     let arkham_block = &yaml[..yaml.find("\n  agent:\n").unwrap()];
@@ -1162,7 +1240,7 @@ mod tests {
       !agent_block.contains("networks:"),
       "a `network_mode` service takes no networks key: {agent_block}"
     );
-    let empty = test_stack(ProxyBackend::Tproxy).render();
+    let empty = test_stack(ProxyBackend::Ebpf).render();
     let empty_arkham = &empty[..empty.find("\n  agent:\n").unwrap()];
     let empty_agent = &empty[empty.find("\n  agent:\n").unwrap()..empty.find("\n  fwd:\n").unwrap()];
     assert!(
@@ -1178,7 +1256,7 @@ mod tests {
 
   #[test]
   fn the_generated_stack_renders_the_sidecar_and_moves_the_explicit_proxy_off_8080() {
-    let yaml = test_stack(ProxyBackend::Tproxy).render();
+    let yaml = test_stack(ProxyBackend::Ebpf).render();
     assert!(
       yaml.starts_with("# generated by `arkham init`."),
       "the header leads the generated file: {yaml}"
@@ -1235,7 +1313,7 @@ mod tests {
       passthrough: vec!["WAYLAND_DISPLAY".to_string()],
       mounts: vec![mount("/srv/ws", "/home/eng/ws", false)],
       file_mounts: vec![mount("/state/files/00-npmrc", "/home/eng/.npmrc", true)],
-      ..test_stack(ProxyBackend::Tproxy)
+      ..test_stack(ProxyBackend::Ebpf)
     }
     .render();
     assert!(yaml.contains("      WAYLAND_DISPLAY: \"${WAYLAND_DISPLAY}\"\n"), "{yaml}");

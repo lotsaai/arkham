@@ -8,6 +8,8 @@
 mod commands;
 #[cfg(target_os = "linux")]
 mod fwd;
+#[cfg(target_os = "linux")]
+mod host;
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +18,7 @@ use arkham_fnox::FnoxSource;
 use clap::{Parser, Subcommand};
 
 use arkham_compose::{AgentArgs, DownArgs, ExposeArgs, InitArgs, LogsArgs, UpArgs};
-use commands::{CaArgs, ConfigArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, SchemesArgs, ServeArgs};
+use commands::{CaArgs, ConfigArgs, DaemonArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, SchemesArgs, ServeArgs};
 
 #[derive(Parser, Debug)]
 #[command(name = "arkham", about = "grant-scoped MITM proxy", version)]
@@ -87,6 +89,8 @@ enum Command {
   Down(DownArgs),
   /// Read the stack's logs.
   Logs(LogsArgs),
+  /// Run the host daemon: one proxy, the project registry, and the control socket.
+  Daemon(DaemonArgs),
 }
 
 #[global_allocator]
@@ -107,8 +111,26 @@ fn ca_path(proxy: &arkham_config::config::ProxyCfg) -> eyre::Result<PathBuf> {
     .ok_or_else(|| eyre::eyre!("unable to resolve user config directory"))
 }
 
+fn main() -> eyre::Result<()> {
+  if std::env::args().nth(1).as_deref() == Some("--landlock-exec") {
+    #[cfg(target_os = "linux")]
+    {
+      if let Err(err) = arkham_compose::landlock_exec() {
+        eprintln!("{}", err.registration_detail());
+        std::process::exit(1);
+      }
+      return Ok(());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+      eyre::bail!("the landlock launcher runs on Linux");
+    }
+  }
+  runtime_main()
+}
+
 #[tokio::main]
-async fn main() -> eyre::Result<()> {
+async fn runtime_main() -> eyre::Result<()> {
   arkham_pki::ca::install_crypto_provider();
   tracing_subscriber::fmt()
     .pretty()
@@ -134,6 +156,7 @@ async fn main() -> eyre::Result<()> {
     Command::Expose(args) => args.run(&cli, arkham_version).await?,
     Command::Down(args) => args.run(&cli, arkham_version).await?,
     Command::Logs(args) => args.run(&cli, arkham_version).await?,
+    Command::Daemon(args) => args.run(&cli, arkham_version).await?,
   }
   Ok(())
 }
@@ -189,56 +212,22 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   let listen_addr = resolved.proxy.listen;
   let (handoff_path, handoff_uid) = resolve_handoff_endpoint(&resolved.proxy)?;
   let grant_count = resolved.grants.len();
-  #[cfg(target_os = "linux")]
-  let fwmark = match args.proxy_backend {
-    // eBPF needs no fwmark: exclusion is cgroup membership plus the proxy PID
-    // the programs compare against, not a routing loop to break.
-    ProxyBackend::None | ProxyBackend::Ebpf => None,
-    ProxyBackend::Tproxy => Some(arkham_tproxy::EGRESS_MARK),
-    ProxyBackend::Tun => Some(arkham_tun::FWMARK),
-  };
-  #[cfg(target_os = "linux")]
-  let state = std::sync::Arc::new(match fwmark {
-    Some(mark) => arkham_proxy::ProxyState::new(resolved, &ca)?.with_fwmark(mark),
-    None => arkham_proxy::ProxyState::new(resolved, &ca)?,
-  });
-  #[cfg(not(target_os = "linux"))]
   let state = std::sync::Arc::new(arkham_proxy::ProxyState::new(resolved, &ca)?);
-  // Bind before capture side effects: a bad listen addr must fail
-  // before nft rules and routes touch the host.
+  // Bind before capture side effects.
   let listener = arkham_proxy::bind_explicit(listen_addr).await?;
   let handoff = bind_handoff_listener(&handoff_path, handoff_uid).await?;
   if !listen_addr.ip().is_loopback() {
     tracing::warn!(listen = %listen_addr, "listening on a non-loopback address: anyone reaching this port can trigger real-secret substitution");
   }
-  tracing::info!(
-    listen = %listen_addr,
-    handoff = %handoff_path.display(),
-    uid = handoff_uid,
-    grants = grant_count,
-    "serving"
-  );
-  #[cfg(target_os = "linux")]
-  if args.proxy_backend == ProxyBackend::Tun {
-    let capture = std::sync::Arc::clone(&state);
-    // Dropping the task runs its teardown guard, which removes the policy
-    // routes; a leaked default route in the capture table blackholes all egress.
-    return with_capture(listener, handoff, state, "TUN", async move {
-      arkham_tun::run_tun(capture).await.map_err(eyre::Report::from)
-    })
-    .await;
-  }
-  #[cfg(target_os = "linux")]
-  if args.proxy_backend == ProxyBackend::Tproxy {
-    let capture = std::sync::Arc::clone(&state);
-    let allow_root_netns = args.tproxy_allow_root_netns;
-    return with_capture(listener, handoff, state, "TPROXY", async move {
-      arkham_tproxy::run_tproxy(capture, allow_root_netns)
-        .await
-        .map_err(eyre::Report::from)
-    })
-    .await;
-  }
+  let announce = || {
+    tracing::info!(
+      listen = %listen_addr,
+      handoff = %handoff_path.display(),
+      uid = handoff_uid,
+      grants = grant_count,
+      "serving"
+    );
+  };
   #[cfg(target_os = "linux")]
   if args.proxy_backend == ProxyBackend::Ebpf {
     let cgroup = args
@@ -248,13 +237,27 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
     let capture = std::sync::Arc::clone(&state);
     let bypass = args.ebpf_bypass.clone();
     let bypass_file = args.ebpf_bypass_file.clone();
-    return with_capture(listener, handoff, state, "eBPF", async move {
-      arkham_ebpf::run_ebpf(capture, cgroup, bypass, bypass_file)
-        .await
-        .map_err(eyre::Report::from)
-    })
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    return with_capture(
+      async move {
+        if ready_rx.await.is_err() {
+          // The capture task owns startup errors; with_capture reports its result.
+          return std::future::pending().await;
+        }
+        announce();
+        serve_explicit_and_handoff(listener, handoff, state).await;
+        Ok(())
+      },
+      "eBPF",
+      async move {
+        arkham_ebpf::run_ebpf(capture, cgroup, bypass, bypass_file, Some(ready_tx))
+          .await
+          .map_err(eyre::Report::from)
+      },
+    )
     .await;
   }
+  announce();
   serve_explicit_and_handoff(listener, handoff, state).await;
   Ok(())
 }
@@ -298,22 +301,21 @@ async fn serve_explicit_and_handoff(
 /// lives here, at process level, never inside the capture task: aborting the
 /// task is what runs its teardown, and every backend has host state to unwind.
 #[cfg(target_os = "linux")]
-async fn with_capture<F>(
-  listener: arkham_proxy::RamaTcpListener,
-  handoff: arkham_proxy::HandoffListener,
-  state: std::sync::Arc<arkham_proxy::ProxyState>,
-  name: &'static str,
-  capture: F,
-) -> eyre::Result<()>
+async fn with_capture<F, S>(service: S, name: &'static str, capture: F) -> eyre::Result<()>
 where
   F: Future<Output = eyre::Result<()>> + Send + 'static,
+  S: Future<Output = eyre::Result<()>>,
 {
   let mut handle = tokio::spawn(capture);
   tokio::select! {
-    () = serve_explicit_and_handoff(listener, handoff, state) => Ok(()),
+    biased;
     capture_result = &mut handle => match capture_result {
       Ok(inner) => inner.map_err(|err| eyre::eyre!("{name} capture failed: {err:?}")),
       Err(err) => Err(eyre::eyre!("{name} task failed: {err}")),
+    },
+    result = service => {
+      handle.abort();
+      result
     },
     _ = tokio::signal::ctrl_c() => {
       handle.abort();

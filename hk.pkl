@@ -71,7 +71,7 @@ local project_steps = new Mapping<String, Step> {
     // gate; unmaintained/yanked advisories stay warnings so the daily
     // advisory-db drift cannot flake pre-commit the way a red network
     // check would.
-    check = "cargo audit --file Cargo.lock"
+    check = "mise run audit"
   }
 
   ["betterleaks"] = new Step {

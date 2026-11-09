@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-#MISE description="Run the docker compose e2e scenarios per capture backend (tproxy, tun)"
+#MISE description="Run the docker compose e2e scenarios with eBPF capture"
 #MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "integration/**"]
 #MISE depends=["build:debug"]
 
@@ -12,8 +12,8 @@ set -euo pipefail
 python3 -m unittest discover -s integration/docker/amqp-witness -p 'test_*.py'
 
 if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
-  echo "skip: test:ssh needs a docker daemon"
-  exit 0
+  echo "test:ssh needs a docker daemon" >&2
+  exit 1
 fi
 
 # The demo values are throwaways; seed a local .env from the example so a
@@ -23,17 +23,11 @@ if [ ! -f integration/.env ] && [ -f integration/.env.example ]; then
   echo "seeded integration/.env from the example"
 fi
 if [ ! -f integration/.env ]; then
-  echo "skip: test:ssh needs integration/.env"
-  exit 0
+  echo "test:ssh needs integration/.env" >&2
+  exit 1
 fi
 bash integration/gen-nats.sh
 
-# eBPF is not here: it captures by cgroup membership and compose cannot pin
-# a service's cgroup path — `ARKHAM_BACKEND=ebpf mise run demo:bwrap` runs
-# the same scenarios over eBPF instead.
-backends=${ARKHAM_TEST_BACKENDS:-"tproxy tun"}
-# Compose interpolates these on every `up` and `down`. Export them for the
-# whole loop so a command that does not prefix them does not warn.
 HOST_UID="$(id -u)"
 HOST_GID="$(id -g)"
 export HOST_UID HOST_GID
@@ -163,7 +157,7 @@ EOF
     XDG_DATA_HOME="$isolate/xdg-data" \
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_CONFIG_SYSTEM=/dev/null \
-    integration/docker/arkham init --backend tun "$workspace"
+    integration/docker/arkham init --backend ebpf "$workspace"
 
   state_root=$isolate/xdg-state/arkham/ws
   grant_toml=$(find "$state_root" -path '*/grants/arkham.toml' -type f -print -quit)
@@ -258,13 +252,9 @@ EOF
   fi
 }
 
-for backend in $backends; do
-  echo "=== backend: $backend ==="
-  # A leftover stack holds an old CA while the rerun rotates the volume, and
-  # the first handshake fails on the mismatch; every round starts clean.
+  # Start clean so the stack and clients use the same CA.
   $compose down --remove-orphans -v --timeout 3
-  # The bind-mounted file survives `down`. A leftover from the previous
-  # backend, or from an earlier run, must not satisfy this round.
+  # The bind-mounted result survives `down` and must not satisfy this run.
   rm -f integration/out/results/covered.json
   # Create the bind mounts as this user. Docker would otherwise create a
   # missing path as root, and the later cleanup cannot remove it.
@@ -278,12 +268,12 @@ for backend in $backends; do
     [ -z "$svc" ] && continue
     services+=("$svc")
   done <<< "$service_list"
-  ARKHAM_BACKEND="$backend" $compose up -d --build "${services[@]}"
+  $compose up -d --build "${services[@]}"
   prepare_nats_discovery
   # Reload arkham so it reads the appended grant. --no-deps leaves the
   # exited certs container alone.
-  ARKHAM_BACKEND="$backend" $compose up -d --no-deps --force-recreate arkham
-  ARKHAM_BACKEND="$backend" NATS_DISCOVERED=1 $compose up -d --no-deps client
+  $compose up -d --no-deps --force-recreate arkham
+  NATS_DISCOVERED=1 $compose up -d --no-deps client
 
   # A failed one-shot leaves the client in `created`. Don't spend the
   # rest of the poll on a container that will never start.
@@ -342,15 +332,14 @@ for backend in $backends; do
   # failure step prints this file; compose down would otherwise erase it.
   if [ "$code" != 0 ]; then
     {
-      echo "=== compose logs (backend $backend, client exit $code) ==="
+      echo "=== compose logs (eBPF, client exit $code) ==="
       $compose logs --no-color || true
     } | tee -a /tmp/arkham-integration-compose.log
   fi
   $compose down --remove-orphans -v --timeout 3
   cleanup_nats_discovery
   if [ "$code" != 0 ]; then
-    echo "=== backend $backend FAILED (exit $code) ==="
+    echo "=== eBPF FAILED (exit $code) ==="
     exit "$code"
   fi
-  echo "=== backend $backend passed ==="
-done
+  echo "=== eBPF passed ==="

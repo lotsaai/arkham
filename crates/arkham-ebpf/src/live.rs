@@ -151,9 +151,11 @@ fn state_with(grants: Vec<Grant>, ca: &arkham_pki::ca::CertAuthority) -> Arc<Pro
   )
 }
 
-/// Start capture, move this process into its cgroup, and fail loudly if the
-/// attach never came up.
-async fn start_capture(
+/// Start capture and fail loudly if the attach never came up.
+///
+/// The process stays in its current cgroup. Callers that want this process
+/// captured move it themselves.
+async fn attach_capture(
   cgroup: &TestCgroup,
   state: Arc<ProxyState>,
   upstream_override: Option<SocketAddr>,
@@ -190,6 +192,18 @@ async fn start_capture(
       panic!("capture task not ready after 5s: {result:?}");
     }
   }
+  capture
+}
+
+/// Start capture and move this process into its cgroup.
+async fn start_capture(
+  cgroup: &TestCgroup,
+  state: Arc<ProxyState>,
+  upstream_override: Option<SocketAddr>,
+  bypass: Vec<(Ipv4Addr, u8)>,
+  bypass_file: Option<PathBuf>,
+) -> JoinHandle<Result<(), Error>> {
+  let capture = attach_capture(cgroup, state, upstream_override, bypass, bypass_file).await;
   cgroup.admit(std::process::id());
   capture
 }
@@ -213,14 +227,23 @@ async fn stop_capture(capture: JoinHandle<Result<(), Error>>) {
 /// remaps arkham's own dial to a loopback stub.
 #[tokio::test]
 #[ignore = "needs root (bpf syscall, cgroup writes)"]
-#[expect(clippy::too_many_lines, reason = "linear live-test script, split would obscure the flow")]
 async fn ebpf_live_tcp_mitm_substitutes() {
+  tcp_mitm(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))).await;
+}
+
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes)"]
+async fn ebpf_live_ipv6_tcp_mitm_substitutes() {
+  tcp_mitm("2001:db8::7".parse().unwrap()).await;
+}
+
+#[expect(clippy::too_many_lines, reason = "linear live-test script, split would obscure the flow")]
+async fn tcp_mitm(dst: std::net::IpAddr) {
   use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
   const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
   const SNI: &str = "testebpf.invalid";
-  const DST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
 
   let _live = LIVE_LOCK.lock().await;
 
@@ -297,7 +320,7 @@ async fn ebpf_live_tcp_mitm_substitutes() {
 
   let tcp = match tokio::time::timeout(
     Duration::from_secs(10),
-    tokio::net::TcpStream::connect(SocketAddr::from((DST, stub_port))),
+    tokio::net::TcpStream::connect(SocketAddr::new(dst, stub_port)),
   )
   .await
   {
@@ -342,6 +365,166 @@ async fn ebpf_live_tcp_mitm_substitutes() {
   stop_capture(capture).await;
 }
 
+fn cgroup_grant(port: u16, bundle: PathBuf) -> Grant {
+  Grant::Token {
+    credential: Credential {
+      label: "t".into(),
+      fake: "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+      value: secrecy::SecretString::from("ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    },
+    allow: vec![EndpointScope {
+      scheme: Scheme::Https,
+      host: "testcgroup.invalid".parse().unwrap(),
+      port,
+      client_cert: None,
+      client_key: None,
+      root_cert: Some(bundle),
+      guest_tls: arkham_config::grants::GuestTlsMode::Tls,
+    }],
+    pattern: None,
+    oauth2: None,
+  }
+}
+
+fn resolved_with(grants: Vec<Grant>) -> ResolvedConfig {
+  ResolvedConfig {
+    proxy: ProxyCfg {
+      listen: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+      handoff_socket: None,
+      handoff_uid: None,
+      ca_file: None,
+      ssh_host_key: None,
+      ssh_known_hosts: None,
+      root_certs: Vec::new(),
+      handshake_timeout_secs: 10,
+    },
+    grants,
+    plugins: Vec::new(),
+  }
+}
+
+/// One captured request. Returns the bearer token the stub observed.
+async fn captured_bearer(
+  connector: &tokio_rustls::TlsConnector,
+  stub: &TcpListener,
+  acceptor: &tokio_rustls::TlsAcceptor,
+  dst: SocketAddr,
+) -> String {
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+  // The proxy dials the stub only after it has read SNI, and the stub's TLS
+  // handshake has to run alongside the client's. Waiting for `accept` before
+  // the client writes ClientHello never reaches the dial.
+  let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(dst))
+    .await
+    .unwrap()
+    .unwrap();
+  let server_name = rustls::pki_types::ServerName::try_from("testcgroup.invalid").unwrap();
+  let (mut server, mut client) = tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::join!(
+      async {
+        let (conn, _) = stub.accept().await.unwrap();
+        acceptor.accept(conn).await.unwrap()
+      },
+      async { connector.connect(server_name, tcp).await.unwrap() },
+    )
+  })
+  .await
+  .unwrap();
+  client
+    .write_all(b"GET /x HTTP/1.1\r\nHost: testcgroup.invalid\r\nAuthorization: Bearer ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n")
+    .await
+    .unwrap();
+  let mut head = Vec::new();
+  let mut chunk = [0u8; 4096];
+  while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+    let n = server.read(&mut chunk).await.unwrap();
+    head.extend_from_slice(&chunk[..n]);
+  }
+  let head_str = String::from_utf8(head).unwrap();
+  let bearer = head_str
+    .split("Bearer ")
+    .nth(1)
+    .and_then(|rest| rest.split(['\r', ' ']).next())
+    .unwrap_or("")
+    .to_string();
+  let body = format!("echo:{bearer}");
+  server
+    .write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+    .await
+    .unwrap();
+  let _ = server.shutdown().await;
+  let mut resp = vec![0u8; 64];
+  let _ = client.read(&mut resp).await;
+  bearer
+}
+
+/// A registered cgroup substitutes. An unregistered cgroup of the same process
+/// splices the empty base snapshot, so the stub sees the fake.
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes)"]
+async fn ebpf_live_cgroup_selects_the_project() {
+  const VALUE: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const FAKE: &str = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const DST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 17);
+
+  let _live = LIVE_LOCK.lock().await;
+  arkham_pki::ca::install_crypto_provider();
+  let ca = arkham_pki::ca::CertAuthority::generate().unwrap();
+  let dir = tempfile::tempdir().unwrap();
+  let bundle = dir.path().join("arkham-ca.pem");
+  std::fs::write(&bundle, ca.cert_pem()).unwrap();
+  let ca_der = ca.cert_der().clone();
+  let stub_cert = arkham_pki::ca::generate_domain_cert("testcgroup.invalid", &ca).unwrap();
+  let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&stub_cert.server_config));
+  let stub = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await.unwrap();
+  let stub_port = stub.local_addr().unwrap().port();
+  let state = state_with(Vec::new(), &ca);
+  let home = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+  let home = home.lines().find_map(|line| line.strip_prefix("0::")).unwrap();
+  let home = std::path::Path::new("/sys/fs/cgroup").join(home.trim_start_matches('/'));
+  let parent = TestCgroup::create("cgroup-select");
+  let registered = parent.path().join("registered");
+  let other = parent.path().join("other");
+  std::fs::create_dir(&registered).unwrap();
+  std::fs::create_dir(&other).unwrap();
+  let registered_id = {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(&registered).unwrap().ino()
+  };
+  state
+    .register_project(registered_id, resolved_with(vec![cgroup_grant(stub_port, bundle)]), &ca)
+    .unwrap();
+
+  let capture = attach_capture(
+    &parent,
+    Arc::clone(&state),
+    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, stub_port))),
+    Vec::new(),
+    None,
+  )
+  .await;
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(ca_der).unwrap();
+  let connector = tokio_rustls::TlsConnector::from(Arc::new(
+    rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth(),
+  ));
+  let dst = SocketAddr::from((DST, stub_port));
+
+  std::fs::write(registered.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+  let saw = captured_bearer(&connector, &stub, &acceptor, dst).await;
+  assert_eq!(saw, VALUE);
+
+  std::fs::write(other.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+  let saw = captured_bearer(&connector, &stub, &acceptor, dst).await;
+  assert_eq!(saw, FAKE);
+
+  std::fs::write(home.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+  std::fs::remove_dir(&registered).unwrap();
+  std::fs::remove_dir(&other).unwrap();
+  stop_capture(capture).await;
+}
+
 /// Connected UDP is relayed both ways, and the reply the client observes must
 /// carry the *original* destination as its source.
 ///
@@ -352,8 +535,16 @@ async fn ebpf_live_tcp_mitm_substitutes() {
 #[tokio::test]
 #[ignore = "needs root (bpf syscall, cgroup writes)"]
 async fn ebpf_live_udp_relay_roundtrip() {
-  const DST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 8);
+  udp_roundtrip(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8))).await;
+}
 
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes)"]
+async fn ebpf_live_ipv6_udp_relay_roundtrip() {
+  udp_roundtrip("2001:db8::8".parse().unwrap()).await;
+}
+
+async fn udp_roundtrip(dst: std::net::IpAddr) {
   let _live = LIVE_LOCK.lock().await;
 
   arkham_pki::ca::install_crypto_provider();
@@ -366,12 +557,14 @@ async fn ebpf_live_udp_relay_roundtrip() {
     .unwrap();
   let stub_addr = stub.local_addr().unwrap();
   let stub_port = stub_addr.port();
+  let (observed_tx, mut observed_rx) = tokio::sync::mpsc::unbounded_channel();
   tokio::spawn(async move {
-    let mut buf = [0u8; 2048];
+    let mut buf = vec![0u8; 65_535];
     loop {
       let Ok((n, from)) = stub.recv_from(&mut buf).await else {
         return;
       };
+      let _ = observed_tx.send(buf[..n].to_vec());
       let mut reply = b"echo:".to_vec();
       reply.extend_from_slice(&buf[..n]);
       let _ = stub.send_to(&reply, from).await;
@@ -384,18 +577,85 @@ async fn ebpf_live_udp_relay_roundtrip() {
   // Connected socket: only `connect()`ed UDP is captured at all, so this is the
   // shape the backend supports. An unconnected `sendto` would never be
   // redirected, which is why DNS is documented as untouched.
-  let client = tokio::net::UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-    .await
-    .unwrap();
-  client.connect(SocketAddr::from((DST, stub_port))).await.unwrap();
+  let bind = if dst.is_ipv4() {
+    std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)
+  } else {
+    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+  };
+  let client = tokio::net::UdpSocket::bind((bind, 0)).await.unwrap();
+  let destination = SocketAddr::new(dst, stub_port);
+  client.connect(destination).await.unwrap();
 
   client.send(b"probe").await.unwrap();
   let mut reply = [0u8; 2048];
-  let n = tokio::time::timeout(Duration::from_secs(5), client.recv(&mut reply))
+  let (n, source) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut reply))
     .await
-    .expect("relay reply within 5s; a timeout here usually means recvmsg4 did not restore the source")
+    .expect("relay reply within 5s")
     .unwrap();
+  assert_eq!(source, destination);
   assert_eq!(&reply[..n], b"echo:probe");
+  assert_eq!(observed_rx.recv().await.unwrap(), b"probe");
+
+  // Neither socket can be serviced until this current-thread test yields.
+  let closed = std::net::UdpSocket::bind((bind, 0)).unwrap();
+  closed.connect(destination).unwrap();
+  let reused = closed.local_addr().unwrap();
+  closed.send(b"closed").unwrap();
+  drop(closed);
+  let replacement = std::net::UdpSocket::bind(reused).unwrap();
+  replacement.send_to(b"uncaptured", (bind, crate::UDP_LISTEN_PORT)).unwrap();
+  drop(replacement);
+  assert_eq!(
+    tokio::time::timeout(Duration::from_secs(5), observed_rx.recv())
+      .await
+      .unwrap()
+      .unwrap(),
+    b"closed"
+  );
+  tokio::time::timeout(Duration::from_millis(200), observed_rx.recv())
+    .await
+    .unwrap_err();
+
+  let large = std::net::UdpSocket::bind((bind, 0)).unwrap();
+  large.connect(destination).unwrap();
+  let boundary = vec![0x5a; 65_507];
+  large.send(&boundary).unwrap();
+  drop(large);
+  assert_eq!(
+    tokio::time::timeout(Duration::from_secs(5), observed_rx.recv())
+      .await
+      .unwrap()
+      .unwrap(),
+    boundary
+  );
+
+  let segmented = std::net::UdpSocket::bind((bind, 0)).unwrap();
+  segmented.connect(destination).unwrap();
+  let segment_size: libc::c_int = 400;
+  // SAFETY: the option points to a live integer and its exact length.
+  let result = unsafe {
+    use std::os::fd::AsRawFd as _;
+    libc::setsockopt(
+      segmented.as_raw_fd(),
+      libc::IPPROTO_UDP,
+      libc::UDP_SEGMENT,
+      (&raw const segment_size).cast(),
+      libc::socklen_t::try_from(std::mem::size_of_val(&segment_size)).unwrap(),
+    )
+  };
+  assert_eq!(result, 0, "UDP_SEGMENT: {}", std::io::Error::last_os_error());
+  let payload = [vec![1; 400], vec![2; 400], vec![3; 200]].concat();
+  segmented.send(&payload).unwrap();
+  drop(segmented);
+  for expected in [vec![1; 400], vec![2; 400], vec![3; 200]] {
+    assert_eq!(
+      tokio::time::timeout(Duration::from_secs(5), observed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap(),
+      expected
+    );
+  }
   stop_capture(capture).await;
 }
 
@@ -409,9 +669,19 @@ async fn ebpf_live_udp_relay_roundtrip() {
 #[tokio::test]
 #[ignore = "needs root (bpf syscall, cgroup writes)"]
 async fn ebpf_live_ungranted_tcp_splices_byte_identical() {
-  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+  tcp_splice(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), false).await;
+  tcp_splice(std::net::IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), true).await;
+}
 
-  const DST: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 9);
+#[tokio::test]
+#[ignore = "needs root (bpf syscall, cgroup writes)"]
+async fn ebpf_live_ipv6_ungranted_tcp_splices_byte_identical() {
+  tcp_splice("2001:db8::9".parse().unwrap(), false).await;
+  tcp_splice("2001:db8::9".parse().unwrap(), true).await;
+}
+
+async fn tcp_splice(dst: std::net::IpAddr, half_close: bool) {
+  use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
   const SENTINEL: &[u8] = b"plain-splice-sentinel";
 
   let _live = LIVE_LOCK.lock().await;
@@ -447,12 +717,15 @@ async fn ebpf_live_ungranted_tcp_splices_byte_identical() {
 
   let mut conn = tokio::time::timeout(
     Duration::from_secs(10),
-    tokio::net::TcpStream::connect(SocketAddr::from((DST, stub_port))),
+    tokio::net::TcpStream::connect(SocketAddr::new(dst, stub_port)),
   )
   .await
   .expect("captured connect within 10s")
   .expect("connect4 must have redirected this to arkham's listener");
   conn.write_all(SENTINEL).await.unwrap();
+  if half_close {
+    conn.shutdown().await.unwrap();
+  }
   let mut echoed = vec![0u8; SENTINEL.len()];
   let _ = tokio::time::timeout(Duration::from_secs(10), conn.read_exact(&mut echoed))
     .await

@@ -202,7 +202,7 @@ mod tests {
     let yaml = Stack {
       agent: agent_paths("/home/eng/github/arkham"),
       tool_mounts: mounts.clone(),
-      ..test_stack(ProxyBackend::Tproxy)
+      ..test_stack(ProxyBackend::Ebpf)
     }
     .render();
     assert!(

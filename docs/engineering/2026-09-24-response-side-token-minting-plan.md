@@ -119,7 +119,7 @@ Per repo conventions, no raw cargo.
 
 - `mise run format` green on every PR.
 - `mise run test` green on every PR; the new unit tests above ride the existing per-file `#[cfg(test)]` style, `snake_case` behavior-descriptive names.
-- PR2 additionally: run the closest end-to-end proof against a live backend, `mise run test:tun` / `test:tproxy` depending on what the fixture needs, and one manual scenario: stub token endpoint returns a real token, client holds a decoy, next request substitutes it back to real upstream. If the live backends are not available in the environment, the `MitmFixture` suite is the evidence and the limitation is stated.
+- PR2 additionally: run the closest end-to-end proof against the live eBPF backend with `mise run test:ebpf`, and one manual scenario: stub token endpoint returns a real token, client holds a decoy, next request substitutes it back to real upstream. If the live backend is not available, the `MitmFixture` suite is the evidence and the limitation is stated.
 
 ## Risks
 

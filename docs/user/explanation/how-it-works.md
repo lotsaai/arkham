@@ -14,7 +14,7 @@ Two capture paths feed the same machinery.
 
 **Explicit proxy.** The client points `HTTP(S)_PROXY` at arkham's listener. Every connection arrives labelled with its destination host and port.
 
-**Transparent capture (Linux).** `--proxy-backend` selects a backend. `tproxy` installs an `IP_TRANSPARENT` listener plus nftables rules and policy routes over netlink, so the kernel redirects every outbound TCP connection in the namespace to arkham; UDP passes through and QUIC on port 443 is dropped so HTTP/3 clients fall back to TCP. `tun` opens a TUN device and feeds it into a userspace stack (smoltcp, medium-ip, any-ip), with policy routes in a dedicated table pointing at the device, and handles UDP itself: DNS relayed to the system resolver, QUIC dropped, other flows relayed to their destination. `ebpf` attaches three programs to a cgroup over `bpf(2)` — a `connect4` hook that records the real destination in a map keyed by socket cookie and rewrites the address to arkham's loopback listener, an egress hook that indexes the redirected flow by its local 4-tuple so the accepted connection can be resolved back, and a `recvmsg4` hook that restores the original source on relayed UDP replies. No netfilter, no policy routes, no `IP_TRANSPARENT`; the attach handles belong to the process, so exit detaches the programs. All three are peers — same interception contract, different mechanism — and in all three the client configured nothing and cannot bypass the proxy. arkham keeps its own upstream dials out of its own capture: a fwmark for `tproxy` and `tun`, cgroup membership plus a PID comparison for `ebpf`.
+**Transparent capture (Linux).** `--proxy-backend ebpf` captures IPv4 and IPv6 TCP and connected UDP from the selected cgroup in arkham's network namespace. It restores the original source on UDP replies and removes closed-socket records. Hosts without IPv6 support run IPv4-only. Capture does not require client proxy settings, but has exclusions. The cgroup and a PID check exclude arkham's own upstream connections.
 
 Then, per connection:
 
@@ -35,7 +35,7 @@ Then, per connection:
 
 **Write-once state.** `ProxyState` is built once at startup behind an `Arc`; there is no reload. A `DashMap` holds `ServerConfig` for the Postgres, Redis, SMTP, LDAP, NATS, and AMQP transports, and the minted pairs. Per-connection work is a `tokio::spawn`, with a 10-second budget on pre-auth and dial phases.
 
-**Capture opts in at the CLI only.** Capture mutates host routes, and TPROXY also host nft rules. Reading it from a config file would make it ambient; arkham requires the explicit flag, binds its listener before touching the host, and tears the rules down on exit.
+**Capture opts in at the CLI only.** arkham requires an explicit flag to attach eBPF programs. It binds its listener before attaching them, and the programs detach on exit.
 
 ## Where the secrets live
 

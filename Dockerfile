@@ -6,12 +6,10 @@
 # dist tarball into a context that holds the binary at its root, so the default
 # is `.`.
 #
-# bare:libcxx-udev-ssl = Ubuntu chisel rootfs (glibc, libc++, libssl,
-# libudev, CA roots). No shell or package manager; policy routing goes
-# through netlink, not `ip`. libudev is a hard runtime dep of the binary
-# (hidapi in the fnox-core tree).
+# bare:libcxx-udev-ssl provides glibc, libc++, libssl, libudev and CA roots.
+# libudev is a hard runtime dependency (hidapi in the fnox-core tree).
 FROM ghcr.io/casualjim/bare:libcxx-udev-ssl
-# TPROXY needs root (netfilter rules, policy routing, SO_MARK); root is in the chisel passwd db.
+# eBPF capture needs root and BPF, PERFMON, and NET_ADMIN capabilities.
 # hadolint ignore=DL3002,DL3066
 USER root
 ARG BIN_DIR=.

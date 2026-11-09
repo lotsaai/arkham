@@ -1,11 +1,6 @@
-# Project-layer config for the transparent integration demo (loaded via
-# `arkham serve --proxy-backend tproxy --config`. The client shares arkham's network
-# namespace and holds only the deterministic fake printed by
-# `arkham fake GH_TOKEN`; capture is via TPROXY policy routing.
-#
-# The tcp:// grant host is the literal destination IP: captured raw TCP has no
-# SNI, the dst address is the identity (crates/arkham-tproxy/src/tproxy.rs tproxy_conn_task).
-# Hence the static api address in compose.yaml.
+# Project-layer config for the transparent integration demo. The client shares
+# arkham's network namespace and cgroup parent and holds only the fake token.
+# Captured raw TCP identifies its destination by IP, so the api address is static.
 [proxy]
 listen = "0.0.0.0:8080"
 ca_file = "/certs/ca.pem"

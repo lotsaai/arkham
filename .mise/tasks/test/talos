@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-#MISE description="Prove talosctl context switching through tun and tproxy against official Talos nodes"
+#MISE description="Prove talosctl context switching through eBPF against official Talos nodes"
 #MISE depends=["build:debug"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
@@ -9,8 +9,8 @@ cd "$proj_dir" || exit 1
 set -euo pipefail
 
 if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
-  echo "skip: test:talos needs a docker daemon"
-  exit 0
+  echo "test:talos needs a docker daemon" >&2
+  exit 1
 fi
 
 talos_version="${ARKHAM_TALOS_VERSION:-v1.14.4}"
@@ -26,6 +26,7 @@ scratch=$proj_dir/target/talos-e2e
 arkham=$proj_dir/target/debug/arkham
 talosctl=""
 state=""
+attempted_clusters=()
 
 cleanup() {
   local status=$?
@@ -41,8 +42,18 @@ cleanup() {
   fi
   docker rm -f "$proxy" >/dev/null 2>&1
   if [ -n "$talosctl" ] && [ -x "$talosctl" ] && [ -n "$state" ]; then
-    "$talosctl" cluster destroy --name "$prod_name" --state "$state" >/dev/null 2>&1
-    "$talosctl" cluster destroy --name "$staging_name" --state "$state" >/dev/null 2>&1
+    local name containers networks
+    for name in "${attempted_clusters[@]}"; do
+      if [ -d "$state/$name/$name" ]; then
+        "$talosctl" cluster destroy --name "$name" --state "$state/$name" || status=1
+      fi
+      containers=$(docker ps -aq --filter "label=talos.owned=true" --filter "label=talos.cluster.name=$name") || status=1
+      networks=$(docker network ls -q --filter "label=talos.owned=true" --filter "label=talos.cluster.name=$name") || status=1
+      if [ -n "$containers" ] || [ -n "$networks" ]; then
+        echo "cluster ${name} left Docker resources behind" >&2
+        status=1
+      fi
+    done
   fi
   exit "$status"
 }
@@ -71,9 +82,6 @@ curl -fsSL -o "$scratch/sha256sum.txt" "https://github.com/siderolabs/talos/rele
 )
 chmod +x "$talosctl"
 
-if [ ! -e /dev/net/tun ]; then
-  sudo modprobe tun
-fi
 
 context_name() {
   "$talosctl" --talosconfig "$1" config info | awk -F: 'tolower($1) ~ /context/ { gsub(/^[ \t]+/, "", $2); print $2; exit }'
@@ -99,36 +107,38 @@ create_cluster() {
   echo "creating ${name} on ${subnet}" >&2
   "$talosctl" cluster create docker \
     --name "$name" \
-    --state "$state" \
+    --state "$state/$name" \
     --workers 0 \
     --subnet "$subnet" \
     --cpus-controlplanes 1.0 \
     --memory-controlplanes 2.0GiB \
     --image "$image" \
-    --talosconfig-destination "$dest" >&2
+    --talosconfig-destination "$dest" >&2 || return
   local container ip network context
-  container=$(control_plane "$name")
+  container=$(control_plane "$name") || return
   if [ -z "$container" ]; then
     echo "no control plane container for ${name}" >&2
     exit 1
   fi
-  ip=$(node_ip "$container")
-  network=$(node_network "$container")
-  context=$(context_name "$dest")
+  ip=$(node_ip "$container") || return
+  network=$(node_network "$container") || return
+  context=$(context_name "$dest") || return
   if [ -z "$ip" ] || [ -z "$network" ] || [ -z "$context" ]; then
     echo "cluster ${name} has no node address, network, or context" >&2
     exit 1
   fi
-  "$talosctl" --talosconfig "$dest" config endpoint "$ip" >&2
-  "$talosctl" --talosconfig "$dest" config node "$ip" >&2
+  "$talosctl" --talosconfig "$dest" config endpoint "$ip" >&2 || return
+  "$talosctl" --talosconfig "$dest" config node "$ip" >&2 || return
   echo "real ${context} reaches ${ip} on ${network}" >&2
-  "$talosctl" --talosconfig "$dest" version >&2
+  "$talosctl" --talosconfig "$dest" version >&2 || return
   printf '%s %s %s\n' "$context" "$ip" "$network"
 }
 
 docker build -t "$arkham_image" -f "$proj_dir/Dockerfile" "$scratch/image"
 
+attempted_clusters+=("$prod_name")
 prod_line=$(create_cluster "$prod_name" "$prod_subnet" "$scratch/prod.yaml")
+attempted_clusters+=("$staging_name")
 staging_line=$(create_cluster "$staging_name" "$staging_subnet" "$scratch/staging.yaml")
 read -r prod_context prod_ip prod_net <<<"$prod_line"
 read -r staging_context staging_ip staging_net <<<"$staging_line"
@@ -147,7 +157,7 @@ env -u ARKHAM_CONFIG \
   GIT_CONFIG_GLOBAL=/dev/null \
   GIT_CONFIG_SYSTEM=/dev/null \
   FNOX_CONFIG_DIR="$scratch/fnox" \
-  "$arkham" init --backend tproxy "$scratch/workspace"
+  "$arkham" init --backend ebpf "$scratch/workspace"
 
 state_root=$scratch/xdg-state/arkham/ws
 grant_toml=$(find "$state_root" -path '*/grants/arkham.toml' -type f -print -quit)
@@ -199,7 +209,7 @@ fi
 run_guest() {
   local dir=$1
   shift
-  timeout -k 15 90 docker run --rm --network "container:${proxy}" \
+  timeout -k 15 90 docker run --rm --network "container:${proxy}" --cgroup-parent arkham-talos.slice \
     -v "${dir}:/work" \
     -v "${talosctl}:/talosctl:ro" \
     -e HOME=/work \
@@ -226,20 +236,20 @@ wait_serving() {
 }
 
 prove_backend() {
-  local backend=$1
+  local backend=ebpf
   echo "=== ${backend}: decoy through the proxy ==="
   docker rm -f "$proxy" >/dev/null 2>&1 || true
   docker run -d --name "$proxy" \
-    --cap-add NET_ADMIN \
-    --device /dev/net/tun \
+    --cap-add NET_ADMIN --cap-add BPF --cap-add PERFMON --cap-add SYS_PTRACE \
+    --pid host --cgroupns host --cgroup-parent arkham-talos.slice \
     --network "$prod_net" \
     -v "${grants_dir}:/arkham/grants:ro" \
     -v "${grant_toml}:/root/.config/arkham/config.toml:ro" \
     -v "${ca}:/certs/ca.pem:ro" \
     -e ARKHAM_CA_FILE=/certs/ca.pem \
-    -e RUST_LOG=info,arkham_proxy=debug,arkham_tproxy=debug \
+    -e RUST_LOG=info,arkham_proxy=debug,arkham_ebpf=debug \
     "$arkham_image" \
-    serve --proxy-backend "$backend"
+    serve --proxy-backend ebpf --ebpf-cgroup enclosing
   docker network connect "$staging_net" "$proxy"
   wait_serving
 
@@ -265,7 +275,6 @@ prove_backend() {
   docker rm -f "$proxy" >/dev/null
 }
 
-prove_backend tproxy
-prove_backend tun
+prove_backend
 
-echo "talosctl substitution proven: ${prod_context} and ${staging_context} on tproxy and tun"
+echo "talosctl substitution proven: ${prod_context} and ${staging_context} on eBPF"

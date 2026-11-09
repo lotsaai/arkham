@@ -92,6 +92,10 @@ pub(crate) struct Layout {
   home: String,
   /// The host home, when resolvable.
   host_home: Option<PathBuf>,
+  /// Directory rewritten files are written under. `None` uses the compose
+  /// state directory. Host sessions pass a scratch directory that is removed
+  /// when the session ends.
+  scratch: Option<PathBuf>,
 }
 
 /// Split a trailing `:ro` or `:rw` off an include entry; bare paths are rw.
@@ -115,7 +119,19 @@ impl Layout {
       root: root.to_path_buf(),
       home,
       host_home,
+      scratch: None,
     }
+  }
+
+  /// Write rewritten files under `scratch` instead of the compose state directory.
+  pub(crate) fn with_scratch(mut self, scratch: PathBuf) -> Self {
+    self.scratch = Some(scratch);
+    self
+  }
+
+  /// Directory material for this run lives in.
+  fn material_dir(&self) -> PathBuf {
+    self.scratch.clone().unwrap_or_else(|| self.state_dir())
   }
 
   /// The absolute workspace root.
@@ -140,12 +156,12 @@ impl Layout {
 
   /// State directory the rewritten files land in.
   pub(crate) fn files_dir(&self) -> PathBuf {
-    self.state_dir().join("files")
+    self.material_dir().join("files")
   }
 
   /// Guest pairs mint here; the adapters read them back for the decoy.
   pub(crate) fn guests_dir(&self) -> PathBuf {
-    self.state_dir().join("guests")
+    self.material_dir().join("guests")
   }
 
   /// Mounts for the workspace root and `[workspace] include`, deepest path
@@ -156,14 +172,22 @@ impl Layout {
   ///
   /// # Errors
   ///
-  /// Returns an error when an include names a path that does not exist.
+  /// Returns an error when an include names a path that does not exist, or
+  /// when that path is `/`, the home directory, or an ancestor of the
+  /// workspace or the home directory.
   pub(crate) fn include_mounts(&self, includes: &[PathBuf]) -> Result<Vec<Mount>, Error> {
+    let workspace = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+    let home = self.host_home.as_deref().and_then(|path| std::fs::canonicalize(path).ok());
     let mut entries = vec![(self.root.clone(), false)];
     for entry in includes {
       let (path, ro) = split_mode(entry);
       let host = expand(&path, &self.root, self.host_home.as_deref());
       if !host.exists() {
         return Err(Error::IncludeMissing { entry: entry.clone() });
+      }
+      let canonical = std::fs::canonicalize(&host)?;
+      if include_widens(&canonical, &workspace, home.as_deref()) {
+        return Err(Error::IncludeWidens { entry: entry.clone() });
       }
       entries.push((host, ro));
     }
@@ -280,6 +304,21 @@ impl Layout {
   }
 }
 
+/// Whether `include` would replace the sandbox root, the home directory, or
+/// an ancestor of either. `include`, `workspace`, and `home` are canonical.
+fn include_widens(include: &Path, workspace: &Path, home: Option<&Path>) -> bool {
+  if include == Path::new("/") {
+    return true;
+  }
+  if home.is_some_and(|home| include == home) {
+    return true;
+  }
+  if workspace.starts_with(include) && include != workspace {
+    return true;
+  }
+  home.is_some_and(|home| home.starts_with(include) && include != home)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -311,6 +350,39 @@ mod tests {
     let hosts: Vec<String> = kept.iter().map(|m| m.host.display().to_string()).collect();
     assert_eq!(hosts, vec!["/home/ivan/github", "/home/ivan/.config/mise", "/opt/data"], "{kept:?}");
     assert!(kept[1].ro, "the surviving mount keeps its own mode");
+  }
+
+  #[test]
+  fn an_include_of_root_home_or_an_ancestor_is_refused() {
+    let base = tempfile::tempdir().unwrap();
+    let base = base.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let root = base.join("mid").join("proj");
+    let sibling = base.join("mid").join("sibling");
+    let mise = home.join(".config").join("mise");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+    std::fs::create_dir_all(&mise).unwrap();
+    let layout = Layout::new(&root, "/home/eng".to_string(), Some(home.clone()));
+    for entry in [
+      PathBuf::from("/"),
+      PathBuf::from("~"),
+      PathBuf::from(".."),
+      PathBuf::from("../.."),
+      home.clone(),
+    ] {
+      let err = layout.include_mounts(std::slice::from_ref(&entry)).unwrap_err();
+      assert!(err.to_string().contains("widens"), "{entry:?}: {err}");
+    }
+    let link = root.join("escape");
+    std::os::unix::fs::symlink("/", &link).unwrap();
+    let err = layout.include_mounts(&[PathBuf::from("escape")]).unwrap_err();
+    assert!(err.to_string().contains("widens"), "{err}");
+    let mounts = layout
+      .include_mounts(&[PathBuf::from("../sibling"), PathBuf::from("~/.config/mise:ro")])
+      .unwrap();
+    assert!(mounts.iter().any(|mount| mount.host == sibling), "{mounts:?}");
+    assert!(mounts.iter().any(|mount| mount.host == mise && mount.ro), "{mounts:?}");
   }
 
   #[test]

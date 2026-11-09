@@ -1,3 +1,19 @@
+## [Unreleased]
+
+### Bug fixes
+
+- Hide configured CA bundles, keys, and visible aliases in Linux host sessions.
+- Require self-placement and daemon confirmation before an agent starts, without migrating foreign process IDs.
+- Reject non-Unicode agent environments without panicking or exposing their values.
+- Preserve write-half-closed TCP clients and route queued UDP datagrams with their original socket identity.
+- Keep IPv4 capture available when IPv6 is administratively disabled.
+- Apply file-only Landlock rights to the read-only profile's sink.
+- Preserve test build options and derive the daemon path from build metadata.
+- Isolate live capture fixtures from host firewall rules and routes.
+- Reject stale dependency-audit exceptions and remove the obsolete webpki-roots exception.
+- Temporarily accept RUSTSEC-2026-0459 until fnox's bundled SQLite/SQLCipher dependency chain is fixed.
+- Adapt the explicit listener to Rama's updated task-scope API.
+
 ## [0.3.37] - 2026-11-06
 
 ### 🚀 Features

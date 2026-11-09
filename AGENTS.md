@@ -17,21 +17,19 @@ Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates
 - **Proxy core**: `arkham-proxy`: owns `ProxyState`, `serve`, `serve_connect_stream` / `serve_transparent_stream`, `relay_guarded`, connection sniffing with SNI resolved through rama's ClientHello parser, and the substitution engines (`transports/http`, `transports/postgres`, `transports/redis`, `transports/smtp`, `transports/ldap`, `transports/nats`, `transports/amqp`, `transports/ssh`, `transports/tcp`, and the shared machine in `transports/engine`).
 - **Plugin host**: `arkham-plugin`: owns wasmtime component-model hosting of rewrite guests around the in-core value swap.
 - **Stack generation**: `arkham-compose`: owns compose/stack generation, path expansion, confinement entry, and ambient source adapters (git, jj, ssh, nats, kube, talos). The stack-command args (`Init`, `Up`, `Down`, `Logs`, `Agent`, `Fwd`) live here behind `arkham-config`'s `CliCommand` trait.
-- **Capture backends**: `arkham-tproxy`, `arkham-tun`, `arkham-ebpf` (userspace halves): own packet capture and hand accepted streams to the proxy core.
+- **Capture backend**: `arkham-ebpf` (userspace half) owns packet capture and hands accepted streams to the proxy core.
 - **BPF programs**: `arkham-ebpf-programs`: owns the no_std kernel-side eBPF programs and the shared map ABI.
 
 | Crate | Role | Dependencies Allowed |
 |---|---|---|
-| `arkham` (binary) | Face: CLI dispatch, `with_capture`, allocator | `arkham-config`, `arkham-fnox`, `arkham-pki`, `arkham-proxy`, `arkham-compose`, `arkham-tproxy`, `arkham-tun`, `arkham-ebpf`; external `clap`, `eyre`, `tokio`, `tracing` |
+| `arkham` (binary) | Face: CLI dispatch, `with_capture`, allocator | `arkham-config`, `arkham-fnox`, `arkham-pki`, `arkham-proxy`, `arkham-compose`, `arkham-ebpf`; external `clap`, `eyre`, `tokio`, `tracing` |
 | `arkham-config` | Config overlay, grants, registry, CLI types | No workspace crates; external `base62`, `base64`, `clap`, `code-workspace`, `confique`, `dirs`, `hex`, `jwt`, `nkeys`, `percent-encoding`, `secrecy`, `serde`, `serde_json`, `sha2`, `strum`, `toml`, `tracing`, `url`, `validator`, `thiserror` |
 | `arkham-fnox` | fnox discovery and value resolution | `arkham-config`; external `fnox-core`, `miette`, `secrecy`, `serde`, `tokio`, `toml`, `tracing`, `thiserror` |
 | `arkham-pki` | CA, leaf generation, SSH key helpers | No workspace crates; external `rama` (boring), `rcgen`, `rand`, `russh`, `rustls`, `time`, `tracing`, `thiserror` |
 | `arkham-proxy` | MITM relay and substitution engines | `arkham-config`, `arkham-pki`, `arkham-plugin`; external `amq-protocol`, `base64`, `bytes`, `fe2o3-amqp-types`, `rama`, `rasn`, `rasn-ldap`, `rustls`, `rustls-native-certs`, `tokio-rustls`, `httparse`, `httlib-hpack`, `nkeys`, `pgwire`, `russh`, `secrecy`, `serde_amqp`, `serde_json`, `smtp-proto`, `strum`, `url`, `tracing`, `thiserror` |
 | `arkham-plugin` | WASM rewrite-guest host | `arkham-config`; external `wasmtime`, `wasmtime-wasi`, `tracing`, `thiserror` |
-| `arkham-compose` | Stack generation and confinement | `arkham-config`, `arkham-fnox`, `arkham-pki`; external `base64`, `clap`, `dirs`, `gix-config`, `gix-discover`, `libc`, `regex`, `secrecy`, `serde`, `serde_yaml`, `shellexpand`, `toml`, `toml_edit`, `tracing`, `url`, `xpanda`, `tokio`, `thiserror` |
-| `arkham-tproxy` | Kernel TPROXY capture backend | `arkham-config`, `arkham-pki`, `arkham-proxy`; external `futures-util`, `libc`, `netlink-packet-core`, `netlink-packet-netfilter`, `netlink-sys`, `rama` (tcp), `rtnetlink`, `rustls`, `secrecy`, `tokio-rustls`, `tracing`, `thiserror` |
-| `arkham-tun` | Userspace TUN capture backend | `arkham-config`, `arkham-pki`, `arkham-proxy`; external `futures-sink`, `futures-util`, `rtnetlink`, `rustls`, `secrecy`, `smoltcp`, `socket2`, `tokio-rustls`, `tokio-util`, `tracing`, `tun`, `thiserror` |
-| `arkham-ebpf` | eBPF capture backend (userspace half) | `arkham-config`, `arkham-proxy`; external `aya`, `dashmap`, `libc`, `tokio`, `tracing`, `thiserror` (`aya-build` build-dep only) |
+| `arkham-compose` | Stack generation and confinement | `arkham-config`, `arkham-fnox`, `arkham-pki`; external `base64`, `clap`, `dirs`, `gix-config`, `gix-discover`, `landlock` (Linux only), `libc`, `regex`, `secrecy`, `serde`, `serde_yaml`, `shellexpand`, `toml`, `toml_edit`, `tracing`, `url`, `xpanda`, `tokio`, `thiserror` |
+| `arkham-ebpf` | eBPF capture backend (userspace half) | `arkham-config`, `arkham-proxy`; external `aya`, `dashmap`, `etherparse`, `libc`, `tokio`, `tracing`, `thiserror` (`aya-build` build-dep only) |
 | `arkham-ebpf-programs` | Kernel-side BPF programs | No workspace crates, no host crates; `aya-ebpf` only |
 
 ### Dependency Rules (STRICT)
@@ -44,7 +42,7 @@ Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates
 6. **`arkham-plugin` depends on `arkham-config` only.** The guest host reads grant and plugin records; it never imports proxy internals, PKI, fnox values, or compose.
 7. **`arkham-proxy` is the sole substitution owner.** Only `arkham-proxy` (`transports/*`, `relay`, `connection`) implements fake-to-real and real-to-fake swaps; backends and the face reuse `serve_transparent_stream` and never reimplement MITM logic.
 8. **`arkham-config` is the sole grant gate.** Only `arkham-config` (`grants/`) implements `EndpointScope` parsing / `uri_match` / `Grant::matches`; proxy, plugin, and backends call it and never reimplement host matching.
-9. **Capture backends depend on the proxy core, never the reverse.** `arkham-tproxy`, `arkham-tun`, `arkham-ebpf` may depend on `arkham-proxy` (plus `arkham-config`, and `arkham-pki` for tproxy/tun); `arkham-proxy` never imports a backend.
+9. **Capture depends on the proxy core, never the reverse.** `arkham-ebpf` may depend on `arkham-proxy` and `arkham-config`; `arkham-proxy` never imports the capture backend.
 10. **`arkham-compose` never touches the relay.** It may depend on `arkham-config`, `arkham-fnox`, `arkham-pki`; it never imports `arkham-proxy`, `arkham-plugin`, or any capture backend.
 11. **`arkham-ebpf-programs` is fully isolated.** It depends on `aya-ebpf` only, inherits no workspace lints, ships no host code, and every host-wide command excludes it (`--exclude arkham-ebpf-programs`); `dist = false` keeps it out of releases.
 12. **No workspace-hack crate.** This workspace deliberately has no `<name>-workspace-hack` crate; `[workspace.dependencies]` (one declaration per external dependency) is the version-dedup mechanism, and `cargo sort --grouped` keeps it ordered.
@@ -88,7 +86,7 @@ Banned domain vocabulary with required replacements: "birth"/"born" → "join"/"
 
 - Responsibility: clap parse (`ArkhamCli`, per-subcommand args), 4-layer config load dispatch, CA path resolution, `with_capture` fail-closed select over the explicit listener plus the selected capture backend.
 - Validation: none beyond what clap and `config::load` enforce; the face adds no second check.
-- Normalization: subcommand absent means `serve`; `--proxy-backend` / `--ebpf-cgroup` / `--tproxy-allow-root-netns` stay CLI/env-only by design and never enter files.
+- Normalization: subcommand absent means `serve`.
 - ❌ SIN: re-checking grant syntax, registry hosts, or fnox names at the face.
 
 ### Config and grants: the single semantic boundary
@@ -114,8 +112,8 @@ Banned domain vocabulary with required replacements: "birth"/"born" → "join"/"
 
 ### Capture and BPF: identity from the socket, bytes explicit
 
-- Responsibility: `tproxy` (IP_TRANSPARENT plus nft over netlink and policy routes), `tun` (TUN device plus userspace smoltcp stack, classify, tracker, UDP relay), `ebpf` (loader, map lookups, TCP MITM leg, UDP relay plus janitor) all treat the captured destination as the identity and hand streams to the proxy core. `arkham-ebpf-programs` owns `connect4`, `recvmsg4`, `capture_egress` and the `CONFIG` / `ORIG_DST` / `FLOW` maps.
-- Validation: exclusion by `SO_MARK` fwmark (`tproxy`, `tun`) or cgroup membership plus PID check (`ebpf`); QUIC :443 dropped, TUN DNS goes to the system resolver.
+- Responsibility: `ebpf` owns the loader, map lookups, TCP MITM leg, UDP relay and janitor. It treats the captured destination as the identity and hands streams to the proxy core. `arkham-ebpf-programs` owns the socket hooks and capture maps.
+- Validation: capture is scoped by cgroup membership with a PID check to exclude arkham's own connections.
 - Normalization: map structs (`Config`, `OrigDst`, `FlowKey`) are `repr(C)` with every byte explicit including padding; byte-order helpers (`decode_addr` / `encode_addr` / `decode_port`) are the only conversion path, pinned by layout tests.
 - ❌ SIN: a `repr(C)` struct with implicit padding, or a second address codec.
 
@@ -139,7 +137,7 @@ Subcommands are enum variants with args that own a `run` method — never separa
 - **Builders**: use `typed-builder` for non-trivial request/configuration types. No long constructor arg lists.
 - **Simplicity**: boring over clever; deletion over addition.
 - **Naming**: `UpperCamelCase` types and variants, `snake_case` fns/modules/variables, `SCREAMING_SNAKE_CASE` consts. CLI subcommands are kebab-case, TOML keys are snake_case, WIT worlds are `arkham:rewrite` `request` / `response`.
-- **Testing**: inline `#[cfg(test)] mod tests` per file over `cargo-nextest`; `tokio::test` for async; helpers co-located (`MitmFixture` in proxy, `make_tun` in tun, `lock_env` plus `tempdir` in config); `pretty_assertions` plus `tempfile` only. Behavior-descriptive `snake_case` names with no `test_` prefix; live capture tests are `tun_live_*` / `tproxy_live_*` / `ebpf_live_*`, `#[ignore]`d, root-only and serial.
+- **Testing**: inline `#[cfg(test)] mod tests` per file over `cargo-nextest`; `tokio::test` for async; helpers co-located (`MitmFixture` in proxy, `lock_env` plus `tempdir` in config); `pretty_assertions` plus `tempfile` only. Behavior-descriptive `snake_case` names with no `test_` prefix; live capture tests are `ebpf_live_*`, `#[ignore]`d, root-only and serial.
 
 ## Development Workflow (Mise)
 
@@ -154,7 +152,7 @@ Subcommands are enum variants with args that own a `run` method — never separa
 | `mise run test` | All tests (Rust `nextest`). |
 | `mise run --force test` | Force a fresh full test run (bypass cache). |
 
-Live and demo variants: `mise run test:tun`, `mise run test:tproxy`, `mise run test:ebpf` (root, serial, `#[ignore]`d live tests), `mise run test:rust` (unit plus plugin e2e via `build:plugins` and `ARKHAM_PLUGIN_FIXTURES`), `mise run demo` (docker compose substitution/splice proof). Start discovery with `mise tasks`; tasks are executable files under `.mise/tasks/`.
+Live and demo variants: `mise run test:ebpf` (root, serial, `#[ignore]`d live tests), `mise run test:rust` (unit plus plugin e2e via `build:plugins` and `ARKHAM_PLUGIN_FIXTURES`), `mise run demo` (docker compose substitution/splice proof). Start discovery with `mise tasks`; tasks are executable files under `.mise/tasks/`.
 
 **IMPORTANT**: After changes, **ALWAYS** run:
 1. `mise format` (invoke as `mise run format` in this repo)

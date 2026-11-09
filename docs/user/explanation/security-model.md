@@ -44,13 +44,11 @@ The grant list is the blast radius. `https://api.anthropic.com` means the real k
 | `*` as a grant host | Matches any destination. arkham warns at startup; the exposure is yours to accept. |
 | A non-loopback listen address | Anyone reaching the port triggers real-secret substitution. Warned at startup. |
 | CA key distribution | Whoever holds `ca.key` or `ca.pem` can mint leaf certificates and intercept granted traffic. Distribute `ca.crt` only. |
-| Compromised arkham process | It holds every real value and the CA. It runs as root with capture enabled, and with `CAP_NET_ADMIN` under TPROXY. Treat the arkham container as tier-zero; keep its mounts minimal. |
+| Compromised arkham process | It holds every real value and the CA. The Linux Compose proxy also has host PID visibility and `SYS_PTRACE` to validate socket ownership. Treat the arkham container as tier-zero; keep its mounts minimal. |
 | Workload trusts extra CAs | A workload with its own MITM proxy in front of arkham sees pre-substitution traffic only if it holds the real credential, which it does not; but it can still see decoy traffic and everything else in the namespace. |
-| QUIC to non-443 ports | Passes through unintercepted. Only `:443` QUIC is dropped. |
+| UDP | Connected UDP is relayed unchanged without substitution. Unconnected `sendto` traffic, including typical DNS, is not captured. |
 
-With `--proxy-backend tun`, UDP is not a pass-through: DNS is relayed to the system resolver and other non-443 UDP flows are relayed to their original destination from inside arkham, so the workload's UDP leaves from arkham's sockets.
-
-With `--proxy-backend ebpf`, connected UDP is relayed unchanged (no substitution), and unconnected `sendto` traffic such as typical DNS is not captured at all. Capture is scoped by cgroup membership rather than by network namespace, so a process that escapes the cgroup leaves the capture; arkham must be run outside that cgroup, which the PID check enforces a second time. The capability set is `CAP_BPF` + `CAP_NET_ADMIN` rather than the wider privileges `tun` needs.
+Capture is scoped by cgroup membership, so a process that escapes the cgroup leaves capture. Normally arkham runs outside that cgroup. With `--ebpf-cgroup enclosing`, the PID check excludes arkham's own connections.
 
 ## Fail-closed defaults
 

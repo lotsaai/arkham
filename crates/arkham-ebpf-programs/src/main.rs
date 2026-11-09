@@ -4,24 +4,20 @@
 //!
 //! Mechanism, per connection:
 //!
-//! 1. `connect4` fires on `connect()`. When the destination is not arkham's own
-//!    and not already loopback, the real destination is recorded under the
-//!    socket cookie and the destination rewritten to `127.0.0.1:<listener>`.
-//! 2. `capture_egress` fires as the redirected packet leaves the machine and
-//!    indexes the socket cookie by the client's local 4-tuple, which is what
-//!    arkham's listener later sees as its peer address.
-//! 3. `recvmsg4` rewrites the *source* address a connected UDP socket observes,
+//! 1. `connect4` and `connect6` record the destination under the socket cookie
+//!    and rewrite it to the corresponding loopback listener.
+//! 2. `capture_egress` indexes TCP by the client's local address and port.
+//!    For UDP it publishes each packet and its socket identity together.
+//! 3. `recvmsg4` and `recvmsg6` rewrite the *source* address a connected UDP socket observes,
 //!    so replies that physically come from arkham's listener still look like
 //!    they came from the address the client connected to.
+//! 4. `release_flow` deletes the maps when the socket closes. It looks the
+//!    4-tuple up by socket cookie, because this hook cannot read `src_port`.
 //!
 //! No netfilter, no policy routes, no `IP_TRANSPARENT`: the kernel's own socket
 //! address rewrite is the whole mechanism.
 //!
-//! Indexing lives in `capture_egress` rather than a `sock_ops` program because
-//! `bpf_sock_ops` has no UDP opcode — the kernel's `BPF_SOCK_OPS_*` enum
-//! contains only TCP callbacks, so connected UDP would never be indexed. Egress
-//! sees every protocol, and runs after the socket's source port has been
-//! autobound, which is exactly when the 4-tuple is final.
+//! Egress runs after the socket's source port has been autobound.
 
 #![no_std]
 #![no_main]
@@ -29,9 +25,9 @@
 use aya_ebpf::{
   EbpfContext as _,
   helpers::{bpf_get_current_cgroup_id, bpf_get_current_pid_tgid, bpf_get_netns_cookie, bpf_get_socket_cookie},
-  macros::{cgroup_skb, cgroup_sock_addr, map},
-  maps::{Array, LruHashMap},
-  programs::{SkBuffContext, SockAddrContext},
+  macros::{cgroup_skb, cgroup_sock, cgroup_sock_addr, map},
+  maps::{Array, LruHashMap, RingBuf},
+  programs::{SkBuffContext, SockAddrContext, SockContext},
 };
 
 /// Loader-provided configuration: map key 0.
@@ -50,9 +46,9 @@ pub struct Config {
   /// `bpf_get_current_cgroup_id` reports it. Zero means unknown, leaving the
   /// pid as the only guard.
   pub proxy_cgroup: u64,
-  /// Loopback port `connect4` rewrites TCP destinations to.
+  /// Loopback port the connect hooks rewrite TCP destinations to.
   pub tcp_port: u32,
-  /// Loopback port `connect4` rewrites UDP destinations to.
+  /// Loopback port the connect hooks rewrite UDP destinations to.
   pub udp_port: u32,
   /// Netns cookie of the loader's own network namespace, as
   /// `SO_NETNS_COOKIE` reports it. Connects from a different network
@@ -83,24 +79,29 @@ pub struct Config {
 /// verifier, where a variable-length map would cost a second lookup path.
 pub const MAX_BYPASS: usize = 8;
 
-/// Original destination recorded before the rewrite. Both fields keep the
-/// kernel's own encodings — `user_ip4` and `user_port` are network byte order —
-/// so `recvmsg4` can write them straight back into the context.
+/// Original destination recorded before the rewrite. Address fields retain
+/// the kernel's network byte order for the receive hooks.
 ///
-/// `proto` is followed by explicit padding rather than `repr(C)`'s implicit
-/// padding, so the bytes userspace reads are the bytes the kernel wrote.
+/// `cgroup_id` is sampled in `connect()`, which runs in the connecting task.
+/// `capture_egress` copies that field. A later packet, including a softirq
+/// retransmit, must not replace it with whichever task happens to be current.
+///
+/// All padding is explicit to keep the kernel and userspace map ABI identical.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct OrigDst {
-  /// Destination address, in the kernel's `user_ip4` encoding.
-  pub ip: u32,
+  /// Destination address, in the kernel's `user_ip4` or `user_ip6` encoding.
+  pub ip: [u32; 4],
   /// Destination port, network byte order in the low 16 bits.
   pub port: u32,
   /// `IPPROTO_TCP` or `IPPROTO_UDP`. Kept so userspace can reject a flow whose
   /// socket has been reused for the other protocol.
   pub proto: u8,
-  /// Padding, always zero.
-  pub _pad: [u8; 3],
+  /// Address family, followed by explicit padding.
+  pub family: u8,
+  pub _pad: [u8; 10],
+  /// Cgroup id of the connecting task, from `bpf_get_current_cgroup_id`.
+  pub cgroup_id: u64,
 }
 
 /// Flow key: the client's local 4-tuple, which is the peer address arkham's
@@ -120,12 +121,12 @@ pub struct OrigDst {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FlowKey {
-  /// Local address, in the kernel's `skc_rcv_saddr` encoding.
-  pub ip: u32,
+  /// Local address in the kernel's socket address encoding.
+  pub ip: [u32; 4],
   /// Local port, host byte order (the kernel reports it unswapped).
   pub port: u16,
-  /// Padding, always zero.
-  pub _pad: [u8; 2],
+  /// Socket address family.
+  pub family: u16,
 }
 
 /// `IPPROTO_TCP`.
@@ -134,6 +135,7 @@ const IPPROTO_TCP: u32 = 6;
 const IPPROTO_UDP: u32 = 17;
 /// `AF_INET`.
 const AF_INET: u32 = 2;
+const AF_INET6: u32 = 10;
 
 /// How many concurrent redirected sockets to remember.
 const MAX_ENTRIES: u32 = 16_384;
@@ -145,9 +147,119 @@ static CONFIG: Array<Config> = Array::with_max_entries(1, 0);
 #[map]
 static ORIG_DST: LruHashMap<u64, OrigDst> = LruHashMap::with_max_entries(MAX_ENTRIES, 0);
 
-/// client's local 4-tuple → cookie.
+/// Cookie plus the cgroup id of the process that connected.
+///
+/// Both fields are `u64`, so the layout has no padding. Userspace duplicates
+/// this struct; the two sides cannot share a type.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FlowRecord {
+  /// Socket cookie, the key into `ORIG_DST`.
+  pub cookie: u64,
+  /// `bpf_get_current_cgroup_id` for the connecting process.
+  pub cgroup_id: u64,
+}
+
+/// client's local 4-tuple → cookie and cgroup.
 #[map]
-static FLOW: LruHashMap<FlowKey, u64> = LruHashMap::with_max_entries(MAX_ENTRIES, 0);
+static FLOW: LruHashMap<FlowKey, FlowRecord> = LruHashMap::with_max_entries(MAX_ENTRIES, 0);
+
+/// cookie → the `FLOW` key, so `release_flow` can delete it.
+///
+/// `sock_release` may read the socket cookie and may not read `src_port`.
+/// The egress hook records the key under the cookie it already holds.
+#[map]
+static COOKIE_FLOW: LruHashMap<u64, FlowKey> = LruHashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UdpPacketHeader {
+  cookie: u64,
+  orig: OrigDst,
+  key: FlowKey,
+  packet_len: u32,
+  gso_size: u32,
+  _pad: [u8; 4],
+}
+
+const _: () = {
+  assert!(core::mem::size_of::<UdpPacketHeader>() == 80);
+  assert!(core::mem::offset_of!(UdpPacketHeader, orig) == 8);
+  assert!(core::mem::offset_of!(UdpPacketHeader, key) == 48);
+  assert!(core::mem::offset_of!(UdpPacketHeader, packet_len) == 68);
+  assert!(core::mem::offset_of!(UdpPacketHeader, gso_size) == 72);
+  assert!(core::mem::offset_of!(UdpPacketHeader, _pad) == 76);
+};
+
+#[map]
+static UDP_PACKETS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
+
+#[inline(always)]
+fn udp_packet<const SIZE: usize>(ctx: &SkBuffContext, header: &UdpPacketHeader) -> bool {
+  let Some(mut entry) = UDP_PACKETS.reserve_bytes(SIZE, 0) else {
+    return false;
+  };
+  let header_size = core::mem::size_of::<UdpPacketHeader>();
+  let Some(end) = header_size.checked_add(header.packet_len as usize) else {
+    entry.discard(0);
+    return false;
+  };
+  let Some(packet) = entry.get_mut(header_size..end) else {
+    entry.discard(0);
+    return false;
+  };
+  // SAFETY: packet is a reservation range of exactly packet_len bytes.
+  if unsafe { aya_ebpf::helpers::bpf_skb_load_bytes(ctx.as_ptr(), 0, packet.as_mut_ptr().cast(), header.packet_len) } != 0 {
+    entry.discard(0);
+    return false;
+  }
+  // SAFETY: the reservation is aligned and large enough for this initialized header.
+  unsafe { entry.as_mut_ptr().cast::<UdpPacketHeader>().write(*header) };
+  entry.submit(0);
+  true
+}
+
+#[inline(always)]
+fn emit_udp(ctx: &SkBuffContext, cookie: u64, orig: OrigDst, key: FlowKey) -> bool {
+  let packet_len = ctx.skb.len();
+  if packet_len == 0 {
+    return false;
+  }
+  // SAFETY: the kernel supplies a live skb context.
+  let gso_size = unsafe { (*ctx.skb.skb).gso_size };
+  let header = UdpPacketHeader {
+    cookie,
+    orig,
+    key,
+    packet_len,
+    gso_size,
+    _pad: [0; 4],
+  };
+  let len = packet_len as usize + core::mem::size_of::<UdpPacketHeader>();
+  if len <= 256 {
+    udp_packet::<256>(ctx, &header)
+  } else if len <= 512 {
+    udp_packet::<512>(ctx, &header)
+  } else if len <= 1024 {
+    udp_packet::<1024>(ctx, &header)
+  } else if len <= 2048 {
+    udp_packet::<2048>(ctx, &header)
+  } else if len <= 4096 {
+    udp_packet::<4096>(ctx, &header)
+  } else if len <= 8192 {
+    udp_packet::<8192>(ctx, &header)
+  } else if len <= 16384 {
+    udp_packet::<16384>(ctx, &header)
+  } else if len <= 32768 {
+    udp_packet::<32768>(ctx, &header)
+  } else if len <= 65536 {
+    udp_packet::<65536>(ctx, &header)
+  } else if len <= 131072 {
+    udp_packet::<131072>(ctx, &header)
+  } else {
+    false
+  }
+}
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -248,41 +360,56 @@ fn udp_port() -> Option<u32> {
 ///
 /// Returns 1 on every path: 1 is allow, 0 is deny, and this backend never
 /// denies — anything not redirected proceeds to its real destination.
-fn redirect(ctx: &SockAddrContext, listener_port: u32) -> i32 {
+// Specialize the family so LLVM keeps context accesses at verifier-approved constant offsets.
+fn redirect<const FAMILY: u32>(ctx: &SockAddrContext, listener_port: u32) -> i32 {
   let addr = ctx.sock_addr;
   // SAFETY: the kernel passes a valid, live `bpf_sock_addr` for this hook.
-  let (family, protocol, ip, port) = unsafe { ((*addr).user_family, (*addr).protocol, (*addr).user_ip4, (*addr).user_port) };
-  if family != AF_INET {
-    return 1; // IPv6 hook (`connect6`) not implemented; leave it alone.
-  }
-  // Loopback already means either an explicit local service or a previous
-  // rewrite; never redirect those, or arkham would capture its own listeners.
-  if is_loopback(ip) {
+  let (family, protocol, port) = unsafe { ((*addr).user_family, (*addr).protocol, (*addr).user_port) };
+  let ip = if FAMILY == AF_INET {
+    let ip = unsafe { (*addr).user_ip4 };
+    if is_loopback(ip) || is_bypassed(ip) {
+      return 1;
+    }
+    [ip, 0, 0, 0]
+  } else if FAMILY == AF_INET6 {
+    let ip = unsafe { (*addr).user_ip6 };
+    if ip == [0, 0, 0, u32::to_be(1)] {
+      return 1;
+    }
+    let [a, b, c, d] = ip;
+    if a == 0 && b == 0 && c == u32::to_be(0xffff) && (is_loopback(d) || is_bypassed(d)) {
+      return 1;
+    }
+    ip
+  } else {
     return 1;
-  }
-  // Bypassed destinations — the loader's own addresses, podman ranges, manual
-  // overrides — keep their own routing: rewriting an address this netns cannot
-  // reach would fake a handshake and then hang until the dial budget runs out.
-  if is_bypassed(ip) {
-    return 1;
-  }
+  };
   // SAFETY: `ctx.as_ptr()` is the context the kernel supplied to this hook.
   let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
   if cookie == 0 {
     return 1;
   }
+  // SAFETY: querying the current cgroup id has no preconditions. This hook
+  // runs in the connecting task, which is the id the project registry keys.
+  let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
   let orig = OrigDst {
     ip,
     port,
     proto: protocol as u8,
-    _pad: [0; 3],
+    family: family as u8,
+    _pad: [0; 10],
+    cgroup_id,
   };
   if ORIG_DST.insert(cookie, orig, 0).is_err() {
     return 1;
   }
   // SAFETY: as above; only the destination being rewritten.
   unsafe {
-    (*addr).user_ip4 = loopback_addr();
+    if FAMILY == AF_INET {
+      (*addr).user_ip4 = loopback_addr();
+    } else {
+      (*addr).user_ip6 = [0, 0, 0, u32::to_be(1)];
+    }
     (*addr).user_port = u16::to_be(listener_port as u16) as u32;
   }
   1
@@ -295,6 +422,16 @@ fn redirect(ctx: &SockAddrContext, listener_port: u32) -> i32 {
 /// protocols are allowed through untouched.
 #[cgroup_sock_addr(connect4)]
 pub fn connect4(ctx: SockAddrContext) -> i32 {
+  connect::<AF_INET>(ctx)
+}
+
+#[cgroup_sock_addr(connect6)]
+pub fn connect6(ctx: SockAddrContext) -> i32 {
+  connect::<AF_INET6>(ctx)
+}
+
+#[inline(always)]
+fn connect<const FAMILY: u32>(ctx: SockAddrContext) -> i32 {
   if is_proxy() {
     return 1;
   }
@@ -321,7 +458,7 @@ pub fn connect4(ctx: SockAddrContext) -> i32 {
     _ => None,
   };
   match listener {
-    Some(port) => redirect(&ctx, port),
+    Some(port) => redirect::<FAMILY>(&ctx, port),
     None => 1,
   }
 }
@@ -335,12 +472,28 @@ pub fn connect4(ctx: SockAddrContext) -> i32 {
 /// mismatched source.
 #[cgroup_sock_addr(recvmsg4)]
 pub fn recvmsg4(ctx: SockAddrContext) -> i32 {
+  recvmsg::<AF_INET>(ctx)
+}
+
+#[cgroup_sock_addr(recvmsg6)]
+pub fn recvmsg6(ctx: SockAddrContext) -> i32 {
+  recvmsg::<AF_INET6>(ctx)
+}
+
+#[inline(always)]
+fn recvmsg<const FAMILY: u32>(ctx: SockAddrContext) -> i32 {
   let addr = ctx.sock_addr;
   // SAFETY: the kernel supplies a live `bpf_sock_addr` for this hook.
-  let (family, ip) = unsafe { ((*addr).user_family, (*addr).user_ip4) };
-  // Only replies that physically came from our own loopback listener need
-  // rewriting; anything else already carries its true source.
-  if family != AF_INET || !is_loopback(ip) {
+  let loopback = unsafe {
+    if FAMILY == AF_INET {
+      is_loopback((*addr).user_ip4)
+    } else if FAMILY == AF_INET6 {
+      (*addr).user_ip6 == [0, 0, 0, u32::to_be(1)]
+    } else {
+      false
+    }
+  };
+  if !loopback {
     return 1;
   }
   // SAFETY: `ctx.as_ptr()` is the context the kernel supplied to this hook.
@@ -355,25 +508,36 @@ pub fn recvmsg4(ctx: SockAddrContext) -> i32 {
   };
   // SAFETY: as above; only the reported source is being restored.
   unsafe {
-    (*addr).user_ip4 = orig.ip;
+    if FAMILY == AF_INET {
+      let [ip, _, _, _] = orig.ip;
+      (*addr).user_ip4 = ip;
+    } else {
+      let [a, b, c, d] = orig.ip;
+      core::ptr::write_volatile(&raw mut (*addr).user_ip6[0], a);
+      core::ptr::write_volatile(&raw mut (*addr).user_ip6[1], b);
+      core::ptr::write_volatile(&raw mut (*addr).user_ip6[2], c);
+      core::ptr::write_volatile(&raw mut (*addr).user_ip6[3], d);
+    }
     (*addr).user_port = orig.port;
   }
   1
 }
 
-/// `capture_egress`: index the redirected flow by the client's local 4-tuple,
-/// so userspace can resolve an accepted connection back to its original
-/// destination.
+/// `capture_egress`: index TCP flows and publish UDP packets with their socket
+/// identity and original destination before the socket can close.
 ///
 /// Only flows that `connect4` actually redirected are recorded — hence the
-/// `ORIG_DST` presence check — so unconnected UDP (typical DNS) keeps its own
-/// addressing and is never touched.
+/// `ORIG_DST` lookup — so unconnected UDP (typical DNS) keeps its own
+/// addressing and is never touched. The cgroup id is copied from that record
+/// rather than sampled here: egress can run in softirq, where `current` is
+/// not the connecting task.
 #[cgroup_skb(egress)]
 pub fn capture_egress(ctx: SkBuffContext) -> i32 {
   if is_proxy() {
     return 1;
   }
-  if ctx.skb.family() != AF_INET {
+  let family = ctx.skb.family();
+  if family != AF_INET && family != AF_INET6 {
     return 1;
   }
   // SAFETY: `ctx.as_ptr()` is the context the kernel supplied to this hook.
@@ -381,17 +545,66 @@ pub fn capture_egress(ctx: SkBuffContext) -> i32 {
   if cookie == 0 {
     return 1;
   }
-  // SAFETY: the presence check only reads the entry; the cookie is not
-  // dereferenced and no mutable borrow escapes.
-  let redirected = unsafe { ORIG_DST.get(cookie) }.is_some();
-  if !redirected {
+  // SAFETY: the entry is copied out before use. The cgroup id inside it was
+  // stored by `connect4`, so this insert does not sample `current`.
+  let Some(orig) = (unsafe { ORIG_DST.get(cookie) }) else {
+    return 1;
+  };
+  let key = FlowKey {
+    ip: if family == AF_INET {
+      [unsafe { core::ptr::read_volatile(&raw const (*ctx.skb.skb).local_ip4) }, 0, 0, 0]
+    } else {
+      unsafe {
+        [
+          core::ptr::read_volatile(&raw const (*ctx.skb.skb).local_ip6[0]),
+          core::ptr::read_volatile(&raw const (*ctx.skb.skb).local_ip6[1]),
+          core::ptr::read_volatile(&raw const (*ctx.skb.skb).local_ip6[2]),
+          core::ptr::read_volatile(&raw const (*ctx.skb.skb).local_ip6[3]),
+        ]
+      }
+    },
+    port: ctx.skb.local_port() as u16,
+    family: family as u16,
+  };
+  if orig.proto == IPPROTO_UDP as u8 {
+    return i32::from(emit_udp(&ctx, cookie, *orig, key));
+  }
+  let _ = COOKIE_FLOW.insert(cookie, key, 0);
+  let _ = FLOW.insert(
+    key,
+    FlowRecord {
+      cookie,
+      cgroup_id: orig.cgroup_id,
+    },
+    0,
+  );
+  1
+}
+
+/// `release_flow`: drop the maps for a socket that is going away.
+///
+/// `FLOW` is keyed by the local 4-tuple and `ORIG_DST` by the socket cookie.
+/// Neither entry is useful after `close`, and a reused source port would
+/// otherwise be attributed to the cgroup that connected last time. Loopback
+/// connects never insert, so there is nothing for them to delete.
+#[cgroup_sock(sock_release)]
+pub fn release_flow(ctx: SockContext) -> i32 {
+  if is_proxy() {
     return 1;
   }
-  let key = FlowKey {
-    ip: ctx.skb.local_ipv4(),
-    port: ctx.skb.local_port() as u16,
-    _pad: [0; 2],
-  };
-  let _ = FLOW.insert(key, cookie, 0);
+  // SAFETY: `ctx.as_ptr()` is the context the kernel supplied to this hook.
+  let cookie = unsafe { bpf_get_socket_cookie(ctx.as_ptr()) };
+  if cookie == 0 {
+    return 1;
+  }
+  // SAFETY: the value is copied out before either map is updated.
+  if let Some(key) = unsafe { COOKIE_FLOW.get(cookie) }.copied() {
+    // SAFETY: the record is read before the map is modified.
+    if unsafe { FLOW.get(&key) }.is_some_and(|record| record.cookie == cookie) {
+      let _ = FLOW.remove(&key);
+    }
+  }
+  let _ = COOKIE_FLOW.remove(&cookie);
+  let _ = ORIG_DST.remove(&cookie);
   1
 }

@@ -587,12 +587,18 @@ pub fn load(cli: &Cli, proxy: Option<&<ProxyCfg as Config>::Layer>) -> Result<(A
   Ok((config, workspace))
 }
 
+/// Workspace root `code-workspace` resolves from `start`.
+#[must_use]
+pub fn workspace_root(start: &Path) -> Option<PathBuf> {
+  resolve_root(None, start).ok()
+}
+
 /// Locate the project-layer file: resolve the workspace root upward from
 /// `start`, then check the unified project config path with a legacy
 /// fallback.
 #[must_use]
 pub fn discover_project_config(start: &Path) -> Option<PathBuf> {
-  let root = resolve_root(None, start).ok()?;
+  let root = workspace_root(start)?;
   project_config_file(&root)
 }
 

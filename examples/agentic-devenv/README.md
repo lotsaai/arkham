@@ -8,7 +8,7 @@ The agent container holds decoy credentials and shares arkham's network namespac
 
 | Service | Job |
 | --- | --- |
-| `arkham` | Captures egress transparently (backend chosen by `arkham init --backend`, `ebpf` by default), terminates TLS on a grant match, swaps decoys for real values, redacts them back on the response. Holds the CA, and resolves real values from fnox itself. |
+| `arkham` | Captures egress transparently with eBPF, terminates TLS on a grant match, swaps decoys for real values, redacts them back on the response. Holds the CA, and resolves real values from fnox itself. |
 | `agent` | Runs the agent behind an entrypoint that trusts arkham's CA, which is all it takes to make a secure agent work. Holds decoys only. |
 
 ## Topology
@@ -36,7 +36,7 @@ From this directory:
 
 ```sh
 arkham rules            # preview what derives: fnox declarations ∩ registry, as [rules.*] blocks
-arkham init             # the stack, the CA, and the entrypoint (--backend ebpf by default)
+arkham init             # the stack, the CA, and the entrypoint
 arkham up               # start both services
 arkham logs -f          # the stack's logs, following
 arkham agent            # init, up, and a shell in the agent — one idempotent command

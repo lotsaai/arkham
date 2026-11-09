@@ -27,14 +27,18 @@ if [ ${#filters[@]} -eq 0 ]; then
   filters=(ebpf_live_)
 fi
 
+# Host firewall rules and routes must not affect the capture fixtures.
+runner=(unshare --net -- bash -c 'set -e; ip link set lo up; exec "$@"' bash
+  "$test_bin" --test-threads=1 --ignored "${filters[@]}")
+
 # Root is needed for bpf(2) and for creating a cgroup and writing to its
 # `cgroup.procs`.
 if [ "${usage_use_sudo:-false}" = "true" ]; then
-  sudo "$test_bin" --test-threads=1 --ignored "${filters[@]}"
+  sudo "${runner[@]}"
 else
   if ! gum confirm "eBPF tests need root (bpf syscall, cgroup writes); escalate with sudo?"; then
     echo "escalation declined; test binary: $test_bin" >&2
     exit 1
   fi
-  sudo "$test_bin" --test-threads=1 --ignored "${filters[@]}"
+  sudo "${runner[@]}"
 fi

@@ -1,5 +1,7 @@
 # Can `arkham-proxy` be reimplemented on `rama`
 
+This investigation records the repository state at the time it was written. The Linux TPROXY and TUN backends have since been removed.
+
 Date: 2026-09-18
 
 ## Question
