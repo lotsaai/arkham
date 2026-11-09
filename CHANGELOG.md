@@ -1,19 +1,47 @@
-## [Unreleased]
+## [0.3.38] - 2026-11-09
 
-### Bug fixes
+### 🚀 Features
 
-- Hide configured CA bundles, keys, and visible aliases in Linux host sessions.
-- Require self-placement and daemon confirmation before an agent starts, without migrating foreign process IDs.
-- Reject non-Unicode agent environments without panicking or exposing their values.
-- Preserve write-half-closed TCP clients and route queued UDP datagrams with their original socket identity.
-- Keep IPv4 capture available when IPv6 is administratively disabled.
-- Apply file-only Landlock rights to the read-only profile's sink.
-- Preserve test build options and derive the daemon path from build metadata.
-- Isolate live capture fixtures from host firewall rules and routes.
-- Reject stale dependency-audit exceptions and remove the obsolete webpki-roots exception.
-- Temporarily accept RUSTSEC-2026-0459 until fnox's bundled SQLite/SQLCipher dependency chain is fixed.
-- Adapt the explicit listener to Rama's updated task-scope API.
+- *(host)* Confine Linux agents through one shared daemon
 
+### 🐛 Bug Fixes
+
+- *(ebpf)* Record the connecting cgroup at connect time
+- *(host)* Run agents only under bubblewrap and name cgroup denials
+- *(host)* Build and test cleanly on macOS
+- *(host)* Close the remaining session confinement findings
+- *(host)* Close the sandbox capability, home, symlink, and flow findings
+- *(host)* Refuse to start when Landlock is not fully enforced
+- *(proxy)* Fill handoff fields on test ProxyCfg values
+- *(host)* Close the register leak, copy the agent env, and keep host /tmp private
+- *(host)* Canonicalize the workspace before project discovery
+- *(ci)* Install bpftool apart from the build packages
+- *(host)* Keep an unmarked directory as its own project
+- *(host)* Refuse widening includes, project include trees, and twin jj
+- *(host)* Discover projects by markers, not fnox files
+- *(host)* Run a home session in the private tmpfs
+- *(host)* Hide other session cgroups from the sandbox
+- *(host)* Harden session activation and captured flow lifetimes
+- *(ci)* Expire stale dependency audit exceptions
+- *(proxy)* Adapt listener to updated Rama scope
+
+### 📚 Documentation
+
+- Diagram the Linux host mode
+
+### 🚜 Refactor
+
+- *(host)* Read the daemon uid through rustix
+
+### 🧪 Testing
+
+- *(host)* Require a symlink workspace to enlist its target
+- *(host)* Require safe includes, projected include trees, and a jj twin
+- *(host)* Require the sandbox to hide other session cgroups
+
+### ⚙️ Miscellaneous Tasks
+
+- Give the Linux job a delegated cgroup and user namespaces
 ## [0.3.37] - 2026-11-06
 
 ### 🚀 Features
@@ -51,6 +79,8 @@
 - *(macos)* Scope the job to crates that build on macOS; spec the daemon and invariants
 - *(cursor)* Add verify-arkham and formal-verify-grant-host skills
 - *(cursor)* Drop verify-arkham tutorial run artifacts and ignore them
+- Update changelog for v0.3.37 [ci skip]
+- Release
 ## [0.3.36] - 2026-11-05
 
 ### 🐛 Bug Fixes
