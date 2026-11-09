@@ -10,10 +10,10 @@ use std::time::Duration;
 use rama::Service;
 use rama::crypto::pki_types::CertificateDer;
 use rama::error::BoxError;
+use rama::graceful::WeakScope;
 use rama::net::address::SocketAddress;
 use rama::net::socket::SocketOptions;
 use rama::net::socket::opts::Domain;
-use rama::rt::Executor;
 pub use rama::tcp::server::TcpListener as RamaTcpListener;
 use rama::tcp::stream::TcpStream as RamaTcpStream;
 use rama::tls::boring::core::x509::store::{X509Store, X509StoreBuilder};
@@ -215,7 +215,7 @@ impl ProxyState {
 pub(crate) fn into_box_error(err: &impl Debug) -> BoxError {
   BoxError::from(format!("{err:?}"))
 }
-/// Serve the explicit listener until its executor shuts down. Accept errors
+/// Serve the explicit listener until the serving future is cancelled. Accept errors
 /// are logged by the listener loop and never end the process.
 pub async fn serve(listener: RamaTcpListener, state: Arc<ProxyState>) {
   listener.serve(ExplicitService { state }).await;
@@ -238,7 +238,7 @@ pub async fn bind_explicit(addr: SocketAddr) -> Result<RamaTcpListener, Error> {
   .try_build_socket(domain)
   .map_err(|err| Error::ListenSocket { source: err.into() })?;
   socket.listen(128).map_err(|err| Error::Listen { source: err.into() })?;
-  RamaTcpListener::bind_socket(socket, Executor::default())
+  RamaTcpListener::bind_socket(socket, WeakScope::detached())
     .await
     .map_err(|err| Error::Bind { source: err })
 }

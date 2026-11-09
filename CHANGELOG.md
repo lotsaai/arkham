@@ -12,6 +12,7 @@
 - Isolate live capture fixtures from host firewall rules and routes.
 - Reject stale dependency-audit exceptions and remove the obsolete webpki-roots exception.
 - Temporarily accept RUSTSEC-2026-0459 until fnox's bundled SQLite/SQLCipher dependency chain is fixed.
+- Adapt the explicit listener to Rama's updated task-scope API.
 
 ## [0.3.37] - 2026-11-06
 
