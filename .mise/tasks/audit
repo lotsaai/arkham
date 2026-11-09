@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+
+#MISE description="Audit dependencies and reject stale advisory ignores"
+
+set -euo pipefail
+
+proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
+cd "$proj_dir"
+
+ignored=$(taplo get --file-path .cargo/audit.toml --output-format json advisories.ignore)
+audit_status=0
+cargo audit --file Cargo.lock || audit_status=$?
+
+mkdir -p .cache
+audit_dir=$(mktemp -d "$proj_dir/.cache/audit.XXXXXXXX")
+trap 'rm -rf -- "$audit_dir"' EXIT
+
+# cargo-audit omits ignored advisories from JSON; shadow its config for the rescan.
+mkdir "$audit_dir/.cargo"
+printf '[advisories]\nignore = []\n' > "$audit_dir/.cargo/audit.toml"
+scan_status=0
+(
+  cd "$audit_dir"
+  cargo audit --file "$proj_dir/Cargo.lock" --json --no-fetch --no-yanked
+) > "$audit_dir/report.json" || scan_status=$?
+if (( scan_status > 1 )); then
+  exit "$scan_status"
+fi
+
+stale=$(jq -ce --argjson ignored "$ignored" '
+  if .settings.ignore != [] then error("unfiltered audit contains ignores") else . end
+  | [.vulnerabilities.list[].advisory.id,
+     (.warnings[][] | .advisory | select(. != null) | .id)] as $matched
+  | ($ignored - $matched) | sort | unique
+' "$audit_dir/report.json")
+if [[ "$stale" != '[]' ]]; then
+  printf 'Stale audit ignores (remove from .cargo/audit.toml): %s\n' "$stale" >&2
+  exit 1
+fi
+
+exit "$audit_status"
