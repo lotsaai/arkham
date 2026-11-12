@@ -13,9 +13,10 @@ base64 = { workspace = true }
 clap = { workspace = true }
 code-workspace = { workspace = true }
 confique = { workspace = true }
+# nkeys disables default features; retain accelerated Ed25519 operations.
+curve25519-dalek = { workspace = true }
 dirs = { workspace = true }
 hex = { workspace = true }
-jwt = { workspace = true }
 nkeys = { workspace = true }
 percent-encoding = { workspace = true }
 secrecy = { workspace = true }

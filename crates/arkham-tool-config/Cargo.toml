@@ -1,0 +1,20 @@
+[package]
+name = "arkham-tool-config"
+version = "0.3.37"
+edition = "2024"
+description = "Shared tool configuration adaptation contracts"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-paths = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

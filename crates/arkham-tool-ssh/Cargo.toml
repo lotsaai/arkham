@@ -1,0 +1,23 @@
+[package]
+name = "arkham-tool-ssh"
+version = "0.3.37"
+edition = "2024"
+description = "SSH configuration adaptation"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-paths = { workspace = true }
+arkham-pki = { workspace = true }
+arkham-tool-config = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

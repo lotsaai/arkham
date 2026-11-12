@@ -1,0 +1,27 @@
+[package]
+name = "arkham-agent"
+version = "0.3.37"
+edition = "2024"
+description = "grant-scoped MITM proxy: host agent wrapper"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-paths = { workspace = true }
+arkham-sandbox = { workspace = true }
+arkham-session-protocol = { workspace = true }
+clap = { workspace = true }
+rustix = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+arkham-workspace = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

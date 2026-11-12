@@ -29,7 +29,7 @@ pub(crate) fn cached_leaf(
   sni: &str,
   alpn: Option<&[u8]>,
 ) -> Result<Arc<ServerConfig>, Error> {
-  let offered = alpn.map(|bytes| bytes.escape_ascii().to_string()).unwrap_or_default();
+  let offered = alpn.map_or_default(|bytes| bytes.escape_ascii().to_string());
   let key = format!("t\0{offered}\0{sni}");
   if let Some(config) = leaves.get(&key) {
     return Ok(config.clone());
@@ -56,7 +56,7 @@ pub(crate) fn cached_leaf_mtls(
   sni: &str,
   alpn: Option<&[u8]>,
 ) -> Result<Arc<ServerConfig>, Error> {
-  let offered = alpn.map(|bytes| bytes.escape_ascii().to_string()).unwrap_or_default();
+  let offered = alpn.map_or_default(|bytes| bytes.escape_ascii().to_string());
   let key = format!("m\0{offered}\0{sni}");
   if let Some(config) = leaves.get(&key) {
     return Ok(config.clone());

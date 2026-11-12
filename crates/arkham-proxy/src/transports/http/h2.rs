@@ -309,7 +309,7 @@ impl H2 {
     let stream_id = u32::from_be_bytes([raw[5], raw[6], raw[7], raw[8]]) & 0x7fff_ffff;
     let payload = &raw[9..];
     if self.block.is_some() && kind != F_CONTINUATION {
-      let mut emit = self.block.take().map(|block| block.raw).unwrap_or_default();
+      let mut emit = self.block.take().map_or_default(|block| block.raw);
       emit.extend_from_slice(raw);
       return Err(emit);
     }
@@ -402,7 +402,7 @@ impl H2 {
     // Prepend the hold-back so cross-frame split secrets substitute whole;
     // hold the overlap window for the next frame (bounded by tail_size).
     // Padding is dropped and the length rewritten — always legal framing.
-    let held_tail = self.data_tails.get_mut(&stream_id).map(std::mem::take).unwrap_or_default();
+    let held_tail = self.data_tails.get_mut(&stream_id).map_or_default(std::mem::take);
     let mut combined = held_tail;
     combined.extend_from_slice(data);
     let hold = if end_stream {

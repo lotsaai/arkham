@@ -1,0 +1,25 @@
+[package]
+name = "arkham-tool-git"
+version = "0.3.37"
+edition = "2024"
+description = "Git configuration adaptation for arkham"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-git-config = { workspace = true }
+arkham-paths = { workspace = true }
+arkham-pki = { workspace = true }
+arkham-tool-config = { workspace = true }
+gix-config = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
