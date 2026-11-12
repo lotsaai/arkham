@@ -5,11 +5,8 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::env;
 use std::path::{Path, PathBuf};
 
-use arkham_config::config::WorkspaceBuild;
-use arkham_config::config::user_config_dirs;
 use arkham_config::config::{HostTlsCfg, RuleCfg};
 use arkham_config::grants::GuestTlsMode;
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
@@ -17,70 +14,6 @@ use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use crate::error::Error;
 use crate::paths::{Mount, covering, expand, translate};
 use crate::workspace::Workspace;
-
-/// Container path both services mount the runtime bypass file at: the agent
-/// entrypoint rewrites it from `podman network inspect`, and arkham's eBPF
-/// loader reloads it live into the programs' bypass list. The host side is
-/// `<workspace-state>/ebpf-bypass`, created at generation and never
-/// overwritten — the agent owns its contents at runtime.
-pub(crate) const BYPASS_CONTAINER_PATH: &str = "/arkham/ebpf-bypass";
-
-/// What the arkham service mounts and forwards so the container's fnox resolves
-/// what the host's does: its config directory (identity, providers, config),
-/// arkham's own fnox level.
-#[derive(Default)]
-pub(crate) struct FnoxBinds {
-  pub(crate) mounts: Vec<Mount>,
-}
-
-impl FnoxBinds {
-  /// Bind mounts for the fnox and arkham config levels that exist on the
-  /// host. Every mount is conditional on the host path existing: docker turns
-  /// a bind of a missing path into a directory, which is never what we want.
-  /// Container paths are what fnox and arkham look at inside, where the home
-  /// is `/root`.
-  pub(crate) fn resolve(fnox_dir: Option<&Path>, config_dir: Option<&Path>) -> Self {
-    let mut binds = Self { mounts: Vec::new() };
-    if let Some(dir) = fnox_dir.filter(|dir| dir.is_dir()) {
-      binds.mounts.push(Mount {
-        host: dir.to_path_buf(),
-        container: PathBuf::from("/root/.config/fnox"),
-        ro: true,
-      });
-    }
-    let mut levels = config_dir
-      .and_then(|dir| std::fs::read_dir(dir).ok())
-      .into_iter()
-      .flatten()
-      .flatten()
-      .map(|entry| entry.path())
-      .filter(|path| {
-        path.is_file()
-          && path.file_name().is_some_and(|name| {
-            let name = name.to_string_lossy();
-            name.starts_with("fnox") && name.ends_with(".toml")
-          })
-      })
-      .collect::<Vec<_>>();
-    levels.sort();
-    for path in levels {
-      binds.mounts.push(Mount {
-        container: Path::new("/root/.config/arkham").join(path.file_name().unwrap_or_default()),
-        host: path,
-        ro: true,
-      });
-    }
-    let rules_d = config_dir.map(|dir| dir.join("rules.d")).filter(|dir| dir.is_dir());
-    if let Some(dir) = rules_d {
-      binds.mounts.push(Mount {
-        host: dir,
-        container: PathBuf::from("/root/.config/arkham/rules.d"),
-        ro: true,
-      });
-    }
-    binds
-  }
-}
 
 /// Resolved mount context for one generation run: the workspace root, the
 /// container home, and the host home. Mount resolution reads through this
@@ -204,30 +137,6 @@ impl Layout {
     ))
   }
 
-  /// Resolve `[workspace.build]` to absolute host paths for compose, failing
-  /// loudly on a missing dockerfile or context: compose would fail without
-  /// naming the setting.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error when the dockerfile is not a file or the context is
-  /// not a directory.
-  pub(crate) fn resolve_build(&self, build: &WorkspaceBuild) -> Result<(PathBuf, PathBuf), Error> {
-    let dockerfile = expand(&build.dockerfile, &self.root, self.host_home.as_deref());
-    if !dockerfile.is_file() {
-      return Err(Error::BuildDockerfileMissing {
-        path: build.dockerfile.clone(),
-      });
-    }
-    let context = expand(&build.context, &self.root, self.host_home.as_deref());
-    if !context.is_dir() {
-      return Err(Error::BuildContextMissing {
-        path: build.context.clone(),
-      });
-    }
-    Ok((context, dockerfile))
-  }
-
   /// The agent-side mounts carrying each mtls rule's guest identity: one pair
   /// minted per rule (`<guests-dir>/<label>.pem` plus `.key`,
   /// load-or-generate), mounted read-only at the container paths the rule's
@@ -273,34 +182,6 @@ impl Layout {
       }
     }
     Ok(mounts)
-  }
-
-  /// The shared bypass-file mount for ebpf stacks, rendered into both
-  /// services: the agent entrypoint writes it, arkham only reads, and one
-  /// read-write entry serves both because the `mounts` vec renders as-is in
-  /// each service.
-  pub(crate) fn bypass_mount(&self) -> Mount {
-    Mount {
-      host: self.state_dir().join("ebpf-bypass"),
-      container: PathBuf::from(BYPASS_CONTAINER_PATH),
-      ro: false,
-    }
-  }
-
-  /// The fnox config directory fnox itself resolves: `FNOX_CONFIG_DIR`, else
-  /// the first existing `<config-dir>/fnox` (on macOS
-  /// `~/.config` is checked too).
-  pub(crate) fn fnox_config_dir(&self) -> Option<PathBuf> {
-    if let Some(dir) = env::var_os("FNOX_CONFIG_DIR") {
-      return Some(PathBuf::from(dir));
-    }
-    let candidates: Vec<PathBuf> = user_config_dirs().into_iter().map(|dir| dir.join("fnox")).collect();
-    candidates
-      .iter()
-      .find(|dir| dir.exists())
-      .or(candidates.first())
-      .cloned()
-      .or_else(|| self.host_home.as_deref().map(|home| home.join(".config").join("fnox")))
   }
 }
 

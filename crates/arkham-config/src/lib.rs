@@ -14,9 +14,7 @@ pub mod import;
 pub mod plugins;
 pub mod registry;
 pub use config::{AppConfig, ProxyCfg, RuleCfg, fake_for, load};
-pub use confine::{
-  FsPolicy, Isolate, WriteProfile, choose_runner, fs_policy, is_fnox_config_name, is_fnox_config_path, require_loopback_listen,
-};
+pub use confine::{FsPolicy, WriteProfile, choose_runner, fs_policy, is_fnox_config_name, is_fnox_config_path, require_loopback_listen};
 pub use error::Error;
 pub use grants::{
   Credential, EndpointScope, Grant, HostPat, PostgresLeg, PostgresScope, ResolvedConfig, Scheme, SslMode, SslNegotiation, decoy_for_rule,

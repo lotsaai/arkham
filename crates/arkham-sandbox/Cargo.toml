@@ -1,5 +1,5 @@
 [package]
-name = "arkham-compose"
+name = "arkham-sandbox"
 version = "0.3.37"
 edition = "2024"
 description = "grant-scoped MITM proxy: workspace confinement and compose generation"

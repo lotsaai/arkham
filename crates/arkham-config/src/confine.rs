@@ -11,19 +11,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
-/// How `arkham agent` confines the command.
-///
-/// `compose` is the default. `bwrap` is the Linux host backend. Landlock can
-/// add restrictions inside bubblewrap. It is not a runner and not a flag.
-#[derive(ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Isolate {
-  /// The compose stack.
-  #[default]
-  Compose,
-  /// The Linux host backend.
-  Bwrap,
-}
-
 /// Filesystem write profile. Orthogonal to secret projection: decoy env,
 /// forged secret files, and capture still apply when the profile is
 /// [`WriteProfile::DangerFullAccess`].

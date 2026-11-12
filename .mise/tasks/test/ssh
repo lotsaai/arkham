@@ -87,15 +87,11 @@ nats_client_log_hides_real_material() {
   done < <(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' "$client")
 }
 
-# Host ~/.config/nats discovery. The caller has already run certs to
-# completion. Copy that CA, then `arkham init` in an empty workspace. That
-# reads the context (no project [rules.nats_*], no fnox key) and writes the
-# generated grant. The guest tree is the decoy mount. The grant file, which
-# states the real seed, is appended to the global config. The caller must
-# not start certs again: gen-secrets.sh truncates that file.
+# Prepare discovery through the host session pipeline. Compose provisions
+# protocol servers only; it does not generate the agent environment.
 prepare_nats_discovery() {
   local real_seed home isolate workspace certs_cid status code
-  local state_root grant_toml compose_file env_name label dest rel host rest container
+  local state_root grant_toml plan_file env_name label dest
   real_seed=$(nats_env_value NATS_NKEY_REAL_SEED)
   if [ -z "$real_seed" ]; then
     echo "missing NATS_NKEY_REAL_SEED in integration/out/nats/nats.env"
@@ -149,7 +145,7 @@ prepare_nats_discovery() {
 }
 EOF
 
-  echo "=== nats discovery: arkham init ==="
+  echo "=== nats discovery: host session preparation ==="
   env -u ARKHAM_CONFIG -u KUBECONFIG -u TALOSCONFIG \
     HOME="$home" \
     XDG_CONFIG_HOME="$isolate/xdg-config" \
@@ -157,13 +153,13 @@ EOF
     XDG_DATA_HOME="$isolate/xdg-data" \
     GIT_CONFIG_GLOBAL=/dev/null \
     GIT_CONFIG_SYSTEM=/dev/null \
-    integration/docker/arkham init --backend ebpf "$workspace"
+    target/debug/examples/prepare-session "$workspace" "$isolate/session" "$home/.config/nats/ca.crt"
 
-  state_root=$isolate/xdg-state/arkham/ws
-  grant_toml=$(find "$state_root" -path '*/grants/arkham.toml' -type f -print -quit)
-  compose_file=$(find "$state_root" -name compose.yml -type f -print -quit)
-  if [ -z "$grant_toml" ] || [ -z "$compose_file" ]; then
-    echo "arkham init did not write a grant layer"
+  state_root=$isolate/session
+  grant_toml=$state_root/grants/arkham.toml
+  plan_file=$state_root/plan.json
+  if [ ! -f "$grant_toml" ] || [ ! -f "$plan_file" ]; then
+    echo "host preparation did not produce a grant and launch plan"
     return 1
   fi
   if ! grep -q 'generated = true' "$grant_toml"; then
@@ -210,23 +206,7 @@ EOF
   mkdir -p "$dest/grants" "$dest/guest"
   find "$dest/grants" "$dest/guest" -mindepth 1 -delete
   cp -a "$(dirname "$grant_toml")/." "$dest/grants/"
-  while IFS= read -r line; do
-    case "$line" in
-      *"/home/eng/.config/nats/"*) ;;
-      *) continue ;;
-    esac
-    rest=${line#*- }
-    host=${rest%%:*}
-    container=${rest#*:}
-    container=${container%%:*}
-    rel=${container#/home/eng/.config/nats/}
-    if [ "$rel" = "$container" ] || [ -z "$rel" ]; then
-      echo "unexpected nats mount: ${line}"
-      return 1
-    fi
-    mkdir -p "$dest/guest/$(dirname "$rel")"
-    cp "$host" "$dest/guest/$rel"
-  done <"$compose_file"
+  python3 integration/copy-nats-plan.py "$plan_file" "$home/.config/nats" "$dest/guest"
   if [ ! -f "$dest/guest/context.txt" ]; then
     echo "discovery did not mount a nats context into the guest"
     return 1

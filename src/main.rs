@@ -6,8 +6,7 @@
 //! else splices through byte-identical.
 
 mod commands;
-#[cfg(target_os = "linux")]
-mod fwd;
+mod daemon;
 #[cfg(target_os = "linux")]
 mod host;
 
@@ -17,8 +16,9 @@ use arkham_config::cli::{Cli, CliCommand, ProxyBackend};
 use arkham_fnox::FnoxSource;
 use clap::{Parser, Subcommand};
 
-use arkham_compose::{AgentArgs, DownArgs, ExposeArgs, InitArgs, LogsArgs, UpArgs};
-use commands::{CaArgs, ConfigArgs, DaemonArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, SchemesArgs, ServeArgs};
+use arkham_sandbox::AgentArgs;
+use commands::{CaArgs, ConfigArgs, FakeArgs, RegistryArgs, RulesArgs, SchemesArgs, ServeArgs};
+use daemon::DaemonArgs;
 
 #[derive(Parser, Debug)]
 #[command(name = "arkham", about = "grant-scoped MITM proxy", version)]
@@ -58,37 +58,8 @@ enum Command {
   /// document. Reads a local file; prints TOML to stdout. Never touches
   /// the bundled registry or runtime config.
   Registry(RegistryArgs),
-  /// Generate this workspace's stack as an editable file: a stub workspace
-  /// config when it has none (rules derive at serve time), the CA, the agent
-  /// entrypoint, and the compose file. Existing files are left untouched; the
-  /// stack is regenerated when the workspace config changed since it was generated.
-  Init(InitArgs),
-  /// Enter the confined agent environment in one go: generate what is missing,
-  /// start the stack, then run the configured shell (or the command after
-  /// `--`). The stack keeps running when that exits, unless `--rm` stops it.
+  /// Run an agent inside the host confinement environment.
   Agent(AgentArgs),
-  /// Forward agent-owned loopback listeners to the wildcard interface.
-  ///
-  /// A sidecar of the generated compose stack, not a user command: it shares
-  /// the agent's PID namespace and arkham's network namespace, so it sees every
-  /// listener of the shared namespace and can attribute the ones the agent's
-  /// own processes hold. Anything else — arkham's capture and explicit-proxy
-  /// listeners, docker's embedded DNS — is never attributable from here and
-  /// is never forwarded. Raw bytes only: payloads are never inspected.
-  Fwd(FwdArgs),
-  /// Start the layered compose project `arkham init` generated.
-  Up(UpArgs),
-  /// Publish an agent port on the host, claiming the host port across
-  /// workspaces: `arkham expose <port> [--host <host-port>]` appends the
-  /// `[[workspace.expose]]` mapping, regenerates, and `up`s (recreating the
-  /// arkham service, so exec sessions drop). A host port another workspace
-  /// claimed fails naming that workspace. `arkham expose --list` reports
-  /// this workspace's publishings plus every workspace's claims.
-  Expose(ExposeArgs),
-  /// Stop the layered compose project.
-  Down(DownArgs),
-  /// Read the stack's logs.
-  Logs(LogsArgs),
   /// Run the host daemon: one proxy, the project registry, and the control socket.
   Daemon(DaemonArgs),
 }
@@ -115,7 +86,7 @@ fn main() -> eyre::Result<()> {
   if std::env::args().nth(1).as_deref() == Some("--landlock-exec") {
     #[cfg(target_os = "linux")]
     {
-      if let Err(err) = arkham_compose::landlock_exec() {
+      if let Err(err) = arkham_sandbox::landlock_exec() {
         eprintln!("{}", err.registration_detail());
         std::process::exit(1);
       }
@@ -149,13 +120,7 @@ async fn runtime_main() -> eyre::Result<()> {
     Command::Rules(args) => args.run(&cli, arkham_version).await?,
     Command::Config(args) => args.run(&cli, arkham_version).await?,
     Command::Registry(args) => args.run(&cli, arkham_version).await?,
-    Command::Init(args) => args.run(&cli, arkham_version).await?,
     Command::Agent(args) => args.run(&cli, arkham_version).await?,
-    Command::Fwd(args) => args.run(&cli, arkham_version).await?,
-    Command::Up(args) => args.run(&cli, arkham_version).await?,
-    Command::Expose(args) => args.run(&cli, arkham_version).await?,
-    Command::Down(args) => args.run(&cli, arkham_version).await?,
-    Command::Logs(args) => args.run(&cli, arkham_version).await?,
     Command::Daemon(args) => args.run(&cli, arkham_version).await?,
   }
   Ok(())

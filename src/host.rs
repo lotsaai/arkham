@@ -7,15 +7,15 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use arkham_compose::{
-  CaPaths, PRIVATE_SESSION_ROOT, RegisterResponse, cgroup_is_confined, decode_request, encode_response, ensure_socket_dir, host_cgroup,
-  peer_uid_allowed, prepare_session, project_root, read_cgroup, read_line, read_starttime, release_session, session_cgroup, write_line,
-};
 use arkham_config::config::ProxyCfg;
 use arkham_config::grants::ResolvedConfig;
 use arkham_config::require_loopback_listen;
 use arkham_pki::ca::{CertAuthority, load_or_generate};
 use arkham_proxy::{ProxyState, bind_explicit, serve};
+use arkham_sandbox::{
+  CaPaths, PRIVATE_SESSION_ROOT, RegisterResponse, cgroup_is_confined, decode_request, encode_response, ensure_socket_dir, host_cgroup,
+  peer_uid_allowed, prepare_session, project_root, read_cgroup, read_line, read_starttime, release_session, session_cgroup, write_line,
+};
 use confique::Config as _;
 use eyre::WrapErr as _;
 use rustix::process::getuid;
@@ -206,8 +206,8 @@ async fn one_client(
 
 async fn activate_session(
   stream: &mut UnixStream,
-  slot: &arkham_compose::SessionSlot,
-  plan: arkham_compose::LaunchPlan,
+  slot: &arkham_sandbox::SessionSlot,
+  plan: arkham_sandbox::LaunchPlan,
 ) -> eyre::Result<()> {
   let response = RegisterResponse::Join { cgroup: slot.path.clone() };
   let bytes = encode_response(&response)?;
@@ -251,7 +251,7 @@ async fn drop_registration(
 
 const REGISTRATION_FAILED: &str = "registration failed";
 
-fn wrapper_detail(err: &arkham_compose::Error) -> String {
+fn wrapper_detail(err: &arkham_sandbox::Error) -> String {
   err.registration_detail()
 }
 

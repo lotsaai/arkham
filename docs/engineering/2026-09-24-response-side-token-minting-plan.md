@@ -132,4 +132,4 @@ Per repo conventions, no raw cargo.
 
 ## Known gap (separate issue)
 
-The registry scout found that `docs/user/reference/registry.md` and `crates/arkham-compose/src/stack.rs` claim a project-tier `<workspace-root>/.config/arkham/rules.d/` override, but `Registry::load` (`registry.rs:102-119`) wires only one override dir. Not this plan's work; should be filed separately.
+The registry scout found that `docs/user/reference/registry.md` and `crates/arkham-sandbox/src/stack.rs` claim a project-tier `<workspace-root>/.config/arkham/rules.d/` override, but `Registry::load` (`registry.rs:102-119`) wires only one override dir. Not this plan's work; should be filed separately.

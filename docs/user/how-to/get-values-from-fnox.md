@@ -54,9 +54,9 @@ Two different gaps behave differently:
 - A key fnox does not declare at all follows `if_missing`. This is the normal "not every machine has every secret" case.
 - A key fnox declares but cannot resolve (provider unreachable, decryption failure) is always a startup error, whatever `if_missing` says. The secret exists; failing closed is correct.
 
-## 4. Container deployments
+## 4. Provider credentials
 
-The generated secure stack mounts `~/.config/fnox/age.txt` into the arkham container read-only, so an age-encrypted store works with no extra wiring. Other providers need their own credentials reachable inside the container; mount them the same way through the compose layers.
+The host daemon resolves secrets using the fnox configuration and provider credentials available to its user.
 
 ## Check it works
 

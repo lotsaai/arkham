@@ -69,13 +69,13 @@ unneeded_field_pattern = "warn"
 unused_result_ok = "warn"
 
 [workspace.dependencies]
-arkham-compose = { path = "crates/arkham-compose" }
 arkham-config = { path = "crates/arkham-config" }
 arkham-ebpf = { path = "crates/arkham-ebpf" }
 arkham-fnox = { path = "crates/arkham-fnox" }
 arkham-pki = { path = "crates/arkham-pki" }
 arkham-plugin = { path = "crates/arkham-plugin" }
 arkham-proxy = { path = "crates/arkham-proxy" }
+arkham-sandbox = { path = "crates/arkham-sandbox" }
 
 # One declaration per external dependency so versions cannot drift between
 # crates. rama tracks main deliberately: its 0.5 line is unpublished.
@@ -168,11 +168,11 @@ wasmtime-wasi = "50"
 xpanda = "0.2"
 
 [dependencies]
-arkham-compose = { workspace = true }
 arkham-config = { workspace = true }
 arkham-fnox = { workspace = true }
 arkham-pki = { workspace = true }
 arkham-proxy = { workspace = true }
+arkham-sandbox = { workspace = true }
 clap = { workspace = true }
 confique = { workspace = true }
 dirs = { workspace = true }

@@ -1,25 +1,22 @@
 #!/usr/bin/env bash
-# Transparent-capture demo without docker: a network namespace, a veth up
-# to the host, and arkham capturing the client's egress inside the netns.
-# The client runs under bwrap (filesystem-sandboxed) while sharing the
-# netns, so it is captured like any proxy-unaware workload.
+# Transparent capture with the API and client in separate network namespaces.
+# The client shares arkham's namespace and joins its capture cgroup under bwrap.
 #
-# Requires: sudo (netns, veth, host nft), iproute2, nft, openssl, bun, curl, bwrap.
-# Run: mise run demo:bwrap (builds as you, escalates only this script)
+# Requires: sudo, iproute2, openssl, ssh-keygen, bun, curl, bwrap.
+# Run: mise run demo:bwrap
 set -euo pipefail
 
 proj_dir=$(cd "$(dirname "$0")/../.." && pwd)
 binary=$proj_dir/target/release/arkham
 
-NS=arkham-bwrap
-HOST_IF=hb-host
-NS_IF=hb-ns
+NS=arkham-bwrap-$$
+API_NS=arkham-api-$$
+API_IF=apa$$
+NS_IF=apc$$
 API_IP=10.99.0.20
-GW_IP=10.99.0.1
 REAL=ghp_deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
-NAT_TABLE=arkham_bwrap_nat
 # arkham stays outside the client's cgroup, so its upstream dials bypass capture.
-EBPF_CGROUP=/sys/fs/cgroup/arkham-bwrap
+EBPF_CGROUP=/sys/fs/cgroup/arkham-bwrap-$$
 
 fail() {
   echo "FAIL: $*" >&2
@@ -27,7 +24,7 @@ fail() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "run as root (sudo)"
-for tool in ip nft openssl bun curl bwrap; do
+for tool in ip openssl ssh-keygen bun curl bwrap; do
   command -v "$tool" >/dev/null || fail "missing tool: $tool"
 done
 [ -x "$binary" ] || fail "build first: mise run build -- --release"
@@ -35,15 +32,18 @@ done
 work=$(mktemp -d /tmp/arkham-bwrap.XXXXXX)
 certs=$work/certs
 mkdir -p "$certs"
+export certs
 
 api_pid=""
 arkham_pid=""
 cleanup() {
   [ -n "$api_pid" ] && kill "$api_pid" 2>/dev/null || true
   [ -n "$arkham_pid" ] && kill "$arkham_pid" 2>/dev/null || true
+  [ -z "$api_pid" ] || wait "$api_pid" 2>/dev/null || true
+  [ -z "$arkham_pid" ] || wait "$arkham_pid" 2>/dev/null || true
   rm -rf "$work"
   ip netns del "$NS" 2>/dev/null || true
-  nft delete table inet "$NAT_TABLE" 2>/dev/null || true
+  ip netns del "$API_NS" 2>/dev/null || true
   rmdir "$EBPF_CGROUP" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -52,23 +52,29 @@ bash "$proj_dir/integration/gen-certs.sh" "$certs" >/dev/null
 
 FAKE=$("$binary" fake GH_TOKEN)
 
-# Netns + veth + NAT: the client namespace reaches the world only through
-# the host, and arkham captures everything on the way out.
+printf '[proxy]\nlisten = "127.0.0.1:8080"\n' >"$work/config.toml"
+cat >"$work/fnox.toml" <<EOF
+[providers.plain]
+type = "plain"
+
+[secrets.GH_TOKEN]
+provider = "plain"
+value = "$REAL"
+EOF
+
+# Separate namespaces keep the API address out of arkham's local-address
+# bypass list while leaving the proxy and captured client in the same netns.
 ip netns add "$NS"
-mkdir -p "/etc/netns/$NS"
-printf 'nameserver 1.1.1.1\n' >"/etc/netns/$NS/resolv.conf"
-ip link add "$HOST_IF" type veth peer name "$NS_IF"
+ip netns add "$API_NS"
+ip link add "$API_IF" type veth peer name "$NS_IF"
+ip link set "$API_IF" netns "$API_NS"
 ip link set "$NS_IF" netns "$NS"
-ip addr add "$GW_IP/24" dev "$HOST_IF"
-ip link set "$HOST_IF" up
+ip netns exec "$API_NS" ip addr add "$API_IP/24" dev "$API_IF"
+ip netns exec "$API_NS" ip link set "$API_IF" up
+ip netns exec "$API_NS" ip link set lo up
 ip netns exec "$NS" ip addr add 10.99.0.2/24 dev "$NS_IF"
 ip netns exec "$NS" ip link set "$NS_IF" up
 ip netns exec "$NS" ip link set lo up
-ip netns exec "$NS" ip route add default via "$GW_IP"
-sysctl -qw net.ipv4.ip_forward=1
-nft add table inet "$NAT_TABLE"
-nft "add chain inet ${NAT_TABLE} postrouting { type nat hook postrouting priority srcnat; }"
-nft add rule inet "$NAT_TABLE" postrouting ip saddr 10.99.0.0/24 oifname "$HOST_IF" masquerade
 
 cat >"$work/arkham.toml" <<EOF
 [proxy]
@@ -77,7 +83,6 @@ ca_file = "$certs/ca.pem"
 
 [rules.demo]
 env = "GH_TOKEN"
-value = "$REAL"
 registry = false
 allow = ["https://api:8443", "tcp://$API_IP:9000"]
 
@@ -87,8 +92,8 @@ allow = ["https://api:8443", "tcp://$API_IP:9000"]
 root_cert = "$certs/ca.crt"
 EOF
 
-# API server (validates only the real token) inside the namespace.
-ip netns exec "$NS" env ARKHAM_REAL="$REAL" CERT_DIR="$certs" \
+# API server (validates only the real token) outside the client's namespace.
+ip netns exec "$API_NS" env ARKHAM_REAL="$REAL" CERT_DIR="$certs" \
   bun run "$proj_dir/integration/api/server.ts" >"$work/api.log" 2>&1 &
 api_pid=$!
 
@@ -102,7 +107,8 @@ sandbox() {
     --symlink usr/lib64 /lib64 \
     --dev /dev \
     --tmpfs /tmp \
-    --ro-bind "$certs" /certs \
+    --dir /certs \
+    --ro-bind "$certs/ca.crt" /certs/ca.crt \
     --clearenv \
     --setenv PATH /usr/bin:/bin \
     "$@"
@@ -110,7 +116,7 @@ sandbox() {
 export -f sandbox
 
 mkdir -p "$EBPF_CGROUP"
-ip netns exec "$NS" env RUST_LOG=info "$binary" serve --proxy-backend ebpf --ebpf-cgroup "$EBPF_CGROUP" --config "$work/arkham.toml" >"$work/arkham.log" 2>&1 &
+ip netns exec "$NS" env RUST_LOG=info ARKHAM_CONFIG="$work/config.toml" "$binary" serve --proxy-backend ebpf --ebpf-cgroup "$EBPF_CGROUP" --config "$work/arkham.toml" >"$work/arkham.log" 2>&1 &
 arkham_pid=$!
 
 # The child joins the capture cgroup before starting bwrap.

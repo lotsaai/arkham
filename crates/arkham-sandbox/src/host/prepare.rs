@@ -73,9 +73,11 @@ pub async fn prepare_session(
     root
   };
   let material = host_material(material_root, scratch, version).await?;
+  let grants_dir = scratch.join("grants");
+  crate::adapt::write_state(&grants_dir, &material.grants)?;
   let mut config = material.config;
   for grant in &material.grants {
-    merge_fragment(&mut config, grant)?;
+    merge_fragment(&mut config, grant, &grants_dir)?;
   }
   arkham_fnox::resolve(&mut config, &material.registry, material.fnox.clone()).await?;
   let rule_envs = config.rules.values().map(|rule| rule.env.clone()).collect();
@@ -116,7 +118,10 @@ pub async fn prepare_session(
       });
     }
   }
-  let config_masks = protected_config_paths(material_root, &binds, ca.source)?;
+  let mut config_masks = protected_config_paths(material_root, &binds, ca.source)?;
+  if grants_dir.exists() {
+    config_masks.push(grants_dir);
+  }
   let mut env = Vec::new();
   for name in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL", "LC_CTYPE"] {
     if let Some(value) = caller_env.get(name) {
@@ -434,11 +439,18 @@ fn push_file_bind(binds: &mut Vec<Bind>, source: PathBuf, dest: PathBuf) {
   });
 }
 
-fn merge_fragment(config: &mut arkham_config::config::AppConfig, grant: &RewriteAdapted) -> Result<(), Error> {
+fn merge_fragment(config: &mut arkham_config::config::AppConfig, grant: &RewriteAdapted, grants_dir: &Path) -> Result<(), Error> {
   if grant.fragment.trim().is_empty() {
     return Ok(());
   }
-  let doc: RulesDoc = toml::from_str(&grant.fragment).map_err(|source| Error::FragmentParse { source })?;
+  let old = format!("{}/rules.d/", crate::adapt::GRANTS_STATE_DIR);
+  let new = format!("{}/rules.d/", grants_dir.display());
+  let escaped = toml::Value::String(new.clone()).to_string();
+  let escaped = &escaped[1..escaped.len() - 1];
+  let encoded_old: String = url::form_urlencoded::byte_serialize(old.as_bytes()).collect();
+  let encoded_new: String = url::form_urlencoded::byte_serialize(new.as_bytes()).collect();
+  let fragment = grant.fragment.replace(&old, escaped).replace(&encoded_old, &encoded_new);
+  let doc: RulesDoc = toml::from_str(&fragment).map_err(|source| Error::FragmentParse { source })?;
   for (label, rule) in doc.rules {
     config.rules.insert(label, rule);
   }
@@ -507,6 +519,27 @@ fn set_env(env: &mut Vec<(String, String)>, key: &str, value: String) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn materialized_client_certificate_is_available_to_the_proxy() {
+    let scratch = tempfile::tempdir().unwrap();
+    let config_file = scratch.path().join("config.toml");
+    std::fs::write(&config_file, "").unwrap();
+    let cli = arkham_config::cli::Cli { config: Some(config_file) };
+    let (mut config, _) = arkham_config::config::load(&cli, None).unwrap();
+    let grants_dir = scratch.path().join("grants");
+    let grant = RewriteAdapted {
+      fragment: "[rules.test]\nenv = \"TEST_TOKEN\"\nallow = [\"https://example.com\"]\n[rules.test.tls.\"https://example.com\"]\nroot_cert = \"/arkham/grants/rules.d/kube-test.ca\"\n".to_string(),
+      decoy: String::new(),
+      materialized: vec![("kube-test.ca".to_string(), b"PRIVATE CA".to_vec())],
+      decoy_files: Vec::new(),
+    };
+    crate::adapt::write_state(&grants_dir, std::slice::from_ref(&grant)).unwrap();
+    merge_fragment(&mut config, &grant, &grants_dir).unwrap();
+    let path = config.rules["test"].tls["https://example.com"].root_cert.as_ref().unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"PRIVATE CA");
+    assert!(path.starts_with(&grants_dir));
+  }
 
   #[cfg(target_os = "linux")]
   #[test]

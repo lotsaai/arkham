@@ -47,5 +47,5 @@ arkham fake GH_TOKEN --pattern 'acme_{base62:24}'
 
 ## Two properties to rely on
 
-- **Stability**: the decoy follows the env name. Renaming an env var changes its decoy, so regenerate any decoy held in a container environment (the secure stack does this for you) or substitution stops matching.
+- **Stability**: the decoy follows the env name. Renaming an env var changes its decoy, so regenerate any manually supplied decoy or substitution stops matching.
 - **Shape validity**: a decoy mimics the real token's format, which is why tools that validate token shape accept it. Corollary: a secret scanner can flag a decoy; that is expected.

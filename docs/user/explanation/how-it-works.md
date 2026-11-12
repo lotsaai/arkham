@@ -29,7 +29,7 @@ Then, per connection:
 
 **Grant by authority, not URL.** The client dials a host:port; the grant names a host:port. Path-level authorisation would require arkham to understand every API's semantics, and a workload that re-encodes or signs the credential defeats substitution anyway. Authority-level grants keep the model honest about what is enforceable.
 
-**Decoys are deterministic.** A decoy seeded from the env name survives restarts and is safe to commit, which is what lets a compose file carry it as a plain environment variable. The cost is that renaming an env var changes the decoy, and a stale decoy stops matching.
+**Decoys are deterministic.** A decoy seeded from the env name survives restarts and is safe to commit. Renaming an env var changes the decoy, and a stale decoy stops matching.
 
 **Splice is byte-identical.** Non-granted traffic is not re-serialised or re-framed. Performance and correctness both depend on the non-matching path being a pipe.
 
