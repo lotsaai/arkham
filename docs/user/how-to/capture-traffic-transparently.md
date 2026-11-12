@@ -25,7 +25,7 @@ echo $$ | sudo tee /sys/fs/cgroup/arkham/cgroup.procs
 
 Destinations the loader's network namespace cannot reach must not be captured. A redirected connection would otherwise complete its local handshake and then hang until the upstream dial budget runs out. The loader bypasses its own non-loopback IPv4 addresses. `--ebpf-bypass` (`ARKHAM_EBPF_BYPASS`, repeat or comma-separate) adds IPv4 CIDRs. Bypassed connections use their normal routes instead of transiting the proxy.
 
-Podman networks need a runtime channel: they are created inside the agent long after arkham starts, so no startup flag can name them. The generated stack mounts a shared bypass file into both services (`ARKHAM_EBPF_BYPASS_FILE`, or `--ebpf-bypass-file` by hand): the agent entrypoint rewrites it from `podman network inspect`, and arkham reloads it live within seconds, no restart. One CIDR per line, `#` comments allowed.
+Use `ARKHAM_EBPF_BYPASS_FILE` or `--ebpf-bypass-file` for CIDRs that change while capture runs. Arkham reloads the file while running. It accepts one CIDR per line and `#` comments.
 
 ## 2. Grant raw TCP by destination address
 
@@ -65,7 +65,7 @@ mise run demo
 
 It runs the container image, a client sharing arkham's netns, and an upstream on an RFC1918 subnet, and it asserts four substitution scenarios and one splice scenario. See [integration/README.md](../../../integration/README.md) for the scenario table.
 
-The same scenarios run without docker over the eBPF backend:
+The bwrap demo exercises a smaller set of scenarios without Docker:
 
 ```sh
 mise run demo:bwrap

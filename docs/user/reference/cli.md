@@ -15,9 +15,9 @@ Serve the proxy.
 | Flag | Environment | Meaning |
 | --- | --- | --- |
 | `--listen <ADDR>` | `ARKHAM_LISTEN` | Explicit-proxy listen address. Default `127.0.0.1:8080`. |
-| `--ca-file <PATH>` | `ARKHAM_CA_FILE` | CA PEM path (certificate followed by key). Default `/certs/ca.pem` when the generated stack mounted it there, else `<config-dir>/arkham/ca.pem`. |
+| `--ca-file <PATH>` | `ARKHAM_CA_FILE` | CA PEM path (certificate followed by key). Default `<config-dir>/arkham/ca.pem`. |
 | `--proxy-backend <BACKEND>` | `ARKHAM_PROXY_BACKEND` | Transparent capture backend: `none` (default, explicit listener only) or `ebpf` (Linux only). |
-| `--ebpf-cgroup <PATH>` | `ARKHAM_EBPF_CGROUP` | With `--proxy-backend ebpf`, the cgroup v2 directory whose member processes get captured, or the literal `enclosing` for the cgroup this process's own cgroup lives under (what a compose stack with one `cgroup_parent` per service uses). Required for that backend; otherwise arkham itself must live outside the named cgroup. |
+| `--ebpf-cgroup <PATH>` | `ARKHAM_EBPF_CGROUP` | With `--proxy-backend ebpf`, the cgroup v2 directory whose member processes get captured, or `enclosing` for the enclosing cgroup. Required for that backend; otherwise arkham itself must live outside the named cgroup. |
 | `--ebpf-bypass <CIDR>` | `ARKHAM_EBPF_BYPASS` | With `--proxy-backend ebpf`, extra CIDRs that are never captured. Repeat the flag, or separate values with commas. Linux only. |
 | `--ebpf-bypass-file <PATH>` | `ARKHAM_EBPF_BYPASS_FILE` | With `--proxy-backend ebpf`, a file of bypass CIDRs, one per line, re-read while capture runs. |
 
@@ -51,41 +51,44 @@ Print a reference config. Each setting appears with its default and its doc comm
 
 Curate an `oauth2` registry fragment from a saved discovery or OpenAPI document. `from-oidc` maps `token_endpoint` and `grant_types_supported`; `from-openapi` maps every `type: oauth2` security scheme and reports `openIdConnect` schemes as skipped. Both print a complete `[providers.<slug>]` TOML fragment to stdout for review and placement in `rules.d`; they never fetch, never write files, and never touch the bundled table. See [the registry reference](registry.md).
 
-## `arkham init [WORKSPACE]`
-
-Generate the workspace stack: the CA and the agent entrypoint when they are missing, and `<state-dir>/arkham/ws/<slug>/compose.yml`. That compose file is generated state. Overrides go in `~/.config/arkham/compose.yaml` or `<workspace>/.config/arkham/compose.yaml`. Rules derive at serve time from fnox declarations the registry knows, and config holds overrides only. An existing stack is rewritten when the rendered file would change and left untouched when it matches. Prints a warning when no rule is in play.
-
 ## `arkham daemon`
 
 Linux only. One loopback proxy and a per-user control socket for host-confined agents. A non-loopback `ARKHAM_LISTEN` is refused, and a second daemon exits when one is already listening. Prints `daemon: ready` on stderr once the socket is bound and capture is active.
 
-## `arkham agent [WORKSPACE] [--rm] [--isolate <compose|bwrap>] [--write-profile <PROFILE>] [-- <COMMAND>...]`
+With no subcommand, prints help without starting anything. `arkham daemon run`
+runs in the foreground. The Linux service commands use
+`systemctl --user` and the unit name `arkham-daemon.service`:
 
-The whole lifecycle in one idempotent run: what `init` does, then `up`, then the configured shell (or `COMMAND`) in the agent. The stack keeps running when that exits, so the next call starts at the exec. `--rm` stops the stack instead: teardown runs after the shell or command exits, including when the terminal's interrupt ends it.
+| Subcommand | Behaviour |
+| --- | --- |
+| `run [--background]` | Run in the foreground, or start the installed user service with `--background` |
+| `unit` | Print a user unit using the current executable's absolute path |
+| `install` | Write `$XDG_CONFIG_HOME/systemd/user/arkham-daemon.service` (normally `~/.config/systemd/user/`) and reload the user manager; does not start or enable it |
+| `start`, `stop`, `restart` | Control the installed service |
+| `status` | Show systemd status, preserving its exit code |
+| `enable`, `disable` | Control startup with the user manager, without starting or stopping it |
+| `logs` | Follow the service's user journal |
 
-`--isolate` defaults to `compose`. `--isolate bwrap` (Linux) does not start a stack. It requires a running `arkham daemon`, then runs `COMMAND` with decoy environment and forged secret files. `--write-profile` is `workspace-write` (the default), `read-only`, or `danger-full-access`. Stderr reports `runner: bwrap` and `enforcement: full`. With no daemon, when bubblewrap cannot run the profile, or when Landlock does not fully enforce it, the command starts nothing. `danger-full-access` does not apply Landlock.
+Stopping or restarting the service terminates its active agent sessions.
+`start` confirms process execution, not capture readiness; check the journal for
+`daemon: ready`.
 
-## `arkham up [WORKSPACE]`
+The user unit delegates its cgroup subtree. It does not grant privileges:
+the installed executable still needs the Linux capabilities required for eBPF
+capture (`CAP_BPF` and `CAP_NET_ADMIN`, and `CAP_PERFMON` where required by the
+kernel). An administrator must provision these on a trusted installation.
+Reinstalling the binary can clear file capabilities. Without them the daemon
+fails closed. The unit does not use sudo.
 
-Start the layered compose project `arkham init` generated, creating the CA and entrypoint if they are still missing. `WORKSPACE` defaults to the current directory; when no layer file exists, the compose command refuses rather than guess.
+Run `arkham daemon install`, then `arkham daemon enable` and
+`arkham daemon start`. The user manager normally starts at login; running without
+a login requires an administrator to enable lingering for the account.
 
-## `arkham expose <PORT> [--host <HOST>] [--workspace <PATH>]` / `arkham expose --list`
+## `arkham agent [WORKSPACE] [--write-profile <PROFILE>] [-- <COMMAND>...]`
 
-Publish container port `PORT` on `127.0.0.1`. `--host` defaults to `PORT`. `--workspace` defaults to the current directory. The command claims that host port across workspaces, adds `[[workspace.expose]]` when that mapping is absent, regenerates, and runs `up`. A host port another workspace already claimed fails and names that workspace. `--list` prints this workspace's publishings and every workspace's claims, and changes nothing.
-
-## `arkham down [WORKSPACE]`
-
-Stop the layered compose project.
-
-## `arkham logs [-f] [--no-log-prefix] [--tail <N>] [--workspace <PATH>] [SERVICE...]`
-
-Read the stack's logs. `--tail` defaults to `all`; no service means every service. `--workspace` defaults to the current directory and is a flag rather than a positional because the service names already take that slot.
+Linux only. Requires a running `arkham daemon` under the same user. Runs the configured shell or `COMMAND` under bubblewrap with a decoy environment and forged secret files. `--write-profile` is `workspace-write` (the default), `read-only`, or `danger-full-access`. Stderr reports `runner: bwrap` and `enforcement: full`. With no daemon, when bubblewrap cannot run the profile, or when Landlock does not fully enforce it, the command starts nothing. `danger-full-access` does not apply Landlock.
 
 See [how to secure your workspace](../how-to/confine-a-workspace.md).
-
-## `arkham fwd`
-
-Sidecar of the generated compose stack, not a user command: it runs on the `fwd` service with arkham's network namespace and the agent's PID namespace, forwards every agent-owned loopback listener to the namespace's own bridge address (the one the host reaches and docker publishes to), and relays raw bytes without inspecting payloads. Anything not attributable to an agent process — arkham's own listeners, docker's embedded DNS — is never forwarded. Loopback listeners only; a listener already bound to a wildcard address is directly reachable and needs no forwarder. Two listeners sharing one port on different loopback addresses cannot both be exposed and are logged and skipped.
 
 ## Exit behaviour
 

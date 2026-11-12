@@ -193,27 +193,22 @@ Per-entry TLS, keyed by the exact `allow` entry string. All keys optional.
 | `client_cert` / `client_key` | Upstream client identity the proxy presents to this entry. Come together. |
 | `root_cert` | Upstream CA bundle trusting this entry's host, additive to webpki roots plus global `root_certs`. |
 | `guest_tls_mode` | `tls` (default) or `mtls`: demand a guest client certificate signed by the arkham CA. `mtls` on a `redis://` fake is rejected at load. `mtls` on an `smtp://` or `ldap://` fake is rejected only when the real string is `smtps://` or `ldaps://`. Postgres keeps `mtls` and closes a guest that opens in cleartext, including a cleartext `CancelRequest`. |
-| `guest_cert` / `guest_key` | Container-internal path the guest's minted certificate and key mount at. Defaults are under the workspace state directory; set these when the client reads its pair from a fixed location. |
+| `guest_cert` / `guest_key` | Paths where the guest's minted certificate and key are made available. Set these when the client reads its pair from a fixed location. |
 
 ## `[workspace]`
 
-Controls the compose stack `arkham init` generates.
+Controls the host-confined agent session.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `home` | `/home/eng` | `$HOME` inside the agent container. Host paths under the host home translate into this prefix; other paths mount at their own path. |
-| `name` | workspace path slug | Compose project name. |
-| `shell` | `sh` | Shell `arkham agent` runs in the container when no command is given. |
-| `init` | none | Init script inside the agent image that the generated entrypoint chains to after installing the CA (`ARKHAM_INIT`). The common entrypoint script names are tried when unset; the command runs directly otherwise. |
-| `include` | empty | Extra host paths the agent service mounts, translated into the container home. `~` expands; relative paths resolve against the workspace root; a trailing `:ro`/`:rw` sets the mode. Overlapping paths reuse the covering mount. A path that does not exist fails generation, because docker would mount an empty directory in its place. `/`, your home directory, or an ancestor of the workspace is refused. |
-| `ports` | empty | Ports published on the host as stable `127.0.0.1:<port>` bindings, forwarded to the same port inside the agent's shared network namespace. The generated stack's `fwd` sidecar exposes every agent-owned loopback listener there; a published port names one reliably from the host instead of through a changing container IP. Applying a change needs a stack restart. Port `0` and the capture listener ports (`15000`, `15001`) are refused at load. |
-| `expose` | empty | `[[workspace.expose]]` mappings with `port` (container) and `host` (host port) keys, publishing `127.0.0.1:<host>` onto a container port that differs — so two workspaces running the same dev server both publish it under distinct host ports. Managed by `arkham expose`, which claims the host port across workspaces. Same load rules as `ports`, and every host port must be distinct across `ports` and `expose`. |
-| `networks` | empty | Existing compose networks the arkham service joins, each declared `external` at the top level: the agent inherits them through the shared network namespace, so a sidecar like `headroom` on one of these networks is reachable by name from the agent. Joining any network moves arkham off the default project network. Applying a change needs a stack restart. |
-| `extra_hosts` | `host.docker.internal:host-gateway` only | Further `host:ip` (or `host=ip`) entries rendered as `extra_hosts` on the arkham and agent services — `/etc/hosts` is per container, so both need each entry: the agent resolves the name, arkham dials the upstream. `host.docker.internal:host-gateway` is always rendered, reaching host-bound services through the capture (which splices unmatched traffic, never blocks it). Applying a change needs a stack restart. |
+| `shell` | `sh` | Shell `arkham agent` runs when no command is given. |
+| `include` | empty | Extra host paths made available to the agent. `~` expands, relative paths resolve against the workspace root, and `:ro` or `:rw` sets the mount mode. |
+| `profile` | `__shared__` | Selects the tool-config profile. |
+| `passthrough` | empty | Names of environment variables copied from the agent caller into the session. |
 
 ## Profiles
 
-Isolated tool-config namespaces for the secure stack. Global profiles live under `<config-dir>/arkham/profiles/<name>/`; project ones under `<workspace root>/.config/arkham/profiles/<name>/`. Each `<tool>/` directory inside a profile mounts into the agent container at the location that tool reads its own configuration from by default, so nothing has to set a config-directory variable. The workspace selects its profile with `[workspace] profile`; unset selects `__shared__`, the base every other profile inherits off and arkham always creates.
+Isolated tool-config namespaces for host sessions. Global profiles live under `<config-dir>/arkham/profiles/<name>/`; project ones under `<workspace root>/.config/arkham/profiles/<name>/`. Each `<tool>/` directory inside a profile is mounted at the tool's default configuration location. The workspace selects its profile with `[workspace] profile`; unset selects `__shared__`.
 
 ```toml
 [workspace]
@@ -250,7 +245,7 @@ Host files rewritten with decoys and mounted read-only into the agent — the es
 | Key | Required | Purpose |
 | --- | --- | --- |
 | `source` | yes | Host file to read. `~` and `$VAR` expand; relative paths resolve against the workspace root. |
-| `dest` | yes | Container path the rewritten file mounts at, read-only, except a kubeconfig or talos document, which mounts writable. `{home}` expands to `[workspace] home` and `$VAR` expands first. |
+| `dest` | yes | Agent path where the rewritten file is mounted, read-only, except a kubeconfig or talos document, which is writable. `{home}` expands to the host home and `$VAR` expands first. |
 | `envs` | no | Env names whose real values are replaced by their decoys in the file. Empty for the structural formats — `kubeconfig` (kubectl), `talos` (talosctl): the adapter knows where the secrets live. |
 | `format` | no | Declared format, skipping detection. Known: `format = "kubeconfig"` and `format = "talos"`, each failing closed when the file does not parse as one. Absent, both are detected by content and other files keep the raw byte-swap. A source matching an automatic location stays with its declaration; the automatic pass skips it. A kubeconfig or talos document mounts writable so `kubectl config use-context` and `talosctl config context` can update the active context. Other rewrites stay read-only. |
 
@@ -287,11 +282,11 @@ direction = "request"
 
 ## `[tools.<name>]`
 
-Tool config mounts for the secure stack, by tool name.
+Tool config mounts for host sessions, by tool name.
 
 | Key | Required | Purpose |
 | --- | --- | --- |
-| `config_dir` | yes | Container path the directory mounts at. `{home}` expands to `[workspace] home`. Must expand to an absolute path. |
+| `config_dir` | yes | Agent path the directory mounts at. `{home}` expands to the host home. Must expand to an absolute path. |
 
 ```toml
 [tools.trae]

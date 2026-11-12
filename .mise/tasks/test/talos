@@ -147,6 +147,7 @@ cp "$scratch/prod.yaml" "$scratch/merged.yaml"
 "$talosctl" --talosconfig "$scratch/merged.yaml" config merge "$scratch/staging.yaml"
 cp "$scratch/merged.yaml" "$scratch/home/.talos/config"
 
+XDG_CONFIG_HOME="$scratch/xdg-config" "$arkham" ca >/dev/null
 # An empty TALOSCONFIG is the default path under HOME, the same file.
 env -u ARKHAM_CONFIG \
   HOME="$scratch/home" \
@@ -157,9 +158,9 @@ env -u ARKHAM_CONFIG \
   GIT_CONFIG_GLOBAL=/dev/null \
   GIT_CONFIG_SYSTEM=/dev/null \
   FNOX_CONFIG_DIR="$scratch/fnox" \
-  "$arkham" init --backend ebpf "$scratch/workspace"
+  target/debug/examples/prepare-session "$scratch/workspace" "$scratch/session" "$scratch/xdg-config/arkham/ca.crt"
 
-state_root=$scratch/xdg-state/arkham/ws
+state_root=$scratch/session
 grant_toml=$(find "$state_root" -path '*/grants/arkham.toml' -type f -print -quit)
 decoy=$(find "$state_root" -path '*/files/talos-config' -type f -print -quit)
 ca=$scratch/xdg-config/arkham/ca.pem

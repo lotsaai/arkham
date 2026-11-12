@@ -15,7 +15,7 @@ Pick by what you need right now. New here? Secure your workspace.
 
 Directions for a working practitioner, one goal each:
 
-- [Secure your workspace](how-to/confine-a-workspace.md) — run a coding agent in a container that holds only decoys.
+- [Secure your workspace](how-to/confine-a-workspace.md) — run a host-confined coding agent with decoys.
 - [Capture traffic transparently](how-to/capture-traffic-transparently.md) — Linux eBPF capture without client proxy settings.
 - [Get values from fnox](how-to/get-values-from-fnox.md) — keep real secrets out of arkham's config entirely.
 - [Extend the known-host registry](how-to/extend-the-registry.md) — teach arkham a private endpoint or token shape.

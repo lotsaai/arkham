@@ -4,18 +4,15 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use arkham_config::cli::ProxyBackend;
 use arkham_config::config::fake_for;
 use tempfile::tempdir;
 
 use crate::ambient::*;
 use crate::decoys::*;
 use crate::expand::*;
-use crate::mounts::*;
 use crate::paths::*;
 use crate::profiles::*;
 use crate::rewrites::*;
-use crate::stack::*;
 
 pub(crate) fn decoys() -> Vec<Decoy> {
   vec![
@@ -35,48 +32,6 @@ pub(crate) fn mount(host: &str, container: &str, ro: bool) -> Mount {
     host: PathBuf::from(host),
     container: PathBuf::from(container),
     ro,
-  }
-}
-
-/// Test agent spec: `root` inside the container, home `/home/eng`, and the
-/// workspace-state storage directory the agent service mounts.
-pub(crate) fn agent_paths(root: &str) -> AgentSpec {
-  AgentSpec {
-    root: PathBuf::from(root),
-    home: "/home/eng".to_string(),
-    storage: PathBuf::from("/state/arkham/ws/arkham/containers"),
-    uid: 1000,
-    devices: Vec::new(),
-    cap_add: Vec::new(),
-    image: DEFAULT_AGENT_IMAGE.to_string(),
-    build: None,
-  }
-}
-
-/// Image tag the test stack renders: obviously fake, so a leaked `:latest`
-/// or a hardcoded version fails the assertion instead of passing silently.
-pub(crate) const TEST_VERSION: &str = "0.0.0-test";
-
-/// A default-ish stack to render in tests; override fields struct-update style.
-pub(crate) fn test_stack(backend: ProxyBackend) -> Stack {
-  Stack {
-    backend,
-    project: "arkham".to_string(),
-    decoys: decoys(),
-    agent: agent_paths("/home/eng"),
-    mounts: Vec::new(),
-    tool_mounts: Vec::new(),
-    fnox: FnoxBinds::default(),
-    guest: Vec::new(),
-    init: None,
-    ports: Vec::new(),
-    expose: Vec::new(),
-    networks: Vec::new(),
-    extra_hosts: Vec::new(),
-    passthrough: Vec::new(),
-    file_mounts: Vec::new(),
-    grants_mounts: Vec::new(),
-    arkham_version: TEST_VERSION.to_string(),
   }
 }
 

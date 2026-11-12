@@ -13,3 +13,4 @@ set -euo pipefail
 # can resolve it, and its sources compile for the `bpf` target alone. Every
 # host-wide command has to exclude it.
 cargo build --locked --quiet --workspace --exclude arkham-ebpf-programs "$@"
+cargo build --locked --quiet -p arkham-sandbox --example prepare-session

@@ -1,17 +1,12 @@
-# Workspace config for this example. `arkham init` reads it from the
-# workspace root: `[workspace]` describes the container layout, `[rules.*]`
-# decides what gets swapped. Real values resolve from fnox at serve time, so no
-# secret belongs in this file.
+# Workspace settings and rules. Real values resolve from fnox in the daemon,
+# so no secret belongs in this file.
 
 [workspace]
-# $HOME inside the agent container. Host paths under your home translate into
-# this prefix; everything else mounts at its own location.
-home = "/home/eng"
 shell = "bash"
 
 # Both env names are registry-known (anthropic, github), so the registry
 # supplies each rule's hosts and decoy shape: `env` alone is a complete rule.
-# `if_missing = "warn"` keeps the stack startable when fnox does not declare
+# `if_missing = "warn"` permits a session when fnox does not declare
 # the key; `arkham rules` prints these blocks for whatever fnox does declare.
 
 [rules.anthropic]

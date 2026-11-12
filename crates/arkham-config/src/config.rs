@@ -51,75 +51,31 @@ pub struct AppConfig {
 /// Selected when `[workspace] profile` is unset.
 pub const SHARED_PROFILE: &str = "__shared__";
 
-/// `$HOME` inside the agent container when `[workspace] home` is unset: the
-/// home every shipped example uses.
-pub const DEFAULT_CONTAINER_HOME: &str = "/home/eng";
-
 /// One tool config mount: the directory of this name under
 /// `profiles/<profile>/` mounts at `config_dir` inside the agent container,
 /// so the tool finds its own configuration where it looks by default.
 #[derive(confique::Config, Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolCfg {
-  /// Container path the directory mounts at; `{home}` expands to
-  /// `[workspace] home`.
+  /// Host path the directory mounts at; `{home}` expands to the host home.
   pub config_dir: String,
 }
 
-/// Extra host paths the generated agent service mounts, translated into the
-/// container home; overlapping paths reuse the covering mount.
+/// Workspace settings for host agent sessions.
 #[derive(confique::Config, Debug, Clone, Default, Serialize)]
+#[config(layer_attr(serde(deny_unknown_fields)))]
 pub struct WorkspaceCfg {
-  /// Compose project name for the generated stack; defaults to the
-  /// workspace slug.
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub name: Option<String>,
-  /// Shell `arkham agent` runs in the container when no command is given;
-  /// defaults to sh.
+  /// Shell `arkham agent` runs when no command is given; defaults to sh.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub shell: Option<String>,
-  /// Init script inside the agent image that the generated entrypoint chains
-  /// to after installing the CA (`ARKHAM_INIT`); the common entrypoint script
-  /// names are tried when unset, and the command runs directly otherwise.
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub init: Option<String>,
-  /// Paths included in the generated compose; `~` expands, relative paths
-  /// resolve against the workspace root.
+  /// Paths included in the sandbox; `~` expands and relative paths resolve against the workspace root.
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub include: Vec<PathBuf>,
-  /// `$HOME` inside the agent container; host paths under the host home
-  /// translate into this prefix, others mount at their own path. Unset
-  /// means `/home/eng` (see `DEFAULT_CONTAINER_HOME`).
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub home: Option<String>,
-  /// Profile selecting the isolated tool-config namespace the generated
-  /// stack mounts; unset selects the shared base profile.
+  /// Isolated tool-config profile; unset selects the shared base profile.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub profile: Option<String>,
-  /// Ports the generated stack publishes on the host as stable `127.0.0.1`
-  /// bindings, forwarded to the same port inside the agent's shared network
-  /// namespace: the `fwd` sidecar exposes every agent-owned loopback
-  /// listener there, and a published port names one from the host reliably
-  /// instead of by a changing container IP. Applying a change needs a stack
-  /// restart — publishings are fixed at container create.
-  #[config(default = [])]
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub ports: Vec<u16>,
-  /// On-demand host publishings with a distinct host port: each entry
-  /// publishes `127.0.0.1:<host>` on the host, forwarded to `<port>` inside
-  /// the agent's shared network namespace (same `fwd` mechanism as `ports`).
-  /// The `arkham expose` command manages these entries so workspaces sharing
-  /// one host never claim the same host port twice. Same load rules as
-  /// `ports`: no zero, no capture listener ports, no host port twice.
-  #[config(default = [])]
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub expose: Vec<ExposeMap>,
-  /// Env names forwarded into the agent environment as `${NAME}` compose
-  /// interpolation: compose substitutes the host value when the stack starts,
-  /// so the generated file holds no secret and values stay fresh without
-  /// regenerating. A name that is also a `[rules.*]` env or a selected decoy
-  /// is a generation-time error — boundary discipline, one name one path.
+  /// Environment names forwarded from the agent process.
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub passthrough: Vec<String>,
@@ -133,65 +89,12 @@ pub struct WorkspaceCfg {
   #[config(default = [])]
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub file_rewrite: Vec<FileRewrite>,
-  /// Devices the generated stack hands the agent container on top of the
-  /// built-in set (`/dev/net/tun`): host device paths passed verbatim to
-  /// compose, e.g. `/dev/kvm`. Applying a change needs a stack restart —
-  /// devices are fixed at container create.
-  #[config(default = [])]
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub devices: Vec<String>,
-  /// Extra Linux capabilities the agent container gains on top of the
-  /// built-in set (`SYS_CHROOT`, `AUDIT_WRITE`, `NET_ADMIN`, `SETUID`,
-  /// `SETGID`, `SYS_ADMIN`): capability names passed verbatim to compose,
-  /// e.g. `SYS_PTRACE`.
-  #[config(default = [])]
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub cap_add: Vec<String>,
-  /// Existing compose networks the arkham service joins, each declared
-  /// `external` at the top level: the agent inherits them through the shared
-  /// network namespace (`network_mode: service:arkham`), so a sidecar like
-  /// `headroom` on one of these networks is reachable by name from the
-  /// agent. Joining any network moves arkham off the default project network.
-  /// Applying a change needs a stack restart.
-  #[config(default = [])]
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub networks: Vec<String>,
-  /// Extra host entries rendered as `extra_hosts` on the arkham and agent
-  /// services (`host:ip` or `host=ip`), beside the always-rendered
-  /// `host.docker.internal:host-gateway`: `/etc/hosts` is per container, so
-  /// both need each entry — the agent resolves the name, arkham dials the
-  /// upstream. The gateway lets the agent reach host-bound services through
-  /// the (spliced, not blocked) capture. Applying a change needs a stack
-  /// restart.
-  #[config(default = [])]
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub extra_hosts: Vec<String>,
-  /// Agent image for the generated stack; defaults to the arkham dev image
-  /// when unset.
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub image: Option<String>,
-  /// Dockerfile build for the agent image; when set, the agent service
-  /// builds it instead of pulling, tagged with `image` above or a derived
-  /// local tag.
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub build: Option<WorkspaceBuild>,
 }
 impl WorkspaceCfg {
   /// Selected profile name, or the shared base when unset.
   #[must_use]
   pub fn profile_name(&self) -> &str {
     self.profile.as_deref().unwrap_or(SHARED_PROFILE)
-  }
-
-  /// `$HOME` inside the agent container: the stated `home`, or the default
-  /// when unset or empty.
-  #[must_use]
-  pub fn container_home(&self) -> &str {
-    self
-      .home
-      .as_deref()
-      .filter(|home| !home.is_empty())
-      .unwrap_or(DEFAULT_CONTAINER_HOME)
   }
 
   /// Every `$VAR` this workspace's settings reference: `include` entries,
@@ -251,8 +154,7 @@ pub struct FileRewrite {
   /// Host file to read: `~` and `$VAR` expand, relative paths resolve
   /// against the workspace root.
   pub source: PathBuf,
-  /// Container path the rewritten file mounts at, read-only; `{home}`
-  /// expands to `[workspace] home` and `$VAR` expands first.
+  /// Host path the rewritten file mounts at, read-only; `{home}` expands to the host home.
   pub dest: String,
   /// Env names whose real values are replaced by their decoys in the file.
   /// Empty for the known config formats (`kubeconfig`, `talos`): the
@@ -284,31 +186,6 @@ impl fmt::Display for RewriteFormat {
       Self::Talos => "talos",
     })
   }
-}
-
-/// One on-demand host publishing with a distinct host port:
-/// `[[workspace.expose]]` with `port = 3000, host = 3001` publishes
-/// `127.0.0.1:3001` on the host, forwarded to port 3000 inside the agent's
-/// shared network namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ExposeMap {
-  /// Port inside the agent's shared network namespace.
-  pub port: u16,
-  /// Port bound on the host (`127.0.0.1`).
-  pub host: u16,
-}
-
-/// Dockerfile build for the agent image: paths resolve against the workspace
-/// root, `~` expands. Both keys are required when `[workspace.build]` is
-/// present; an absent section pulls `image` (or the default) instead.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkspaceBuild {
-  /// Dockerfile to build, relative to the workspace root.
-  pub dockerfile: PathBuf,
-  /// Build context directory, relative to the workspace root.
-  pub context: PathBuf,
 }
 
 /// Proxy listener settings (CLI/env/file overlay).
@@ -899,50 +776,6 @@ impl AppConfig {
       }
       if let Some(flow) = &rule.oauth2 {
         validate_flow(flow, "config", label)?;
-      }
-    }
-    for port in &self.workspace.ports {
-      if *port == 0 {
-        return Err(Error::PortZero);
-      }
-      // The capture listeners hold these ports inside the shared netns, and
-      // the `fwd` sidecar only forwards agent-owned listeners, so a published
-      // capture port would shadow a host port with a dead binding. The
-      // literals must stay in step with arkham-ebpf's `TCP_LISTEN_PORT` and
-      // `UDP_LISTEN_PORT` (and with `arkham expose`'s pre-check).
-      if *port == 15_000 || *port == 15_001 {
-        return Err(Error::CapturePort { port: *port });
-      }
-    }
-    // Host-side publishings must name distinct host ports: two bindings on
-    // one host port is a compose create error, caught here with the setting
-    // named instead.
-    let mut hosts: BTreeSet<u16> = self.workspace.ports.iter().copied().collect();
-    for map in &self.workspace.expose {
-      for port in [map.port, map.host] {
-        if port == 0 {
-          return Err(Error::PortZero);
-        }
-        if port == 15_000 || port == 15_001 {
-          return Err(Error::CapturePort { port });
-        }
-      }
-      if !hosts.insert(map.host) {
-        return Err(Error::ExposeHostConflict { port: map.host });
-      }
-    }
-    for name in &self.workspace.networks {
-      let plain = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-      if !plain {
-        return Err(Error::NetworkInvalid { name: name.clone() });
-      }
-    }
-    for entry in &self.workspace.extra_hosts {
-      let shaped = entry
-        .split_once([':', '='])
-        .is_some_and(|(host, addr)| !host.trim().is_empty() && !addr.trim().is_empty());
-      if !shaped {
-        return Err(Error::ExtraHostsInvalid { entry: entry.clone() });
       }
     }
     Ok(())
@@ -1709,94 +1542,29 @@ allow = ["https://b.example"]
     assert_eq!(fake_for("SOME_TOKEN", Some("{bogus:10}")), "{bogus:10}");
   }
 
-  /// Workspace ports are load-refused when they cannot name an exposed
-  /// agent listener: port 0 is no port, and the capture listeners are never
-  /// agent-owned, so publishing one shadows a host port with a dead binding.
   #[test]
-  fn workspace_ports_refuse_zero_and_the_capture_listener_ports() {
+  fn compose_workspace_settings_are_rejected() {
     let _guard = lock_env();
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
     set_env("ARKHAM_CONFIG", &global);
-    for (ports, expected) in [
-      ("[0]", "port 0"),
-      ("[15000]", "capture listener port"),
-      ("[15001]", "capture listener port"),
-      ("[3000, 0]", "port 0"),
+    for setting in [
+      "name = \"old\"",
+      "init = \"old\"",
+      "home = \"/old\"",
+      "ports = [3000]",
+      "expose = []",
+      "devices = []",
+      "cap_add = []",
+      "networks = []",
+      "extra_hosts = []",
+      "image = \"old\"",
+      "build = {}",
     ] {
-      write_file(&global, format!("[workspace]\nports = {ports}\n").as_str());
-      let err = load(&cli_for(&["arkham"]), None).unwrap_err();
-      assert!(err.to_string().contains(expected), "ports {ports}: {err:?}");
+      write_file(&global, &format!("[workspace]\n{setting}\n"));
+      assert!(load(&cli_for(&["arkham"]), None).is_err(), "{setting} was accepted");
     }
-    write_file(&global, "[workspace]\nports = [3000, 8080, 5432]\n");
-    let (config, _) = load(&cli_for(&["arkham"]), None).unwrap();
-    assert_eq!(config.workspace.ports, vec![3000, 8080, 5432]);
-    write_file(&global, "[proxy]\n");
-    let (config, _) = load(&cli_for(&["arkham"]), None).unwrap();
-    assert!(config.workspace.ports.is_empty(), "absent ports stay empty");
-    scrub_env();
-  }
-
-  /// Workspace networking keys load, default empty, and refuse malformed
-  /// values: blank network names, host entries without a target, zero or
-  /// capture ports in expose maps, and a host port published twice.
-  #[test]
-  fn workspace_networking_keys_validate() {
-    let _guard = lock_env();
-    scrub_env();
-    let dir = tempfile::tempdir().unwrap();
-    let global = dir.path().join("global.toml");
-    set_env("ARKHAM_CONFIG", &global);
-    for (body, expected) in [
-      ("networks = [\"\"]", "not a plain network name"),
-      ("networks = [\"has space\"]", "not a plain network name"),
-      ("extra_hosts = [\"bare-host\"]", "must be `host:ip`"),
-      ("extra_hosts = [\":1.2.3.4\"]", "must be `host:ip`"),
-      ("expose = [{ port = 0, host = 3000 }]", "port 0"),
-      ("expose = [{ port = 3000, host = 15000 }]", "capture listener port"),
-      ("ports = [3000]\nexpose = [{ port = 3000, host = 3000 }]", "published twice"),
-    ] {
-      write_file(&global, format!("[workspace]\n{body}\n").as_str());
-      let err = load(&cli_for(&["arkham"]), None).unwrap_err();
-      assert!(err.to_string().contains(expected), "{body}: {err:?}");
-    }
-    write_file(
-      &global,
-      "[workspace]\nports = [3000]\nnetworks = [\"headroom_default\"]\nextra_hosts = [\"host.docker.internal:host-gateway\"]\n[[workspace.expose]]\nport = 5173\nhost = 5174\n",
-    );
-    let (config, _) = load(&cli_for(&["arkham"]), None).unwrap();
-    assert_eq!(config.workspace.networks, vec!["headroom_default".to_string()]);
-    assert_eq!(config.workspace.extra_hosts, vec!["host.docker.internal:host-gateway".to_string()]);
-    assert_eq!(config.workspace.expose, vec![ExposeMap { port: 5173, host: 5174 }]);
-    write_file(&global, "[proxy]\n");
-    let (config, _) = load(&cli_for(&["arkham"]), None).unwrap();
-    assert!(config.workspace.networks.is_empty(), "absent networks stay empty");
-    assert!(config.workspace.extra_hosts.is_empty(), "absent extra_hosts stay empty");
-    assert!(config.workspace.expose.is_empty(), "absent expose stays empty");
-    scrub_env();
-  }
-
-  #[test]
-  fn workspace_image_and_build_parse() {
-    let _guard = lock_env();
-    scrub_env();
-    let dir = tempfile::tempdir().unwrap();
-    let global = dir.path().join("global.toml");
-    set_env("ARKHAM_CONFIG", &global);
-    write_file(
-      &global,
-      "[workspace]\nimage = \"ghcr.io/example/devenv:1.0\"\n[workspace.build]\ndockerfile = \"docker/Dockerfile.agent\"\ncontext = \"docker\"\n",
-    );
-    let (config, _) = load(&cli_for(&["arkham"]), None).unwrap();
-    assert_eq!(config.workspace.image.as_deref(), Some("ghcr.io/example/devenv:1.0"));
-    let build = config.workspace.build.as_ref().unwrap();
-    assert_eq!(build.dockerfile, PathBuf::from("docker/Dockerfile.agent"));
-    assert_eq!(build.context, PathBuf::from("docker"));
-    write_file(&global, "[proxy]\n");
-    let (config, _) = load(&cli_for(&["arkham"]), None).unwrap();
-    assert!(config.workspace.image.is_none(), "absent image stays none");
-    assert!(config.workspace.build.is_none(), "absent build stays none");
     scrub_env();
   }
 
@@ -1832,23 +1600,6 @@ allow = ["https://b.example"]
       ..WorkspaceCfg::default()
     };
     assert_eq!(workspace.referenced_variables(&[]), BTreeSet::from(["REGISTRY_HOST".to_string()]));
-  }
-
-  /// Unset or empty `home` means the default container home; a stated home
-  /// wins.
-  #[test]
-  fn container_home_defaults_when_unset_or_empty() {
-    assert_eq!(WorkspaceCfg::default().container_home(), "/home/eng");
-    let explicit = WorkspaceCfg {
-      home: Some("/home/agent".to_string()),
-      ..WorkspaceCfg::default()
-    };
-    assert_eq!(explicit.container_home(), "/home/agent");
-    let empty = WorkspaceCfg {
-      home: Some(String::new()),
-      ..WorkspaceCfg::default()
-    };
-    assert_eq!(empty.container_home(), "/home/eng");
   }
 
   /// `arkham config` prints this: every setting, its default, and the doc

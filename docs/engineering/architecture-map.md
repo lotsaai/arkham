@@ -10,7 +10,7 @@ Written from `origin/main` @ `ebd9578`. The TLS-leg sections were updated when `
 | `arkham` (bin, `src/`) | CLI with `serve`, `agent`, `init`, `up`, `fwd` and others. Builds `ProxyState` and starts the explicit listener and the capture backend. | 1022 (668) | `Command` main.rs:32; serve path main.rs:176-252; `ServeArgs` commands.rs:30; `fwd::run` fwd.rs:111 |
 | `arkham-proxy` | The MITM core: ingress dispatch, protocol pick, TLS legs, relay and substitution engine. **Every protocol vertical lives here.** | 16244 (13019) | `ProxyState` lib.rs:70; `serve` lib.rs:236; `serve_connect_stream` lib.rs:331; `serve_transparent_stream` lib.rs:367; traits in `transports/mod.rs` (§2) |
 | `arkham-config` | Config load, rule registry, **grants model**, fake generation, OAuth flows | 8001 (5987) | `AppConfig` config.rs:29; `RuleCfg` config.rs:359; `fake_for` config.rs:917; `Grant` grants/mod.rs:396; `resolve` grants/mod.rs:620; `Registry` registry.rs:133; `OAuthFlow` registry.rs:37 |
-| `arkham-compose` | `arkham init/agent/up`: generates the compose stack and rewrites host tool configs into guest decoys plus grant fragments | 6765 (4938) | `AgentArgs` confine.rs:764; `generate_stack` stack.rs:362; `RewriteAdapted` adapt.rs:30; `GrantFragment` adapt.rs:58 |
+| `arkham-sandbox` | Host session preparation, projected tool configs, and bubblewrap/Landlock launch | | `AgentArgs`; `prepare_session`; `LaunchPlan`; `RewriteAdapted` |
 | `arkham-plugin` | Wasm (wasmtime component) HTTP rewrite hooks | 708 (496) | `RewriteHook` lib.rs:72; `Registry` lib.rs:154; `Registry::select` lib.rs:298 |
 | `arkham-pki` | CA, leaf/client-pair minting, SSH keys | 766 (495) | `CertAuthority` ca.rs:30; `generate_domain_cert` ca.rs:129; `boring_pair` ca.rs:140; `generate_domain_pair` ca.rs:365; `SshKey` ssh.rs:23 |
 | `arkham-fnox` | Resolves real secret values from fnox | 1095 (785) | `FnoxSource` lib.rs:24; `resolve` lib.rs:437 |
@@ -20,7 +20,7 @@ Written from `origin/main` @ `ebd9578`. The TLS-leg sections were updated when `
 Nothing on main is split into one crate per protocol. Each protocol is spread across three crates:
 - `arkham-proxy/src/transports/<p>/`
 - `arkham-config/src/grants/<p>.rs`
-- for some protocols, `arkham-compose/src/<p>.rs`
+- for some protocols, `arkham-sandbox/src/<p>.rs`
 
 ## 2. Shared base that protocols must reuse
 
@@ -239,26 +239,25 @@ flowchart TD
    - The upstream is dialled with `dial_marked`, which applies the fwmark when a capture backend is active.
 4. **Swap.** The `(down, up)` machines get their pairs from `eligible_pairs` (engine/mod.rs:160) on `PairCtx`. `relay_guarded` pumps both directions, `Rewritten::Emit` writes, and hits are logged by `log_hits` (relay.rs:737).
 
-## 5. `arkham agent` / compose: host configs → guest decoys
+## 5. `arkham agent`: host configs → guest decoys
 
 ```mermaid
 flowchart TD
-  A[AgentArgs::run confine.rs:816] --> B[init_workspace confine.rs:407]
-  B --> C[generate_stack stack.rs:362]
-  C --> C1[StackBuilder::resolve :101<br/>registry + fnox + resolution_env]
-  C1 --> C2[secrets :147<br/>Selection::select + apply_rule_patterns → decoy env values]
-  C2 --> C3[rewrites :161 → write_rewrites rewrites.rs:97<br/>kube/talos adapt or apply_rewrites real→decoy]
-  C3 --> C4[ambient :213 → derive_sources ambient.rs:67<br/>git/jj/ssh/nats/kube/talos adapters]
-  C4 --> C5[grants :238 → adapt::write_state adapt.rs:229<br/>state/grants/arkham.toml + rules.d blobs]
-  C5 --> C6[profiles / guest_identities / stack → Stack::render :500]
-  C6 --> D[compose.yml written when the render differs]
-  A --> E[up_workspace confine.rs:622] --> F[exec_agent confine.rs:676]
+  A[AgentArgs::run] --> B[Register with host daemon]
+  B --> C[prepare_session]
+  C --> D[host_material: fnox selection and tool adapters]
+  D --> E[Private grant fragments and credential files]
+  E --> F[Resolve grants in daemon]
+  D --> G[LaunchPlan: decoy environment and projected files]
+  F --> H[Register project with proxy]
+  G --> I[Launch under bubblewrap and Landlock]
+  H --> I
 ```
 
-- **Agent container:** gets decoy env vars (stack.rs:730-731) and decoy twin files, mounted read-only at the tool's default path through `RewriteCollector::twin`.
-- **arkham container:** mounts `state/grants` at `/arkham/grants` read-only, and mounts `grants/arkham.toml` as `/root/.config/arkham/config.toml`. Config discovery derives `rules.d` from that file's directory, so the service does not set `ARKHAM_CONFIG`.
-  - At start the arkham service runs `fnox::resolve`, then `grants::resolve`, then `ProxyState::new` (main.rs:176-207).
-- **Adapter output contract:** a `GrantFragment` with the real value goes to arkham only. The decoy document goes to the agent. Materialized blobs (client cert, key, CA, ssh identity) are named `/arkham/grants/rules.d/<prefix><label>.*` (adapt.rs:200-216).
+The daemon retains real credentials and materialised adapter files in private
+session storage. The launcher receives decoys, public trust material, and mount
+instructions. Protected paths hide the daemon's credential storage from the guest.
+Compose is used by integration fixtures, not by the agent runtime.
 
 ## Not checked / unsure
 - Smaller duplicates *inside* the large machines (amqp 2075, ldap 1381, http 1439, h2 871, nats 1187). I compared only the hold-back/guard and constructor regions.
