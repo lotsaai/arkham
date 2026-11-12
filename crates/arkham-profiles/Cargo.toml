@@ -1,0 +1,19 @@
+[package]
+name = "arkham-profiles"
+version = "0.3.37"
+edition = "2024"
+description = "grant-scoped MITM proxy: tool profile mounts"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-paths = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

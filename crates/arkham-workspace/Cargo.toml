@@ -1,0 +1,28 @@
+[package]
+name = "arkham-workspace"
+version = "0.3.37"
+edition = "2024"
+description = "Workspace configuration and secret selection"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-fnox = { workspace = true }
+arkham-launch-plan = { workspace = true }
+arkham-paths = { workspace = true }
+arkham-pki = { workspace = true }
+arkham-tool-config = { workspace = true }
+dirs = { workspace = true }
+secrecy = { workspace = true }
+shellexpand = { workspace = true }
+thiserror = { workspace = true }
+xpanda = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+toml_edit = { workspace = true }
+
+[lints]
+workspace = true

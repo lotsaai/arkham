@@ -5,8 +5,6 @@ experimental = true
 lockfile = true
 env_shell_expand = true
 idiomatic_version_file_enable_tools = ["rust"]
-rust.cargo_home = ".cache/native/cargo"
-rust.rustup_home = ".cache/native/rustup"
 
 [tools]
 "aqua:nextest-rs/nextest/cargo-nextest" = "latest"
@@ -43,6 +41,4 @@ components = "llvm-tools,rustfmt,rust-src"
 
 [env]
 CARGO_TERM_COLOR = "always"
-CARGO_HOME = "{{config_root}}/.cache/native/cargo"
-RUSTUP_HOME = "{{config_root}}/.cache/native/rustup"
 RUSTUP_TOOLCHAIN = "stable"

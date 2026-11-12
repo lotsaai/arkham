@@ -16,7 +16,7 @@ use arkham_config::cli::{Cli, CliCommand, ProxyBackend};
 use arkham_fnox::FnoxSource;
 use clap::{Parser, Subcommand};
 
-use arkham_sandbox::AgentArgs;
+use arkham_agent::AgentArgs;
 use commands::{CaArgs, ConfigArgs, FakeArgs, RegistryArgs, RulesArgs, SchemesArgs, ServeArgs};
 use daemon::DaemonArgs;
 
@@ -86,7 +86,7 @@ fn main() -> eyre::Result<()> {
   if std::env::args().nth(1).as_deref() == Some("--landlock-exec") {
     #[cfg(target_os = "linux")]
     {
-      if let Err(err) = arkham_sandbox::landlock_exec() {
+      if let Err(err) = run_landlock_exec(&std::env::args_os().collect::<Vec<_>>()) {
         eprintln!("{}", err.registration_detail());
         std::process::exit(1);
       }
@@ -98,6 +98,23 @@ fn main() -> eyre::Result<()> {
     }
   }
   runtime_main()
+}
+
+#[cfg(target_os = "linux")]
+fn run_landlock_exec(args: &[std::ffi::OsString]) -> Result<(), arkham_sandbox::Error> {
+  let mut args = args.iter();
+  let mut plan = None;
+  let mut command = Vec::new();
+  while let Some(arg) = args.next() {
+    if arg == "--landlock-exec" {
+      plan = args.next();
+    } else if arg == "--" {
+      command.extend(args.cloned());
+      break;
+    }
+  }
+  let plan = plan.ok_or(arkham_sandbox::Error::ControlLimit)?;
+  arkham_sandbox::landlock_exec(Path::new(plan), &command)
 }
 
 #[tokio::main]

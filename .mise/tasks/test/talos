@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 #MISE description="Prove talosctl context switching through eBPF against official Talos nodes"
-#MISE depends=["build:debug"]
+#MISE depends=["build:debug", "build:container"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1
@@ -61,7 +61,7 @@ trap cleanup EXIT
 
 rm -rf "$scratch"
 mkdir -p "$scratch/image" "$scratch/fnox" "$scratch/home/.talos" "$scratch/workspace" "$scratch/xdg-config" "$scratch/xdg-state" "$scratch/xdg-data"
-cp "$arkham" "$scratch/image/arkham"
+cp target/container/release/arkham "$scratch/image/arkham"
 
 case "$(uname -m)" in
   x86_64) talos_arch=amd64 ;;
@@ -105,7 +105,7 @@ node_network() {
 create_cluster() {
   local name=$1 subnet=$2 dest=$3
   echo "creating ${name} on ${subnet}" >&2
-  "$talosctl" cluster create docker \
+  env -u KUBECONFIG HOME="$scratch/home" "$talosctl" cluster create docker \
     --name "$name" \
     --state "$state/$name" \
     --workers 0 \

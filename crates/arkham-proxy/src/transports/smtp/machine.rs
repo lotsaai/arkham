@@ -199,7 +199,7 @@ impl Smtp {
         real_user: scope.upstream.user.as_bytes().to_vec(),
         fake_pass: scope.downstream.password.expose_secret().as_bytes().to_vec(),
         real_pass: scope.upstream.password.expose_secret().as_bytes().to_vec(),
-        label: grant.credential().map(|credential| credential.label.clone()).unwrap_or_default(),
+        label: grant.credential().map_or_default(|credential| credential.label.clone()),
       })
     });
     let gate = Arc::new(DataGate::new());

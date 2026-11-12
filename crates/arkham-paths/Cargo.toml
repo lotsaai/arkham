@@ -1,0 +1,11 @@
+[package]
+name = "arkham-paths"
+version = "0.3.37"
+edition = "2024"
+description = "Shared workspace path operations"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[lints]
+workspace = true

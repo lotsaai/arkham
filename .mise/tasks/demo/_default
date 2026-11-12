@@ -7,10 +7,11 @@ cd "$proj_dir" || exit 1
 
 set -euo pipefail
 
-mise run build
+mise run test
+mise run build:container
 bash integration/gen-nats.sh
 mkdir -p integration/docker
-cp target/release/arkham integration/docker/arkham
+cp target/container/release/arkham integration/docker/arkham
 
 compose="docker compose -f integration/compose.yaml"
 trap '$compose down --remove-orphans -v --timeout 3' EXIT

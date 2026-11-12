@@ -249,11 +249,7 @@ pub(crate) fn password_credential(label: &str, fake: &SecretString, value: Secre
 
 /// The fake connection string a rule states, or empty when it states none.
 pub(crate) fn stated_fake(rule: &RuleCfg) -> String {
-  rule
-    .value
-    .as_ref()
-    .map(|value| value.expose_secret().to_string())
-    .unwrap_or_default()
+  rule.value.as_ref().map_or_default(|value| value.expose_secret().to_string())
 }
 
 fn endpoint_match(entry: &EndpointScope, scheme: Scheme, host: &str, port: u16) -> bool {
