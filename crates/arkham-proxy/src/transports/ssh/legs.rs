@@ -197,7 +197,12 @@ struct Guest {
 }
 impl russh::server::Handler for Guest {
   type Error = RusshError;
-  fn auth_publickey_offered(&mut self, _user: &str, public_key: &PublicKey) -> impl Future<Output = Result<Auth, Self::Error>> {
+  fn auth_publickey_offered(
+    &mut self,
+    _user: &str,
+    offer: russh::server::PublicKeyOffer<'_>,
+  ) -> impl Future<Output = Result<Auth, Self::Error>> {
+    let public_key = offer.public_key;
     tracing::debug!(key = ?public_key.to_openssh(), "ssh guest leg: key offered");
     let auth = if *public_key == self.legs.decoy {
       Auth::Accept
@@ -207,7 +212,8 @@ impl russh::server::Handler for Guest {
     ready(Ok(auth))
   }
 
-  fn auth_publickey(&mut self, user: &str, public_key: &PublicKey) -> impl Future<Output = Result<Auth, Self::Error>> {
+  fn auth_publickey(&mut self, user: &str, key: russh::server::VerifiedPublicKey<'_>) -> impl Future<Output = Result<Auth, Self::Error>> {
+    let public_key = key.public_key;
     tracing::debug!(key = ?public_key.to_openssh(), "ssh guest leg: signed auth");
     let auth = if *public_key == self.legs.decoy {
       self.user = user.to_string();
@@ -221,7 +227,12 @@ impl russh::server::Handler for Guest {
   fn auth_password(&mut self, _user: &str, _password: &str) -> impl Future<Output = Result<Auth, Self::Error>> {
     ready(Ok(Auth::reject()))
   }
-  async fn channel_open_session(&mut self, mut channel: Channel<ServerMsg>, session: &mut Session) -> Result<bool, Self::Error> {
+  async fn channel_open_session(
+    &mut self,
+    mut channel: Channel<ServerMsg>,
+    reply: russh::server::ChannelOpenHandle,
+    session: &mut Session,
+  ) -> Result<(), Self::Error> {
     if self.upstream.is_none() {
       let handle = self.dial_upstream().await?;
       self.upstream = Some(handle);
@@ -229,9 +240,10 @@ impl russh::server::Handler for Guest {
     // The slot was filled just above; an empty read still closes the
     // channel quietly instead of panicking.
     let Some(upstream) = self.upstream.as_ref() else {
-      return Ok(false);
+      return Ok(());
     };
     let remote = upstream.channel_open_session().await?;
+    reply.accept().await;
     let (mut read, write) = remote.split();
     let guest_id = channel.id();
     let guest_writer = session.handle();
@@ -287,7 +299,7 @@ impl russh::server::Handler for Guest {
       let _ = guest_writer.close(guest_id).await;
       let _ = pump_writer.close().await;
     });
-    Ok(true)
+    Ok(())
   }
 }
 
@@ -386,8 +398,14 @@ struct UpstreamLeg {
 impl russh::client::Handler for UpstreamLeg {
   type Error = RusshError;
 
-  fn check_server_key(&mut self, server_public_key: &PublicKey) -> impl Future<Output = Result<bool, Self::Error>> {
-    ready(self.verify_server_key(server_public_key))
+  fn check_server_key(
+    &mut self,
+    server_public_key: &russh::keys::PublicKeyOrCertificate,
+  ) -> impl Future<Output = Result<bool, Self::Error>> {
+    ready(match server_public_key {
+      russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => self.verify_server_key(key),
+      russh::keys::PublicKeyOrCertificate::Certificate(_) => Ok(false),
+    })
   }
 }
 
@@ -407,8 +425,6 @@ impl UpstreamLeg {
 
 #[cfg(test)]
 mod tests {
-  use russh::CryptoVec;
-
   use super::*;
   use arkham_pki::ssh::SshKey;
   use arkham_pki::ssh::known_hosts_line_for_public;
@@ -426,16 +442,23 @@ mod tests {
   impl russh::server::Handler for Stub {
     type Error = RusshError;
 
-    fn auth_publickey(&mut self, _user: &str, public_key: &PublicKey) -> impl Future<Output = Result<Auth, Self::Error>> {
+    fn auth_publickey(
+      &mut self,
+      _user: &str,
+      key: russh::server::VerifiedPublicKey<'_>,
+    ) -> impl Future<Output = Result<Auth, Self::Error>> {
+      let public_key = key.public_key;
       *self.saw_key.lock().expect("stub mutex") = Some(public_key.clone());
       ready(Ok(if *public_key == self.admit { Auth::Accept } else { Auth::reject() }))
     }
 
-    fn channel_open_session(
+    async fn channel_open_session(
       &mut self,
       mut channel: Channel<ServerMsg>,
+      reply: russh::server::ChannelOpenHandle,
       session: &mut Session,
-    ) -> impl Future<Output = Result<bool, Self::Error>> {
+    ) -> Result<(), Self::Error> {
+      reply.accept().await;
       let writer = session.handle();
       let id = channel.id();
       tokio::spawn(async move {
@@ -445,7 +468,7 @@ mod tests {
             // clients wait for that reply.
             let _ = writer.channel_success(id).await;
             let reply = format!("ok:{}", String::from_utf8_lossy(&command));
-            let _ = writer.data(id, CryptoVec::from(reply)).await;
+            let _ = writer.data(id, reply).await;
             let _ = writer.exit_status_request(id, 0).await;
             let _ = writer.eof(id).await;
             let _ = writer.close(id).await;
@@ -453,7 +476,7 @@ mod tests {
           }
         }
       });
-      ready(Ok(true))
+      Ok(())
     }
   }
 
@@ -463,7 +486,10 @@ mod tests {
   impl russh::client::Handler for Client {
     type Error = RusshError;
 
-    fn check_server_key(&mut self, _server_public_key: &PublicKey) -> impl Future<Output = Result<bool, Self::Error>> {
+    fn check_server_key(
+      &mut self,
+      _server_public_key: &russh::keys::PublicKeyOrCertificate,
+    ) -> impl Future<Output = Result<bool, Self::Error>> {
       ready(Ok(true))
     }
   }

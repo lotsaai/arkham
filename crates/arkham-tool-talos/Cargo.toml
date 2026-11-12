@@ -1,0 +1,26 @@
+[package]
+name = "arkham-tool-talos"
+version = "0.3.37"
+edition = "2024"
+description = "Talos configuration adaptation"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-pki = { workspace = true }
+arkham-tool-config = { workspace = true }
+base64 = { workspace = true }
+pem = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rustls = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

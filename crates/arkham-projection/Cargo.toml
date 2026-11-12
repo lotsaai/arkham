@@ -1,0 +1,24 @@
+[package]
+name = "arkham-projection"
+version = "0.3.37"
+edition = "2024"
+description = "Filesystem projection for Arkham sessions"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-launch-plan = { workspace = true }
+arkham-paths = { workspace = true }
+dirs = { workspace = true }
+libc = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+arkham-sandbox = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

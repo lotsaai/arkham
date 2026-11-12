@@ -2,7 +2,8 @@
 
 #MISE description="Run the docker compose e2e scenarios with eBPF capture"
 #MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "integration/**"]
-#MISE depends=["build:debug"]
+#MISE outputs=[]
+#MISE depends=["build:debug", "build:container"]
 
 proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
 cd "$proj_dir" || exit 1
@@ -42,10 +43,9 @@ cleanup_nats_discovery() {
 }
 trap cleanup_nats_discovery EXIT
 
-# The debug binary comes from the `build:debug` dependency; compose mounts
-# it from here (the image is runtime-only, no build stage).
+# Only the portable container build goes into the runtime image.
 mkdir -p integration/docker
-cp target/debug/arkham integration/docker/arkham
+cp target/container/release/arkham integration/docker/arkham
 
 compose="docker compose -f integration/compose.yaml --env-file integration/.env"
 client=arkham-integration-client-1
@@ -298,7 +298,7 @@ EOF
       echo "missing $covered"
       code=1
     else
-      integration/docker/arkham schemes > /tmp/arkham-schemes.txt
+      target/debug/arkham schemes > /tmp/arkham-schemes.txt
       while IFS= read -r scheme; do
         [ -z "$scheme" ] && continue
         if ! grep -Fq "\"${scheme}\"" "$covered"; then

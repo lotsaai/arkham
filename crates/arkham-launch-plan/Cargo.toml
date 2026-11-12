@@ -1,0 +1,15 @@
+[package]
+name = "arkham-launch-plan"
+version = "0.3.37"
+edition = "2024"
+description = "Launch plan contracts for Arkham sandbox sessions"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true

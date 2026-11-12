@@ -10,7 +10,13 @@ Written from `origin/main` @ `ebd9578`. The TLS-leg sections were updated when `
 | `arkham` (bin, `src/`) | CLI with `serve`, `agent`, `init`, `up`, `fwd` and others. Builds `ProxyState` and starts the explicit listener and the capture backend. | 1022 (668) | `Command` main.rs:32; serve path main.rs:176-252; `ServeArgs` commands.rs:30; `fwd::run` fwd.rs:111 |
 | `arkham-proxy` | The MITM core: ingress dispatch, protocol pick, TLS legs, relay and substitution engine. **Every protocol vertical lives here.** | 16244 (13019) | `ProxyState` lib.rs:70; `serve` lib.rs:236; `serve_connect_stream` lib.rs:331; `serve_transparent_stream` lib.rs:367; traits in `transports/mod.rs` (§2) |
 | `arkham-config` | Config load, rule registry, **grants model**, fake generation, OAuth flows | 8001 (5987) | `AppConfig` config.rs:29; `RuleCfg` config.rs:359; `fake_for` config.rs:917; `Grant` grants/mod.rs:396; `resolve` grants/mod.rs:620; `Registry` registry.rs:133; `OAuthFlow` registry.rs:37 |
-| `arkham-sandbox` | Host session preparation, projected tool configs, and bubblewrap/Landlock launch | | `AgentArgs`; `prepare_session`; `LaunchPlan`; `RewriteAdapted` |
+| `arkham-sandbox` | Bubblewrap, Landlock, and cgroup enforcement | | `spawn`; `landlock_exec`; `SessionSlot` |
+| `arkham-agent` | Wrapper registration and lifecycle | | `AgentArgs` |
+| `arkham-session` | Daemon-side session preparation | | `prepare_session`; `PreparedSession` |
+| `arkham-launch-plan` | Shared launch data | | `LaunchPlan`; `Bind` |
+| `arkham-session-protocol` | Registration messages and socket checks | | `RegisterRequest`; `RegisterResponse` |
+| `arkham-workspace`, `arkham-projection` | Workspace inputs and protected-file projection | | `Workspace`; `projected_files` |
+| `arkham-tool-*`, `arkham-profiles`, `arkham-git-config`, `arkham-paths` | Tool adaptation, profiles, Git discovery, and paths | | Concrete adapter `adapt` functions |
 | `arkham-plugin` | Wasm (wasmtime component) HTTP rewrite hooks | 708 (496) | `RewriteHook` lib.rs:72; `Registry` lib.rs:154; `Registry::select` lib.rs:298 |
 | `arkham-pki` | CA, leaf/client-pair minting, SSH keys | 766 (495) | `CertAuthority` ca.rs:30; `generate_domain_cert` ca.rs:129; `boring_pair` ca.rs:140; `generate_domain_pair` ca.rs:365; `SshKey` ssh.rs:23 |
 | `arkham-fnox` | Resolves real secret values from fnox | 1095 (785) | `FnoxSource` lib.rs:24; `resolve` lib.rs:437 |
@@ -20,7 +26,7 @@ Written from `origin/main` @ `ebd9578`. The TLS-leg sections were updated when `
 Nothing on main is split into one crate per protocol. Each protocol is spread across three crates:
 - `arkham-proxy/src/transports/<p>/`
 - `arkham-config/src/grants/<p>.rs`
-- for some protocols, `arkham-sandbox/src/<p>.rs`
+- for some protocols, a dedicated `arkham-tool-*` adapter crate
 
 ## 2. Shared base that protocols must reuse
 
@@ -258,6 +264,31 @@ The daemon retains real credentials and materialised adapter files in private
 session storage. The launcher receives decoys, public trust material, and mount
 instructions. Protected paths hide the daemon's credential storage from the guest.
 Compose is used by integration fixtures, not by the agent runtime.
+
+## 6. Runtime and dependency compatibility
+
+The root `Dockerfile` is shared by the shipped image and the SSH/protocol and
+Talos integration fixtures; it retains `ghcr.io/casualjim/bare:libcxx-udev-ssl`.
+`mise run build:container` uses `ghcr.io/casualjim/rust-builder` directly, with
+no custom builder image or new version pins. Required tools are prepared inside
+the container; no host binaries, PATH, Cargo home or Rustup home are forwarded.
+Source is mounted read-only and build/download caches are writable. Its separate
+`target/container` directory keeps these objects apart from native
+host builds. The task runs the binary with the runtime image's loader before
+fixtures use it. Release images continue to package the CI-built dist binary.
+The file-based test runner declares the container build as a prerequisite.
+Its nested test runs do not force build dependencies again; test tasks still
+execute, while mise reuses the binary and successful runtime-check marker until
+an input changes or an output disappears.
+
+Root `[patch.crates-io]` entries pin upstream `age` crypto updates and a
+`libsqlite3-sys` revision compatible with fnox's rusqlite requirement that bundles
+SQLCipher 4.20.0. These are dependency fixes, not audit exemptions; the remaining
+accepted advisories and their removal conditions live in `.cargo/audit.toml`.
+
+NATS user JWT metadata is decoded with the existing `base64` and `serde_json`
+dependencies. Arkham checks its header and user public key; the upstream NATS
+server verifies the account signature.
 
 ## Not checked / unsure
 - Smaller duplicates *inside* the large machines (amqp 2075, ldap 1381, http 1439, h2 871, nats 1187). I compared only the hold-back/guard and constructor regions.

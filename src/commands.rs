@@ -1,7 +1,7 @@
 //! Binary-owned subcommands: each args struct implements [`CliCommand`] and
 //! owns its `run`.
 //!
-//! The `agent` command lives in `arkham-sandbox`; [`serve`](crate::serve)
+//! The `agent` command lives in `arkham-agent`; [`serve`](crate::serve)
 //! keeps its backend machinery in the crate root.
 
 #[cfg(target_os = "linux")]
@@ -16,7 +16,7 @@ use arkham_config::grants::{EndpointScope, Scheme, decoy_for_rule};
 use arkham_config::import::{flow_from_oidc, flows_from_openapi, to_toml_fragment};
 use arkham_fnox::{FnoxSource, resolve};
 use arkham_pki::ca::load_or_generate;
-use arkham_sandbox::rules_command;
+use arkham_workspace::rules_command;
 use clap::{Args, Subcommand};
 use confique::Config;
 use confique::toml::FormatOptions;

@@ -54,7 +54,7 @@ impl Redis {
               .then(|| (scope.downstream.clone(), scope.upstream.clone())),
             fake: scope.downstream.password.expose_secret().to_string(),
             real: scope.upstream.password.expose_secret().to_string(),
-            label: grant.credential().map(|credential| credential.label.clone()).unwrap_or_default(),
+            label: grant.credential().map_or_default(|credential| credential.label.clone()),
             closed: false,
           }
         })
@@ -196,7 +196,7 @@ fn take_inline(buf: &mut Vec<u8>) -> Option<(Vec<u8>, Command)> {
 
 /// Name the verb and carry the token offsets.
 fn classify(tokens: Vec<Vec<u8>>, args: Vec<(usize, usize)>) -> Command {
-  let verb = tokens.first().map(Vec::as_slice).unwrap_or_default();
+  let verb = tokens.first().map_or_default(Vec::as_slice);
   Command {
     auth: verb.eq_ignore_ascii_case(b"AUTH"),
     hello: verb.eq_ignore_ascii_case(b"HELLO"),

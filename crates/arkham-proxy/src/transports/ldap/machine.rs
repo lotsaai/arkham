@@ -234,7 +234,7 @@ impl Ldap {
           real: scope.upstream.password.expose_secret().to_string(),
           downstream_dn: scope.downstream.dn.clone(),
           upstream_dn: scope.upstream.dn.clone(),
-          label: grant.credential().map(|credential| credential.label.clone()).unwrap_or_default(),
+          label: grant.credential().map_or_default(|credential| credential.label.clone()),
           swap,
           notes: VecDeque::new(),
           msg_id: None,
@@ -248,7 +248,7 @@ impl Ldap {
         let scope = grant.ldap(Some(host), port)?;
         let real = scope.upstream.password.expose_secret().as_bytes().to_vec();
         let fake = scope.downstream.password.expose_secret().as_bytes().to_vec();
-        let label = grant.credential().map(|credential| credential.label.clone()).unwrap_or_default();
+        let label = grant.credential().map_or_default(|credential| credential.label.clone());
         Some(Up {
           pair: CredentialPair {
             needle: real,

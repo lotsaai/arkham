@@ -46,10 +46,10 @@ enum DaemonCommand {
 impl CliCommand for DaemonArgs {
   type Error = eyre::Report;
 
-  async fn run(self, _cli: &Cli, version: &str) -> Result<(), Self::Error> {
+  async fn run(self, _cli: &Cli, arkham_version: &str) -> Result<(), Self::Error> {
     #[cfg(target_os = "linux")]
     match self.command {
-      DaemonCommand::Run { background: false } => crate::host::run(version).await,
+      DaemonCommand::Run { background: false } => crate::host::run(arkham_version).await,
       DaemonCommand::Run { background: true } | DaemonCommand::Start => systemd::UserService::systemctl("start").await,
       DaemonCommand::Unit => systemd::UserService::print_unit(),
       DaemonCommand::Install => systemd::UserService::install().await,
@@ -63,7 +63,7 @@ impl CliCommand for DaemonArgs {
     #[cfg(not(target_os = "linux"))]
     {
       let _ = self.command;
-      eyre::bail!("the host daemon runs on Linux, not this arkham {version} build")
+      eyre::bail!("the host daemon runs on Linux, not this arkham {arkham_version} build")
     }
   }
 }
