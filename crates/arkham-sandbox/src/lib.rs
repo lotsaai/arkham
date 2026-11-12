@@ -1,8 +1,4 @@
-//! Workspace confinement: `arkham rules` prints env-only rules for the
-//! fnox-declared names the registry knows; `arkham init` generates the
-//! workspace stack as generated state; `arkham up`/`down`/`logs` drive
-//! the layered compose project; `arkham agent` runs that whole sequence
-//! in one go.
+//! Workspace confinement and host agent session preparation.
 
 mod adapt;
 mod ambient;
@@ -10,7 +6,6 @@ mod confine;
 mod decoys;
 mod error;
 mod expand;
-mod expose;
 mod git;
 mod host;
 mod jj;
@@ -25,10 +20,9 @@ mod stack;
 mod talos;
 mod workspace;
 
-pub use confine::{AgentArgs, DownArgs, InitArgs, LogsArgs, UpArgs};
+pub use confine::AgentArgs;
 pub use decoys::rules_command;
 pub use error::Error;
-pub use expose::ExposeArgs;
 pub use host::{
   CaPaths, LaunchPlan, PRIVATE_SESSION_ROOT, PreparedSession, RegisterRequest, RegisterResponse, cgroup_is_confined, daemon_socket_path,
   decode_request, encode_response, parse_starttime, peer_uid_allowed, prepare_session, project_root, read_line, write_line,

@@ -57,7 +57,7 @@ volumes:
   - ~/.config/arkham/ca.crt:/usr/local/share/ca-certificates/arkham-ca.crt:ro
 ```
 
-and run `update-ca-certificates` from the entrypoint when it exists. The generated secure stack does exactly this.
+and run `update-ca-certificates` from the entrypoint when it exists.
 
 ## 5. Rotate
 

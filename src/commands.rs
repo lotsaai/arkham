@@ -1,18 +1,14 @@
 //! Binary-owned subcommands: each args struct implements [`CliCommand`] and
 //! owns its `run`.
 //!
-//! Workspace commands (`init`, `agent`, `up`, `down`, `logs`) live in
-//! `arkham-compose` instead; [`serve`](crate::serve) keeps its backend
-//! machinery in the crate root and [`ServeArgs::run`] delegates to it.
+//! The `agent` command lives in `arkham-sandbox`; [`serve`](crate::serve)
+//! keeps its backend machinery in the crate root.
 
 #[cfg(target_os = "linux")]
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
-#[cfg(target_os = "linux")]
-use crate::fwd;
 use crate::{ca_path, generation_registry, serve};
-use arkham_compose::rules_command;
 use arkham_config::ExposeSecret;
 use arkham_config::cli::{Cli, CliCommand, ProxyBackend};
 use arkham_config::config::{AppConfig, ProxyCfg, cwd_project_rules_dir, load, reference_samples, validate_pattern};
@@ -20,11 +16,10 @@ use arkham_config::grants::{EndpointScope, Scheme, decoy_for_rule};
 use arkham_config::import::{flow_from_oidc, flows_from_openapi, to_toml_fragment};
 use arkham_fnox::{FnoxSource, resolve};
 use arkham_pki::ca::load_or_generate;
+use arkham_sandbox::rules_command;
 use clap::{Args, Subcommand};
 use confique::Config;
 use confique::toml::FormatOptions;
-#[cfg(not(target_os = "linux"))]
-use eyre::bail;
 use eyre::{Report, eyre};
 use tracing::warn;
 /// Arguments for the serve command.
@@ -287,44 +282,6 @@ impl CliCommand for ConfigArgs {
   }
 }
 
-#[derive(Args, Debug, Clone, Copy)]
-pub struct FwdArgs;
-
-impl CliCommand for FwdArgs {
-  type Error = Report;
-  /// Runs the loopback exposure sidecar.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error on non-Linux hosts, or whatever the sidecar returns.
-  async fn run(self, _cli: &Cli, _arkham_version: &str) -> Result<(), Self::Error> {
-    #[cfg(not(target_os = "linux"))]
-    bail!("arkham fwd reads /proc/net/tcp and exists on Linux only");
-    #[cfg(target_os = "linux")]
-    fwd::run().await
-  }
-}
-
-/// Arguments for the host daemon.
-#[derive(Args, Debug, Clone, Default)]
-pub struct DaemonArgs;
-
-impl CliCommand for DaemonArgs {
-  type Error = Report;
-  /// Serves the shared host proxy and the control socket.
-  ///
-  /// # Errors
-  ///
-  /// Returns an error on non-Linux hosts, when the listen address is not
-  /// loopback, or when the daemon cannot bind its socket.
-  async fn run(self, _cli: &Cli, arkham_version: &str) -> Result<(), Self::Error> {
-    #[cfg(not(target_os = "linux"))]
-    bail!("the host daemon runs on Linux, not this arkham {arkham_version} build");
-    #[cfg(target_os = "linux")]
-    crate::host::run(arkham_version).await
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -357,96 +314,13 @@ mod tests {
       other => panic!("expected agent, got {other:?}"),
     }
   }
-
   #[test]
-  fn init_takes_the_backend_flag_and_the_workspace() {
-    let cli = ArkhamCli::try_parse_from(["arkham", "init", "--backend", "ebpf", "/srv/project"]).unwrap();
-    match cli.command {
-      Some(Command::Init(args)) => {
-        assert_eq!(args.backend, Some(ProxyBackend::Ebpf));
-        assert_eq!(args.workspace, Some(PathBuf::from("/srv/project")));
-      }
-      other => panic!("expected init, got {other:?}"),
+  fn obsolete_compose_commands_and_flags_are_rejected() {
+    for command in ["init", "up", "down", "logs", "expose", "fwd"] {
+      ArkhamCli::try_parse_from(["arkham", command]).unwrap_err();
     }
-    let cli = ArkhamCli::try_parse_from(["arkham", "init"]).unwrap();
-    match cli.command {
-      Some(Command::Init(args)) => assert_eq!(args.backend, None, "the OS default resolves later"),
-      other => panic!("expected init, got {other:?}"),
-    }
-    ArkhamCli::try_parse_from(["arkham", "init", "--backend", "sideways"]).unwrap_err();
-  }
-
-  #[test]
-  fn agent_rm_is_off_until_asked_for() {
-    let cli = ArkhamCli::try_parse_from(["arkham", "agent", "--rm", "--", "claude"]).unwrap();
-    match cli.command {
-      Some(Command::Agent(args)) => {
-        assert!(args.rm, "--rm stops the stack on exit");
-        assert_eq!(args.command, vec![OsString::from("claude")]);
-      }
-      other => panic!("expected agent, got {other:?}"),
-    }
-
-    let cli = ArkhamCli::try_parse_from(["arkham", "agent"]).unwrap();
-    match cli.command {
-      Some(Command::Agent(args)) => assert!(!args.rm, "the stack outlives the agent by default"),
-      other => panic!("expected agent, got {other:?}"),
-    }
-  }
-
-  #[test]
-  fn the_stack_commands_take_the_workspace_positional() {
-    for argv in [vec!["arkham", "up"], vec!["arkham", "down"]] {
-      let cli = ArkhamCli::try_parse_from(&argv).unwrap();
-      let workspace = match cli.command {
-        Some(Command::Up(args)) => args.workspace,
-        Some(Command::Down(args)) => args.workspace,
-        other => panic!("expected a stack command for {argv:?}, got {other:?}"),
-      };
-      assert_eq!(workspace, None, "absent means the current directory");
-    }
-
-    let cli = ArkhamCli::try_parse_from(["arkham", "up", "/srv/project"]).unwrap();
-    match cli.command {
-      Some(Command::Up(args)) => assert_eq!(args.workspace, Some(PathBuf::from("/srv/project"))),
-      other => panic!("expected up, got {other:?}"),
-    }
-  }
-
-  #[test]
-  fn logs_takes_its_flags_service_names_and_workspace() {
-    let cli = ArkhamCli::try_parse_from([
-      "arkham",
-      "logs",
-      "--follow",
-      "--no-log-prefix",
-      "--tail",
-      "50",
-      "--workspace",
-      "/srv/project",
-      "arkham",
-      "agent",
-    ])
-    .unwrap();
-    match cli.command {
-      Some(Command::Logs(logs)) => {
-        assert!(logs.follow && logs.no_log_prefix);
-        assert_eq!(logs.tail, "50");
-        assert_eq!(logs.workspace, Some(PathBuf::from("/srv/project")));
-        assert_eq!(logs.services, vec!["arkham", "agent"], "one or more services, all by default");
-      }
-      other => panic!("expected logs, got {other:?}"),
-    }
-
-    let cli = ArkhamCli::try_parse_from(["arkham", "logs"]).unwrap();
-    match cli.command {
-      Some(Command::Logs(logs)) => {
-        assert!(!logs.follow && !logs.no_log_prefix);
-        assert_eq!(logs.tail, "all", "the tail default is everything");
-        assert_eq!(logs.workspace, None, "absent means the current directory");
-        assert!(logs.services.is_empty(), "no services means all of them");
-      }
-      other => panic!("expected logs, got {other:?}"),
+    for flag in ["--isolate", "--rm", "--build"] {
+      ArkhamCli::try_parse_from(["arkham", "agent", flag]).unwrap_err();
     }
   }
 }

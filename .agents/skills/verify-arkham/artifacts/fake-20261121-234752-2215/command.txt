@@ -1,0 +1,1 @@
+arkham fake DEMO_TOKEN --pattern ghp_\{hex:36\} 

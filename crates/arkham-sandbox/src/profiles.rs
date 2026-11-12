@@ -172,9 +172,7 @@ pub(crate) fn profile_mounts(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::stack::*;
   use crate::test_support::*;
-  use arkham_config::cli::ProxyBackend;
 
   #[test]
   fn shared_profile_mounts_tools_at_each_tools_default_location() {
@@ -198,18 +196,6 @@ mod tests {
       "{rendered:?}"
     );
     assert!(!rendered.iter().any(|mount| mount.contains("not-a-tool")), "{rendered:?}");
-
-    let yaml = Stack {
-      agent: agent_paths("/home/eng/github/arkham"),
-      tool_mounts: mounts.clone(),
-      ..test_stack(ProxyBackend::Ebpf)
-    }
-    .render();
-    assert!(
-      yaml.contains(&format!("- {}:/home/eng/.pi:rw", shared.join("pi").display())),
-      "{yaml}"
-    );
-    assert!(!yaml.contains("not-a-tool"), "{yaml}");
   }
 
   #[test]

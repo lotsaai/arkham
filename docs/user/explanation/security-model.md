@@ -7,7 +7,7 @@ What arkham defends against, what it does not, and the edges you are choosing to
 A credential that leaves the agent is the decoy. The agent holds only a format-valid fake and works unchanged — the swap is transparent. Concretely:
 
 - **Exfiltration to a third party.** A prompt-injected tool, a curious dependency, or a log sink receives the decoy. Any host outside the allow entries gets the decoy and rejects it. The real value never travels there.
-- **Leaked environment or config.** A container dump, a screenshot, a paste of `env`: all carry decoys, which are deterministic and safe to commit.
+- **Leaked environment or config.** An agent environment dump, a screenshot, or a paste of `env` carries decoys, which are deterministic and safe to commit.
 - **The token-issuance path.** When a rule's registry entry declares an OAuth2 flow, freshly issued tokens never reach the agent: the proxy rewrites the token response, the agent holds a minted decoy, and later requests swap it back. Rotating refresh tokens get one decoy per issued value.
 - **The response path.** arkham redacts real values back to decoys in responses, so even output from a granted host shows the client the fake.
 
@@ -32,7 +32,7 @@ The grant list is the blast radius. `https://api.anthropic.com` means the real k
 
 ## What arkham is not
 
-- **Not a sandbox.** arkham constrains where a real credential travels on the wire. It does not constrain what the workload computes, reads, or writes. A workload that can exfiltrate data can exfiltrate everything except the real credential.
+- **Proxy use alone is not a sandbox.** The proxy constrains where a real credential travels on the wire. Host-confined agents also use bubblewrap and Landlock, subject to the selected write profile and host limitations.
 - **Not path authorisation.** Grants match the authority. A grant to `https://api.example.com` permits `/admin` as much as `/v1/models`. If an API's paths differ in sensitivity, treat the credential as granted to all of them.
 - **Not protection against credential-derived payloads.** arkham swaps the decoy where it appears verbatim, in headers, basic auth, and bodies, over HTTP/1 and HTTP/2. A workload that hashes, signs, or re-encodes the credential before sending sends a decoy-derived value, and the upstream rejects the request. That rejection is the system working; it is also a workload arkham cannot help.
 - **Not anonymous.** arkham terminates TLS on granted hosts, which means it reads that traffic. You are moving trust from the API's certificate to your CA, deliberately, for a scoped set of hosts.
@@ -44,7 +44,7 @@ The grant list is the blast radius. `https://api.anthropic.com` means the real k
 | `*` as a grant host | Matches any destination. arkham warns at startup; the exposure is yours to accept. |
 | A non-loopback listen address | Anyone reaching the port triggers real-secret substitution. Warned at startup. |
 | CA key distribution | Whoever holds `ca.key` or `ca.pem` can mint leaf certificates and intercept granted traffic. Distribute `ca.crt` only. |
-| Compromised arkham process | It holds every real value and the CA. The Linux Compose proxy also has host PID visibility and `SYS_PTRACE` to validate socket ownership. Treat the arkham container as tier-zero; keep its mounts minimal. |
+| Compromised arkham process | The daemon holds real values and the CA. Treat it and its host as trusted. |
 | Workload trusts extra CAs | A workload with its own MITM proxy in front of arkham sees pre-substitution traffic only if it holds the real credential, which it does not; but it can still see decoy traffic and everything else in the namespace. |
 | UDP | Connected UDP is relayed unchanged without substitution. Unconnected `sendto` traffic, including typical DNS, is not captured. |
 

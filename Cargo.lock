@@ -373,12 +373,12 @@ dependencies = [
 name = "arkham"
 version = "0.3.38"
 dependencies = [
- "arkham-compose",
  "arkham-config",
  "arkham-ebpf",
  "arkham-fnox",
  "arkham-pki",
  "arkham-proxy",
+ "arkham-sandbox",
  "clap",
  "confique",
  "dirs 7.0.0",
@@ -391,46 +391,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "arkham-compose"
-version = "0.3.38"
-dependencies = [
- "arkham-config",
- "arkham-fnox",
- "arkham-pki",
- "base64 0.23.1",
- "clap",
- "dirs 7.0.0",
- "gix-config",
- "gix-discover",
- "http 1.5.0",
- "k8s-openapi",
- "kube-client",
- "landlock",
- "libc",
- "nkeys",
- "pem 4.0.0",
- "pretty_assertions",
- "regex",
- "rustix",
- "rustls 0.23.46",
- "secrecy",
- "serde",
- "serde_json",
- "serde_yaml",
- "shellexpand",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "toml 1.2.1+spec-1.1.0",
- "toml_edit 0.25.19+spec-1.1.0",
- "tower 0.5.3",
- "tracing",
- "tracing-subscriber",
- "url",
- "xpanda",
 ]
 
 [[package]]
@@ -585,6 +545,46 @@ dependencies = [
  "tokio-rustls 0.26.6",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "arkham-sandbox"
+version = "0.3.38"
+dependencies = [
+ "arkham-config",
+ "arkham-fnox",
+ "arkham-pki",
+ "base64 0.23.1",
+ "clap",
+ "dirs 7.0.0",
+ "gix-config",
+ "gix-discover",
+ "http 1.5.0",
+ "k8s-openapi",
+ "kube-client",
+ "landlock",
+ "libc",
+ "nkeys",
+ "pem 4.0.0",
+ "pretty_assertions",
+ "regex",
+ "rustix",
+ "rustls 0.23.46",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "shellexpand",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 1.2.1+spec-1.1.0",
+ "toml_edit 0.25.19+spec-1.1.0",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "xpanda",
 ]
 
 [[package]]

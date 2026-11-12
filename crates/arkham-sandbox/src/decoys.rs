@@ -144,12 +144,6 @@ impl Selection {
       .partition(|decoy| self.registry.lookup(&decoy.env).is_some_and(|known| !known.hosts.is_empty()))
   }
 
-  /// Env names serve-time derivation turns into rules: fnox-declared,
-  /// registry-known, with hosts.
-  pub(crate) fn derivable_envs(&self) -> Vec<String> {
-    self.split_by_hosts(self.select()).0.into_iter().map(|decoy| decoy.env).collect()
-  }
-
   /// Coverage warning for entering the agent: one sorted warning for
   /// fnox-declared names no rule, passthrough, or provider wiring covers.
   /// Never prints values.
@@ -255,11 +249,8 @@ impl Report {
   }
 }
 
-/// `arkham rules`: env-only rules for the secrets this workspace can get, plus
-/// a note naming the fnox declarations no registry entry covers. One
-/// `[rules.<label>]` block per env var fnox declares that the registry knows
-/// how to swap; `arkham init` writes the same blocks into a fresh workspace
-/// config.
+/// `arkham rules`: env-only rules for secrets known to this workspace, plus
+/// notes naming fnox declarations that cannot be derived.
 ///
 /// `root` adds the workspace's own `rules.d` overrides, so the printed rules
 /// match the ones generation derives decoys from.
@@ -274,10 +265,7 @@ pub fn rules_command(root: Option<&Path>) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::paths::*;
   use crate::test_support::*;
-  use arkham_config::cli::ProxyBackend;
-  use std::path::PathBuf;
 
   #[test]
   fn rules_toml_prints_derived_rules_as_blocks() {
@@ -290,23 +278,6 @@ mod tests {
     assert!(toml.contains("[rules.github_token]\nenv = \"GITHUB_TOKEN\""), "{toml}");
     assert!(toml.contains("[rules.anthropic_api_key]\nenv = \"ANTHROPIC_API_KEY\""), "{toml}");
     assert!(!toml.contains("value ="), "{toml}");
-  }
-
-  #[test]
-  fn grants_layer_mounts_at_the_standard_config_path() {
-    let mut stack = test_stack(ProxyBackend::Ebpf);
-    stack.grants_mounts = vec![Mount {
-      host: Path::new("/state/arkham/ws/arkham/grants").to_path_buf(),
-      container: PathBuf::from("/arkham/grants"),
-      ro: true,
-    }];
-    let yaml = stack.render();
-    assert!(yaml.contains("- /state/arkham/ws/arkham/grants:/arkham/grants:ro"), "{yaml}");
-    assert!(
-      yaml.contains("- /state/arkham/ws/arkham/grants/arkham.toml:/root/.config/arkham/config.toml:ro"),
-      "the grant layer must BE the global config so rules.d resolves beside it: {yaml}"
-    );
-    assert!(!yaml.contains("ARKHAM_CONFIG"), "{yaml}");
   }
 
   #[test]

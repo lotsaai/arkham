@@ -34,7 +34,7 @@ Higher rule wins.
 - `crates/arkham-pki/` = CA + per-domain leaf cache (`ca.rs`); hand-rolled ClientHello parse (`sni.rs`, `MAX_HELLO` 16K)
 - `crates/arkham-tproxy/`, `crates/arkham-tun/`, `crates/arkham-ebpf/` = the three capture backends; all reuse `serve_candidate_stream`
 - `crates/arkham-ebpf-programs/` = the no_std BPF programs; its map structs are a byte-level ABI with `crates/arkham-ebpf/src/lib.rs`, so every field including padding must be explicit on both sides
-- `crates/arkham-compose/` = compose stack generation
+- `crates/arkham-sandbox/` = compose stack generation
 - flag logic in the wrong module (grant matching outside `grants.rs`, config parsing outside `config.rs`, substitution outside `substitute/`)
 
 ### Fail-closed MITM discipline non-negotiable

@@ -38,7 +38,7 @@ Cover these 10 areas; skip none silently, mark clean ones clean with one line of
 
 ### 1. Crate roles and dependency directions
 
-Face `arkham` calls libraries; libraries never call the face. `arkham-config` and `arkham-pki` are leaves. `arkham-fnox` and `arkham-plugin` depend on `arkham-config` only. `arkham-proxy` owns substitution and may depend on config, pki, plugin only. Backends depend on proxy; proxy never imports a backend. `arkham-compose` never imports proxy, plugin, or backends. `arkham-ebpf-programs` is isolated (`aya-ebpf` only).
+Face `arkham` calls libraries; libraries never call the face. `arkham-config` and `arkham-pki` are leaves. `arkham-fnox` and `arkham-plugin` depend on `arkham-config` only. `arkham-proxy` owns substitution and may depend on config, pki, plugin only. Backends depend on proxy; proxy never imports a backend. `arkham-sandbox` never imports proxy, plugin, or backends. `arkham-ebpf-programs` is isolated (`aya-ebpf` only).
 
 Hard violations: a new workspace dep outside the allowed table; proxy importing a backend; compose importing proxy; plugin importing proxy or fnox; any crate importing the binary.
 

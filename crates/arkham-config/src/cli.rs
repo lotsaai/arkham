@@ -3,7 +3,7 @@
 //!
 //! The globals live beside the config overlay because [`load`](crate::config::load)
 //! takes them as its highest-precedence layer. Each subcommand's args struct
-//! lives with its implementation — workspace commands in `arkham-compose`, the
+//! lives with its implementation — workspace commands in `arkham-sandbox`, the
 //! rest in the binary — and implements [`CliCommand`].
 
 use std::path::PathBuf;

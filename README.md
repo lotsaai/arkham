@@ -4,7 +4,7 @@ Give your coding agent fake credentials that work. arkham is a secure agent envi
 
 A leaked prompt, a pasted log, or a dependency that phones home carries the decoy. The upstream rejects it everywhere except the grant. The real value appears on the wire only to a host you named.
 
-One command drops you into that environment. `arkham agent` starts the stack and opens a shell in a container that holds only decoys. Supported traffic is captured transparently without proxy settings, subject to capture exclusions.
+Start `arkham daemon`, then run `arkham agent` to open a confined host shell with decoys. Supported traffic is captured transparently without proxy settings, subject to capture exclusions.
 
 Underneath sits a grant-scoped proxy. A workload can also point its proxy settings at arkham, or on Linux arkham can capture its traffic with `--proxy-backend ebpf`. On a grant match arkham terminates TLS with a per-domain leaf signed by its own CA and swaps the decoy for the real value in headers, basic auth, and bodies, over HTTP/1 and HTTP/2. On the response it swaps real values back to decoys. Every other connection is spliced byte for byte with the real upstream certificate untouched.
 
@@ -58,24 +58,21 @@ The `ebpf` backend additionally needs a nightly toolchain (the BPF target has no
 
 ## Try it in 30 seconds
 
-You need docker and your secrets in fnox. Install arkham, name your source directories once, then step into any workspace as a secure agent.
+You need Linux, bubblewrap, Landlock, eBPF capture privileges, and secrets declared to fnox. Start the daemon in one terminal:
 
 ```sh
-mise use -g github:casualjim/arkham
-mkdir -p ~/.config/arkham
-cat > ~/.config/arkham/config.toml <<'EOF'
-[workspace]
-# source directories you want beside your workspace
-include = ["~/projects"]
-EOF
-
-cd ~/projects/my-awesome-thing
-arkham agent
-# do work, exit the agent
-arkham down
+arkham daemon run
 ```
 
-Container home, shell, listener, and CA all default, so that file is the whole setup. `arkham agent` generates the stack, starts it, and drops you into the agent. The agent holds only decoys. Real values stay in fnox and reach only granted hosts. `arkham down` stops the devenv.
+In another terminal, enter your workspace:
+
+```sh
+cd ~/projects/my-awesome-thing
+arkham rules
+arkham agent
+```
+
+The agent holds decoys. The daemon resolves real values from fnox and substitutes them only for granted hosts. Exit the shell to end the session and stop the daemon separately when it is no longer needed.
 
 To see the raw credential swap from both sides of the wire, follow the [tutorial](docs/user/tutorial.md).
 
@@ -87,7 +84,7 @@ env = "GITHUB_TOKEN"          # decoy seed, registry key, fnox key
 allow = ["https://api.github.com"]
 ```
 
-That file is the whole config. The listener defaults to `127.0.0.1:8080` and the CA to `/certs/ca.pem` when the stack mounted it there, else `<config-dir>/arkham/ca.pem`. Start the proxy, hand your agent its decoy, and the rule is live:
+The listener defaults to `127.0.0.1:8080` and the CA to `<config-dir>/arkham/ca.pem`. Start the proxy, hand your agent its decoy, and the rule is live:
 
 ```sh
 arkham serve
@@ -110,12 +107,12 @@ Everything lives under [docs/user](docs/user/README.md), arranged by what you ne
 
 Two runnable examples ship in the repository:
 
-- [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to secure with `arkham up`: one arkham container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
-- [integration](integration/README.md) — the compose demo behind `mise run demo`. The scenario table there is what the client asserts.
+- [examples/agentic-devenv](examples/agentic-devenv/README.md) describes a host-confined workspace with decoys and transparent capture.
+- [integration](integration/README.md) describes the container-based proxy integration demo behind `mise run demo`. The [bwrap demo](integration/bwrap/README.md) exercises host capture.
 
-## Linux host mode
+## Linux host confinement
 
-`arkham daemon` and `arkham agent --isolate bwrap` are the Linux host path. The container quickstart above is a different one.
+`arkham daemon` and `arkham agent` run the proxy and confined agent on the Linux host.
 
 ```mermaid
 flowchart TB
@@ -141,7 +138,7 @@ flowchart TB
     REAL["Real secret files and home config. Never mounted into the sandbox"]
   end
   UP["Upstream services"]
-  WRAP["arkham agent --isolate bwrap"] -->|register| SOCK
+  WRAP["arkham agent"] -->|register| SOCK
   SOCK -->|"registers the session; the wrapper joins its cgroup before the agent starts"| SCG
   AGENT -->|connect| EBPFK
   EBPFK -->|redirected| PROXY
