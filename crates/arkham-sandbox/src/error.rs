@@ -1,6 +1,8 @@
 //! Errors from confinement and process execution.
 
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use zbus::Error as BusError;
 
 /// A confinement or process execution failure.
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +76,30 @@ pub enum Error {
   #[cfg(target_os = "linux")]
   #[error("landlock did not enforce the profile")]
   LandlockIncomplete,
+  /// The user's systemd manager could not be reached or refused a request.
+  #[cfg(target_os = "linux")]
+  #[error("systemd user manager: {source}")]
+  SystemdBus {
+    /// Underlying failure.
+    #[source]
+    source: BusError,
+  },
+  /// The systemd job that delegates a cgroup did not finish as `done`.
+  #[cfg(target_os = "linux")]
+  #[error("systemd job for {unit} ended with {result}")]
+  SystemdJob {
+    /// Transient unit name.
+    unit: String,
+    /// Job result reported by systemd.
+    result: String,
+  },
+  /// The bus closed before the systemd job reported its result.
+  #[cfg(target_os = "linux")]
+  #[error("systemd job for {unit} never reported a result")]
+  SystemdJobLost {
+    /// Transient unit name.
+    unit: String,
+  },
 }
 
 impl From<arkham_config::Error> for Error {
@@ -95,6 +121,8 @@ impl Error {
       Self::ControlMessage { .. } | Self::ControlLimit => "registration failed".to_string(),
       #[cfg(target_os = "linux")]
       Self::LandlockPath { .. } | Self::Landlock { .. } | Self::LandlockIncomplete => "landlock did not enforce the profile".to_string(),
+      #[cfg(target_os = "linux")]
+      Self::SystemdBus { .. } | Self::SystemdJob { .. } | Self::SystemdJobLost { .. } => self.to_string(),
     }
   }
 }

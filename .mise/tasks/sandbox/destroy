@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#MISE description="Stop and delete the arkham-dev machine and its disks"
+#MISE tags=["sandbox"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+
+smolvm machine stop --name arkham-dev
+smolvm machine delete --name arkham-dev --force

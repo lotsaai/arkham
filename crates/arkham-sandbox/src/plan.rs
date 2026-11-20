@@ -424,8 +424,8 @@ mod tests {
     assert!(text.contains("--ro-bind /scratch/fnox.toml /work/fnox.toml"));
   }
 
-  #[test]
-  fn a_sandbox_does_not_expose_another_sessions_cgroup() {
+  #[tokio::test]
+  async fn a_sandbox_does_not_expose_another_sessions_cgroup() {
     use std::io::Write as _;
 
     for profile in [WriteProfile::ReadOnly, WriteProfile::WorkspaceWrite, WriteProfile::DangerFullAccess] {
@@ -448,7 +448,7 @@ mod tests {
     launched.workdir = PathBuf::from("/tmp");
     launched.binds.clear();
     launched.ca_host = ca;
-    let parent = crate::host_cgroup().unwrap();
+    let parent = crate::host_cgroup().await.unwrap();
     let sibling = parent.join(format!("other-session-{}", std::process::id()));
     let _sibling = RemoveDir(sibling.clone());
     std::fs::create_dir(&sibling).unwrap();

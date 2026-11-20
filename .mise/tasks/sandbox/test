@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+#MISE description="Run the full test suite in the arkham-dev machine"
+#MISE tags=["sandbox", "test"]
+#MISE dir="{{config_root}}"
+#MISE daemons=["sandbox"]
+#MISE raw_args=true
+
+set -euo pipefail
+
+exec smolvm machine exec --stream --name arkham-dev --user root -- \
+  su - eng -c 'cd /home/eng/github/lotsaai/arkham && mise trust --quiet && mise install --quiet && mise run --force test "$@"' zsh "$@"

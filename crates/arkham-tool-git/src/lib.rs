@@ -520,30 +520,18 @@ mod tests {
   use super::*;
   use std::env;
   use std::ffi::OsString;
-  use std::sync::{Mutex, MutexGuard, PoisonError};
 
-  static ENV_LOCK: Mutex<()> = Mutex::new(());
+  use arkham_test_support::IsolatedHome;
+  use test_context::test_context;
 
-  fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
-  }
-
-  /// Pin git's global resolution to a fixture and scrub `GIT_CONFIG_*`,
-  /// `HOME`, and `XDG_CONFIG_HOME` so the host's environment cannot leak
-  /// into the assertion.
+  /// Pin git's global resolution to a fixture and scrub `GIT_CONFIG_*` so the
+  /// host's environment cannot leak into the assertion. `HOME` and
+  /// `XDG_CONFIG_HOME` are already private under `IsolatedHome`.
   fn git_env<T>(global: &Path, test: impl FnOnce() -> T) -> T {
-    let _guard = lock_env();
-    let pinned_home = tempfile::tempdir().unwrap();
-    let saved: Vec<(String, Option<OsString>)> = [
-      "GIT_CONFIG_GLOBAL",
-      "GIT_CONFIG_NOSYSTEM",
-      "GIT_CONFIG_COUNT",
-      "HOME",
-      "XDG_CONFIG_HOME",
-    ]
-    .into_iter()
-    .map(|name| (name.to_string(), env::var_os(name)))
-    .collect();
+    let saved: Vec<(String, Option<OsString>)> = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_COUNT"]
+      .into_iter()
+      .map(|name| (name.to_string(), env::var_os(name)))
+      .collect();
     let mut keys: Vec<String> = env::vars()
       .map(|(name, _)| name)
       .filter(|name| name.starts_with("GIT_CONFIG_KEY"))
@@ -554,20 +542,18 @@ mod tests {
       .filter_map(|name| env::var(name).ok().map(|value| (name.clone(), value)))
       .collect();
     for name in &keys {
-      // SAFETY: test-only mutation, serialized by ENV_LOCK.
+      // SAFETY: test-only mutation, serialized by `IsolatedHome`.
       unsafe { env::remove_var(name) };
     }
-    // SAFETY: test-only mutation, serialized by ENV_LOCK.
+    // SAFETY: test-only mutation, serialized by `IsolatedHome`.
     unsafe {
       env::set_var("GIT_CONFIG_GLOBAL", global);
       env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-      env::set_var("HOME", pinned_home.path());
-      env::set_var("XDG_CONFIG_HOME", pinned_home.path().join("xdg"));
       env::remove_var("GIT_CONFIG_COUNT");
     };
     let result = test();
     for (name, value) in saved {
-      // SAFETY: test-only mutation, serialized by ENV_LOCK.
+      // SAFETY: test-only mutation, serialized by `IsolatedHome`.
       unsafe {
         match value {
           Some(value) => env::set_var(&name, value),
@@ -576,7 +562,7 @@ mod tests {
       }
     }
     for (name, value) in saved_keys {
-      // SAFETY: test-only mutation, serialized by ENV_LOCK.
+      // SAFETY: test-only mutation, serialized by `IsolatedHome`.
       unsafe { env::set_var(&name, value) };
     }
     result
@@ -603,8 +589,9 @@ mod tests {
     }]
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn https_remote_without_stated_username_defaults_to_oauth2() {
+  fn https_remote_without_stated_username_defaults_to_oauth2(_ctx: &mut IsolatedHome) {
     let home = tempfile::tempdir().unwrap();
     let global = home.path().join("gitconfig");
     fs::write(&global, "[user]\n\tname = Ivan\n").unwrap();
@@ -634,8 +621,9 @@ mod tests {
     assert!(body.contains("username='oauth2'"), "{body}");
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn https_mints_render_into_one_helper_script() {
+  fn https_mints_render_into_one_helper_script(_ctx: &mut IsolatedHome) {
     let home = tempfile::tempdir().unwrap();
     let global = home.path().join("gitconfig");
     fs::write(&global, "[credential \"https://github.com\"]\n\tusername = casualjim\n").unwrap();
@@ -682,8 +670,9 @@ mod tests {
     assert!(!twin.contains("extraHeader"), "{twin}");
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn host_credential_helpers_are_scrubbed_from_the_twin() {
+  fn host_credential_helpers_are_scrubbed_from_the_twin(_ctx: &mut IsolatedHome) {
     let home = tempfile::tempdir().unwrap();
     let global = home.path().join("gitconfig");
     fs::write(
@@ -713,8 +702,9 @@ mod tests {
     assert_eq!(twin.matches("helper =").count(), 1, "only the minted helper remains: {twin}");
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn insteadof_rewrites_the_remote_host() {
+  fn insteadof_rewrites_the_remote_host(_ctx: &mut IsolatedHome) {
     let home = tempfile::tempdir().unwrap();
     let global = home.path().join("gitconfig");
     fs::write(&global, "[url \"https://github.com/\"]\n\tinsteadOf = https://gh.internal/\n").unwrap();
@@ -743,8 +733,9 @@ mod tests {
     );
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn authorization_extraheader_skips_the_source() {
+  fn authorization_extraheader_skips_the_source(_ctx: &mut IsolatedHome) {
     let home = tempfile::tempdir().unwrap();
     let global = home.path().join("gitconfig");
     fs::write(
@@ -774,8 +765,9 @@ mod tests {
     );
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn insteadof_base_with_userinfo_skips_the_source() {
+  fn insteadof_base_with_userinfo_skips_the_source(_ctx: &mut IsolatedHome) {
     let home = tempfile::tempdir().unwrap();
     let global = home.path().join("gitconfig");
     fs::write(
@@ -805,8 +797,9 @@ mod tests {
     );
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn worktree_pointer_resolves_the_common_config() {
+  fn worktree_pointer_resolves_the_common_config(_ctx: &mut IsolatedHome) {
     let main = tempfile::tempdir().unwrap();
     repo(
       main.path(),
@@ -842,8 +835,9 @@ mod tests {
     );
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn ssh_remote_with_sshcommand_identity_mints_the_ssh_grant() {
+  fn ssh_remote_with_sshcommand_identity_mints_the_ssh_grant(_ctx: &mut IsolatedHome) {
     let home = tempfile::tempdir().unwrap();
     let key = SshKey::generate().unwrap().to_openssh().unwrap();
     fs::create_dir_all(home.path().join(".ssh")).unwrap();

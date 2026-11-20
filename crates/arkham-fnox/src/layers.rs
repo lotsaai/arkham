@@ -588,6 +588,9 @@ mod tests {
   // LazyLock statics, so they cannot share a process.
   use std::io::Write as _;
 
+  use arkham_test_support::IsolatedHome;
+  use test_context::test_context;
+
   use super::*;
 
   /// Enter `dir` as the process cwd, restoring the previous one on drop.
@@ -655,8 +658,9 @@ mod tests {
       .and_then(|secret| secret.default.clone())
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn arkham_layer_beats_fnox_global() {
+  fn arkham_layer_beats_fnox_global(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write("fnox/config.toml", &secret("GITHUB_TOKEN", "global"));
     let arkham = host.write("arkham/fnox.toml", &secret("GITHUB_TOKEN", "arkham"));
@@ -668,8 +672,9 @@ mod tests {
     assert_eq!(secret.source_path.as_deref(), Some(arkham.as_path()));
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn arkham_layer_alone_is_discovered() {
+  fn arkham_layer_alone_is_discovered(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write("arkham/fnox.toml", &secret("GITHUB_TOKEN", "arkham"));
     let _cwd = host.enter("work");
@@ -678,8 +683,9 @@ mod tests {
     assert_eq!(value(&config, "GITHUB_TOKEN").as_deref(), Some("arkham"));
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn project_file_beats_arkham_layer() {
+  fn project_file_beats_arkham_layer(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write("fnox/config.toml", &secret("GITHUB_TOKEN", "global"));
     host.write("arkham/fnox.toml", &secret("GITHUB_TOKEN", "arkham"));
@@ -690,8 +696,9 @@ mod tests {
     assert_eq!(value(&config, "GITHUB_TOKEN").as_deref(), Some("project"));
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn arkham_local_stands_in_for_the_local_slot() {
+  fn arkham_local_stands_in_for_the_local_slot(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write("arkham/fnox.toml", &secret("GITHUB_TOKEN", "plain"));
     host.write("arkham/fnox.local.toml", &secret("GITHUB_TOKEN", "local"));
@@ -701,8 +708,9 @@ mod tests {
     assert_eq!(value(&config, "GITHUB_TOKEN").as_deref(), Some("local"));
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn fnox_profile_replaces_the_local_slot() {
+  fn fnox_profile_replaces_the_local_slot(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write("arkham/fnox.toml", &secret("GITHUB_TOKEN", "plain"));
     host.write("arkham/fnox.local.toml", &secret("GITHUB_TOKEN", "local"));
@@ -714,8 +722,9 @@ mod tests {
     assert_eq!(value(&config, "GITHUB_TOKEN").as_deref(), Some("staging"));
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn project_local_overrides_the_project_file() {
+  fn project_local_overrides_the_project_file(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write(
       "work/fnox.toml",
@@ -729,8 +738,9 @@ mod tests {
     assert_eq!(value(&config, "ONLY_PLAIN").as_deref(), Some("plain"));
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn project_local_under_a_profile_keeps_root_keys_and_prefers_the_profile_table() {
+  fn project_local_under_a_profile_keeps_root_keys_and_prefers_the_profile_table(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write(
       "work/fnox.local.toml",
@@ -744,8 +754,9 @@ mod tests {
     assert_eq!(value(&config, "ONLY_ROOT").as_deref(), Some("root"));
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn root_true_stops_the_walk_above_it() {
+  fn root_true_stops_the_walk_above_it(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write("arkham/fnox.toml", &secret("GITHUB_TOKEN", "arkham"));
     host.write("work/fnox.toml", &secret("ONLY_OUTER", "outer"));
@@ -757,8 +768,9 @@ mod tests {
     assert_eq!(value(&config, "ONLY_OUTER"), None);
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn imports_merge_under_the_file_that_imports_them() {
+  fn imports_merge_under_the_file_that_imports_them(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write(
       "work/extra.toml",
@@ -775,8 +787,9 @@ mod tests {
     assert_eq!(value(&config, "ONLY_IMPORTED").as_deref(), Some("yes"));
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn nothing_anywhere_is_still_config_not_found() {
+  fn nothing_anywhere_is_still_config_not_found(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     let _cwd = host.enter("work");
 
@@ -784,8 +797,9 @@ mod tests {
     assert!(matches!(err, FnoxError::ConfigNotFound { .. }), "{err:?}");
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn an_inherited_profile_file_is_discovered() {
+  fn an_inherited_profile_file_is_discovered(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write("work/fnox.staging.toml", "[profiles.staging]\ninherits = [\"prod\"]\n");
     host.write("work/fnox.prod.toml", &secret("GITHUB_TOKEN", "from-prod"));
@@ -796,8 +810,9 @@ mod tests {
     assert_eq!(value(&config, "GITHUB_TOKEN").as_deref(), Some("from-prod"));
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn an_inherited_profile_without_a_file_still_errors() {
+  fn an_inherited_profile_without_a_file_still_errors(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write("work/fnox.staging.toml", "[profiles.staging]\ninherits = [\"prod\"]\n");
     set_profile("staging");
@@ -807,8 +822,9 @@ mod tests {
     assert!(matches!(err, FnoxError::ProfileNotFound { .. }), "{err:?}");
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn the_arkham_level_resolves_its_imports() {
+  fn the_arkham_level_resolves_its_imports(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write("arkham/extra.toml", &secret("GITHUB_TOKEN", "imported"));
     host.write("arkham/fnox.toml", "import = [\"extra.toml\"]\n");
@@ -820,8 +836,9 @@ mod tests {
 
   /// Without the arkham level on disk, the copy must land on fnox's own loader's
   /// result, so the only behaviour that differs is the level that was added.
+  #[test_context(IsolatedHome)]
   #[test]
-  fn the_copied_chain_matches_fnox_own_loader() {
+  fn the_copied_chain_matches_fnox_own_loader(_ctx: &mut IsolatedHome) {
     let host = Host::new();
     host.write("fnox/config.toml", &secret("GLOBAL_ONLY", "global"));
     host.write("work/fnox.toml", &(secret("PROJECT", "project") + &secret("SHARED", "project")));

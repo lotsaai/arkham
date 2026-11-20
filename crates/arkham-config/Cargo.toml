@@ -34,10 +34,12 @@ validator = { workspace = true }
 etcetera = { workspace = true }
 
 [dev-dependencies]
+arkham-test-support = { workspace = true }
 pretty_assertions = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+test-context = { workspace = true }
 
 [lints]
 workspace = true

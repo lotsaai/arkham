@@ -999,6 +999,8 @@ mod live;
 #[cfg(test)]
 mod tests {
   use super::*;
+  use arkham_test_support::IsolatedHome;
+  use test_context::test_context;
 
   #[test]
   fn ipv6_bind_falls_back_only_when_unavailable() {
@@ -1238,8 +1240,9 @@ mod tests {
   /// out by a host with many interfaces. The assertions avoid naming machine
   /// state, which differs per host — they pin the explicit and file entries'
   /// survival, not the automatic tail.
+  #[test_context(IsolatedHome)]
   #[test]
-  fn bypass_assembly_keeps_explicit_entries_within_capacity() {
+  fn bypass_assembly_keeps_explicit_entries_within_capacity(_ctx: &mut IsolatedHome) {
     let explicit = vec![(Ipv4Addr::new(198, 51, 100, 7), 32), (Ipv4Addr::new(198, 51, 100, 7), 32)];
     let file = vec![(Ipv4Addr::new(10, 89, 0, 0), 16), (Ipv4Addr::new(198, 51, 100, 7), 32)];
     let assembled = build_bypass(explicit, file);

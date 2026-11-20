@@ -1,5 +1,4 @@
-# The CI image job builds with the repository root as the context and copies the
-# release binary out of target/. Keep everything else out of the context.
+# Only binaries passed to the runtime Dockerfile belong in the build context.
 /*
 !/Dockerfile
 !/target

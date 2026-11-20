@@ -2,16 +2,14 @@
 
 #MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer, cert, exec)"
 #MISE depends=["build:debug"]
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
 
 cluster="arkham-k3s-test"
-scratch=$proj_dir/target/k3s-e2e
+scratch=$MISE_CONFIG_ROOT/target/k3s-e2e
 plugin_dir=""
-arkham=$proj_dir/target/debug/arkham
+arkham=$MISE_CONFIG_ROOT/target/debug/arkham
 serve_pid=""
 # One budget for /readyz, node Ready, and coredns Ready. Cluster create
 # (image pull included) is outside it. Override when a runner is slower.

@@ -1028,32 +1028,22 @@ mod tests {
   use super::*;
   use std::ffi::OsStr;
   use std::io::Write as _;
-  use std::sync::{Mutex, MutexGuard, PoisonError};
 
+  use arkham_test_support::IsolatedHome;
   use clap::Parser as _;
+  use test_context::test_context;
 
-  static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-  fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
-  }
-
+  /// Remove the `ARKHAM_*` variables `IsolatedHome` does not own.
   fn scrub_env() {
-    for key in [
-      "ARKHAM_CONFIG",
-      "ARKHAM_LISTEN",
-      "ARKHAM_CA_FILE",
-      "ARKHAM_HANDOFF_SOCKET",
-      "ARKHAM_HANDOFF_UID",
-    ] {
-      // SAFETY: test-only mutation, serialized by ENV_LOCK.
+    for key in ["ARKHAM_LISTEN", "ARKHAM_CA_FILE", "ARKHAM_HANDOFF_SOCKET", "ARKHAM_HANDOFF_UID"] {
+      // SAFETY: test-only mutation, serialized by `IsolatedHome`.
       unsafe { env::remove_var(key) };
     }
   }
 
-  /// Test-only env write; callers hold `ENV_LOCK`.
+  /// Test-only env write; callers run under `IsolatedHome`.
   fn set_env(key: &str, value: impl AsRef<OsStr>) {
-    // SAFETY: test-only mutation, serialized by ENV_LOCK.
+    // SAFETY: test-only mutation, serialized by `IsolatedHome`.
     unsafe { env::set_var(key, value) };
   }
 
@@ -1092,9 +1082,9 @@ mod tests {
     }
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn overlay_merges_proxy_scalar_and_rules_by_label() {
-    let _guard = lock_env();
+  fn overlay_merges_proxy_scalar_and_rules_by_label(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1144,9 +1134,9 @@ allow = ["https://c.example"]
     scrub_env();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn a_config_flag_pointing_at_nothing_yields_the_global_layer_alone() {
-    let _guard = lock_env();
+  fn a_config_flag_pointing_at_nothing_yields_the_global_layer_alone(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1172,9 +1162,9 @@ allow = ["https://a.example"]
     scrub_env();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn unified_project_path_wins_over_the_legacy_flat_file() {
-    let _guard = lock_env();
+  fn unified_project_path_wins_over_the_legacy_flat_file(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let project_root = dir.path().join("proj");
@@ -1200,9 +1190,9 @@ allow = ["https://a.example"]
     scrub_env();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn tools_merge_by_name_with_project_winning() {
-    let _guard = lock_env();
+  fn tools_merge_by_name_with_project_winning(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1247,9 +1237,9 @@ allow = ["https://a.example"]
     assert!(err.to_string().contains("ghost"), "{err:?}");
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn precedence_cli_beats_env_beats_project_beats_global() {
-    let _guard = lock_env();
+  fn precedence_cli_beats_env_beats_project_beats_global(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1285,9 +1275,9 @@ allow = ["https://a.example"]
     scrub_env();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn config_flag_replaces_project_layer() {
-    let _guard = lock_env();
+  fn config_flag_replaces_project_layer(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1325,9 +1315,9 @@ allow = ["https://a.example"]
     assert_eq!(discover_project_config(dir.path()), None);
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn rule_value_is_optional_and_defaults_absent() {
-    let _guard = lock_env();
+  fn rule_value_is_optional_and_defaults_absent(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1349,9 +1339,9 @@ env = "GITHUB_TOKEN"
     scrub_env();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn rule_parses_every_new_field() {
-    let _guard = lock_env();
+  fn rule_parses_every_new_field(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1377,9 +1367,9 @@ if_missing = "warn"
     scrub_env();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn an_ssh_rule_loads_its_key_material_from_the_file() {
-    let _guard = lock_env();
+  fn an_ssh_rule_loads_its_key_material_from_the_file(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1407,9 +1397,9 @@ guest_key = "/arkham/grants/rules.d/t.guest_key"
     scrub_env();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn rules_dir_sits_beside_the_config_file() {
-    let _guard = lock_env();
+  fn rules_dir_sits_beside_the_config_file(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1443,9 +1433,9 @@ guest_key = "/arkham/grants/rules.d/t.guest_key"
     assert_eq!(render_template("{hex:4096}", "seed").len(), 4096);
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn validate_rejects_bad_entries() {
-    let _guard = lock_env();
+  fn validate_rejects_bad_entries(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1456,9 +1446,9 @@ guest_key = "/arkham/grants/rules.d/t.guest_key"
     scrub_env();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn validate_rejects_empty_env() {
-    let _guard = lock_env();
+  fn validate_rejects_empty_env(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1470,9 +1460,9 @@ guest_key = "/arkham/grants/rules.d/t.guest_key"
     scrub_env();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn validate_rejects_a_bad_pattern() {
-    let _guard = lock_env();
+  fn validate_rejects_a_bad_pattern(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1488,9 +1478,9 @@ guest_key = "/arkham/grants/rules.d/t.guest_key"
     scrub_env();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn any_host_allow_still_loads() {
-    let _guard = lock_env();
+  fn any_host_allow_still_loads(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1510,9 +1500,9 @@ guest_key = "/arkham/grants/rules.d/t.guest_key"
     validate_pattern("unclosed_{hex:8").unwrap_err();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn duplicate_env_names_rejected() {
-    let _guard = lock_env();
+  fn duplicate_env_names_rejected(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");
@@ -1542,9 +1532,9 @@ allow = ["https://b.example"]
     assert_eq!(fake_for("SOME_TOKEN", Some("{bogus:10}")), "{bogus:10}");
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn compose_workspace_settings_are_rejected() {
-    let _guard = lock_env();
+  fn compose_workspace_settings_are_rejected(_ctx: &mut IsolatedHome) {
     scrub_env();
     let dir = tempfile::tempdir().unwrap();
     let global = dir.path().join("global.toml");

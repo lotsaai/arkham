@@ -334,6 +334,8 @@ mod tests {
   use super::*;
   use arkham_config::WriteProfile;
   use arkham_launch_plan::{CA_DEST, LaunchPlan};
+  use arkham_test_support::IsolatedHome;
+  use test_context::test_context;
 
   #[cfg(target_os = "linux")]
   #[test]
@@ -370,8 +372,9 @@ mod tests {
     assert!(!root.path().join("missing.toml").exists());
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn symlink_targets_and_translated_hardlinks_are_protected() {
+  fn symlink_targets_and_translated_hardlinks_are_protected(_ctx: &mut IsolatedHome) {
     let base = tempfile::tempdir().unwrap();
     let base_path = base.path().canonicalize().unwrap();
     let workspace = base_path.join("workspace");
@@ -396,8 +399,9 @@ mod tests {
   }
 
   #[cfg(target_os = "linux")]
+  #[test_context(IsolatedHome)]
   #[test]
-  fn a_remapped_ca_bundle_and_hardlink_are_hidden_from_the_sandbox() {
+  fn a_remapped_ca_bundle_and_hardlink_are_hidden_from_the_sandbox(_ctx: &mut IsolatedHome) {
     let base = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
     let workspace = base.path().join("workspace");
     let source = base.path().join("source");

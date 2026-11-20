@@ -218,6 +218,9 @@ fn set_env(env: &mut Vec<(String, String)>, key: &str, value: String) {
 
 #[cfg(test)]
 mod tests {
+  use arkham_test_support::IsolatedHome;
+  use test_context::test_context;
+
   use super::*;
 
   #[test]
@@ -251,8 +254,9 @@ mod tests {
     assert!(path.starts_with(&grants_dir));
   }
 
+  #[test_context(IsolatedHome)]
   #[tokio::test]
-  async fn the_rule_set_stays_at_the_snapshot_after_the_file_changes() {
+  async fn the_rule_set_stays_at_the_snapshot_after_the_file_changes(_ctx: &mut IsolatedHome) {
     let root = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let config_dir = root.path().join(".config").join("arkham");
@@ -289,8 +293,9 @@ mod tests {
     assert!(!rendered.contains("real-snapshot-value"));
   }
 
+  #[test_context(IsolatedHome)]
   #[tokio::test]
-  async fn an_include_tree_projects_its_fnox_file() {
+  async fn an_include_tree_projects_its_fnox_file(_ctx: &mut IsolatedHome) {
     let base = tempfile::tempdir().unwrap();
     let base = base.path().canonicalize().unwrap();
     let root = base.join("proj");
@@ -324,10 +329,10 @@ mod tests {
     assert!(std::fs::read_to_string(&fnox).unwrap().contains(marker));
   }
 
+  #[test_context(IsolatedHome)]
   #[tokio::test]
-  async fn a_private_tmp_session_does_not_project_home_or_the_host_tmp() {
-    let home = tempfile::tempdir().unwrap();
-    let home = home.path().canonicalize().unwrap();
+  async fn a_private_tmp_session_does_not_project_home_or_the_host_tmp(ctx: &mut IsolatedHome) {
+    let home = ctx.path().canonicalize().unwrap();
     let marker = "HOME_PROJECT_SECRET_9f3a";
     std::fs::write(home.join("fnox.toml"), format!("# {marker}\n")).unwrap();
     std::fs::create_dir(home.join(".git")).unwrap();
@@ -335,15 +340,6 @@ mod tests {
     std::fs::create_dir_all(&probe).unwrap();
     let host_fnox = probe.join("fnox.toml");
     std::fs::write(&host_fnox, "# HOST_TMP_FNOX\n").unwrap();
-    let saved = std::env::var_os("HOME");
-    let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
-    let saved_jj = std::env::var_os("JJ_CONFIG");
-    // SAFETY: test-only mutation of HOME. The previous value is restored before return.
-    unsafe {
-      std::env::set_var("HOME", &home);
-      std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
-      std::env::set_var("JJ_CONFIG", home.join(".jjconfig.toml"));
-    };
     let scratch = tempfile::tempdir().unwrap();
     std::fs::write(scratch.path().join("ca.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
     let prepared = prepare_session(
@@ -358,21 +354,6 @@ mod tests {
       &BTreeMap::new(),
     )
     .await;
-    // SAFETY: test-only restore of the HOME value captured above.
-    unsafe {
-      match saved {
-        Some(value) => std::env::set_var("HOME", value),
-        None => std::env::remove_var("HOME"),
-      }
-      match saved_xdg {
-        Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-        None => std::env::remove_var("XDG_CONFIG_HOME"),
-      }
-      match saved_jj {
-        Some(value) => std::env::set_var("JJ_CONFIG", value),
-        None => std::env::remove_var("JJ_CONFIG"),
-      }
-    }
     let _ = std::fs::remove_dir_all(&probe);
     let prepared = prepared.unwrap();
     assert_eq!(prepared.plan.workspace, Path::new("/tmp"));
@@ -402,8 +383,9 @@ mod tests {
     assert!(!rendered.contains(marker), "{rendered}");
   }
 
+  #[test_context(IsolatedHome)]
   #[tokio::test]
-  async fn the_plan_env_comes_from_the_caller_not_the_process() {
+  async fn the_plan_env_comes_from_the_caller_not_the_process(_ctx: &mut IsolatedHome) {
     let root = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
     let config_dir = root.path().join(".config").join("arkham");

@@ -4,9 +4,7 @@
 #MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**"]
 #MISE outputs=["target/release/arkham"]
 #MISE depends=["test"]
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
 

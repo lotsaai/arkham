@@ -73,6 +73,9 @@ fn nearest_registered(start: &Path, registered: &[PathBuf]) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+  use arkham_test_support::IsolatedHome;
+  use test_context::test_context;
+
   use super::*;
 
   #[test]
@@ -217,8 +220,9 @@ mod tests {
 
   /// A start at the home directory, including through a symlink, enlists
   /// nothing from that directory. The session workspace is the private `/tmp`.
+  #[test_context(IsolatedHome)]
   #[test]
-  fn a_home_directory_is_not_enlisted_and_uses_the_private_tmp() {
+  fn a_home_directory_is_not_enlisted_and_uses_the_private_tmp(_ctx: &mut IsolatedHome) {
     let real = tempfile::tempdir().unwrap();
     let real = real.path().canonicalize().unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
@@ -227,66 +231,42 @@ mod tests {
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let private_tmp = PathBuf::from("/tmp");
 
-    let home_env = HomeVar::set(&real);
+    set_home(&real);
     let from_home = project_root(&real, &[]).unwrap();
     let from_link = project_root(&link, &[]).unwrap();
     assert_eq!(from_home, private_tmp);
     assert_eq!(from_link, private_tmp);
     assert_ne!(from_home, real);
-    drop(home_env);
 
-    let home_env = HomeVar::set(&link);
+    set_home(&link);
     assert_eq!(project_root(&real, &[]).unwrap(), private_tmp);
-    drop(home_env);
 
     std::fs::create_dir(real.join(".git")).unwrap();
     let child = real.join("notes");
     std::fs::create_dir(&child).unwrap();
-    let home_env = HomeVar::set(&real);
+    set_home(&real);
     assert_eq!(project_root(&real, &[]).unwrap(), private_tmp);
     assert_eq!(project_root(&child, std::slice::from_ref(&real)).unwrap(), private_tmp);
-    drop(home_env);
   }
 
   /// A project whose own marker sits under home stays that project.
+  #[test_context(IsolatedHome)]
   #[test]
-  fn a_project_under_home_stays_that_project() {
+  fn a_project_under_home_stays_that_project(_ctx: &mut IsolatedHome) {
     let home = tempfile::tempdir().unwrap();
     let home = home.path().canonicalize().unwrap();
     let project = home.join("app");
     let nested = project.join("src");
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::create_dir(project.join(".git")).unwrap();
-    let _home_env = HomeVar::set(&home);
+    set_home(&home);
     assert_eq!(project_root(&nested, &[]), Some(project.clone()));
     assert_eq!(project_root(&nested, std::slice::from_ref(&home)), Some(project));
   }
 
-  /// Restore `HOME` when the test ends, including on panic.
-  struct HomeVar {
-    saved: Option<std::ffi::OsString>,
-  }
-
-  impl HomeVar {
-    fn set(path: &Path) -> Self {
-      let saved = std::env::var_os("HOME");
-      // SAFETY: test-only mutation of HOME. The previous value is restored on drop.
-      unsafe {
-        std::env::set_var("HOME", path);
-      };
-      Self { saved }
-    }
-  }
-
-  impl Drop for HomeVar {
-    fn drop(&mut self) {
-      // SAFETY: test-only restore of the HOME value captured in `set`.
-      unsafe {
-        match self.saved.take() {
-          Some(value) => std::env::set_var("HOME", value),
-          None => std::env::remove_var("HOME"),
-        }
-      }
-    }
+  /// Point `HOME` at `path`; `IsolatedHome` restores it when the test ends.
+  fn set_home(path: &Path) {
+    // SAFETY: test-only mutation, serialized by `IsolatedHome`.
+    unsafe { std::env::set_var("HOME", path) };
   }
 }

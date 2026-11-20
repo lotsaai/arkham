@@ -3,9 +3,7 @@
 #MISE description="Build the example WASM plugins to target/plugins"
 #MISE sources=["examples/plugins/**", "crates/arkham-plugin/wit/**", ".mise/tasks/build/plugins"]
 #MISE outputs=["target/plugins/marker-request.wasm", "target/plugins/marker-response.wasm", "target/plugins/trap-request.wasm"]
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
 
