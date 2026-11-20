@@ -2,9 +2,7 @@
 
 #MISE description="Run the Rust and plugin e2e tests for this project"
 #MISE depends=["build:plugins"]
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
 
@@ -40,7 +38,7 @@ while (($#)); do
   shift
 done
 
-metadata_dir="$proj_dir/target/nextest"
+metadata_dir="$MISE_CONFIG_ROOT/target/nextest"
 mkdir -p "$metadata_dir"
 cargo metadata --locked --format-version 1 "${cargo_args[@]}" > "$metadata_dir/cargo-metadata.json"
 cargo nextest list --locked --cargo-quiet --workspace --exclude arkham-ebpf-programs \
@@ -59,7 +57,7 @@ fi
 
 # `ARKHAM_PLUGIN_FIXTURES` activates the plugin_e2e_ tests (built by the
 # build:plugins dependency); without it each prints a skip line and passes.
-ARKHAM_PLUGIN_FIXTURES="$proj_dir/target/plugins" cargo nextest run \
+ARKHAM_PLUGIN_FIXTURES="$MISE_CONFIG_ROOT/target/plugins" cargo nextest run \
   --cargo-metadata "$metadata_dir/cargo-metadata.json" \
   --binaries-metadata "$metadata_dir/binaries-metadata.json" \
   --show-progress=bar --status-level=slow "${run_args[@]}"

@@ -1,0 +1,33 @@
+FROM ghcr.io/casualjim/devenv:latest
+
+USER 0
+ENV MISE_ENV=""
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bubblewrap \
+        dbus \
+        docker-buildx \
+        docker-compose-v2 \
+        docker.io \
+        iproute2 \
+        iptables \
+        kmod \
+        libcap2-bin \
+        libudev-dev \
+        nftables \
+        openssh-client \
+        openssl \
+        python3 \
+        systemd \
+        systemd-sysv \
+        zstd \
+    && rm -rf /var/lib/apt/lists/* \
+    && systemctl enable docker.service containerd.service \
+    && usermod -aG docker eng
+
+USER 1000
+
+ENTRYPOINT ["/sbin/init"]
+CMD []
+STOPSIGNAL SIGRTMIN+3

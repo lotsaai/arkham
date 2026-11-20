@@ -1,0 +1,5 @@
+[daemons.sandbox]
+task = "sandbox:start"
+ready_cmd = "smolvm machine exec --name arkham-dev -- systemctl is-active docker containerd"
+watch = ["Dockerfile.sandbox", "Smolfile", ".mise/tasks/sandbox/**"]
+stop_signal = { signal = "SIGTERM", timeout = "60s" }

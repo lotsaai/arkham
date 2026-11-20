@@ -107,6 +107,8 @@ pub fn trusted_socket(path: &Path) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+  use std::fs::Permissions;
+
   use super::*;
 
   #[test]
@@ -124,6 +126,9 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let parent = dir.path().join("arkham");
     std::fs::create_dir(&parent).unwrap();
+    // Directories follow the process umask; a login umask of 002 makes them group-writable.
+    std::fs::set_permissions(dir.path(), Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&parent, Permissions::from_mode(0o700)).unwrap();
     let socket = parent.join("daemon.sock");
     assert!(matches!(trusted_socket(&socket), Err(Error::NoDaemon)));
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();

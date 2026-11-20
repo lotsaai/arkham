@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 
 #MISE description="Prove talosctl context switching through eBPF against official Talos nodes"
-#MISE depends=["build:debug", "build:container"]
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
 
@@ -22,8 +20,8 @@ staging_subnet=172.31.11.0/24
 proxy="arkham-talos-proxy"
 arkham_image="arkham-talos-e2e:local"
 
-scratch=$proj_dir/target/talos-e2e
-arkham=$proj_dir/target/debug/arkham
+scratch=$MISE_CONFIG_ROOT/target/talos-e2e
+arkham=$MISE_CONFIG_ROOT/target/debug/arkham
 talosctl=""
 state=""
 attempted_clusters=()
@@ -61,7 +59,7 @@ trap cleanup EXIT
 
 rm -rf "$scratch"
 mkdir -p "$scratch/image" "$scratch/fnox" "$scratch/home/.talos" "$scratch/workspace" "$scratch/xdg-config" "$scratch/xdg-state" "$scratch/xdg-data"
-cp target/container/release/arkham "$scratch/image/arkham"
+cp "$arkham" "$scratch/image/arkham"
 
 case "$(uname -m)" in
   x86_64) talos_arch=amd64 ;;
@@ -134,7 +132,7 @@ create_cluster() {
   printf '%s %s %s\n' "$context" "$ip" "$network"
 }
 
-docker build -t "$arkham_image" -f "$proj_dir/Dockerfile" "$scratch/image"
+docker build -t "$arkham_image" -f "$MISE_CONFIG_ROOT/Dockerfile" "$scratch/image"
 
 attempted_clusters+=("$prod_name")
 prod_line=$(create_cluster "$prod_name" "$prod_subnet" "$scratch/prod.yaml")

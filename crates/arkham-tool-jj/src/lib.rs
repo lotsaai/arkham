@@ -169,23 +169,18 @@ mod tests {
   use super::*;
   use std::env;
   use std::ffi::OsString;
-  use std::sync::{Mutex, MutexGuard, PoisonError};
 
-  static ENV_LOCK: Mutex<()> = Mutex::new(());
+  use arkham_test_support::IsolatedHome;
+  use test_context::test_context;
 
-  fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
-  }
-
-  /// Pin jj's and git's resolution to fixtures.
-  fn env<T>(home: &Path, xdg: &Path, git_global: &Path, jj_config: Option<&str>, test: impl FnOnce() -> T) -> T {
-    let _guard = lock_env();
-    let names = ["HOME", "XDG_CONFIG_HOME", "JJ_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"];
+  /// Pin git's resolution to a fixture and set or clear `JJ_CONFIG`. `HOME` and
+  /// `XDG_CONFIG_HOME` are already private under `IsolatedHome`, which restores
+  /// `JJ_CONFIG`.
+  fn env<T>(git_global: &Path, jj_config: Option<&str>, test: impl FnOnce() -> T) -> T {
+    let names = ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"];
     let saved: Vec<(String, Option<OsString>)> = names.into_iter().map(|name| (name.to_string(), env::var_os(name))).collect();
-    // SAFETY: test-only mutation, serialized by ENV_LOCK.
+    // SAFETY: test-only mutation, serialized by `IsolatedHome`.
     unsafe {
-      env::set_var("HOME", home);
-      env::set_var("XDG_CONFIG_HOME", xdg);
       env::set_var("GIT_CONFIG_GLOBAL", git_global);
       env::set_var("GIT_CONFIG_NOSYSTEM", "1");
       match jj_config {
@@ -195,7 +190,7 @@ mod tests {
     }
     let result = test();
     for (name, value) in saved {
-      // SAFETY: test-only mutation, serialized by ENV_LOCK.
+      // SAFETY: test-only mutation, serialized by `IsolatedHome`.
       unsafe {
         match value {
           Some(value) => env::set_var(&name, value),
@@ -219,14 +214,14 @@ mod tests {
     fs::write(git.join("config"), local).unwrap();
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn later_chain_files_win_and_git_identity_falls_back() {
-    let home = tempfile::tempdir().unwrap();
-    fs::write(home.path().join(".jjconfig.toml"), "[user]\nname = 'Home Name'\n").unwrap();
-    let xdg = tempfile::tempdir().unwrap();
-    fs::create_dir_all(xdg.path().join("jj")).unwrap();
+  fn later_chain_files_win_and_git_identity_falls_back(ctx: &mut IsolatedHome) {
+    fs::write(ctx.path().join(".jjconfig.toml"), "[user]\nname = 'Home Name'\n").unwrap();
+    let xdg = ctx.path().join(".config");
+    fs::create_dir_all(xdg.join("jj")).unwrap();
     fs::write(
-      xdg.path().join("jj").join("config.toml"),
+      xdg.join("jj").join("config.toml"),
       "[user]\nemail = 'platform@mail'\n[ui]\ndefault-command = 'log'\n",
     )
     .unwrap();
@@ -235,10 +230,7 @@ mod tests {
     fs::write(&git_global, "[user]\n\tname = Git Name\n\temail = git@mail\n").unwrap();
     let work = tempfile::tempdir().unwrap();
     git_repo(work.path(), "");
-    let twin = env(home.path(), xdg.path(), &git_global, None, || {
-      adapt(work.path()).expect("user chain present")
-    })
-    .decoy;
+    let twin = env(&git_global, None, || adapt(work.path()).expect("user chain present")).decoy;
     let parsed: Value = toml::from_str(&twin[twin.find('[').unwrap()..]).unwrap();
     let user = parsed.get("user").unwrap();
     assert_eq!(
@@ -254,33 +246,30 @@ mod tests {
     );
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn git_identity_fills_a_missing_user() {
-    let home = tempfile::tempdir().unwrap();
-    let xdg = tempfile::tempdir().unwrap();
-    fs::create_dir_all(xdg.path().join("jj")).unwrap();
-    fs::write(xdg.path().join("jj").join("config.toml"), "[ui]\ncolor = 'never'\n").unwrap();
+  fn git_identity_fills_a_missing_user(ctx: &mut IsolatedHome) {
+    let xdg = ctx.path().join(".config");
+    fs::create_dir_all(xdg.join("jj")).unwrap();
+    fs::write(xdg.join("jj").join("config.toml"), "[ui]\ncolor = 'never'\n").unwrap();
     let git_home = tempfile::tempdir().unwrap();
     let git_global = git_home.path().join("gitconfig");
     fs::write(&git_global, "[user]\n\tname = Git Name\n\temail = git@mail\n").unwrap();
     let work = tempfile::tempdir().unwrap();
     git_repo(work.path(), "");
-    let twin = env(home.path(), xdg.path(), &git_global, None, || {
-      adapt(work.path()).expect("user chain present")
-    })
-    .decoy;
+    let twin = env(&git_global, None, || adapt(work.path()).expect("user chain present")).decoy;
     assert!(twin.contains("Git Name"), "{twin}");
     assert!(twin.contains("git@mail"), "{twin}");
     assert!(twin.contains("color = \"never\""), "the chain travels verbatim: {twin}");
   }
 
+  #[test_context(IsolatedHome)]
   #[test]
-  fn jj_config_env_replaces_the_default_chain() {
-    let home = tempfile::tempdir().unwrap();
-    let xdg = tempfile::tempdir().unwrap();
-    fs::create_dir_all(xdg.path().join("jj")).unwrap();
-    fs::write(xdg.path().join("jj").join("config.toml"), "[ui]\ndefault-command = 'log'\n").unwrap();
-    fs::write(home.path().join(".jjconfig.toml"), "[user]\nname = 'Home Name'\n").unwrap();
+  fn jj_config_env_replaces_the_default_chain(ctx: &mut IsolatedHome) {
+    let xdg = ctx.path().join(".config");
+    fs::create_dir_all(xdg.join("jj")).unwrap();
+    fs::write(xdg.join("jj").join("config.toml"), "[ui]\ndefault-command = 'log'\n").unwrap();
+    fs::write(ctx.path().join(".jjconfig.toml"), "[user]\nname = 'Home Name'\n").unwrap();
     let only = tempfile::tempdir().unwrap();
     let only_file = only.path().join("only.toml");
     fs::write(&only_file, "[template-aliases]\n'commit_id.short()' = 'commit_id.short(8)'\n").unwrap();
@@ -289,10 +278,7 @@ mod tests {
     fs::write(&git_global, "").unwrap();
     let work = tempfile::tempdir().unwrap();
     git_repo(work.path(), "");
-    let twin = env(home.path(), xdg.path(), &git_global, only_file.to_str(), || {
-      adapt(work.path()).expect("user chain present")
-    })
-    .decoy;
+    let twin = env(&git_global, only_file.to_str(), || adapt(work.path()).expect("user chain present")).decoy;
     assert!(twin.contains("template-aliases"), "{twin}");
     assert!(
       !twin.contains("default-command"),

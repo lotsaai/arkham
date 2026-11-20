@@ -3,7 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use arkham_config::WriteProfile;
-use arkham_sandbox::{peer_uid_allowed, read_cgroup};
+use arkham_sandbox::{join_session, peer_uid_allowed, session_exit};
 use arkham_session_protocol::{RegisterRequest, RegisterResponse, daemon_socket_path, read_line, trusted_socket, write_line};
 
 use crate::{Error, Result};
@@ -45,15 +45,8 @@ pub(crate) async fn agent(profile: WriteProfile, workspace: Option<&Path>, comma
     RegisterResponse::Rejected { error } => return Err(Error::DaemonRejected { detail: error }),
     RegisterResponse::Ready { .. } => return Err(arkham_session_protocol::Error::NoDaemon.into()),
   };
-  let original = read_cgroup(std::process::id())?;
-  let original = Path::new("/sys/fs/cgroup")
-    .join(original.trim_start_matches('/'))
-    .join("cgroup.procs");
-  let restore = std::fs::OpenOptions::new().write(true).open(original)?;
-  std::fs::write(cgroup.join("cgroup.procs"), "0").map_err(|source| arkham_sandbox::Error::SessionCgroup {
-    path: cgroup.clone(),
-    source,
-  })?;
+  let restore = session_exit(&cgroup)?;
+  join_session(&cgroup).await?;
   let mut placement = SelfPlacement(Some(restore));
   write_line(&mut stream, b"activate").await?;
   let line = read_line(&mut stream).await?;

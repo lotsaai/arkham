@@ -53,7 +53,7 @@ pub async fn run(version: &str) -> eyre::Result<()> {
   )?);
   let registered = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
   let explicit = bind_explicit(proxy.listen).await?;
-  let cgroup = host_cgroup()?;
+  let cgroup = host_cgroup().await?;
   let capture_state = Arc::clone(&state);
   let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
   crate::with_capture(
@@ -312,6 +312,7 @@ mod tests {
 
   #[tokio::test]
   async fn a_failed_register_write_drops_the_session() {
+    host_cgroup().await.unwrap();
     let runtime = tempfile::tempdir().unwrap();
     std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let _env = RestoreEnv::set("XDG_RUNTIME_DIR", runtime.path());
@@ -351,7 +352,7 @@ mod tests {
     let marker = format!("{}-", std::process::id());
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap();
     assert!(!cgroup.contains(&marker), "client stayed in the session cgroup: {cgroup}");
-    let parent = host_cgroup().unwrap();
+    let parent = host_cgroup().await.unwrap();
     let leaked = std::fs::read_dir(&parent)
       .unwrap()
       .flatten()

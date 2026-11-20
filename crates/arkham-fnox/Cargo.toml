@@ -17,8 +17,10 @@ toml_edit = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+arkham-test-support = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
+test-context = { workspace = true }
 tokio = { workspace = true }
 
 [lints]

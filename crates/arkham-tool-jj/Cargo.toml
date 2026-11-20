@@ -15,7 +15,9 @@ toml = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+arkham-test-support = { workspace = true }
 tempfile = { workspace = true }
+test-context = { workspace = true }
 
 [lints]
 workspace = true

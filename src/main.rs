@@ -334,6 +334,8 @@ mod serve_handoff_tests {
   use std::time::Duration;
 
   use arkham_config::cli::Cli;
+  use arkham_test_support::IsolatedHome;
+  use test_context::test_context;
   use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
   use tokio::net::{TcpListener, UnixStream};
 
@@ -346,14 +348,11 @@ mod serve_handoff_tests {
     path
   }
 
-  fn isolate_serve_env(home: &Path, handoff: &Path) {
-    // SAFETY: nextest runs this test in its own process. HOME and overlay env
-    // must not touch the operator's real config directory.
+  /// `IsolatedHome` already keeps HOME and the XDG directories off the operator's
+  /// real config; this clears the remaining overlay env and names the socket.
+  fn isolate_serve_env(handoff: &Path) {
+    // SAFETY: test-only mutation, serialized by `IsolatedHome`.
     unsafe {
-      std::env::set_var("HOME", home);
-      std::env::set_var("XDG_CONFIG_HOME", home.join("xdg-config"));
-      std::env::set_var("XDG_STATE_HOME", home.join("xdg-state"));
-      std::env::remove_var("ARKHAM_CONFIG");
       std::env::remove_var("ARKHAM_LISTEN");
       std::env::remove_var("ARKHAM_CA_FILE");
       std::env::set_var("ARKHAM_HANDOFF_SOCKET", handoff);
@@ -383,14 +382,15 @@ mod serve_handoff_tests {
 
   /// `arkham serve` must expose the Unix-socket PROXY handoff the Network
   /// Extension connects to, not only the explicit TCP listener.
+  #[test_context(IsolatedHome)]
   #[tokio::test]
-  async fn serve_binds_the_configured_handoff_socket_and_relays_proxy_v1() {
+  async fn serve_binds_the_configured_handoff_socket_and_relays_proxy_v1(_ctx: &mut IsolatedHome) {
     arkham_pki::ca::install_crypto_provider();
     let work = tempfile::tempdir().unwrap();
     let handoff = work.path().join("handoff.sock");
     let config = write_serve_config(work.path(), "127.0.0.1:0");
 
-    isolate_serve_env(work.path(), &handoff);
+    isolate_serve_env(&handoff);
 
     let cli = Cli { config: Some(config) };
     let serve_task = tokio::spawn(async move { serve(&cli, ServeArgs::default()).await });

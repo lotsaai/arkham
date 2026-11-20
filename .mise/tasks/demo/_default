@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 
 #MISE description="Run the transparent docker compose integration demo"
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
 
-mise run test
-mise run build:container
+mise run build
 bash integration/gen-nats.sh
 mkdir -p integration/docker
-cp target/container/release/arkham integration/docker/arkham
+cp target/release/arkham integration/docker/arkham
 
 compose="docker compose -f integration/compose.yaml"
 trap '$compose down --remove-orphans -v --timeout 3' EXIT

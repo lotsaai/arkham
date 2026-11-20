@@ -2,10 +2,8 @@
 
 #MISE description="Run the transparent bwrap (no docker) integration demo"
 #MISE depends=["build:release"]
+#MISE dir="{{config_root}}"
 #USAGE flag "--use-sudo" help="Skip the gum escalation prompt and go straight to sudo"
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
 
 set -euo pipefail
 

@@ -1,0 +1,15 @@
+[package]
+name = "arkham-test-support"
+version = "0.3.37"
+edition = "2024"
+description = "Test-only environment isolation harness"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+tempfile = { workspace = true }
+test-context = { workspace = true }
+
+[lints]
+workspace = true

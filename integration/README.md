@@ -186,10 +186,10 @@ cp integration/.env.example integration/.env   # gitignored; adjust freely
 
 
 
-The task runs the test suite, then `mise run build:container` builds a release
-binary in the maintained Rust builder and checks it in the supported runtime image.
-It packs that binary via the repo `Dockerfile` and runs the Compose scenarios.
-Native host debug binaries are not copied into the image.
+The task builds the release binary, packs it into
+the runtime image via the repo `Dockerfile`, and runs
+`docker compose up --abort-on-container-exit --exit-code-from client`.
+
 Client exit code 0 means every scenario passed.
 
 Recomputing the fake after changing `env` in `arkham.toml`:

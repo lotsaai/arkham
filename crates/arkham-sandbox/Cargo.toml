@@ -16,7 +16,9 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+futures = { workspace = true }
 landlock = { workspace = true }
+zbus = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
