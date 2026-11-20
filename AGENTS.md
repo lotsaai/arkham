@@ -37,6 +37,7 @@ Grant-scoped MITM proxy. Terminates client TLS with per-domain leaf certificates
 | `arkham-sandbox` | Confinement and process execution | `arkham-config`, `arkham-launch-plan` |
 | `arkham-session` | Daemon-side session preparation | `arkham-config`, `arkham-fnox`, `arkham-pki`, `arkham-paths`, `arkham-launch-plan`, `arkham-tool-config`, all six `arkham-tool-*`, `arkham-profiles`, `arkham-workspace`, `arkham-projection` |
 | `arkham-session-protocol` | Registration messages and socket checks | `arkham-config`, `arkham-launch-plan` |
+| `arkham-test-support` | Test-only environment isolation harness (dev-dependency only) | No workspace crates; external `tempfile`, `test-context` |
 | `arkham-tool-config` | Shared tool adaptation types and serialization | `arkham-config`, `arkham-paths`; external `base64`, `serde`, `serde_yaml`, `thiserror`, `toml` |
 | `arkham-tool-git` | Git configuration adaptation | `arkham-config`, `arkham-pki`, `arkham-paths`, `arkham-tool-config`, `arkham-git-config` |
 | `arkham-tool-jj` | jj configuration adaptation | `arkham-config`, `arkham-tool-config`, `arkham-git-config` |

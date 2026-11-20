@@ -18,7 +18,9 @@ toml = { workspace = true }
 
 [dev-dependencies]
 arkham-sandbox = { workspace = true }
+arkham-test-support = { workspace = true }
 tempfile = { workspace = true }
+test-context = { workspace = true }
 
 [lints]
 workspace = true

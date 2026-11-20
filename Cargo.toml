@@ -84,6 +84,7 @@ arkham-proxy = { path = "crates/arkham-proxy" }
 arkham-sandbox = { path = "crates/arkham-sandbox" }
 arkham-session = { path = "crates/arkham-session" }
 arkham-session-protocol = { path = "crates/arkham-session-protocol" }
+arkham-test-support = { path = "crates/arkham-test-support" }
 arkham-tool-config = { path = "crates/arkham-tool-config" }
 arkham-tool-git = { path = "crates/arkham-tool-git" }
 arkham-tool-jj = { path = "crates/arkham-tool-jj" }
@@ -118,7 +119,7 @@ etherparse = "0.19"
 eyre = "0.6"
 fe2o3-amqp = { version = "0.18.3", default-features = false, features = ["acceptor"] }
 fe2o3-amqp-types = "0.18.0"
-fnox-core = "1.39"
+fnox-core = { git = "https://github.com/lotsaai/fnox", branch = "fix/rsa-0.10" }
 futures = "0.3"
 gix-config = { version = "0.62", features = ["sha1"] }
 gix-discover = { version = "0.57", features = ["sha1"] }
@@ -168,6 +169,7 @@ shellexpand = "3"
 smtp-proto = "0.2.5"
 strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"
+test-context = "0.5.8"
 thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "parking_lot", "rt", "rt-multi-thread", "sync", "time"] }
@@ -183,6 +185,7 @@ validator = { version = "0.21", features = ["derive"] }
 wasmtime = { version = "50", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
 wasmtime-wasi = "50"
 xpanda = "0.2"
+zbus = { version = "6", default-features = false, features = ["proxy", "tokio"] }
 
 [dependencies]
 arkham-agent = { workspace = true }
@@ -210,8 +213,10 @@ tracing-subscriber = { workspace = true }
 arkham-ebpf = { workspace = true }
 
 [dev-dependencies]
+arkham-test-support = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+test-context = { workspace = true }
 
 [lints]
 workspace = true
@@ -220,9 +225,3 @@ workspace = true
 [profile.dist]
 inherits = "release"
 lto = "thin"
-
-[patch.crates-io]
-# shortcut: unreleased age crypto dependencies reconcile russh; replace when age releases them.
-age = { git = "https://github.com/str4d/rage", rev = "b5b68c4f4f7ea5c368bc060f6fe0237549c3a13f" }
-# shortcut: use fixed SQLCipher until fnox's rusqlite requirement admits libsqlite3-sys 0.40.
-libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite", rev = "0f1ab7393ae5d62d44a94a5a5107c00b23d4ed58" }

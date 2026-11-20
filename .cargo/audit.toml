@@ -33,8 +33,4 @@ ignore = [
   # when fnox-core stops enabling the aws-sdk legacy rustls default.
   "RUSTSEC-2026-0382",
 
-  # Marvin attack on rsa. No fixed release exists upstream.
-  # fnox-core 1.48.0 -> patched age 0.12.1 -> rsa 0.10.0-rc.18.
-  "RUSTSEC-2023-0071",
-
 ]

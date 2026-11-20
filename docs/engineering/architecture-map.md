@@ -269,17 +269,11 @@ Compose is used by integration fixtures, not by the agent runtime.
 
 The root `Dockerfile` is shared by the shipped image and the SSH/protocol and
 Talos integration fixtures; it retains `ghcr.io/casualjim/bare:libcxx-udev-ssl`.
-`mise run build:container` uses `ghcr.io/casualjim/rust-builder` directly, with
-no custom builder image or new version pins. Required tools are prepared inside
-the container; no host binaries, PATH, Cargo home or Rustup home are forwarded.
-Source is mounted read-only and build/download caches are writable. Its separate
-`target/container` directory keeps these objects apart from native
-host builds. The task runs the binary with the runtime image's loader before
-fixtures use it. Release images continue to package the CI-built dist binary.
-The file-based test runner declares the container build as a prerequisite.
-Its nested test runs do not force build dependencies again; test tasks still
-execute, while mise reuses the binary and successful runtime-check marker until
-an input changes or an output disappears.
+Linux builds and tests run in the `arkham-dev` smolvm machine
+([smolvm.md](smolvm.md)), whose image and the runtime base both come from
+Ubuntu 26.04, so the test fixtures copy the debug `target/debug/arkham` built
+there.
+Release images continue to package the CI-built dist binary.
 
 Root `[patch.crates-io]` entries pin upstream `age` crypto updates and a
 `libsqlite3-sys` revision compatible with fnox's rusqlite requirement that bundles

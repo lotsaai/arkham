@@ -288,6 +288,7 @@ mod tests {
 
   #[tokio::test]
   async fn an_unplaced_peer_is_not_migrated_or_activated() {
+    crate::host_cgroup().await.unwrap();
     let pid = std::process::id();
     let before = read_cgroup(pid).unwrap();
     let start = read_starttime(pid).unwrap();
@@ -299,6 +300,7 @@ mod tests {
 
   #[tokio::test]
   async fn a_live_unplaced_process_is_never_migrated() {
+    crate::host_cgroup().await.unwrap();
     let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
     let mut child = Kill(child);
     let pid = child.0.id();
@@ -315,6 +317,7 @@ mod tests {
   async fn releasing_a_session_kills_its_members_without_moving_other_processes() {
     use std::io::BufRead as _;
 
+    crate::host_cgroup().await.unwrap();
     let pid = std::process::id();
     let slot = session_cgroup(pid, read_starttime(pid).unwrap()).unwrap();
     let mut unrelated = Kill(

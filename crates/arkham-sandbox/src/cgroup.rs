@@ -2,8 +2,13 @@
 
 use crate::Error;
 use crate::identity::parse_starttime;
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+
+/// Directory under the daemon's cgroup that holds session cgroups.
+const HOST: &str = "arkham-host";
 
 /// A cgroup directory created for one registered session.
 #[derive(Debug)]
@@ -27,7 +32,7 @@ pub fn session_cgroup(pid: u32, starttime: u64) -> Result<SessionSlot, Error> {
   if !identity_holds(&pidfd, pid, starttime)? {
     return Err(Error::SessionReused);
   }
-  let path = host_cgroup()?.join(format!("{pid}-{starttime}"));
+  let path = host_dir()?.join(format!("{pid}-{starttime}"));
   std::fs::create_dir(&path).map_err(|source| session_cgroup_io(&path, source))?;
   let id = match std::fs::metadata(&path) {
     Ok(meta) => meta.ino(),
@@ -137,15 +142,82 @@ fn placement_holds(pid: u32, starttime: u64, session: &Path) -> Result<bool, Err
 
 /// Directory sessions are created under. Capture attaches here.
 ///
+/// When this process's cgroup is not writable, the user's systemd manager
+/// first moves the process into a scope delegated to it.
+///
 /// # Errors
 ///
-/// Returns an error when this process's cgroup cannot be read or the
-/// directory cannot be created.
-pub fn host_cgroup() -> Result<PathBuf, Error> {
+/// Returns an error when this process's cgroup cannot be read, delegation
+/// fails, or the directory cannot be created.
+pub async fn host_cgroup() -> Result<PathBuf, Error> {
+  match host_dir() {
+    Err(Error::SessionCgroup { source, .. }) if source.kind() == ErrorKind::PermissionDenied => {
+      crate::systemd::delegate_self().await?;
+      host_dir()
+    }
+    result => result,
+  }
+}
+
+fn host_dir() -> Result<PathBuf, Error> {
   let rel = read_cgroup(std::process::id())?;
-  let parent = Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')).join("arkham-host");
+  let parent = Path::new("/sys/fs/cgroup").join(rel.trim_start_matches('/')).join(HOST);
   std::fs::create_dir_all(&parent).map_err(|source| session_cgroup_io(&parent, source))?;
   Ok(parent)
+}
+
+/// Move this process into `session`. When the cgroup it leaves is not
+/// writable, the user's systemd manager moves it into the daemon's unit.
+///
+/// # Errors
+///
+/// Returns an error when neither the direct move nor the systemd move succeeds.
+pub async fn join_session(session: &Path) -> Result<(), Error> {
+  let source = match std::fs::write(session.join("cgroup.procs"), "0") {
+    Ok(()) => return Ok(()),
+    Err(source) if source.kind() == ErrorKind::PermissionDenied => source,
+    Err(source) => return Err(session_cgroup_io(session, source)),
+  };
+  let Some((unit, subcgroup)) = session_unit(session) else {
+    return Err(session_cgroup_io(session, source));
+  };
+  crate::systemd::attach_self(unit, &subcgroup).await
+}
+
+/// Open the `cgroup.procs` this process returns to when its session ends:
+/// its current cgroup, or the daemon's unit cgroup when the current one is
+/// not writable.
+///
+/// # Errors
+///
+/// Returns an error when neither cgroup can be opened for writing.
+pub fn session_exit(session: &Path) -> Result<File, Error> {
+  let current = Path::new("/sys/fs/cgroup").join(read_cgroup(std::process::id())?.trim_start_matches('/'));
+  match open_procs(&current) {
+    Ok(file) => Ok(file),
+    Err(source) if source.kind() == ErrorKind::PermissionDenied => {
+      let Some(unit) = session.parent().and_then(Path::parent) else {
+        return Err(session_cgroup_io(&current, source));
+      };
+      open_procs(unit).map_err(|source| session_cgroup_io(unit, source))
+    }
+    Err(source) => Err(session_cgroup_io(&current, source)),
+  }
+}
+
+fn open_procs(cgroup: &Path) -> std::io::Result<File> {
+  OpenOptions::new().write(true).open(cgroup.join("cgroup.procs"))
+}
+
+/// Unit name and unit-relative subcgroup for `<unit>/arkham-host/<session>`.
+fn session_unit(session: &Path) -> Option<(&str, String)> {
+  let name = session.file_name()?.to_str()?;
+  let host = session.parent()?;
+  if host.file_name()? != HOST {
+    return None;
+  }
+  let unit = host.parent()?.file_name()?.to_str()?;
+  Some((unit, format!("/{HOST}/{name}")))
 }
 
 /// Kill remaining members and wait until the cgroup can be removed.
@@ -195,4 +267,22 @@ pub fn read_cgroup(pid: u32) -> Result<String, Error> {
     .find_map(|line| line.strip_prefix("0::"))
     .map(str::to_string)
     .ok_or(Error::NoCgroup { pid })
+}
+
+#[cfg(test)]
+mod tests {
+  use std::path::Path;
+
+  use super::session_unit;
+
+  #[test]
+  fn a_session_path_names_its_unit_and_subcgroup() {
+    let session = Path::new("/sys/fs/cgroup/user.slice/user@1000.service/app.slice/arkham.service/arkham-host/12-99");
+    assert_eq!(session_unit(session), Some(("arkham.service", "/arkham-host/12-99".to_string())));
+  }
+
+  #[test]
+  fn a_path_outside_the_host_directory_has_no_unit() {
+    assert_eq!(session_unit(Path::new("/sys/fs/cgroup/arkham.service/other/12-99")), None);
+  }
 }

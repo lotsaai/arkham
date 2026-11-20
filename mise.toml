@@ -28,6 +28,8 @@ mold = { version = "latest", os = ["linux"] }
 k3d = "latest"
 "cargo:cargo-outdated" = "latest"
 kubectl = "latest"
+"cargo:docsrs-mcp" = "latest"
+microsandbox = "latest"
 
 [[tools.rust]]
 version = "stable"
@@ -40,5 +42,7 @@ version = "nightly-2026-09-18"
 components = "llvm-tools,rustfmt,rust-src"
 
 [env]
+# BoringSSL's build script does not read CXXSTDLIB.
+BORING_BSSL_RUST_CPPLIB = "{% if os() == 'linux' %}{{ get_env(name='CXXSTDLIB', default='stdc++') }}{% else %}{{ get_env(name='CXXSTDLIB', default='c++') }}{% endif %}"
 CARGO_TERM_COLOR = "always"
 RUSTUP_TOOLCHAIN = "stable"

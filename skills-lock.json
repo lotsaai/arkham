@@ -1,113 +1,120 @@
 {
-  "version": 1,
+  "version": 2,
   "skills": {
     "cargo-workflows": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/cargo-workflows/SKILL.md",
-      "computedHash": "14a5bc62c6206505c027201b5c075916a0987ca528428ecb6f2d7f10272b4685"
+      "computedHash": "192126a970618d7e863c5bbedacd920f2269d9cc43610aa3de49b70eb59c068a"
     },
     "clang": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/compilers/clang/SKILL.md",
-      "computedHash": "7a585a4af02b439314efb24dae5e44efee7e09a8c9872b8fa1df129c12632251"
+      "computedHash": "ce8646f185a03b05b6349903a24de7e9d4ca40db8d4c481b76b94c238d24f845"
     },
     "cmake": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/build-systems/cmake/SKILL.md",
-      "computedHash": "ca5d2b6e4df8cc503ac624a44d61bf5d823abba1eb1fbc0de0d6969eba351db6"
+      "computedHash": "73b0f1e334e5e5d5cb50460fa71e35e6029fab5f56a4a91b83a5d0af597d7a52"
     },
     "ebpf": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/observability/ebpf/SKILL.md",
-      "computedHash": "61520a57fe9a1dff62aca420f4e110560286aeb120fdaf8b7a104c4d263d8052"
+      "computedHash": "d3004012e44129f3fdabba0b24c499553df759ced4301a4a94439304a4f4b06e"
     },
     "ebpf-rust": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/observability/ebpf-rust/SKILL.md",
-      "computedHash": "201d066ec47162743fa26bb1f62efe65b97cc1494c69e1ea75a6b56cc7267f96"
+      "computedHash": "cbf5e8219f17100c38f5208959bd02c6dd8f26ffcaa3fa18c1d9ee0d47e4f726"
+    },
+    "microsandbox": {
+      "source": "superradcompany/skills",
+      "commit": "62403288e8102486ea47f379e19dc2e2c0f7e5e2",
+      "sourceType": "github",
+      "skillPath": "microsandbox/SKILL.md",
+      "computedHash": "2a9d92334f3f8bbf9be102a26e7cf55e708257ddd0f3d96f960dc42cad3628ed"
     },
     "rust-async-internals": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rust-async-internals/SKILL.md",
-      "computedHash": "426642b578012af58d08dbbf5c5297dd88251eece4e468d348aefb64c55f094b"
+      "computedHash": "c8e3466aea49c128f5d32266c7f72a8e6947cdcf11371a6facb2473044cf4705"
     },
     "rust-build-times": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rust-build-times/SKILL.md",
-      "computedHash": "80825b76fc15facc5a1f609eb8356c957758fb75feef4248d913b61d897ccefd"
+      "computedHash": "0485b13b7355ab97ed92c16dd819529ab90781022807d98b7036bd92143ed724"
     },
     "rust-cross": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rust-cross/SKILL.md",
-      "computedHash": "85da1c9f50dcf43048a1e55ed9b18dee61ca6ec072e273f3df5ca8d2fcbeca01"
+      "computedHash": "9bfe7f5ed35ffbdbdec9e3717f2faa9f2c518e40853879b42cfce2969e5d5cc3"
     },
     "rust-debugging": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rust-debugging/SKILL.md",
-      "computedHash": "70002eabb81f25ffdf84ba7203b6d0069cfe976dea30d17a3b558d335458488f"
+      "computedHash": "7cd7add5e0cada606a2371552e9114b16444462f7ec7945c167c59a5a788410d"
     },
     "rust-ffi": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rust-ffi/SKILL.md",
-      "computedHash": "55fadeaff081bf9ccdc7a266cd85850fadf17508c2733a3519f52c40a1071735"
+      "computedHash": "5d875b02421147510e83c4cd0ae0ceb252b77199a776bca919ccfa18292e339f"
     },
     "rust-no-std": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rust-no-std/SKILL.md",
-      "computedHash": "797e2e67e004552a4d1caaec57f0e98a3d57f0ba53588ee1389e89383163a573"
+      "computedHash": "4e9d87c3361dde2db7ecf98fc787e2cc0e60c01c033bdf21236621340219cf4d"
     },
     "rust-profiling": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rust-profiling/SKILL.md",
-      "computedHash": "6470a08bc2c0072c405ff7f0d9db099aef66c06d49dc85cff6fdca0ed459a14c"
+      "computedHash": "51ae6cb1df7d8ea11853097529b4fdf7871d2c16cbbcb25e038da5189144241e"
     },
     "rust-sanitizers-miri": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rust-sanitizers-miri/SKILL.md",
-      "computedHash": "40dd6e8743eb7cab2c02f70c9019967856975efd273700f31f0ace6fc2740ccb"
+      "computedHash": "053235b88f6ceae89121f08ef0123f6f097e902aede62e70e3728db97214f5bf"
     },
     "rust-security": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rust-security/SKILL.md",
-      "computedHash": "3c3763fbb2da225b1286304e42bae6d95201e1a1fdc15d7550eee5ab337394f6"
+      "computedHash": "327bfd02b584b86e18b04b12b7de9804b40664c394f21cccd453aef1dc3f9258"
     },
     "rust-skills": {
       "source": "leonardomso/rust-skills",
       "sourceType": "github",
       "skillPath": "SKILL.md",
-      "computedHash": "9719e9ebd94783d3436ed26156bf9bf2e4c7f63b3220d9d17ff90cba55c92bb8"
+      "computedHash": ""
     },
     "rust-unsafe": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rust-unsafe/SKILL.md",
-      "computedHash": "0f98528d2805553c7264c19c006b582cf2bccfc501932feabbde284fed5a412c"
+      "computedHash": "7d2d5b0301cb6557cbf94f01bebd36ae9ce2f260aa72ddec9024999aab8bb231"
     },
     "rustc-basics": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/rust/rustc-basics/SKILL.md",
-      "computedHash": "4adaaf43e27841c15ccb529d17c537e575e5238af0e11886aa7ef7c9f4800b03"
+      "computedHash": "0f7a2f29a49466931154604784c7716898c0095aa35bdb9666bc0bf4e7f54927"
     },
     "wasm-wasmtime": {
       "source": "mohitmishra786/low-level-dev-skills",
       "sourceType": "github",
       "skillPath": "skills/runtimes/wasm-wasmtime/SKILL.md",
-      "computedHash": "8ad36cd05ec6c058f1b00362335ae64ec731a03627df9a278b6eae242cb3dba4"
+      "computedHash": ""
     }
   }
 }

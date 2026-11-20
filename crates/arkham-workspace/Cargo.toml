@@ -21,7 +21,9 @@ thiserror = { workspace = true }
 xpanda = { workspace = true }
 
 [dev-dependencies]
+arkham-test-support = { workspace = true }
 tempfile = { workspace = true }
+test-context = { workspace = true }
 toml_edit = { workspace = true }
 
 [lints]

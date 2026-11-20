@@ -4,7 +4,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::fs::File;
+use std::fs::{File, Permissions};
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ struct Isolated {
   fnox_dir: tempfile::TempDir,
   ca_file: PathBuf,
   path: std::ffi::OsString,
+  /// The daemon and agent reach the user's systemd manager through this bus.
+  bus: Option<std::ffi::OsString>,
 }
 
 impl Isolated {
@@ -27,7 +29,10 @@ impl Isolated {
     let config_home = tempfile::tempdir().unwrap();
     let fnox_dir = tempfile::tempdir().unwrap();
     let ca_file = runtime.path().join("ca.pem");
+    // tempfile creates directories with the process umask; a login umask of 002 would make it group-writable.
+    std::fs::set_permissions(runtime.path(), Permissions::from_mode(0o700)).unwrap();
     let path = std::env::var_os("PATH").unwrap();
+    let bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
     Self {
       runtime,
       home,
@@ -35,6 +40,7 @@ impl Isolated {
       fnox_dir,
       ca_file,
       path,
+      bus,
     }
   }
 
@@ -45,7 +51,7 @@ impl Isolated {
   }
 
   fn envs(&self) -> Vec<(&str, &std::ffi::OsStr)> {
-    vec![
+    let mut envs = vec![
       ("PATH", self.path.as_os_str()),
       ("HOME", self.home.path().as_os_str()),
       ("USER", "ubuntu".as_ref()),
@@ -58,7 +64,11 @@ impl Isolated {
       ("http_proxy", "http://secret-proxy.invalid".as_ref()),
       ("HTTPS_PROXY", "http://secret-proxy.invalid".as_ref()),
       ("ALL_PROXY", "http://secret-proxy.invalid".as_ref()),
-    ]
+    ];
+    if let Some(bus) = &self.bus {
+      envs.push(("DBUS_SESSION_BUS_ADDRESS", bus.as_os_str()));
+    }
+    envs
   }
 }
 
@@ -270,10 +280,13 @@ fn a_wrapper_never_starts_the_command_without_activation_acknowledgement() {
   let workspace = tempfile::tempdir().unwrap();
   let socket_dir = isolated.runtime.path().join("arkham");
   std::fs::create_dir(&socket_dir).unwrap();
+  std::fs::set_permissions(&socket_dir, Permissions::from_mode(0o700)).unwrap();
   let listener = UnixListener::bind(socket_dir.join("daemon.sock")).unwrap();
   std::fs::set_permissions(socket_dir.join("daemon.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
-  let cgroup = isolated.runtime.path().join("fake-cgroup");
-  std::fs::create_dir(&cgroup).unwrap();
+  let unit = isolated.runtime.path().join("fake-unit");
+  let cgroup = unit.join("arkham-host").join("1-1");
+  std::fs::create_dir_all(&cgroup).unwrap();
+  std::fs::write(unit.join("cgroup.procs"), "").unwrap();
   std::fs::write(cgroup.join("cgroup.procs"), "").unwrap();
   let root = workspace.path().to_path_buf();
   let marker = root.join("command-ran");

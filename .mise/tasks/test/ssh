@@ -3,10 +3,8 @@
 #MISE description="Run the docker compose e2e scenarios with eBPF capture"
 #MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "integration/**"]
 #MISE outputs=[]
-#MISE depends=["build:debug", "build:container"]
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
 
@@ -43,9 +41,10 @@ cleanup_nats_discovery() {
 }
 trap cleanup_nats_discovery EXIT
 
-# Only the portable container build goes into the runtime image.
+# The debug binary comes from the `build:debug` dependency; compose mounts
+# it from here (the image is runtime-only, no build stage).
 mkdir -p integration/docker
-cp target/container/release/arkham integration/docker/arkham
+cp target/debug/arkham integration/docker/arkham
 
 compose="docker compose -f integration/compose.yaml --env-file integration/.env"
 client=arkham-integration-client-1

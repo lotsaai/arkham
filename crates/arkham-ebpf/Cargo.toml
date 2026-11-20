@@ -24,9 +24,11 @@ aya-build = { workspace = true }
 aya-obj = { workspace = true }
 arkham-config = { workspace = true }
 arkham-pki = { workspace = true }
+arkham-test-support = { workspace = true }
 rustls = { workspace = true }
 secrecy = { workspace = true }
 tempfile = { workspace = true }
+test-context = { workspace = true }
 tokio-rustls = { workspace = true }
 
 [lints]

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#MISE description="Open a login shell as eng in the arkham-dev machine"
+#MISE tags=["sandbox"]
+#MISE dir="{{config_root}}"
+#MISE daemons=["sandbox"]
+#MISE interactive=true
+
+set -euo pipefail
+
+exec smolvm machine exec -it --name arkham-dev --user root -- su - eng

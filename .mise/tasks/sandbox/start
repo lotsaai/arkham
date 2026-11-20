@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+#MISE description="Run the arkham-dev machine in the foreground; destroy it when stopped"
+#MISE tags=["sandbox"]
+#MISE dir="{{config_root}}"
+#MISE depends=["sandbox:create"]
+
+set -euo pipefail
+
+# pitchfork signals the whole process group, more than once; destroy runs once.
+trap 'exit 0' TERM INT
+trap "trap '' TERM INT; mise run sandbox:destroy" EXIT
+
+smolvm machine start --name arkham-dev
+smolvm machine logs --name arkham-dev --follow
