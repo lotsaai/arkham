@@ -25,14 +25,13 @@ pub struct AgentArgs {
 impl CliCommand for AgentArgs {
   type Error = Error;
 
+  #[cfg(target_os = "linux")]
   async fn run(self, _cli: &Cli, _arkham_version: &str) -> Result<(), Self::Error> {
-    #[cfg(target_os = "linux")]
-    {
-      crate::linux::agent(self.write_profile, self.workspace.as_deref(), &self.command).await
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-      Err(Error::HostLinuxOnly)
-    }
+    crate::linux::agent(self.write_profile, self.workspace.as_deref(), &self.command).await
+  }
+
+  #[cfg(not(target_os = "linux"))]
+  fn run(self, _cli: &Cli, _arkham_version: &str) -> impl Future<Output = Result<(), Self::Error>> + Send {
+    std::future::ready(Err(Error::HostLinuxOnly))
   }
 }
