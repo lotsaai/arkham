@@ -5,6 +5,7 @@
 #MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 cargo_args=()
 build_args=()

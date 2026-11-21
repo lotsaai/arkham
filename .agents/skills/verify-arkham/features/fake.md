@@ -1,31 +1,24 @@
 # Print a decoy
 
-`arkham fake` prints the deterministic format-valid decoy for an env var name. The same name always yields the same value; different names yield different values.
+`arkham fake <ENV>` prints the deterministic format-valid decoy for an env var name. The same name always yields the same value, different names differ, and `--pattern` overrides the registry shape for one invocation.
 
 ## Sub-features
 
-- `fake-print` prints one decoy on stdout and exits 0.
-- `fake-stable` repeats the same name and gets the identical string.
-- `fake-distinct` uses two names and gets two different strings.
+- `fake-print` prints one decoy line and exits 0 (`DEMO_TOKEN` → `f92b2afa339693227aa209aac3eb48f9`).
+- `fake-stable` the same name gives the identical string.
+- `fake-distinct` two names give two strings.
+- `fake-pattern` `--pattern 'ghp_{hex:36}'` gives that shape.
 
 ## How to get to it (user POV)
 
-- Run `arkham fake <ENV_NAME>` from any directory (no config required for the default hex decoy).
+- `arkham fake <ENV_NAME> [--pattern <PATTERN>]` from any directory.
 
-## Driving it with verify-arkham helpers
+## Driving it with mise tasks
 
-Preconditions:
-
-- `doctor.sh` exited 0.
-- `ARKHAM` is `target/debug/arkham` or `ARKHAM_BIN`.
-
-- **Print decoy.** Run `"$ARKHAM" fake DEMO_TOKEN`. Exit 0; stdout is a non-empty single line (known value `f92b2afa339693227aa209aac3eb48f9` for `DEMO_TOKEN`).
-- **Stability.** Run the same command again. Stdout equals the first run byte-for-byte.
-- **Distinct.** Run `"$ARKHAM" fake OTHER_TOKEN`. Stdout differs from `DEMO_TOKEN`'s decoy.
-- **Proof.** Write both outputs under `artifacts/fake-<runid>/` as `demo.txt` and `other.txt` plus the commands in `SUMMARY.txt`.
+- **Run.** `mise run verify:fake`.
+- **Pass when.** `PASS fake`; `artifacts/fake-<runid>/stdout.txt` holds the last decoy printed.
 
 ## Gotchas
 
-- Do not pass `--config` unless checking config-related decoy templates; the default path needs none.
-- Trailing newlines: compare trimmed single lines.
-- Never log or commit a real secret while proving decoys; this feature only prints fakes.
+- `fake` still loads config and fnox discovery; when a rule resolves, INFO logs go to stdout ahead of the decoy (product gap). The task isolates `HOME` and sets `RUST_LOG=warn`.
+- A registry-known name (`GITHUB_TOKEN`) gets the registry's shape, not `{hex:32}`.

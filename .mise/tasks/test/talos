@@ -5,6 +5,7 @@
 #MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   echo "test:talos needs a docker daemon" >&2

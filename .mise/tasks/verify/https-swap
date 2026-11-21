@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#MISE description="Verify tutorial step 7 offline: CA trust gates the HTTPS swap"
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+source integration/verify/lib.sh
+verify_init https-swap
+
+DECOY="$("$ARKHAM" fake DEMO_TOKEN)"
+REAL="$(equal_length_real "$DECOY")"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -subj /CN=localhost -addext subjectAltName=DNS:localhost \
+  -keyout upstream.key -out upstream.crt 2>"$ARTIFACTS/openssl.log"
+chmod 644 upstream.key
+start_upstream tls -v "$WORK/upstream.crt:/tls/crt:ro" -v "$WORK/upstream.key:/tls/key:ro" \
+  -e CERT=/tls/crt -e KEY=/tls/key
+URL="https://localhost:${UPSTREAM_HOST_PORT}"
+
+cat >arkham.toml <<EOF
+[proxy]
+listen = "127.0.0.1:0"
+ca_file = "ca.pem"
+
+[rules.demo]
+env = "DEMO_TOKEN"
+value = "${REAL}"
+allow = ["${URL}"]
+
+[rules.demo.tls."${URL}"]
+root_cert = "upstream.crt"
+EOF
+"$ARKHAM" ca --config arkham.toml >"$ARTIFACTS/ca-stdout.pem"
+spawn "$ARTIFACTS/proxy.log" "$ARKHAM" serve --config arkham.toml
+wait_log "$ARTIFACTS/proxy.log" "$LAST_PID" serving
+PROXY="http://127.0.0.1:$(bound_port "$ARTIFACTS/proxy.log")"
+
+set +e
+curl -sS --max-time 5 -x "$PROXY" "$URL/" -H "Authorization: Bearer ${DECOY}" \
+  >"$ARTIFACTS/untrusted-body.txt" 2>"$ARTIFACTS/untrusted-stderr.txt"
+echo $? >"$ARTIFACTS/untrusted-exit.txt"
+set -e
+expect "untrusted client refused (curl 60)" test "$(cat "$ARTIFACTS/untrusted-exit.txt")" = 60
+expect "upstream untouched while untrusted" fails docker exec "$UPSTREAM_NAME" test -e /tmp/seen.txt
+
+curl -sS --max-time 5 --cacert ca.crt -x "$PROXY" "$URL/" \
+  -H "Authorization: Bearer ${DECOY}" >"$ARTIFACTS/client-body.txt"
+upstream_seen "$UPSTREAM_NAME" >"$ARTIFACTS/upstream-seen.txt"
+expect "upstream got the real value" test "$(cat "$ARTIFACTS/upstream-seen.txt")" = "Bearer ${REAL}"
+expect "client got the decoy back" test "$(cat "$ARTIFACTS/client-body.txt")" = "upstream saw: Bearer ${DECOY}"
+verify_pass https-swap

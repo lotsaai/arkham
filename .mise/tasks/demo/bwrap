@@ -6,6 +6,7 @@
 #USAGE flag "--use-sudo" help="Skip the gum escalation prompt and go straight to sudo"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 # build:release (task dependency) builds as the current user so target/
 # stays user-owned. Only the demo script needs root: netns, veth, host NAT,

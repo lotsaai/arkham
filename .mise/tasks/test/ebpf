@@ -8,6 +8,7 @@
 #USAGE arg "[filters]" var=#true help="Test-name filters; default: ebpf_live_"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 # Build the test binary as the current user so target/ stays user-owned.
 # Building this package is also what runs its `build.rs`, and therefore

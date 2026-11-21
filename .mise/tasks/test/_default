@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 #MISE description="Run the full project test suite"
 #MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**", ".mise/tasks/test/**"]

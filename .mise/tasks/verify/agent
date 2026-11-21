@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#MISE description="Verify arkham daemon run + arkham agent: bwrap, full Landlock, decoy env, captured swap"
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+source integration/verify/lib.sh
+
+: "${XDG_RUNTIME_DIR:?the daemon socket and user bus live in XDG_RUNTIME_DIR}"
+if python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' "$XDG_RUNTIME_DIR/arkham/daemon.sock" 2>/dev/null; then
+  echo "verify fail: a daemon already serves $XDG_RUNTIME_DIR/arkham/daemon.sock; never drive a daemon this task did not start" >&2
+  exit 2
+fi
+
+# bwrap gives the agent a private /tmp, so the workspace lives in the checkout.
+mkdir -p "$ROOT/target/verify-work"
+WORK="$(mktemp -d "$ROOT/target/verify-work/agent-$RUN_ID.XXXXXX")"
+verify_init agent
+
+# Same capability grant as test:rust, removed on exit.
+sudo -n setcap cap_bpf,cap_net_admin,cap_perfmon=ep "$ARKHAM"
+CLEANUPS+=("sudo -n setcap -r '$ARKHAM'")
+
+# Agent env holds decoys only for fnox-declared names the registry knows, so
+# the workspace declares GITHUB_TOKEN to fnox and allows the upstream on top.
+DECOY="$("$ARKHAM" fake GITHUB_TOKEN)"
+REAL="$(equal_length_real "$DECOY")"
+
+# Loopback is never captured: the agent dials the container's bridge address.
+start_upstream captured
+UPSTREAM=$UPSTREAM_NAME
+IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$UPSTREAM")"
+
+mkdir -p ws/.config/arkham
+git -C ws init -q
+cat >ws/fnox.toml <<EOF
+[secrets.GITHUB_TOKEN]
+default = "${REAL}"
+EOF
+cat >ws/.config/arkham/config.toml <<EOF
+[rules.github_token]
+env = "GITHUB_TOKEN"
+allow = ["http://${IP}:8000"]
+EOF
+
+ARKHAM_LISTEN="127.0.0.1:0" spawn "$ARTIFACTS/daemon.log" "$ARKHAM" daemon run
+wait_log "$ARTIFACTS/daemon.log" "$LAST_PID" "daemon: ready" 30
+expect "daemon names the port it bound" test "$(bound_port "$ARTIFACTS/daemon.log")" -gt 0
+
+(
+  cd ws
+  "$ARKHAM" agent -- sh -c "printf 'env:%s\n' \"\$GITHUB_TOKEN\"; curl -sS --max-time 10 http://${IP}:8000/ -H \"Authorization: Bearer \$GITHUB_TOKEN\""
+) >"$ARTIFACTS/agent-stdout.txt" 2>"$ARTIFACTS/agent-stderr.txt"
+upstream_seen "$UPSTREAM" >"$ARTIFACTS/upstream-seen.txt"
+
+expect "runner: bwrap" grep -q "runner: bwrap" "$ARTIFACTS/agent-stderr.txt"
+expect "enforcement: full" grep -q "enforcement: full" "$ARTIFACTS/agent-stderr.txt"
+expect "agent env holds the decoy" grep -qx "env:${DECOY}" "$ARTIFACTS/agent-stdout.txt"
+expect "agent got the decoy back" grep -qx "upstream saw: Bearer ${DECOY}" "$ARTIFACTS/agent-stdout.txt"
+expect "upstream got the real value" test "$(cat "$ARTIFACTS/upstream-seen.txt")" = "Bearer ${REAL}"
+expect "real value never reached the agent" fails grep -Fq -e "$REAL" "$ARTIFACTS/agent-stdout.txt" "$ARTIFACTS/agent-stderr.txt"
+verify_pass agent

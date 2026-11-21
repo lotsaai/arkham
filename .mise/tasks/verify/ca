@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+#MISE description="Verify arkham ca writes ca.pem, ca.crt, ca.key and prints only the certificate"
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+source integration/verify/lib.sh
+verify_init ca
+
+run_cli ca ca --config arkham.toml
+expect "ca exits 0" test "$CLI_EXIT" = 0
+expect "ca.pem is 600" grep -qx '600 ca.pem' "$ARTIFACTS/workspace-files.txt"
+expect "ca.key is 600" grep -qx '600 ca.key' "$ARTIFACTS/workspace-files.txt"
+expect "ca.crt written" grep -q ' ca.crt$' "$ARTIFACTS/workspace-files.txt"
+expect "stdout is the certificate" grep -q 'BEGIN CERTIFICATE' "$ARTIFACTS/stdout.txt"
+expect "stdout carries no key" fails grep -q "PRIVATE KEY" "$ARTIFACTS/stdout.txt"
+verify_pass ca

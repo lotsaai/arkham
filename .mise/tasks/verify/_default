@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+#MISE description="Run every verify:* user-path check"
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+
+for feature in fake schemes ca rules config registry http-swap https-swap agent; do
+  mise run "verify:$feature"
+done

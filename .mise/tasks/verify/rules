@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+#MISE description="Verify arkham rules derives registry-known fnox names and lists uncovered ones"
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+source integration/verify/lib.sh
+verify_init rules
+
+run_cli rules rules
+expect "rules exits 0" test "$CLI_EXIT" = 0
+expect "derived rule" grep -qx '\[rules.github_token\]' "$ARTIFACTS/stdout.txt"
+expect "derived env" grep -qx 'env = "GITHUB_TOKEN"' "$ARTIFACTS/stdout.txt"
+expect "uncovered name listed" grep -qx '# UNKNOWN_THING' "$ARTIFACTS/stdout.txt"
+expect "no value printed" fails grep -q fixture-not-a-secret "$ARTIFACTS/stdout.txt"
+verify_pass rules

@@ -3,6 +3,8 @@
 #MISE description="Run the linters and formatters"
 #MISE dir="{{config_root}}"
 
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+
 # hk is git-only, and a jj workspace has no `.git` of its own. Bridge to the
 # jj repo's git backend so hk can resolve files, but keep every write out of
 # that shared repo: the scratch index and object store live under `.cache`,

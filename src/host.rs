@@ -53,6 +53,7 @@ pub async fn run(version: &str) -> eyre::Result<()> {
   )?);
   let registered = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
   let explicit = bind_explicit(proxy.listen).await?;
+  let listen_addr = explicit.local_addr()?;
   let cgroup = host_cgroup().await?;
   let capture_state = Arc::clone(&state);
   let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -62,7 +63,7 @@ pub async fn run(version: &str) -> eyre::Result<()> {
         // The capture task owns startup errors; with_capture reports its result.
         return std::future::pending().await;
       }
-      tracing::info!(listen = %proxy.listen, socket = %socket_path.display(), "host daemon ready");
+      tracing::info!(listen = %listen_addr, socket = %socket_path.display(), "host daemon ready");
       eprintln!("daemon: ready");
       tokio::select! {
         () = serve(explicit, Arc::clone(&state)) => Ok(()),
