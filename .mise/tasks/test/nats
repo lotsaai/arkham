@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+#MISE description="Run the NATS e2e scenarios with eBPF capture"
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "integration/**"]
+#MISE outputs=[]
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source integration/e2e.sh
+
+e2e_init nats
+e2e_up nats nats-jwt
+bash integration/nats-discovery.sh
+NATS_DISCOVERED=1 e2e_client
+bash integration/nats-client-hides-real.sh
+e2e_covered nats

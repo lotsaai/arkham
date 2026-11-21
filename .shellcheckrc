@@ -1,0 +1,2 @@
+# Test tasks source integration/e2e.sh by its repo-root path; follow it.
+external-sources=true

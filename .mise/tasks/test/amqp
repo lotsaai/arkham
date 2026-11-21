@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+#MISE description="Run the AMQP e2e scenarios with eBPF capture"
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "integration/**"]
+#MISE outputs=[]
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source integration/e2e.sh
+
+python3 -m unittest discover -s integration/docker/amqp-witness -p 'test_*.py'
+
+e2e_init amqp
+e2e_up amqp amqp-witness
+e2e_client
+e2e_covered amqp amqps

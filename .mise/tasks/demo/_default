@@ -14,7 +14,7 @@ compose="docker compose -f integration/compose.yaml"
 trap '$compose down --remove-orphans -v --timeout 3' EXIT
 # compose up --abort-on-container-exit hangs after teardown with the
 # netns-sharing client; drive the lifecycle directly instead.
-$compose up -d --build
+ARKHAM_CLIENT=http $compose up -d --build
 
 client=arkham-integration-client-1
 state=running
