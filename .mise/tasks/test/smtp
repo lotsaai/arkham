@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+
+#MISE description="Run the SMTP e2e scenarios with eBPF capture"
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "integration/**"]
+#MISE outputs=[]
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source integration/e2e.sh
+
+e2e_init smtp
+e2e_up mail
+# The decoy dialled straight at the mail server, outside capture, must be refused.
+$compose up --no-deps --exit-code-from smtp-direct smtp-direct
+e2e_client
+e2e_covered smtp smtps

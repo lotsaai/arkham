@@ -74,11 +74,11 @@ services:
       - PERFMON
       - SYS_PTRACE
     volumes:
-      - ./out/arkham.toml:/etc/arkham/arkham.toml:ro
+      - ../target/integration/arkham.toml:/etc/arkham/arkham.toml:ro
       - certs:/certs:ro
       - arkham-config:/arkham-config:ro
-      # Discovered NATS grant blobs (CA). Empty unless test:ssh ran arkham init.
-      - ./out/nats-discovery/grants:/arkham/grants:ro
+      # Discovered NATS grant blobs (CA). Empty unless test:nats ran discovery.
+      - ../target/integration/nats-discovery/grants:/arkham/grants:ro
     networks:
       default: {}
       server:
@@ -347,7 +347,7 @@ services:
       retries: 15
     volumes:
       - certs:/certs:ro
-      - ./out/nats/server.conf:/etc/nats/server.conf:ro
+      - ../target/integration/nats/server.conf:/etc/nats/server.conf:ro
     networks:
       server:
         ipv4_address: 10.202.0.90
@@ -371,8 +371,8 @@ services:
       retries: 15
     volumes:
       - certs:/certs:ro
-      - ./out/nats/jwt.conf:/etc/nats/jwt.conf:ro
-      - ./out/nats/operator.jwt:/etc/nats/operator.jwt:ro
+      - ../target/integration/nats/jwt.conf:/etc/nats/jwt.conf:ro
+      - ../target/integration/nats/operator.jwt:/etc/nats/operator.jwt:ro
     networks:
       server:
         ipv4_address: 10.202.0.91
@@ -447,7 +447,7 @@ services:
       - DAC_OVERRIDE
     volumes:
       - ./docker/amqp-witness:/witness:ro
-      - ./out/results:/out
+      - ../target/integration/results:/out
     network_mode: service:amqp
     depends_on:
       amqp:
@@ -466,7 +466,7 @@ services:
   # Decoy AUTH straight at the mail server, from a network namespace the
   # capture rules do not cover. Not the client: that container is the
   # confined agent and must not hold NET_ADMIN. An empty SMTP_URL skips
-  # the dial so the client still reaches run.ts.
+  # the dial.
   smtp-direct:
     image: python:3-slim@sha256:db3231d3fce4c59182f8364dbec08b8bad4fdfca673dfb226f3c9e77b6b48cd2
     working_dir: /srv
@@ -500,7 +500,7 @@ services:
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
-      - ./out/results:/out
+      - ../target/integration/results:/out
     networks:
       server:
         ipv4_address: 10.202.0.70
@@ -526,7 +526,7 @@ services:
         set -euo pipefail
         apt-get update -qq && apt-get install -qq -y openssh-client python3 iproute2
         mkdir -p /opt/client
-        cp /srv/package.json /srv/run.ts /opt/client/
+        cp /srv/package.json /srv/*.ts /opt/client/
         (cd /opt/client && bun install)
         chmod -R a+rX /opt/client
         if [ -f /opt/nats-discovered/context.txt ]; then
@@ -554,11 +554,13 @@ services:
           chown "$$HOST_UID:$$gid" /tmp/decoy
           chmod 600 /tmp/decoy
           export HOME=/tmp SSH_IDENTITY=/tmp/decoy
-          exec setpriv --reuid="$$HOST_UID" --regid="$$gid" --clear-groups bun /opt/client/run.ts
+          exec setpriv --reuid="$$HOST_UID" --regid="$$gid" --clear-groups bun "/opt/client/$${ARKHAM_CLIENT}.ts"
         fi
-        exec bun /opt/client/run.ts
+        exec bun "/opt/client/$${ARKHAM_CLIENT}.ts"
     environment:
       ARKHAM_COVERED: /out/covered.json
+      # The protocol client to run; each test:<protocol> task names its own.
+      ARKHAM_CLIENT: ${ARKHAM_CLIENT:-}
       HOST_UID: ${HOST_UID:-}
       HOST_GID: ${HOST_GID:-}
       ARKHAM_FAKE: ghp_27ac12868ee51ad4e09a0a53b61ac927d0319142 # nosemgrep: deterministic decoy from `arkham fake GH_TOKEN`, not a credential
@@ -587,8 +589,8 @@ services:
     volumes:
       - ./client:/srv:ro
       - certs:/certs:ro
-      - ./out/results:/out
-      - ./out/nats-discovery/guest:/opt/nats-discovered:ro
+      - ../target/integration/results:/out
+      - ../target/integration/nats-discovery/guest:/opt/nats-discovered:ro
     network_mode: service:arkham
     depends_on:
       smtp-direct:
