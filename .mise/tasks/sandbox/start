@@ -11,4 +11,9 @@ trap 'exit 0' TERM INT
 trap "trap '' TERM INT; mise run sandbox:destroy" EXIT
 
 smolvm machine start --name arkham-dev
+# The machine is ready (mise.arch.toml ready_cmd) only after the checkout's
+# toolchain is installed; /run clears on every boot.
+smolvm machine exec --stream --name arkham-dev --user root -- \
+  su - eng -c 'cd /home/eng/github/lotsaai/arkham && mise trust && mise install'
+smolvm machine exec --name arkham-dev --user root -- touch /run/arkham-dev-ready
 smolvm machine logs --name arkham-dev --follow

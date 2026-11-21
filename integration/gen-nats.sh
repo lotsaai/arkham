@@ -105,9 +105,11 @@ nkey_real_url="tls://nkey:${nkey_real_seed}@nats:4222?sslrootcert=/certs/ca.crt"
 jwt_fake_url="nats://creds:${jwt_fake_seed}:${jwt_fake}@nats-jwt:4223"
 jwt_real_url="tls://creds:${jwt_real_seed}:${jwt_real}@nats-jwt:4223?sslrootcert=/certs/ca.crt"
 
-out=integration/out
+out=target/integration
 nats=$out/nats
-mkdir -p "$nats" "$out/results"
+# Every compose bind source, created as this user: docker would create a
+# missing one as root.
+mkdir -p "$nats" "$out/results" "$out/nats-discovery/grants" "$out/nats-discovery/guest"
 
 template=integration/arkham.toml
 rendered=$(mktemp)

@@ -113,7 +113,7 @@ jobs:
           timeout 20 bwrap --unshare-user --unshare-pid --die-with-parent --bind / / --dev /dev --proc /proc -- true
           mise build
 
-      # test:ssh tears the stack down before this step runs, after writing
+      # Each compose test task tears the stack down before this step runs, after writing
       # /tmp/arkham-integration-compose.log. The live `compose logs` call
       # covers a failure that left containers behind.
       - name: Dump integration compose logs
