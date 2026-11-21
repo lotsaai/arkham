@@ -1,70 +1,48 @@
 ---
 name: verify-arkham
-description: Drive the arkham CLI the way a user does (fake, serve, HTTP credential swap, grant gate). Use when proving a change to proxy substitution, grants, CA, or CLI dispatch without relying only on unit tests.
+description: Prove arkham's user-facing behaviour (decoys, HTTP/HTTPS swap, grant gate, CA, rules, registry curation, daemon + confined agent, protocol fixtures) through the repo's mise tasks. Use when a change to substitution, grants, CA, CLI, or confinement needs proof beyond unit tests.
 ---
 
-# Verify arkham (CLI)
+# Verify arkham
 
-Primary surface: the `arkham` binary. Secondary surfaces (do not use as the default proof): `mise run demo` (docker tproxy compose), `mise run demo:bwrap`, live capture tests (`test:tun` / `test:tproxy` / `test:ebpf`, root).
+Every drive is a mise task. Never run arkham, its helpers, docker fixtures, or test scripts directly. On the Arch workstation `mise.arch.toml` attaches each task to the `sandbox` daemon, which brings the `arkham-dev` machine up when it is down.
 
 ## Launch
 
-From the repo root:
-
-```sh
-mise run build:debug
-```
-
-Ready when `./target/debug/arkham --version` prints a version line. There is no long-lived app server for CLI features; each drive starts its own isolated proxy and upstream (see helpers). Do not attach to a user's existing `arkham serve` on `:8080`.
-
-Teardown: kill only the PIDs the helper started (the helper's `trap` does this). Proof under `.cursor/skills/verify-arkham/artifacts/` must survive teardown.
+Nothing to launch by hand. Each `verify:*` task depends on `build:debug` and stops what it started on exit. Upstreams are `python:3-alpine` containers on docker-assigned ports; `arkham serve` and `arkham daemon run` run natively on `127.0.0.1:0` and the task reads the bound port from their `serving` / `host daemon ready` line. No port is chosen ahead of time.
 
 ## Doctor
 
-```sh
-.cursor/skills/verify-arkham/helpers/doctor.sh
-```
-
-Requires an executable `target/debug/arkham` (override with `ARKHAM_BIN`), `curl`, and `python3`. Exit non-zero means do not drive.
+`mise tasks ls` lists `verify` and `verify:*`. A task that fails before its first `expect` (`verify fail: …`) is an environment problem: stop and report it to the user; never work around it.
 
 ## Drive
 
-Prefer feature recipes under `features/`. For the core credential-swap journey:
+| Task | Feature | Proves |
+|---|---|---|
+| `mise run verify` | all of the below | runs each `verify:*` in turn |
+| `mise run verify:fake` | [fake](features/fake.md) | stable, distinct, `--pattern` |
+| `mise run verify:schemes` | [schemes](features/schemes.md) | every served scheme listed |
+| `mise run verify:ca` | [ca](features/ca.md) | `ca.pem`/`ca.crt`/`ca.key`, key never on stdout |
+| `mise run verify:rules` | [rules](features/rules.md) | derived and uncovered fnox names |
+| `mise run verify:config` | [config](features/config.md) | reference config |
+| `mise run verify:registry` | [registry](features/registry.md) | `from-oidc` / `from-openapi` fragments |
+| `mise run verify:http-swap` | [credential-swap](features/credential-swap.md), [grant-gate](features/grant-gate.md) | tutorial §1–6 |
+| `mise run verify:https-swap` | [https-swap](features/https-swap.md) | tutorial §7, offline |
+| `mise run verify:agent` | [confine-agent](features/confine-agent.md) | daemon + agent, eBPF capture |
+| `mise run --force test` | [protocol-swaps](features/protocol-swaps.md) and everything above at unit/e2e level | the repo's full suite |
 
-```sh
-.cursor/skills/verify-arkham/helpers/tutorial-http-swap.sh
-```
-
-Optional env: `ARKHAM_BIN`, `LISTEN_PORT` (default 18080), `UPSTREAM_PORT` (18000), `OFF_PORT` (18001), `ARTIFACTS`, `KEEP_WORK=1`.
-
-Harness handles are CLI flags and HTTP headers from `docs/user/tutorial.md`, not UI selectors.
-
-Heavy path (optional, not required for a routine proof): `mise run demo` asserts the scenario table in `integration/README.md`. Needs docker and `integration/.env`.
+The tasks live in `.mise/tasks/verify/`; their shared code and fixtures in `integration/verify/`.
 
 ## Evidence
 
-Default location: `.cursor/skills/verify-arkham/artifacts/<feature>-<runid>/`.
+Each `verify:*` writes `.agents/skills/verify-arkham/artifacts/<feature>-<runid>/` (gitignored): `command.txt`, `stdout.txt`, `stderr.txt`, `exit.txt`, `workspace-files.txt` for CLI features; client body, upstream record, and logs for swaps; `SUMMARY.txt` on pass. A failing `expect` prints `proof fail: <what>; see <dir>`.
 
-Proof standards:
-
-- Exercise the real user path (`arkham fake`, `arkham serve --config`, `curl -x`, grant miss).
-- Capture action and resulting state: decoy value, client response body, upstream `seen` header file, off-grant response.
-- Side effects: upstream file must show the real secret on a grant hit; client body and off-grant path must not.
-- Do not treat `mise run test` alone as proof of the user path.
+Proof standards: the real user path (CLI, `curl -x`, `arkham agent --`); both sides of the wire; off-grant upstream records the decoy. `mise run test` green alone is not a user-path proof.
 
 ## Cleanup
 
-Helpers remove their temp workdirs and stop only the processes they spawned. Never `pkill arkham`. Leave `artifacts/` in place.
-
-## Helpers
-
-| Script | Invocation |
-| --- | --- |
-| doctor | `.cursor/skills/verify-arkham/helpers/doctor.sh` |
-| tutorial HTTP swap + grant gate | `.cursor/skills/verify-arkham/helpers/tutorial-http-swap.sh` |
-
-Both are executable. Read `features/README.md` before picking a recipe.
+Tasks remove their own processes, containers (`arkham-verify-*`), temp work dirs, and the temporary file capabilities `verify:agent` grants. Evidence stays.
 
 ## Feature map
 
-See [features/README.md](features/README.md). After product changes, refresh the map with `/maintain-verification-skill`.
+See [features/README.md](features/README.md). After product changes, refresh it with `/skill:maintain-verification-skill`.

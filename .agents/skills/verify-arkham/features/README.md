@@ -1,36 +1,38 @@
 # arkham verification map
 
-Maintained source for verifying user-facing arkham CLI behavior. Read this index, then the matching feature file.
+Maintained source for verifying user-facing arkham behaviour. Read this index, then the matching feature file.
 
 ## Baseline preconditions
 
-- Build `target/debug/arkham` with `mise run build:debug` (or set `ARKHAM_BIN`).
-- Run `.cursor/skills/verify-arkham/helpers/doctor.sh` and require exit 0.
-- Use isolated ports (helpers default to 18080 / 18000 / 18001). Never drive a proxy you did not start.
-- Work from a disposable config directory the helper creates; do not write into the developer's `~/.config/arkham`.
+- Drive only through mise tasks (`mise run verify:<feature>`, `mise run --force test`). Never run binaries or scripts directly.
+- The tasks build `target/debug/arkham` themselves and isolate `HOME` and `XDG_CONFIG_HOME`.
 
 ## Driving conventions
 
-- Start every recipe from doctor-ok with no shared proxy.
-- Treat commands as literal; keep quoted flags unchanged.
-- Capture stdout, stderr, exit codes, and named artifact files.
-- Restore nothing global; only helper-owned processes and temp dirs.
+- One task per feature; `mise run verify` runs them all.
+- Treat task names as literal.
 
 ## Proof and skip reporting
 
-- Capture the user action and the resulting state (client view and upstream view for swaps).
-- Mutation / side-effect proof: upstream file contents, not only curl exit 0.
-- Record the feature ID and entry point with every artifact (`SUMMARY.txt`).
-- Report an unreachable path with the unmet precondition; do not mark it verified via another path.
+- Capture the user action and the resulting state; for swaps, the client view and the upstream record.
+- A task that fails with `verify fail:` is an environment failure: report it, do not mark the feature verified another way.
 
 ## Feature entry contract
 
-Each feature file: H1, one paragraph, then exactly `Sub-features`, `How to get to it (user POV)`, `Driving it with verify-arkham helpers`, `Gotchas`.
+Each feature file: H1, one paragraph, then exactly `Sub-features`, `How to get to it (user POV)`, `Driving it with mise tasks`, `Gotchas`.
 
 ## Features
 
-- [Print a decoy](./fake.md) — `arkham fake` deterministic decoy for an env name.
-- [HTTP credential swap](./credential-swap.md) — tutorial path: serve + curl through proxy; upstream sees real, client sees decoy.
-- [Grant gate](./grant-gate.md) — non-allowed destination keeps the decoy; real secret must not appear.
-- [List schemes](./schemes.md) — `arkham schemes` prints supported URL schemes.
-- [Mint a CA](./ca.md) — `arkham ca` writes `ca.pem` / `ca.crt` / `ca.key` beside the configured CA path.
+- [Print a decoy](./fake.md) — `arkham fake`.
+- [List schemes](./schemes.md) — `arkham schemes`.
+- [Mint a CA](./ca.md) — `arkham ca`.
+- [Preview rules](./rules.md) — `arkham rules`.
+- [Reference config](./config.md) — `arkham config`.
+- [Curate OAuth registry entries](./registry.md) — `arkham registry from-oidc` / `from-openapi`.
+- [HTTP credential swap](./credential-swap.md) — tutorial §1–5.
+- [Grant gate](./grant-gate.md) — tutorial §6.
+- [HTTPS swap with CA trust](./https-swap.md) — tutorial §7.
+- [Confined agent session](./confine-agent.md) — `arkham daemon run` + `arkham agent`.
+- [Protocol swaps](./protocol-swaps.md) — Postgres, Redis, SMTP, LDAP, NATS, AMQP, SSH, HTTP/OAuth2 fixtures.
+
+Not yet mapped: `serve --proxy-backend ebpf` with a hand-made cgroup, `[plugins]`, profiles, `[[workspace.file_rewrite]]`, `daemon install/start`.

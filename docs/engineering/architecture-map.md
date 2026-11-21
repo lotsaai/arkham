@@ -1,290 +1,247 @@
 # arkham architecture map
 
-Written from `origin/main` @ `ebd9578`. The TLS-leg sections were updated when `accept_guest` and `connect_server` became default methods on `TlsHalves`. Line numbers in files this change did not touch are still from that commit. Crate prod-line totals are still from that commit. `AGENTS.md` and the rest of `docs/` were not used as sources. All paths are relative to the repo root, and `proxy/` means `crates/arkham-proxy/src/`.
-**Prod lines** are non-test lines, so `#[cfg(test)]` items, `e2e/`, `fuzz_props.rs`, `props.rs`, `harness.rs`, `fixtures.rs` and `test_support.rs` are left out. The count still includes comments. The number in brackets counts code only, without comments or blank lines.
+Maps the code as it is on `main`. Locations are file paths and symbol names, not line numbers, so search for the symbol. `proxy/` means `crates/arkham-proxy/src/` and `grants/` means `crates/arkham-config/src/grants/`.
 
 ## 1. Crates
 
-| Crate | Role | Prod lines | Key public types/traits (file:line) |
-|---|---|---|---|
-| `arkham` (bin, `src/`) | CLI with `serve`, `agent`, `init`, `up`, `fwd` and others. Builds `ProxyState` and starts the explicit listener and the capture backend. | 1022 (668) | `Command` main.rs:32; serve path main.rs:176-252; `ServeArgs` commands.rs:30; `fwd::run` fwd.rs:111 |
-| `arkham-proxy` | The MITM core: ingress dispatch, protocol pick, TLS legs, relay and substitution engine. **Every protocol vertical lives here.** | 16244 (13019) | `ProxyState` lib.rs:70; `serve` lib.rs:236; `serve_connect_stream` lib.rs:331; `serve_transparent_stream` lib.rs:367; traits in `transports/mod.rs` (§2) |
-| `arkham-config` | Config load, rule registry, **grants model**, fake generation, OAuth flows | 8001 (5987) | `AppConfig` config.rs:29; `RuleCfg` config.rs:359; `fake_for` config.rs:917; `Grant` grants/mod.rs:396; `resolve` grants/mod.rs:620; `Registry` registry.rs:133; `OAuthFlow` registry.rs:37 |
-| `arkham-sandbox` | Bubblewrap, Landlock, and cgroup enforcement | | `spawn`; `landlock_exec`; `SessionSlot` |
-| `arkham-agent` | Wrapper registration and lifecycle | | `AgentArgs` |
-| `arkham-session` | Daemon-side session preparation | | `prepare_session`; `PreparedSession` |
-| `arkham-launch-plan` | Shared launch data | | `LaunchPlan`; `Bind` |
-| `arkham-session-protocol` | Registration messages and socket checks | | `RegisterRequest`; `RegisterResponse` |
-| `arkham-workspace`, `arkham-projection` | Workspace inputs and protected-file projection | | `Workspace`; `projected_files` |
-| `arkham-tool-*`, `arkham-profiles`, `arkham-git-config`, `arkham-paths` | Tool adaptation, profiles, Git discovery, and paths | | Concrete adapter `adapt` functions |
-| `arkham-plugin` | Wasm (wasmtime component) HTTP rewrite hooks | 708 (496) | `RewriteHook` lib.rs:72; `Registry` lib.rs:154; `Registry::select` lib.rs:298 |
-| `arkham-pki` | CA, leaf/client-pair minting, SSH keys | 766 (495) | `CertAuthority` ca.rs:30; `generate_domain_cert` ca.rs:129; `boring_pair` ca.rs:140; `generate_domain_pair` ca.rs:365; `SshKey` ssh.rs:23 |
-| `arkham-fnox` | Resolves real secret values from fnox | 1095 (785) | `FnoxSource` lib.rs:24; `resolve` lib.rs:437 |
-| `arkham-ebpf` | cgroup sock_addr eBPF redirect capture | 1406 (883); `live.rs` is `#[cfg(test)]` (lib.rs:873) and excluded | `run_ebpf` lib.rs:459; call at tcp.rs:56 |
-| `arkham-ebpf-programs` | BPF programs (bpf target only) | 398 (214) | main.rs |
+| Crate | Role | Key public items |
+|---|---|---|
+| `arkham` (bin, `src/`) | CLI with `serve`, `fake`, `schemes`, `ca`, `rules`, `config`, `registry`, `agent`, `daemon`. No subcommand means `serve`. | `Command` and `serve` in `main.rs`; `with_capture` in `main.rs`; `host::run`, `accept_loop`, `one_client` in `host.rs`; `daemon::systemd` |
+| `arkham-proxy` | MITM core: ingress, protocol pick, TLS legs, relay, substitution. Every protocol vertical lives here. | `ProxyState`, `serve`, `bind_explicit`, `serve_connect_stream`, `serve_transparent_stream`, `serve_captured_stream` (`lib.rs`); `bind_handoff`, `serve_handoff` (`handoff.rs`); `Projects` (`projects.rs`) |
+| `arkham-config` | Config overlay, rule schema, grants, registry, decoys, OAuth flows | `AppConfig`, `RuleCfg`, `fake_for` (`config.rs`); `Grant`, `resolve`, `uri_match` (`grants/resolve.rs`); `Scheme`, `HostPat`, `EndpointScope` (`grants/scope.rs`); `Registry`, `OAuthFlow` (`registry.rs`); `Cli`, `ProxyBackend` (`cli.rs`) |
+| `arkham-fnox` | Resolves real values from fnox | `FnoxSource`, `resolve`, `export_provider_env` |
+| `arkham-pki` | CA, leaf and client-pair minting, SSH keys | `CertAuthority`, `load_or_generate`, `generate_domain_pair`, `load_or_generate_client_pair` (`ca.rs`); `SshKey`, `load_or_generate_host_key`, `pinned_host_keys` (`ssh.rs`) |
+| `arkham-plugin` | wasmtime component hosting for HTTP rewrite hooks | `RewriteHook`, `Registry::load`, `Registry::select` |
+| `arkham-agent` | Wrapper side of `arkham agent` | `AgentArgs`; `agent` in `linux.rs` |
+| `arkham-session-protocol` | Newline-framed control messages | `RegisterRequest`, `RegisterResponse` (`Join`, `Ready`, `Rejected`), `daemon_socket_path`, `trusted_socket` |
+| `arkham-session` | Daemon-side session preparation | `prepare_session`, `PreparedSession` |
+| `arkham-sandbox` | cgroups, bubblewrap, Landlock | `spawn`, `landlock_exec` (`linux.rs`); `session_cgroup`, `host_cgroup`, `join_session`, `SessionSlot` (`cgroup.rs`); `bwrap_argv` (`plan.rs`) |
+| `arkham-launch-plan` | Launch data shared by preparation and confinement | `LaunchPlan`, `Bind` |
+| `arkham-workspace` | Project discovery, secret selection, value expansion | `project_root` (`discover.rs`); `build_expander` (`expand.rs`) |
+| `arkham-projection` | Forged twins and protected-path masks | `projection_files`, `protected_config_paths`, `projected_files` |
+| `arkham-profiles` | Profile mount selection | `profile_mounts` |
+| `arkham-paths` | Host and guest path operations | `Mount`, `translate`, `canonicalize_dir` |
+| `arkham-tool-config` | Shared adapter output types | `RewriteAdapted`, `GrantFragment`, `DecoyFile`, `render_fragment` |
+| `arkham-tool-{git,jj,kube,nats,ssh,talos}` | Per-tool config adapters (host config to guest decoy) | one `adapt` per crate |
+| `arkham-git-config` | Git config discovery | `resolve` |
+| `arkham-ebpf` | eBPF capture, userspace half | `run_ebpf` (`lib.rs`); `serve` (`tcp.rs`); `FlowTables` (`flow.rs`) |
+| `arkham-ebpf-programs` | Kernel-side programs, bpf target only | `connect4` / `connect6` hooks and map ABI |
+| `arkham-test-support` | Test-only env isolation | `IsolatedHome` |
 
-Nothing on main is split into one crate per protocol. Each protocol is spread across three crates:
-- `arkham-proxy/src/transports/<p>/`
-- `arkham-config/src/grants/<p>.rs`
-- for some protocols, a dedicated `arkham-tool-*` adapter crate
+A protocol is spread across `proxy/transports/<p>/`, `grants/<p>.rs`, and for some protocols an `arkham-tool-*` adapter.
 
 ## 2. Shared base that protocols must reuse
 
-### 2a. Transport traits: `proxy/transports/mod.rs`
-| Item | Line | Signature |
-|---|---|---|
-| `ServeStream<'a,G,S>` | 44 | `{ guest: G, params: CandidateParams<'a>, scope: &'a S }` |
-| `Transport` | 54 | `type Scope: Sync; fn serve<G: AsyncRead+AsyncWrite+Unpin+Send+'static>(&self, ServeStream<'_,G,Self::Scope>) -> impl Future<Output=Result<(),Error>>` |
-| `TlsHalves` | 74 | `type Scope; fn accept_guest` and `fn connect_server` have default bodies (tokio-rustls). A protocol implements `tls`, `tls_label`, `root_cert`, `client_paths`. Defaults: `guest_alpn` and `server_alpn` offer nothing; `client_builder` verifies chain and name against the named root, or the platform store when the scope names none. |
-| `PairCtx<'a>` | 204 | `{ grants:&[Grant], host:&str, port:u16, plugins:&arkham_plugin::Registry, mint:Option<MintStore> }` |
+### 2a. Transport traits: `proxy/transports/halves.rs`
 
-**How a new protocol plugs in:**
-1. Implement `Transport::serve`.
-2. Implement `TlsHalves` if it has TLS legs. Supply `tls`. Override `guest_alpn`, `server_alpn`, or `client_builder` only when the wire law differs.
-3. Build its `(down, up)` wire pair from `PairCtx`.
+| Item | Shape |
+|---|---|
+| `ServeStream<'a, G, S>` | `{ guest, params: CandidateParams, scope }` |
+| `Transport` | `type Scope; fn serve(&self, ServeStream<…>) -> impl Future<Output = Result<()>>` |
+| `TlsHalves` | Required: `tls`, `tls_label`, `root_cert`, `client_paths`, `guest_tls`, `upstream_host`. Defaults: `guest_alpn`, `server_alpn`, `client_builder`, `client_config`, `accept_guest`, `connect_server`, `settle`. rustls only. |
+| `TlsCache` | One per `ProxyState`: CA reread, guest leaf cache, upstream root cache |
+| `within` | Bounds one handshake step by a budget |
 
-`accept_guest` and `connect_server` are default methods. Postgres overrides ALPN (`postgresql`) and `client_builder` (libpq `EgressCertVerifier`). Redis, SMTP, LDAP, NATS, and AMQP use the defaults.
+`proxy/transports/legs.rs` holds the shared leg plumbing:
 
-### 2b. TLS caches: `proxy/transports/tls.rs`
-| Fn | Line | Signature |
-|---|---|---|
-| `cached_leaf` | 27 | `(ca:&CertAuthority, leaves:&DashMap<String,Arc<ServerConfig>>, sni:&str, alpn:Option<&[u8]>) -> Result<Arc<ServerConfig>>` |
-| `cached_leaf_mtls` | 52 | same args; cache key is mode, ALPN offer, and server name; client verifier on arkham's CA |
-| `cached_roots` | 87 | `(roots:&DashMap<RootCert,Arc<RootCertStore>>, root:&RootCert) -> Result<Arc<RootCertStore>>` (Path or System, fails closed if empty) |
+| Item | Role |
+|---|---|
+| `PairCtx` | `{ grants, host, port, plugins, mint }`, built by `PairCtx::new` |
+| `open_flagged` / `FlaggedScope` / `FlaggedOpen` | Guest TLS opening when the scope is TLS, then `dial_marked` upstream. `FlaggedScope` is implemented for Redis, SMTP, LDAP, AMQP. |
+| `Settled` | `Clear`, `GuestTls`, `ServerTls`, `Both` |
+| `relay_settled!` | Relays whichever `Settled` combination came back |
 
-These are free functions over the one `TlsCache` built in `ProxyState::new`. The leaf key includes the ALPN offer, so a `postgresql` leaf and a leaf with no ALPN do not collide on the same name.
+**How a new protocol plugs in:** implement `Transport`; implement `TlsHalves` if it has TLS legs, overriding ALPN or `client_builder` only when the wire law differs; reuse `open_flagged` and `relay_settled!` if its opening fits; build its `(down, up)` pair from `PairCtx`.
 
-Related helpers in `proxy/connection.rs`:
-| Helper | Line | What it does |
-|---|---|---|
-| `guest_tls_opening` | 299 | ClientHello, SNI/authority check, `MintBucket::allow` |
-| `client_identity` | 95 | Loads the upstream client cert/key |
-| `client_auth_policy` | 130 | boring mTLS policy (HTTPS only) |
-| `trust_anchors` | 196 | Reads extra trust anchors |
-| `dial_marked` | 215 | Dials upstream with an optional fwmark |
-| `Prefixed` | 254 | Replays already-read bytes in front of a stream |
-| `GuestIo` | 37 | Guest stream wrapper for the rama path |
+### 2b. TLS caches and connection helpers
+
+`proxy/transports/tls.rs`: `cached_leaf`, `cached_leaf_mtls` (client verifier on arkham's CA), and `cached_roots` (path or system store, fails closed when empty). The leaf key includes the ALPN offer.
+
+`proxy/connection.rs`:
+
+| Helper | What it does |
+|---|---|
+| `guest_tls_opening` | ClientHello, SNI and authority check, `MintBucket::allow` |
+| `client_identity` | Loads the upstream client cert and key |
+| `client_auth_policy` | boring mTLS policy (HTTPS only) |
+| `trust_anchors` | Extra `root_cert` bundles |
+| `dial_marked` | Upstream dial, 10 s budget, `SO_MARK` on Linux |
+| `Prefixed` | Replays already-read bytes in front of a stream |
+| `GuestIo` | Guest stream plus rama extensions for the HTTPS path |
 
 ### 2c. HTTPS stack (rama + boring)
-- `ProxyState.relay` / `extra_relays` (lib.rs:72-73) are `TlsMitmRelay<CachedBoringMitmCertIssuer<…>>` (lib.rs:57). They are built by `https_relay` (lib.rs:106), using `CertAuthority::boring_pair` and webpki plus extra anchors per `root_cert`.
-- `HttpsTransport::serve` (http/mod.rs:48):
-  1. `read_client_hello`
-  2. scope via `grant.endpoint(Https)`
-  3. `client_auth_policy`
-  4. `TlsMitmRelayService::new(relay, SubstitutionService)` (http/mod.rs:124)
-- `SubstitutionService` (http/mod.rs:196) picks a machine by the negotiated ALPN:
-  - h2: `https_h2_pair` :329
-  - http/1.1: `https_pair` :305
-  - anything else: `raw_tls_pair` :354
-  - then calls `relay_guarded`.
-- **Only HTTP/HTTPS use boring.** Every other TLS protocol uses rustls through `TlsHalves`, so there are two TLS stacks.
 
-### 2d. TCP transport + engine
-| Piece | File:line | Notes |
+- `ProxyState.relay` and `extra_relays` are rama `TlsMitmRelay`s built by `build_relays` in `projects.rs`: one global plus one per `root_cert` bundle.
+- `HttpsTransport` (`proxy/transports/http/transport.rs`) reads the ClientHello, requires the SNI to match the CONNECT authority, takes a `MintBucket` token, dials, and hands both legs to `TlsMitmRelayService` with `SubstitutionService`.
+- `SubstitutionService` picks the machine by negotiated ALPN: `https_h2_pair` for h2, `https_pair` for http/1.1, `raw_tls_pair` otherwise, then calls `relay_guarded`.
+- Only HTTP and HTTPS use boring. Every other TLS protocol uses rustls through `TlsHalves`.
+
+### 2d. Engine and relay
+
+| Piece | Location | Notes |
 |---|---|---|
-| `TcpTransport::serve` | tcp/mod.rs:26 | `dial_marked` → `raw_tcp_pair` (:68) → `relay_guarded` |
-| `splice` | tcp/mod.rs:55 | Decline path: replay `initial`, then `copy_bidirectional` |
-| `Raw` machine | tcp/machine.rs:17 | `new` :28 (equal-length pairs only), `length_changing` :39, `from_pairs` :44, `Wire::feed` :55 (needle hold-back) |
-| `Wire` trait | engine/mod.rs:72 | `feed(&mut self, &[u8]) -> Fut<(Rewritten, Vec<Hit>)>` plus `take_reply`, `take_peer_note`/`apply_peer_note`, `take_upgrade`, `arm_upgrade`, `release_handoff`, `local_upgrade` |
-| `Rewritten` | engine/mod.rs:57 | `Emit(Cow)` / `Hold` / `Close` |
-| `CredentialPair` | :152 | `{needle, replacement, label}` |
-| `eligible_pairs` | :160 | `(grants, scheme, host, port, Direction) -> Vec<CredentialPair>` |
-| `max_tail_size` | :311 | longest needle − 1 |
-| `scan_with_tail` | :342 | |
-| `replace_bytes` / `replace_in` | :376 / :400 | |
-| `needle_prefix_suffix_len` | :429 | Bytes to hold back |
-| `needle_safe_emit_len` | :443 | `(data, pairs, tail_bound) -> usize` |
-| Relay | relay.rs | `relay_guarded` :85 → `relay_stop` :108 runs `pump_requests` :183 (→ `feed_guest` :269 → `Wire::feed` → write upstream) and `pump_responses` :399 together. `relay_stop` returns both sockets for STARTTLS-style upgrades (`RelayEnd::Upgrade`). |
+| `Wire` | `engine/wire.rs` | `feed(chunk) -> (Rewritten, Vec<Hit>)` plus reply, peer-note, upgrade and handoff hooks |
+| `Rewritten` | `engine/wire.rs` | `Emit` / `Hold` / `Close` |
+| `Direction` | `engine/wire.rs` | `Downstream` swaps fake to real, `Upstream` real to fake |
+| `CredentialPair` | `engine/wire.rs` | `{ needle, replacement, label }` |
+| `eligible_pairs` | `engine/scan.rs` | Grants for a scheme, host, port and direction |
+| `scan_with_tail`, `replace_bytes`, `replace_in`, `needle_safe_emit_len` | `engine/scan.rs` | Hold-back scanning shared by machines |
+| `Raw` | `tcp/machine.rs` | `new` (equal length), `length_changing`, `from_pairs`; holds back longest needle minus one |
+| `TcpTransport`, `splice` | `tcp/transport.rs` | `splice` replays read bytes, then `copy_bidirectional` |
+| `relay_guarded` / `relay_stop` | `proxy/relay.rs` | `pump_requests` and `pump_responses` run together. `relay_stop` returns both sockets as `RelayEnd::Upgrade` for STARTTLS-style upgrades. |
 
-**How a new protocol plugs in:** implement `Wire` for a framing machine and pass a `(down, up)` pair to `relay_guarded`, or to `relay_stop` if it needs an upgrade. Unframed bytes should use `Raw`.
+**How a new protocol plugs in:** implement `Wire` for its framing and pass `(down, up)` to `relay_guarded`, or to `relay_stop` if it upgrades. Unframed bytes use `Raw`.
 
-### 2e. OAuth / mint
-- **Rules:** `OAuthFlow` (registry.rs:37) rides on `Grant::Token.oauth2` (grants/mod.rs:406). Importers are `flow_from_oidc` (import.rs:22) and `flows_from_openapi` (:67).
-- **Engine:**
-  - `MintPlan` :192
-  - `mint_plan_for` :203
-  - `minted_pairs` :242
-  - `mint_and_redact` :268
-- **Store:**
-  - `MintStore::mint` (mint.rs:66) renders a decoy with `fake_for(real_value, pattern)`.
-  - `MintStore` is what `PairCtx.mint` carries. A clone shares the pair map.
-- **Users:** only the HTTP h1 and h2 machines (`http/machine.rs`, `http/h2.rs`). Other protocols get `PairCtx.mint` but never read it.
-- **Name clash:** `MintBucket` (mint.rs:135, `ProxyState.mint`) is the *leaf-issuance burst guard*, not OAuth.
+### 2e. Grants: `arkham-config/src/grants/`
 
-### 2f. Grants model: `arkham-config/src/grants/`
-- **Types (mod.rs):**
-  - `HostPat` :39 (Exact/Wildcard/Any; `matches` :56)
-  - `Scheme` :91 (14 variants)
-  - `Credential{label,fake,value}` :159
-  - `GuestTlsMode` :172
-  - `EndpointScope` :183 (scheme, host, port, client_cert/key, root_cert, guest_tls)
-  - `SshScope` :207
-  - `RootCert` :221
-- **`Grant` enum (:396):**
-  - `Token{credential, allow:Vec<EndpointScope>, pattern, oauth2}`
-  - `Postgres`, `Redis`, `Smtp`, `Ldap`, `Nats`, `Amqp`, each `{credential, scope:Box<XScope>}`
-  - `Ssh{allow}`
-- **Matchers:**
-  - `matches` :484 (dispatches to `XScope::matches` in each `grants/<p>.rs`)
-  - `endpoint` :501
-  - per-protocol lookups `postgres/redis/smtp/ldap/nats/amqp/ssh` :514-586
-  - `uri_match` :861
-- **Build:**
-  1. `resolve` :620
-  2. `GrantCollector::collect` :642
-  3. `RuleCfg::value_scheme` (config.rs:413) routes connection strings to `connection_string` :669, which dispatches to `<p>::grant` :682-688
-  4. everything else goes through `token`/`ssh`.
+- `scope.rs`: `HostPat` (`Exact`, `Wildcard`, `Any`), `Scheme` (14 variants, printed by `arkham schemes`), `Credential`, `GuestTlsMode`, `EndpointScope` and its `FromStr`, `SshScope`, `RootCert`.
+- `resolve.rs`: `Grant` (`Token`, `Postgres`, `Redis`, `Smtp`, `Ldap`, `Nats`, `Amqp`, `Ssh`); `Grant::matches`, `endpoint`, and one lookup per protocol; `uri_match`; `resolve` into `ResolvedConfig`; `GrantCollector` with `connection_string`, `ssh`, `token`; `decoy_for_rule` (equal length for `tcp://`).
+- `<p>.rs` for postgres, redis, smtp, ldap, nats, amqp: leg and scope types, `from_strings`, `matches`, `grant`.
+- `RuleCfg::value_scheme` in `config.rs` routes connection-string values to `GrantCollector::connection_string`.
+- `mod.rs` is module declarations and re-exports only.
 
-**How a new protocol plugs in today:** add a `Scheme` variant, a `Grant` variant, a lookup fn, a `value_scheme` branch, a `connection_string` arm, and a `grants/<p>.rs` holding the `XScope` type, `from_strings`, `matches` and `grant`.
+**How a new protocol plugs in:** a `Scheme` variant plus its `EndpointScope::from_str` and default-port arms; `grants/<p>.rs`; a `Grant` variant with arms in `credential`, `matches`, and `connection_string` and a lookup fn; a `value_scheme` prefix.
 
-### 2g. Compose adapters/rewrites (host config → guest decoy)
-- **Output types (adapt.rs):**
-  - `RewriteAdapted{fragment, decoy, materialized, decoy_files}` :30
-  - `GrantFragment` :58 (a TOML rule with the real value)
-  - `render_fragment` :107
-  - `write_state` :229 writes `<state>/grants/arkham.toml` plus `rules.d/` blobs and prunes stale ones
-- **Explicit `[workspace] file_rewrite`:**
-  1. `write_rewrites` (rewrites.rs:97) → `ExplicitRewrites::output` :287
-  2. `sniff` picks the format, `kube::adapt` / `talos::adapt` handle it
-  3. otherwise a byte swap `apply_rewrites` (expand.rs:115) turns real into decoy
-- **Ambient (default paths):** `derive_sources` (ambient.rs:67) runs these adapters:
+### 2f. Fakes, OAuth, mint
 
-  | Adapter | ambient.rs | Calls |
-  |---|---|---|
-  | git | :145 | `git::adapt` git.rs:86 |
-  | jj | :171 | `jj::adapt` jj.rs:41 |
-  | ssh | :202 | `ssh::adapt` ssh.rs:63 |
-  | nats | :227 | `nats::adapt` nats.rs:90 |
-  | kube/talos | :249 | `kube::adapt` kube.rs:232 / `talos::adapt` talos.rs:151 |
+- `fake_for(seed, pattern)` in `config.rs`: SHA-256 of the seed through a template, default `{hex:32}`. Wrappers: `Registry::decoy`, `decoy_for_rule`, `ContextIdentity::secret` (`context.rs`), `MintStore::mint`.
+- `OAuthFlow` (`registry.rs`) rides on `Grant::Token.oauth2`; `flow_from_oidc` and `flows_from_openapi` in `import.rs` import flows.
+- `mint_plan_for` and `mint_and_redact` (`engine/scan.rs`) mint decoys for token responses through `MintStore` (`proxy/mint.rs`). Only the HTTP h1 and h2 machines use it.
+- `MintBucket` (`proxy/mint.rs`, `ProxyState.mint`) is the leaf-issuance burst guard (20 per 10 s), not OAuth.
 
-  Results go through `RewriteCollector::twin` (rewrites.rs:190).
-- **How a new protocol plugs in:** write an `adapt()` that returns `RewriteAdapted` and call it from `AmbientDeriver`, or from the `RewriteFormat` match in `rewrites.rs:300`.
+### 2g. Plugins
 
-### 2h. Fake generation
-- `fake_for(seed, pattern)` (config.rs:917): SHA-256 of the seed, rendered through a template (default `{hex:32}`, :25).
-- Wrappers:
-  - `Registry::decoy` registry.rs:443
-  - `decoy_for_rule` grants/mod.rs:848 (forces equal length for `tcp://`)
-  - `ContextIdentity::secret` context.rs:114
-  - `MintStore::mint` mint.rs:73
-- Direct calls: grants/nats.rs:227,238 and kube.rs:437.
+`arkham_plugin::Registry::load` compiles the configured guests once. `select(scheme, host, port, Direction)` returns a fresh `Box<dyn RewriteHook>`. Only `http_pair` and `https_pair` call it; other protocols carry `PairCtx.plugins` and ignore it.
 
-### 2i. Plugin registry
-- `arkham_plugin::Registry::load` (lib.rs:259) is built once in `ProxyState::new` (lib.rs:150).
-- `select(scheme, host, port, Direction)` (:298) returns a `Box<dyn RewriteHook>`.
-- **Only HTTP/HTTPS pairs call `select`** (http/mod.rs:289-346). Every other protocol gets `PairCtx.plugins` and ignores it.
+### 2h. Tool adapters (host config to guest decoy)
+
+Each `arkham-tool-*` crate exposes one `adapt` returning `RewriteAdapted` (talos returns `TalosAdapted`, nats `AdaptedNats`). `arkham-session` calls them while preparing a session. Their grant fragments are written under `GRANTS_STATE_DIR` and merged before `grants::resolve`.
 
 ## 3. Per protocol
 
-Per-protocol prod lines below are proxy files plus the matching `grants/` file (plus compose where it exists).
-
-| Protocol | Files (prod lines) | Reuses | Notes |
+| Protocol | Proxy files | Path | Notes |
 |---|---|---|---|
-| http | http/mod.rs (HttpTransport :142), machine.rs (1439) | `read_http_head`, `dial_marked`, `relay_guarded`, `Raw`, engine, plugins, mint | — |
-| https | http/mod.rs (HttpsTransport :43), machine.rs, h2.rs (871) | rama/boring relay, `client_auth_policy`, engine, plugins, mint | Re-implements the `guest_tls_opening` checks inline at http/mod.rs:62-95 (SNI/authority mismatch and `mint.allow`) because it needs the parsed hello. h1 and h2 machines have parallel construction and refresh code; I did not check it line by line. |
-| tcp | tcp/ (178) | engine `Raw`, `relay_guarded` | Reference implementation |
-| ssh | ssh/mod.rs (119), legs.rs (408); compose ssh.rs (223), git.rs | `splice`, `Prefixed`, `dial_marked`; russh for both legs | Own `DashMap` key cache (ssh/mod.rs:26). No engine use, since SSH terminates both legs. |
-| postgres | postgres/mod.rs, machine.rs, auth.rs (1114); grants 340 | `TlsHalves` + `cached_*`, `guest_tls_opening`, `Raw`, `relay_guarded` | ALPN `postgresql` (`guest_alpn` :81, `server_alpn` :87). Custom `EgressCertVerifier` for libpq sslmodes (`client_builder` :101, type :244). |
-| redis | redis/ (598); grants 283 | `TlsHalves` + `cached_*`, `guest_tls_opening`, `Raw`, `relay_guarded` | — |
-| smtp | smtp/mod.rs, machine.rs, session.rs (1960); grants 451 | `TlsHalves` + `cached_*`, `guest_tls_opening`, `relay_guarded`, `Raw::length_changing` | No ALPN. Guest leaves and upstream roots come from `tls.rs`. |
-| ldap | ldap/ (2023); grants 332 | `TlsHalves` + `cached_*`, `relay_stop`/upgrade, `Raw` | StartTLS goes through `relay_stop` |
-| amqp | amqp/ (2296); grants 308 | `TlsHalves` + `cached_*`, `guest_tls_opening`, `relay_guarded` | Machine is 2075 lines. Imports `needle_prefix_suffix_len`/`replace_bytes` but not `Raw`. |
-| nats | nats/ (1589); grants 1160; compose nats.rs (503) | `TlsHalves` + `cached_*`, `guest_tls_opening`, `relay_guarded`, `Raw::from_pairs` | — |
-| kube | compose kube.rs (482) only | Rides `Grant::Token` with an `https://` allow entry plus per-host TLS cfg (mTLS), so it uses the HTTPS stack | No proxy code |
-| talos | compose talos.rs (424) only | Same as kube (HTTPS endpoint grant, mTLS, default port 50000 at talos.rs:299) | No proxy code |
-| git / jj | compose git.rs (516), jj.rs (162) | HTTPS token grants (credential helper) plus SSH grants | — |
+| http | `http/transport.rs`, `http/machine.rs` | `HttpTransport` → `http_pair` → `relay_guarded` | No grant: `raw_tcp_pair` |
+| https | `http/transport.rs`, `http/machine.rs`, `http/h2.rs` | rama/boring, §2c | Mint and plugins |
+| tcp | `tcp/` | `TcpTransport` → `Raw` → `relay_guarded` | Reference implementation |
+| ssh | `ssh/transport.rs`, `ssh/legs.rs` | russh on both legs | No `TlsHalves`, no engine. Own `DashMap` key cache. |
+| postgres | `postgres/` (`transport.rs`, `machine.rs`, `auth.rs`) | Own opening: `read_guest_opening`, `request_upstream_tls`, `auth::settle` | ALPN `postgresql`; `client_builder` uses `EgressCertVerifier` for libpq sslmodes |
+| redis | `redis/` | `open_flagged` → `settle` → `relay_guarded` | |
+| smtp | `smtp/` (`session.rs`) | `open_flagged` → `session::run` | STARTTLS inside the session; `Raw::length_changing` for replies |
+| ldap | `ldap/` | `open_flagged` → `relay_stop` → StartTLS | |
+| amqp | `amqp/` | `open_flagged` → `relay_guarded` | |
+| nats | `nats/` | Own `ServerLeg`, `after_info`, `handshake_first` | Not on `FlaggedScope` |
+| kube, talos | none | `Grant::Token` with an `https://` allow entry plus per-host mTLS | Adapter crates only |
+| git, jj | none | HTTPS token grants plus SSH grants | Adapter crates only |
 
-### Duplication on main (file:line)
-| What | Copies | Base it should use |
-|---|---|---|
-| `Leg`/`Scope` structs (`host`, `port`, `password`, `is_*_tls`, `root_cert`, `client_cert`/`key`, `guest_tls`) | redis.rs:16/35, smtp.rs:23/43, ldap.rs:17/35, amqp.rs:13/33 | Shared leg/scope |
+### Duplication
 
-### Protocol knowledge sitting in shared files
-These are the places a new protocol has to edit today:
-- **engine/mod.rs:12-19** re-exports protocol machines and helpers: `Amqp`, `H2`, `Http`, `Ldap`, `Postgres`, `read_guest_opening`, `request_upstream_tls`, `Redis`, `SshLegs`, `Raw`.
-- **engine/mod.rs:226-237** `grant_pattern` lists every `Grant` variant.
-- **identity.rs:54-80, 111-143, 162-184** `Expect` has one arm per protocol.
-- **lib.rs:75-84, 174-194** `ProxyState` has one field per protocol.
-- **grants/mod.rs:91, 396, 514-586, 682-688** and **config.rs:413-437**.
+Each `grants/<p>.rs` (redis, smtp, ldap, amqp, postgres) defines its own leg and scope struct with the same host, port, password, TLS flag, cert and `guest_tls` fields. No shared type exists.
 
-### Cleartext swaps the same credential as TLS
+### Protocol knowledge in shared files
 
-A TLS hello on a cleartext scope, a swap that waited for a TLS upstream, a close on a cleartext NATS INFO with `tls_required`, and an mTLS plaintext-guest refusal are gone. A matched grant swaps the real credential on cleartext the same way it does on TLS. See `AGENTS.md`.
+A new protocol still edits these:
 
-## 4. One connection, guest → upstream
+- `engine/mod.rs` re-exports protocol machines and helpers.
+- `engine/scan.rs` `grant_pattern` lists every `Grant` variant.
+- `identity.rs` `Expect` has one arm per protocol, and `expect` and `Expect::serve` match on it.
+- `lib.rs` `ProxyState` has one transport field per protocol.
+- `grants/scope.rs`, `grants/resolve.rs`, and `RuleCfg::value_scheme` in `config.rs`.
 
-```mermaid
-flowchart TD
-  A[Explicit: lib.rs:273 ExplicitService::serve] --> B[dispatch lib.rs:283<br/>read_head/httparse]
-  B -->|CONNECT, no grant| SP[dial_marked + copy_bidirectional lib.rs:300-309]
-  B -->|CONNECT| C[serve_connect_stream lib.rs:331]
-  B -->|absolute http://| F[forward_arm lib.rs:394 → http_pair → relay_guarded]
-  T[ebpf tcp.rs:56] --> D[serve_transparent_stream lib.rs:367]
-  C --> E[identity::expect identity.rs:111<br/>grants → Expect]
-  D --> E
-  E --> S[Expect::serve identity.rs:154]
-  S -->|Splice| SPL[tcp::splice tcp/mod.rs:55]
-  S -->|Raw| TCP[TcpTransport::serve tcp/mod.rs:26]
-  S -->|Tls| HS[HttpsTransport::serve http/mod.rs:48<br/>→ rama TlsMitmRelayService → SubstitutionService :212]
-  S -->|Plain| HT[HttpTransport::serve http/mod.rs:148]
-  S -->|Redis/Pg/Smtp/Ldap/Nats/Amqp| P[X::serve<br/>guest_tls_opening connection.rs:299<br/>dial_marked connection.rs:215<br/>accept_guest / connect_server TlsHalves]
-  S -->|Ssh| SSH[SshTransport::serve ssh/mod.rs:51 → SshLegs::serve legs.rs:170]
-  TCP --> R[relay_guarded relay.rs:85 → relay_stop :108]
-  HS --> R
-  HT --> R
-  P --> R
-  R --> PQ[pump_requests :183 → feed_guest :269 → Wire::feed → server write]
-  R --> PR[pump_responses :399 → Wire::feed up → guest write]
-```
+Cleartext swaps the same credential as TLS. `proxy/cleartext_guard.rs` is a test that fails if a cleartext-only refusal comes back.
 
-1. **Ingress.** CONNECT goes through `dispatch` (lib.rs:283). Transparent capture goes through `serve_transparent_stream` (lib.rs:367); there `host=None`, so identity comes from the SNI or Host header.
-2. **Pick.** `expect` (identity.rs:111) checks the protocol lookups first (pg, redis, smtp, ldap, nats, amqp, ssh), then https, http and tcp, and otherwise splices. This is the only `match` on protocol (identity.rs:162).
-3. **Legs.**
-   - Protocol verticals settle TLS with `guest_tls_opening` + `TlsHalves` (rustls).
-   - HTTPS uses rama/boring.
-   - The upstream is dialled with `dial_marked`, which applies the fwmark when a capture backend is active.
-4. **Swap.** The `(down, up)` machines get their pairs from `eligible_pairs` (engine/mod.rs:160) on `PairCtx`. `relay_guarded` pumps both directions, `Rewritten::Emit` writes, and hits are logged by `log_hits` (relay.rs:737).
+## 4. One connection, guest to upstream
 
-## 5. `arkham agent`: host configs → guest decoys
+Three ingress paths build `CandidateParams` and call `identity::expect`. `Expect::serve` is the only `match` that picks a transport.
 
 ```mermaid
-flowchart TD
-  A[AgentArgs::run] --> B[Register with host daemon]
-  B --> C[prepare_session]
-  C --> D[host_material: fnox selection and tool adapters]
-  D --> E[Private grant fragments and credential files]
-  E --> F[Resolve grants in daemon]
-  D --> G[LaunchPlan: decoy environment and projected files]
-  F --> H[Register project with proxy]
-  G --> I[Launch under bubblewrap and Landlock]
-  H --> I
+flowchart LR
+  EXP["Explicit listener<br/>dispatch"] -->|CONNECT| CS[serve_connect_stream]
+  EXP -->|"absolute http://"| FW["forward_arm<br/>http_pair or splice"]
+  EBPF["arkham-ebpf tcp.rs"] --> CAP[serve_captured_stream]
+  HO["handoff socket<br/>PROXY header"] --> TS[serve_transparent_stream]
+  CS --> E{expect}
+  CAP --> E
+  TS --> E
+  E -->|Splice| SPL[tcp::splice]
+  E -->|Raw| TCP[TcpTransport]
+  E -->|Tls| HTTPS[HttpsTransport]
+  E -->|Plain| HTTP[HttpTransport]
+  E -->|"Postgres, Redis, Smtp,<br/>Ldap, Nats, Amqp"| P["protocol Transport"]
+  E -->|Ssh| SSH[SshTransport]
 ```
 
-The daemon retains real credentials and materialised adapter files in private
-session storage. The launcher receives decoys, public trust material, and mount
-instructions. Protected paths hide the daemon's credential storage from the guest.
-Compose is used by integration fixtures, not by the agent runtime.
+`expect` checks the protocol lookups first (postgres, redis, smtp, ldap, nats, amqp, ssh), then https, http and tcp endpoints, and otherwise splices. CONNECT with no grant is spliced in `dispatch` before `serve_connect_stream`. `serve_captured_stream` selects the session's grants with `Projects::snapshot_for(cgroup)`; cgroup 0 or an unknown id uses the process-level config.
 
-## 6. Runtime and dependency compatibility
+A granted HTTPS request captured by eBPF:
 
-The root `Dockerfile` is shared by the shipped image and the SSH/protocol and
-Talos integration fixtures; it retains `ghcr.io/casualjim/bare:libcxx-udev-ssl`.
-Linux builds and tests run in the `arkham-dev` smolvm machine
-([smolvm.md](smolvm.md)), whose image and the runtime base both come from
-Ubuntu 26.04, so the test fixtures copy the debug `target/debug/arkham` built
-there.
-Release images continue to package the CI-built dist binary.
+```mermaid
+sequenceDiagram
+  participant G as Guest
+  participant K as eBPF connect hook
+  participant T as arkham-ebpf tcp.rs
+  participant P as arkham-proxy
+  participant H as HttpsTransport
+  participant R as rama TlsMitmRelay
+  participant M as Http machine
+  participant U as Upstream
+  G->>K: connect(upstream)
+  K->>T: redirect to loopback :15000
+  T->>T: flows.original, live_cgroup, retained_cgroup
+  T->>P: serve_captured_stream(cgroup, dest)
+  P->>P: snapshot_for(cgroup), expect → Tls
+  P->>H: serve(ServeStream)
+  H->>H: read_client_hello, mint.allow
+  H->>U: dial_marked
+  H->>R: guest and upstream legs
+  R->>G: leaf for SNI (TLS handshake)
+  R->>U: TLS handshake
+  R->>M: SubstitutionService: ALPN → https_pair
+  G->>M: request with decoy
+  M->>U: Wire::feed Downstream: decoy → real
+  U->>M: response with real
+  M->>G: Wire::feed Upstream: real → decoy
+```
 
-Root `[patch.crates-io]` entries pin upstream `age` crypto updates and a
-`libsqlite3-sys` revision compatible with fnox's rusqlite requirement that bundles
-SQLCipher 4.20.0. These are dependency fixes, not audit exemptions; the remaining
-accepted advisories and their removal conditions live in `.cargo/audit.toml`.
+The explicit path is the same from `expect` on, after `dispatch` reads the CONNECT head and replies 200.
 
-NATS user JWT metadata is decoded with the existing `base64` and `serde_json`
-dependencies. Arkham checks its header and user public key; the upstream NATS
-server verifies the account signature.
+## 5. Processes
 
-## Not checked / unsure
-- Smaller duplicates *inside* the large machines (amqp 2075, ldap 1381, http 1439, h2 871, nats 1187). I compared only the hold-back/guard and constructor regions.
-- Whether the hold-back logic `Raw::feed` repeats inside the http/h2 machines' own `held` handling. They call the engine helpers, but I didn't diff the loops.
-- `postgres/auth.rs` (SCRAM/MD5 swap, 433 lines) wasn't checked for overlap with other machines.
+`arkham serve` (`main.rs` `serve`) resolves config, fnox and grants, builds `ProxyState`, binds the explicit listener and the handoff socket, and serves both. With `--proxy-backend ebpf` it runs `run_ebpf` beside them under `with_capture`, which ends the process if capture dies.
+
+`arkham daemon` (`host.rs` `host::run`) starts `ProxyState` with no grants, binds the explicit listener and the control socket, attaches capture at `host_cgroup()` under `with_capture`, and accepts `arkham agent` registrations. Each session's grants live in `ProxyState.projects`, keyed by cgroup id.
+
+## 6. `arkham agent`: registration and launch
+
+```mermaid
+sequenceDiagram
+  participant W as arkham agent (wrapper)
+  participant D as arkham daemon
+  participant P as ProxyState
+  participant S as bubblewrap + Landlock
+  W->>D: connect control socket
+  D->>D: check peer uid, pid, starttime, cgroup, refuse confined peers
+  W->>D: RegisterRequest{cwd, profile, env}
+  D->>D: project_root, write session ca.pem
+  D->>D: prepare_session: adapters, fnox, grants, LaunchPlan
+  D->>D: session_cgroup(pid, starttime)
+  D->>P: register_project(cgroup id, grants)
+  D->>W: Join{cgroup}
+  W->>W: join_session
+  W->>D: activate
+  D->>W: Ready{plan}
+  W->>S: spawn(plan): bwrap, then arkham --landlock-exec
+  S->>S: Landlock fully enforced, exec agent
+  S-->>W: agent exits
+  W->>W: restore cgroup placement
+  D->>P: drop_registration
+```
+
+The daemon keeps real credentials and materialised adapter files in private session storage. The launcher gets decoys, the CA certificate, and mount instructions; the plan reaches bwrap through a memfd. Protected paths hide the daemon's credential storage from the guest. Compose is used by integration fixtures only.
+
+## 7. Runtime and dependency notes
+
+- The root `Dockerfile` (base `ghcr.io/casualjim/bare:libcxx-udev-ssl`) is shared by the shipped image and the SSH, protocol, and Talos fixtures. Fixtures copy the debug `target/debug/arkham`; release images package the CI-built dist binary.
+- Linux builds and tests run in the `arkham-dev` smolvm machine ([smolvm.md](smolvm.md)). Its image and the runtime base both come from Ubuntu 26.04, so the fixtures copy the `target/debug/arkham` built there.
+- `fnox-core` comes from the `lotsaai/fnox` `fix/rsa-0.10` branch and `rama` from its upstream `main` branch, both as git dependencies in the root `Cargo.toml`. Accepted advisories and their removal conditions live in `.cargo/audit.toml`.
+- NATS user JWT metadata is decoded with `base64` and `serde_json`. Arkham checks the header and user public key; the NATS server verifies the account signature.

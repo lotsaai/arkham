@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#MISE description="Verify arkham fake: stable, distinct, --pattern"
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+source integration/verify/lib.sh
+verify_init fake
+
+run_cli - fake DEMO_TOKEN
+first=$(cat "$ARTIFACTS/stdout.txt")
+expect "fake exits 0" test "$CLI_EXIT" = 0
+expect "known DEMO_TOKEN decoy" test "$first" = f92b2afa339693227aa209aac3eb48f9
+run_cli - fake DEMO_TOKEN
+expect "same name, same decoy" test "$(cat "$ARTIFACTS/stdout.txt")" = "$first"
+run_cli - fake OTHER_TOKEN
+expect "different name, different decoy" test "$(cat "$ARTIFACTS/stdout.txt")" != "$first"
+run_cli - fake DEMO_TOKEN --pattern 'ghp_{hex:36}'
+expect "--pattern shape" grep -Eqx 'ghp_[0-9a-f]{36}' "$ARTIFACTS/stdout.txt"
+verify_pass fake

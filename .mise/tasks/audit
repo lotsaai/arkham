@@ -4,6 +4,7 @@
 #MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 ignored=$(taplo get --file-path .cargo/audit.toml --output-format json advisories.ignore)
 audit_status=0

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#MISE description="Verify arkham registry from-oidc and from-openapi print provider fragments"
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+source integration/verify/lib.sh
+verify_init registry
+
+run_cli registry registry from-oidc oidc.json example EXAMPLE_CLIENT_SECRET
+expect "from-oidc exits 0" test "$CLI_EXIT" = 0
+expect "oidc provider" grep -qx '\[providers.example\]' "$ARTIFACTS/stdout.txt"
+expect "oidc token_url" grep -qx 'token_url = "https://id.example/token"' "$ARTIFACTS/stdout.txt"
+cp "$ARTIFACTS/stdout.txt" "$ARTIFACTS/oidc-stdout.txt"
+
+run_cli - registry from-openapi openapi.json example EXAMPLE_CLIENT_SECRET
+expect "from-openapi exits 0" test "$CLI_EXIT" = 0
+expect "openapi provider" grep -qx '\[providers.machine\]' "$ARTIFACTS/stdout.txt"
+expect "openapi token_url" grep -qx 'token_url = "https://api.example/oauth/token"' "$ARTIFACTS/stdout.txt"
+expect "openIdConnect reported skipped" grep -q 'skipped security scheme' "$ARTIFACTS/stdout.txt" "$ARTIFACTS/stderr.txt"
+expect "nothing written" test "$(wc -l <"$ARTIFACTS/workspace-files.txt")" = 2
+verify_pass registry

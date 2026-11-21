@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#MISE description="Verify arkham schemes lists every served scheme"
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+source integration/verify/lib.sh
+verify_init schemes
+
+run_cli - schemes
+expect "schemes exits 0" test "$CLI_EXIT" = 0
+for scheme in http https tcp postgres redis rediss ldap ldaps ssh smtp smtps nats amqp amqps; do
+  expect "scheme $scheme listed" grep -qx "$scheme" "$ARTIFACTS/stdout.txt"
+done
+verify_pass schemes

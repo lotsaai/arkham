@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#MISE description="Verify tutorial steps 1-6: HTTP swap on a grant hit, decoy kept off-grant"
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+source integration/verify/lib.sh
+verify_init http-swap
+
+DECOY="$("$ARKHAM" fake DEMO_TOKEN)"
+REAL="$(equal_length_real "$DECOY")"
+start_upstream granted
+GRANTED=$UPSTREAM_NAME GRANTED_PORT=$UPSTREAM_HOST_PORT
+start_upstream off-grant
+OFF=$UPSTREAM_NAME OFF_PORT=$UPSTREAM_HOST_PORT
+
+cat >arkham.toml <<EOF
+[proxy]
+listen = "127.0.0.1:0"
+ca_file = "ca.pem"
+
+[rules.demo]
+env = "DEMO_TOKEN"
+value = "${REAL}"
+allow = ["http://127.0.0.1:${GRANTED_PORT}"]
+EOF
+spawn "$ARTIFACTS/proxy.log" "$ARKHAM" serve --config arkham.toml
+wait_log "$ARTIFACTS/proxy.log" "$LAST_PID" serving
+PROXY="http://127.0.0.1:$(bound_port "$ARTIFACTS/proxy.log")"
+
+curl -sS --max-time 5 -x "$PROXY" "http://127.0.0.1:${GRANTED_PORT}/" \
+  -H "Authorization: Bearer ${DECOY}" >"$ARTIFACTS/client-body.txt"
+upstream_seen "$GRANTED" >"$ARTIFACTS/upstream-seen.txt"
+expect "upstream got the real value" test "$(cat "$ARTIFACTS/upstream-seen.txt")" = "Bearer ${REAL}"
+expect "client got the decoy back" test "$(cat "$ARTIFACTS/client-body.txt")" = "upstream saw: Bearer ${DECOY}"
+
+curl -sS --max-time 5 -x "$PROXY" "http://127.0.0.1:${OFF_PORT}/" \
+  -H "Authorization: Bearer ${DECOY}" >"$ARTIFACTS/off-grant-body.txt"
+upstream_seen "$OFF" >"$ARTIFACTS/off-upstream-seen.txt"
+expect "off-grant upstream got the decoy" test "$(cat "$ARTIFACTS/off-upstream-seen.txt")" = "Bearer ${DECOY}"
+verify_pass http-swap

@@ -115,39 +115,36 @@ Two runnable examples ship in the repository:
 `arkham daemon` and `arkham agent` run the proxy and confined agent on the Linux host.
 
 ```mermaid
-flowchart TB
-  subgraph HOST["Host kernel, one network namespace, shared"]
-    direction TB
-    subgraph DCG["Daemon cgroup. The daemon process stays in this cgroup"]
-      subgraph DAEMON["arkham daemon, one process, your uid"]
-        SOCK["Unix control socket. Peer uid must be the daemon uid"]
-        PROXY["Proxy in this process. Capture listeners 127.0.0.1 and ::1, TCP :15000 and UDP :15001. Also the explicit loopback listener. Holds the real credentials and substitutes them"]
-        EBPFU["eBPF userspace in this process. Resolves captured destinations and session identity"]
-      end
-      subgraph ATTACH["arkham-host. The eBPF programs are attached here, once, and cover every session under it"]
-        subgraph SCG["pid-starttime, one directory per session"]
-          subgraph BWRAP["bubblewrap. user, pid, uts, ipc, and cgroup namespaces unshared. net shared with the host. tmpfs root. workspace-write and a home session get a private /tmp. The host /sys/fs/cgroup tree is not mounted"]
-            subgraph LL["Landlock, arkham --landlock-exec, then exec. Fully enforced or the command does not start. danger-full-access does not apply Landlock"]
-              AGENT["Agent process. Sees the project bind, forged fnox twins, config twins, the CA certificate, and decoy env"]
-            end
-          end
-        end
-      end
-    end
-    EBPFK["connect4 and connect6, attached at arkham-host. TCP goes to :15000 and connected UDP to :15001 on the matching loopback address. The real destination and cgroup id are stored. Loopback, foreign network namespaces, and bypassed destinations are not rewritten"]
-    REAL["Real secret files and home config. Never mounted into the sandbox"]
-  end
+flowchart LR
+  WRAP["arkham agent"]
   UP["Upstream services"]
-  WRAP["arkham agent"] -->|register| SOCK
-  SOCK -->|"registers the session; the wrapper joins its cgroup before the agent starts"| SCG
-  AGENT -->|connect| EBPFK
-  EBPFK -->|redirected| PROXY
-  EBPFU -.->|"the cgroup id selects that session's grants"| PROXY
-  PROXY -->|"real credentials"| UP
-  REAL -.->|"the daemon reads these to build twins"| DAEMON
+  subgraph HOST["Linux host, one shared network namespace"]
+    REAL[("Real secrets and home config")]
+    subgraph DAEMON["arkham daemon, your uid"]
+      SOCK["Control socket"]
+      PROXY["Proxy, holds real credentials"]
+      EBPFU["eBPF userspace"]
+    end
+    subgraph CG["cgroup arkham-host"]
+      KPROG["eBPF connect4 / connect6"]
+      AGENT["Agent in bubblewrap + Landlock"]
+    end
+  end
+  WRAP -->|register| SOCK
+  SOCK -->|session cgroup| AGENT
+  AGENT -->|connect| KPROG
+  KPROG -->|"TCP :15000, UDP :15001"| PROXY
+  EBPFU -.->|"cgroup id selects grants"| PROXY
+  REAL -.->|"read by the daemon"| PROXY
+  PROXY -->|real credentials| UP
 ```
 
-Filesystem isolation is bubblewrap plus Landlock. The network is shared with the host; captured TCP and connected UDP are redirected to the proxy, which alone holds the real credentials, and the cgroup id is how the proxy tells which session's grants apply. Discovery uses project markers, and fnox only decides which files get rewritten.
+- **Control socket.** Accepts only peers with the daemon's uid. The wrapper joins its session cgroup (`arkham-host/<pid>-<starttime>`) before the agent starts.
+- **Sandbox.** bubblewrap unshares the user, pid, uts, ipc, and cgroup namespaces, keeps the host network, and mounts a tmpfs root without the host `/sys/fs/cgroup`. `workspace-write` and home sessions get a private `/tmp`. `arkham --landlock-exec` then enforces Landlock fully or the command does not start; `danger-full-access` skips Landlock.
+- **Agent view.** The project bind, forged fnox twins, config twins, the CA certificate, and decoy env. Real secret files are never mounted.
+- **Capture.** The eBPF programs attach once at `arkham-host`. They redirect TCP and connected UDP to the proxy on the matching loopback address and record the real destination and cgroup id. Loopback, foreign network namespaces, and bypassed destinations are not rewritten.
+
+Discovery uses project markers, and fnox only decides which files get rewritten.
 
 Host sessions hide the configured CA private key and the contents of Arkham config that exists at launch, including discovered hard-link aliases. Unrelated project `.config` files remain usable. Missing config paths are not reserved, and an existing symlink entry can still be replaced even though its original target stays masked.
 

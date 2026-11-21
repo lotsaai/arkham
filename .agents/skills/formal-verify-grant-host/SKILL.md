@@ -32,7 +32,7 @@ Proven able to fail: a scratch edit that let `*.example.com` match apex `example
 - Enumerated patterns/hosts/schemes/ports in `crates/arkham-config/tests/formal_grant_host.rs` only — not every Unicode hostname.
 - Token grants only (not Postgres/Redis/SMTP/LDAP/NATS/AMQP/SSH scope matchers).
 - Does not model TLS, capture backends, or substitution engines.
-- Oracle: `.cursor/skills/formal-verify-grant-host/oracle.py` (must stay independent of the Rust source).
+- Oracle: `.agents/skills/formal-verify-grant-host/oracle.py` (must stay independent of the Rust source).
 
 ## When a change touches coverage
 
@@ -43,7 +43,7 @@ If the diff edits any coverage file above, run this skill before claiming the ch
 From the repo root:
 
 ```sh
-.cursor/skills/formal-verify-grant-host/run.sh
+.agents/skills/formal-verify-grant-host/run.sh
 ```
 
 Requires `python3` and a workspace-capable `cargo` (same toolchain as the repo). Exit 0 prints `PASS` and the case count. Exit 1 prints mismatches in code terms (`host-N` / `token-N` with rust vs oracle).

@@ -5,6 +5,7 @@
 #MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 cluster="arkham-k3s-test"
 scratch=$MISE_CONFIG_ROOT/target/k3s-e2e

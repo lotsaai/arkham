@@ -1,0 +1,14 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "fixture", "version": "1" },
+  "paths": {},
+  "components": {
+    "securitySchemes": {
+      "machine": {
+        "type": "oauth2",
+        "flows": { "clientCredentials": { "tokenUrl": "https://api.example/oauth/token", "scopes": {} } }
+      },
+      "oidc": { "type": "openIdConnect", "openIdConnectUrl": "https://api.example/.well-known/openid-configuration" }
+    }
+  }
+}

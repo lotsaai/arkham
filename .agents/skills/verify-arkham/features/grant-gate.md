@@ -1,28 +1,22 @@
 # Grant gate
 
-When the destination is not on the rule's allow list, arkham must not substitute: the upstream (or response path) keeps the decoy, and the real secret never appears.
+When the destination is not on the rule's allow list, arkham splices instead of substituting: the upstream receives the decoy and the real secret never leaves the proxy.
 
 ## Sub-features
 
-- `gate-miss` sends the same decoy to a host/port with no allow entry.
-- `gate-no-leak` asserts the real secret string is absent from the client-visible result.
+- `gate-decoy-upstream` the off-grant upstream records the decoy.
 
 ## How to get to it (user POV)
 
-- Tutorial §6: second upstream on an uncovered port, same `curl -x` with the decoy.
-- Packaged inside `tutorial-http-swap.sh` after the grant-hit proof (off-port check).
+- Tutorial §6: a second upstream on an uncovered port, same `curl -x`.
 
-## Driving it with verify-arkham helpers
+## Driving it with mise tasks
 
-Preconditions:
-
-- Same as credential-swap; the helper runs the gate after the swap proof.
-
-- **Run journey.** `.cursor/skills/verify-arkham/helpers/tutorial-http-swap.sh`
-- **Observe.** `artifacts/tutorial-http-swap-<runid>/off-grant-body.txt` and `SUMMARY.txt`.
-- **Pass when.** The file does not contain the helper’s real secret string. Helper exits 0.
+- **Run.** `mise run verify:http-swap` (the gate runs after the swap).
+- **Observe.** `off-upstream-seen.txt`, `off-grant-body.txt`.
+- **Pass when.** `PASS http-swap`.
+- **Transparent capture.** Integration scenarios 5 and 28 under `mise run --force test`.
 
 ## Gotchas
 
-- A splice may still return some HTTP body from `python3 -m http.server`; absence of the real secret is the proof, not a specific body string.
-- Do not weaken the check to "proxy logged splice" — logs are not the user-visible guarantee.
+- The upstream's own record is the proof. Absence of the real value in a body that never echoes headers proves nothing.

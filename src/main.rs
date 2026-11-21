@@ -197,6 +197,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   let state = std::sync::Arc::new(arkham_proxy::ProxyState::new(resolved, &ca)?);
   // Bind before capture side effects.
   let listener = arkham_proxy::bind_explicit(listen_addr).await?;
+  let listen_addr = listener.local_addr()?;
   let handoff = bind_handoff_listener(&handoff_path, handoff_uid).await?;
   if !listen_addr.ip().is_loopback() {
     tracing::warn!(listen = %listen_addr, "listening on a non-loopback address: anyone reaching this port can trigger real-secret substitution");

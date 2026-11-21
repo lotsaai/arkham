@@ -6,6 +6,7 @@
 #MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 # Standalone guest crates (excluded from the workspace): each builds into its
 # own target dir, then the component is copied to target/plugins.

@@ -4,6 +4,7 @@
 #MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 mise run build
 bash integration/gen-nats.sh

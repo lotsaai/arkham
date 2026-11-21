@@ -7,6 +7,7 @@
 #MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 # `--exclude arkham-ebpf-programs`: it is a workspace member only so `aya-build`
 # can resolve it, and its sources compile for the `bpf` target alone. Every

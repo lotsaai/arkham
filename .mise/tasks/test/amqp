@@ -7,6 +7,7 @@
 #MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 source integration/e2e.sh
 
 python3 -m unittest discover -s integration/docker/amqp-witness -p 'test_*.py'

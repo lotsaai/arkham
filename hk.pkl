@@ -48,7 +48,10 @@ local rust_steps = new Mapping<String, Step> {
 local project_steps = new Mapping<String, Step> {
   ...rust_steps
 
-  ["shellcheck"] = Builtins.shellcheck
+  // Vendored tool skills under .agents/ are upstream scripts kept verbatim.
+  ["shellcheck"] = (Builtins.shellcheck) {
+    exclude = List(".agents/**")
+  }
 
   ["hadolint"] = Builtins.hadolint
 
