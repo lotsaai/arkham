@@ -332,7 +332,9 @@ pub fn projected_files(root: &Path, mounts: &[Mount]) -> Result<Vec<PathBuf>, Er
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[cfg(target_os = "linux")]
   use arkham_config::WriteProfile;
+  #[cfg(target_os = "linux")]
   use arkham_launch_plan::{CA_DEST, LaunchPlan};
   use arkham_test_support::IsolatedHome;
   use test_context::test_context;
