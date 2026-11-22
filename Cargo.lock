@@ -203,9 +203,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "amq-protocol"
-version = "10.7.0"
+version = "10.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba56915f72aa721b4bca471fa71ff8ec10aecc0d5e2d99497edb44358ccedd7b"
+checksum = "cf08ab00c52935bbaf9e9dca0de400011db2d626f6dcfb236f43f35c8946d2a6"
 dependencies = [
  "amq-protocol-tcp",
  "amq-protocol-types",
@@ -217,9 +217,9 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-tcp"
-version = "10.7.0"
+version = "10.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84153f37233d155953ccbacb21257b4cb82edb68e57066495ff86495d8783a32"
+checksum = "84beee776afc514ab326e54f824c928e549cb5b1b37e31e95fa78e2b5c222f39"
 dependencies = [
  "amq-protocol-uri",
  "async-rs",
@@ -230,9 +230,9 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-types"
-version = "10.7.0"
+version = "10.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1aca84dae6981386bc016fc44434ff9cb6b1f99c25fd0e890ddb048c91261db1"
+checksum = "8239f8a079586a154ae81aa91b3ac2e530ddb8872e42ba9e4b66be003a074a81"
 dependencies = [
  "cookie-factory",
  "nom 8.0.0",
@@ -242,9 +242,9 @@ dependencies = [
 
 [[package]]
 name = "amq-protocol-uri"
-version = "10.7.0"
+version = "10.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b58add0b63b221e87956f3ec47d6b8f1a0a6f69cc970b668590000c3aa701af"
+checksum = "d796cf5ba20d19e8270b0251407024135729649a6ef00988bc27ca160c9c39f4"
 dependencies = [
  "amq-protocol-types",
  "percent-encoding",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-agent"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-paths",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-config"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-test-support",
  "base62",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-ebpf"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -486,14 +486,14 @@ dependencies = [
 
 [[package]]
 name = "arkham-ebpf-programs"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "aya-ebpf",
 ]
 
 [[package]]
 name = "arkham-fnox"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-test-support",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-git-config"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "gix-config",
  "gix-discover",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-launch-plan"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "serde",
@@ -530,11 +530,11 @@ dependencies = [
 
 [[package]]
 name = "arkham-paths"
-version = "0.3.39"
+version = "0.3.40"
 
 [[package]]
 name = "arkham-pki"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "rama",
  "rand 0.10.4",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-plugin"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "thiserror 2.0.21",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-profiles"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-paths",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-projection"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-launch-plan",
@@ -587,7 +587,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-proxy"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "actson",
  "amq-protocol",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-sandbox"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-launch-plan",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-session"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-fnox",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-session-protocol"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-launch-plan",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-test-support"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "tempfile",
  "test-context",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tool-config"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-paths",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tool-git"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-git-config",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tool-jj"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-git-config",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tool-kube"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tool-nats"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-paths",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tool-ssh"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-paths",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-tool-talos"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-pki",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "arkham-workspace"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-config",
  "arkham-fnox",
@@ -1033,9 +1033,9 @@ dependencies = [
 
 [[package]]
 name = "async-rs"
-version = "0.8.13"
+version = "0.8.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "407bdac3815af195d2d63fa50595610ea8ba4d47b7fc5a37895b05d3b571c241"
+checksum = "a8db2f6b977344cace6a5f3d8e060771430b997d5fdaf42bebe1fd0479b79f55"
 dependencies = [
  "async-compat",
  "async-global-executor",
@@ -7965,7 +7965,7 @@ dependencies = [
 [[package]]
 name = "rama"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "base64 0.23.1",
@@ -8029,7 +8029,7 @@ dependencies = [
 [[package]]
 name = "rama-core"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "asynk-strim",
@@ -8056,7 +8056,7 @@ dependencies = [
 [[package]]
 name = "rama-crypto"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "base64 0.23.1",
@@ -8088,7 +8088,7 @@ dependencies = [
 [[package]]
 name = "rama-error"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "tokio",
 ]
@@ -8096,7 +8096,7 @@ dependencies = [
 [[package]]
 name = "rama-haproxy"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "rama-core",
  "rama-net",
@@ -8107,7 +8107,7 @@ dependencies = [
 [[package]]
 name = "rama-http"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "base64 0.23.1",
@@ -8140,7 +8140,7 @@ dependencies = [
 [[package]]
 name = "rama-http-backend"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "parking_lot 0.13.0",
  "pin-project-lite",
@@ -8161,7 +8161,7 @@ dependencies = [
 [[package]]
 name = "rama-http-core"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "atomic-waker",
@@ -8185,7 +8185,7 @@ dependencies = [
 [[package]]
 name = "rama-http-headers"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "base64 0.23.1",
@@ -8204,7 +8204,7 @@ dependencies = [
 [[package]]
 name = "rama-http-types"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "bytes",
  "fnv",
@@ -8234,7 +8234,7 @@ dependencies = [
 [[package]]
 name = "rama-icap"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "itoa",
  "parking_lot 0.13.0",
@@ -8248,7 +8248,7 @@ dependencies = [
 [[package]]
 name = "rama-json"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "itoa",
  "rama-utils",
@@ -8260,7 +8260,7 @@ dependencies = [
 [[package]]
 name = "rama-macros"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -8271,7 +8271,7 @@ dependencies = [
 [[package]]
 name = "rama-net"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -8310,7 +8310,7 @@ dependencies = [
 [[package]]
 name = "rama-quic"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "fastbloom",
@@ -8339,7 +8339,7 @@ dependencies = [
 [[package]]
 name = "rama-quic-proto"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "rama-core",
  "rama-tls",
@@ -8351,7 +8351,7 @@ dependencies = [
 [[package]]
 name = "rama-tcp"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "libc",
  "parking_lot 0.13.0",
@@ -8367,7 +8367,7 @@ dependencies = [
 [[package]]
 name = "rama-tls"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -8392,7 +8392,7 @@ dependencies = [
 [[package]]
 name = "rama-tls-boring"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -8416,7 +8416,7 @@ dependencies = [
 [[package]]
 name = "rama-ua"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "chacha20",
@@ -8436,7 +8436,7 @@ dependencies = [
 [[package]]
 name = "rama-udp"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "ahash",
  "libc",
@@ -8452,7 +8452,7 @@ dependencies = [
 [[package]]
 name = "rama-unix"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "libc",
  "pin-project-lite",
@@ -8465,7 +8465,7 @@ dependencies = [
 [[package]]
 name = "rama-utils"
 version = "0.5.0"
-source = "git+https://github.com/plabayo/rama?branch=main#c9f23fcbbee299e1994518717a194d3760c60778"
+source = "git+https://github.com/plabayo/rama?branch=main#bbb15f2e1f7c9a832c7381ddd9f98aba08fff948"
 dependencies = [
  "atomic-waker",
  "base64 0.23.1",
@@ -10318,9 +10318,9 @@ checksum = "8c447be3a2abfa84b2d91680c56600bd6b2873866de27b36ec911be705e291da"
 
 [[package]]
 name = "tcp-stream"
-version = "0.34.17"
+version = "0.34.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2afa87967dbc0fa02957531aab16e5d5fe8a8aa71d8efd9d4173c1f14c59e381"
+checksum = "21550d81d337f6e49e99229514ae1407310df2863ebc0a59c1156f56b50ab8e0"
 dependencies = [
  "async-rs",
  "cfg-if",

@@ -1,6 +1,6 @@
 [package]
 name = "arkham-git-config"
-version = "0.3.39"
+version = "0.3.40"
 edition = "2024"
 description = "Git configuration discovery for arkham"
 license = "Apache-2.0"

@@ -1,6 +1,6 @@
 [package]
 name = "arkham-tool-nats"
-version = "0.3.39"
+version = "0.3.40"
 edition = "2024"
 description = "NATS context adaptation for Arkham"
 license = "Apache-2.0"

@@ -1,3 +1,8 @@
+## [0.3.40] - 2026-11-22
+
+### 💼 Other
+
+- Move dist config to 0.34.0
 ## [0.3.39] - 2026-11-22
 
 ### 🚀 Features
@@ -16,6 +21,11 @@
 ### 🧪 Testing
 
 - Split integration scenarios by protocol
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.39 [ci skip]
+- Release
 
 ### 💼 Other
 

@@ -1,6 +1,6 @@
 [package]
 name = "arkham-tool-config"
-version = "0.3.39"
+version = "0.3.40"
 edition = "2024"
 description = "Shared tool configuration adaptation contracts"
 license = "Apache-2.0"
