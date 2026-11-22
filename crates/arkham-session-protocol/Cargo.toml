@@ -1,6 +1,6 @@
 [package]
 name = "arkham-session-protocol"
-version = "0.3.37"
+version = "0.3.39"
 edition = "2024"
 description = "Session registration protocol and socket ownership"
 license = "Apache-2.0"

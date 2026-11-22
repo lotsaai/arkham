@@ -1,6 +1,6 @@
 [package]
 name = "arkham-tool-kube"
-version = "0.3.37"
+version = "0.3.39"
 edition = "2024"
 description = "Kubernetes configuration adaptation for arkham"
 license = "Apache-2.0"

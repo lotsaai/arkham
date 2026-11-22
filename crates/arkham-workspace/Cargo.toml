@@ -1,6 +1,6 @@
 [package]
 name = "arkham-workspace"
-version = "0.3.37"
+version = "0.3.39"
 edition = "2024"
 description = "Workspace configuration and secret selection"
 license = "Apache-2.0"

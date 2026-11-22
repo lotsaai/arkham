@@ -1,6 +1,6 @@
 [package]
 name = "arkham-sandbox"
-version = "0.3.38"
+version = "0.3.39"
 edition = "2024"
 description = "Linux confinement and process execution"
 license = "Apache-2.0"

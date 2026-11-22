@@ -1,3 +1,26 @@
+## [0.3.39] - 2026-11-22
+
+### 🚀 Features
+
+- Replaced compose stack flow with host-confined agent daemon
+
+### 🐛 Bug Fixes
+
+- Return a ready future for Linux-only commands off Linux
+- *(projection)* Import Linux-only test types only on Linux
+
+### 🚜 Refactor
+
+- Split host confinement into purpose-specific crates
+
+### 🧪 Testing
+
+- Split integration scenarios by protocol
+
+### 💼 Other
+
+- Run Linux tests in smolvm arkham-dev machine
+- Run mise tasks inside the smolvm sandbox
 ## [0.3.38] - 2026-11-09
 
 ### 🚀 Features
@@ -42,6 +65,8 @@
 ### ⚙️ Miscellaneous Tasks
 
 - Give the Linux job a delegated cgroup and user namespaces
+- Update changelog for v0.3.38 [ci skip]
+- Release
 ## [0.3.37] - 2026-11-06
 
 ### 🚀 Features
