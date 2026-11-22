@@ -23,7 +23,7 @@ lychee = "latest"
 node = "lts"
 "github:nats-io/nsc" = "2.15.0"
 cmake = "latest"
-cargo-dist = "latest"
+cargo-dist = "0.33.0"
 mold = { version = "latest", os = ["linux"] }
 k3d = "latest"
 "cargo:cargo-outdated" = "latest"
