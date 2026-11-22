@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "arkham"
-version = "0.3.39"
+version = "0.3.40"
 dependencies = [
  "arkham-agent",
  "arkham-config",
