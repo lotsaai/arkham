@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 #MISE description="Run the linters and formatters"
+#MISE dir="{{config_root}}"
 
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 # hk is git-only, and a jj workspace has no `.git` of its own. Bridge to the
 # jj repo's git backend so hk can resolve files, but keep every write out of
@@ -11,11 +11,11 @@ cd "$proj_dir" || exit 1
 # which both `.gitignore` and `.jjignore` exclude. Without this, hk's staging
 # would land in the repo that owns the git backend, outside this workspace.
 if jj root >/dev/null 2>&1 && [ -n "$(jj git root 2>/dev/null)" ] && ! git rev-parse --git-dir >/dev/null 2>&1; then
-  scratch="$proj_dir/.cache/hk"
+  scratch="$MISE_CONFIG_ROOT/.cache/hk"
   mkdir -p "$scratch/objects"
   export GIT_DIR
   GIT_DIR=$(jj git root)
-  export GIT_WORK_TREE="$proj_dir"
+  export GIT_WORK_TREE="$MISE_CONFIG_ROOT"
   export GIT_INDEX_FILE="$scratch/index"
   export GIT_OBJECT_DIRECTORY="$scratch/objects"
   export GIT_ALTERNATE_OBJECT_DIRECTORIES="$GIT_DIR/objects"

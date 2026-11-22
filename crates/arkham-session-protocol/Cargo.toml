@@ -1,0 +1,24 @@
+[package]
+name = "arkham-session-protocol"
+version = "0.3.37"
+edition = "2024"
+description = "Session registration protocol and socket ownership"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-launch-plan = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

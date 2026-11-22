@@ -126,7 +126,7 @@ env = "NATS_URL"
 value = "nats://agent:arkham_fake_nats_pass@nats:4222"
 
 # Nkey and user JWT. The sentinels below are not seeds. `integration/gen-nats.sh`
-# copies this file to `integration/out/arkham.toml` and replaces them. Compose
+# copies this file to `target/integration/arkham.toml` and replaces them. Compose
 # mounts that copy. The client holds the fake seed and the fake JWT. The real
 # seed stays in the fnox value.
 [rules.nats_nkey]

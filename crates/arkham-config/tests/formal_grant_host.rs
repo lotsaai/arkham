@@ -1,7 +1,7 @@
-//! Differential check vs `.cursor/skills/formal-verify-grant-host/oracle.py`.
+//! Differential check vs `.agents/skills/formal-verify-grant-host/oracle.py`.
 //!
 //! See that skill for property, bounds, and sync commit. Run via
-//! `.cursor/skills/formal-verify-grant-host/run.sh`.
+//! `.agents/skills/formal-verify-grant-host/run.sh`.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -146,7 +146,7 @@ fn hostpat_and_token_endpoint_match_independent_oracle() {
   let mut cases = host_cases();
   cases.extend(token_cases());
 
-  let oracle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cursor/skills/formal-verify-grant-host/oracle.py");
+  let oracle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.agents/skills/formal-verify-grant-host/oracle.py");
   assert!(oracle.is_file(), "missing oracle at {}", oracle.display());
 
   let payload = serde_json::to_vec(&cases).expect("serialize cases");

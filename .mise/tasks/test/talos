@@ -2,11 +2,10 @@
 
 #MISE description="Prove talosctl context switching through eBPF against official Talos nodes"
 #MISE depends=["build:debug"]
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
   echo "test:talos needs a docker daemon" >&2
@@ -22,8 +21,8 @@ staging_subnet=172.31.11.0/24
 proxy="arkham-talos-proxy"
 arkham_image="arkham-talos-e2e:local"
 
-scratch=$proj_dir/target/talos-e2e
-arkham=$proj_dir/target/debug/arkham
+scratch=$MISE_CONFIG_ROOT/target/talos-e2e
+arkham=$MISE_CONFIG_ROOT/target/debug/arkham
 talosctl=""
 state=""
 attempted_clusters=()
@@ -105,7 +104,7 @@ node_network() {
 create_cluster() {
   local name=$1 subnet=$2 dest=$3
   echo "creating ${name} on ${subnet}" >&2
-  "$talosctl" cluster create docker \
+  env -u KUBECONFIG HOME="$scratch/home" "$talosctl" cluster create docker \
     --name "$name" \
     --state "$state/$name" \
     --workers 0 \
@@ -134,7 +133,7 @@ create_cluster() {
   printf '%s %s %s\n' "$context" "$ip" "$network"
 }
 
-docker build -t "$arkham_image" -f "$proj_dir/Dockerfile" "$scratch/image"
+docker build -t "$arkham_image" -f "$MISE_CONFIG_ROOT/Dockerfile" "$scratch/image"
 
 attempted_clusters+=("$prod_name")
 prod_line=$(create_cluster "$prod_name" "$prod_subnet" "$scratch/prod.yaml")
@@ -147,6 +146,7 @@ cp "$scratch/prod.yaml" "$scratch/merged.yaml"
 "$talosctl" --talosconfig "$scratch/merged.yaml" config merge "$scratch/staging.yaml"
 cp "$scratch/merged.yaml" "$scratch/home/.talos/config"
 
+XDG_CONFIG_HOME="$scratch/xdg-config" "$arkham" ca >/dev/null
 # An empty TALOSCONFIG is the default path under HOME, the same file.
 env -u ARKHAM_CONFIG \
   HOME="$scratch/home" \
@@ -157,9 +157,9 @@ env -u ARKHAM_CONFIG \
   GIT_CONFIG_GLOBAL=/dev/null \
   GIT_CONFIG_SYSTEM=/dev/null \
   FNOX_CONFIG_DIR="$scratch/fnox" \
-  "$arkham" init --backend ebpf "$scratch/workspace"
+  target/debug/examples/prepare-session "$scratch/workspace" "$scratch/session" "$scratch/xdg-config/arkham/ca.crt"
 
-state_root=$scratch/xdg-state/arkham/ws
+state_root=$scratch/session
 grant_toml=$(find "$state_root" -path '*/grants/arkham.toml' -type f -print -quit)
 decoy=$(find "$state_root" -path '*/files/talos-config' -type f -print -quit)
 ca=$scratch/xdg-config/arkham/ca.pem

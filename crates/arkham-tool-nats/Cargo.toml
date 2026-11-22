@@ -1,0 +1,30 @@
+[package]
+name = "arkham-tool-nats"
+version = "0.3.37"
+edition = "2024"
+description = "NATS context adaptation for Arkham"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-paths = { workspace = true }
+arkham-tool-config = { workspace = true }
+regex = { workspace = true }
+secrecy = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+nkeys = { workspace = true }
+pretty_assertions = { workspace = true }
+serde = { workspace = true }
+tempfile = { workspace = true }
+toml = { workspace = true }
+
+[lints]
+workspace = true

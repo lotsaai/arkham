@@ -274,7 +274,7 @@ impl Amqp {
   pub(crate) fn new(grants: &[Grant], host: &str, port: u16, dir: Direction, swap: bool) -> Result<Self, crate::Error> {
     let found = grants.iter().find_map(|grant| {
       let scope = grant.amqp(Some(host), port)?;
-      let label = grant.credential().map(|credential| credential.label.clone()).unwrap_or_default();
+      let label = grant.credential().map_or_default(|credential| credential.label.clone());
       Some((scope, label))
     });
     if let Some((scope, _)) = &found {
@@ -2542,8 +2542,8 @@ mod tests {
     (class_id, method_id)
   }
 
-  fn method_frame(class: AMQPClass) -> Vec<u8> {
-    encode_frame(&AMQPFrame::Method(0, class))
+  fn method_frame(channel: u16, class: AMQPClass) -> Vec<u8> {
+    encode_frame(&AMQPFrame::Method(channel, class))
   }
 
   fn numeric_descriptor<T: Serialize>(value: &T) -> u64 {
@@ -2556,17 +2556,21 @@ mod tests {
 
   #[test]
   fn class_and_method_ids_match_generated_frames() {
-    let start_ok = method_frame(AMQPClass::Connection(connection::AMQPMethod::StartOk(
-      connection::StartOk::default(),
-    )));
+    let start_ok = method_frame(
+      0,
+      AMQPClass::Connection(connection::AMQPMethod::StartOk(connection::StartOk::default())),
+    );
     assert_eq!(method_ids_on_the_wire(&start_ok), super::start_ok_ids(), "start-ok");
-    let connection_close = method_frame(AMQPClass::Connection(connection::AMQPMethod::Close(connection::Close::default())));
+    let connection_close = method_frame(
+      0,
+      AMQPClass::Connection(connection::AMQPMethod::Close(connection::Close::default())),
+    );
     assert_eq!(
       method_ids_on_the_wire(&connection_close),
       super::connection_close_ids(),
       "connection.close"
     );
-    let channel_close = method_frame(AMQPClass::Channel(channel::AMQPMethod::Close(channel::Close::default())));
+    let channel_close = method_frame(1, AMQPClass::Channel(channel::AMQPMethod::Close(channel::Close::default())));
     assert_eq!(method_ids_on_the_wire(&channel_close), super::channel_close_ids(), "channel.close");
   }
 

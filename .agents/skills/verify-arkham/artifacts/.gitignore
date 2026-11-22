@@ -1,0 +1,3 @@
+# verify:* task evidence. Keep this file so the directory stays tracked.
+*
+!.gitignore

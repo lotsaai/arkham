@@ -1,8 +1,9 @@
 # Integration demo (transparent capture)
 
-The demo runs the real container image with a client that shares arkham's
+The demo runs the proxy container image with a client that shares arkham's
 network namespace and does not configure a proxy. arkham uses eBPF capture
-for the client cgroup. For a docker-free demo, see the
+for the client cgroup. This Compose test fixture is separate from the
+host-confined `arkham agent` runtime. For a Docker-free demo, see the
 [bwrap demo](bwrap/README.md).
 
 Topology:
@@ -47,7 +48,7 @@ Topology:
 | 20 | Same client with a user seed that is not the decoy | `[rules.nats_nkey]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
 | 21 | `credsAuthenticator` to `nats-jwt:4223`. The client writes the decoy creds file under `~/.config/nats`, selects it from `context.txt`, and reads the `creds` path | `[rules.nats_jwt]`: `nats://creds:<user-seed>:<user-jwt>@nats-jwt:4223`; the account JWT is preloaded on the operator server | publish and subscribe succeed only when the proxy replaces the decoy JWT and signs with the real seed |
 | 22 | Same client with a user JWT that is not the decoy | `[rules.nats_jwt]` | nats-server returns `Authorization Violation`. The CONNECT was not swapped. The error text contains neither the real seed nor the real user JWT |
-| 23 | The client reads the decoy nkey context that host discovery mounted, then subscribes and publishes. `test:ssh` is the only path that runs it | no hand-written `[rules.nats_*]` and no fnox key. `arkham init` reads a host `~/.config/nats` context whose nkey file is the real seed and whose `ca` is the demo CA. The generated fragment (`generated = true`, `if_missing = ignore`) is appended to the global config. The arkham service mounts the CA blob. The client receives only the decoy files | nats-server accepts the session, so the proxy swapped the mounted decoy for the real seed. The real seed is absent from the guest tree |
+| 23 | The client reads a discovered decoy nkey context, then subscribes and publishes. `test:nats` is the only path that runs it | Host NATS context, with no hand-written NATS rule or fnox key | nats-server accepts the decoy identity after substitution, and the client never receives the real seed |
 | 24 | `amqplib` (AMQP 0-9-1) to `amqp:5672` with the decoy user and password: open, declare a queue, publish with a confirm, read the message back | `[rules.amqp_plain]`: fake `amqp://` URL; the real URL is cleartext `amqp://` on port 5672 | RabbitMQ accepts the swapped user and password on its cleartext port 5672 and the message comes back |
 | 25 | `rhea` (AMQP 1.0) to `amqp:5672` with the decoy: SASL `PLAIN`, then `open` | `[rules.amqp_plain]` | the broker sends `open`, which it never does after a refused login |
 | 26 | Both clients to `amqp:5671` over TLS with the decoy | `[rules.amqp_tls]`: fake `amqps://` URL; real URL carries `sslrootcert` | same swaps on a guest leg that is TLS from the first byte |
@@ -74,7 +75,7 @@ verification on: it dials by that name, and arkham mints the guest leaf
 for it. The server uses the image default `scram-sha-256`. The password
 is not on the wire. Arkham finishes the guest handshake with the decoy
 and the upstream handshake with the real password, then splices the
-query stream. Scenario 6 is gated on `DATABASE_URL`, so `run.ts` still runs when that service is absent.
+query stream.
 Scenario 7 exercises runtime token minting
 (`crates/arkham-proxy/src/mint.rs`): the client secret is a static
 substitution (`arkham fake OIDC_CLIENT_SECRET`, pinned in
@@ -84,7 +85,7 @@ Scenarios 9 and 10 are the official `redis:7-alpine` image and Bun's
 `RedisClient`. The proxy is the only code we wrote on that path. A
 `tls-ca-cert-file` makes Redis require a client certificate; this demo
 authenticates with passwords and the upstream client has no certificate,
-so the server is started with `tls-auth-clients no`. Scenarios 9 and 10 are gated on `REDIS_URL` and `REDIS_TLS_URL`, so `run.ts` still runs when the Redis service is absent. `integration/bwrap/run.sh` does not run `run.ts`.
+so the server is started with `tls-auth-clients no`.
 Scenarios 11 and 12 are `mailserver/docker-mailserver` 16.0.1 (pinned by digest) and Python's `smtplib`. The proxy is the only code we wrote on that path. `SMTP_ONLY` stays unset because Dovecot answers SASL. `setup email add` runs before supervisord so the account is in Dovecot's user database at first start. The server presents a demo-CA leaf and does not ask for a client certificate; the demo authenticates with passwords. Scenarios 11 and 12 are gated on `SMTP_URL` and `SMTPS_URL`.
 
 AUTH before STARTTLS being refused in scenario 11 is Postfix's own `530`. That refusal does not show which password was on the wire. The proof that AUTH before STARTTLS swaps the real password is the in-process test `smtp_auth_swaps_before_and_after_starttls`. The decoy-only failure against the real server is `smtp-direct`: a one-shot on the server network, outside the captured namespace, that runs `SMTP.login` of the decoy against `mail:587` and `mail:465`. It does not run when `SMTP_URL` is empty. The client container never holds `NET_ADMIN`. The wrong-password check in the scenario is a different password sent through the proxy, not that dial.
@@ -124,7 +125,7 @@ upstream leg is TLS. Payloads are never rewritten, so the decoy in the
 published message arrives unchanged. Scenarios 17 and 18 are gated on
 `NATS_URL`. Scenarios 19 and 20 use the same server, with a user nkey
 added beside the password user. `integration/gen-nats.sh` mints the
-operator, accounts, and users with `nsc` and writes `integration/out`, which is gitignored.
+operator, accounts, and users with `nsc` and writes `target/integration`, which is gitignored.
 The fake user JWT is signed by an account the server does not preload.
 Scenarios 21 and 22 use a second `nats:2.15.1-alpine` service in
 operator mode. The account JWT is preloaded under `resolver: MEMORY`,
@@ -134,14 +135,12 @@ and 20 are gated on `NATS_NKEY_URL`. Scenarios 21 and 22 are gated on
 `NATS_JWT_URL`. Scenarios 19 and 21 write the fnox decoy into the client
 container's own `~/.config/nats` and read it back. That is not discovery:
 the proxy grant is still the fnox URL, and `compose::nats::adapt` does not
-run. Scenario 23 is the discovery proof. `test:ssh` writes a host
-`~/.config/nats` context, runs `arkham init` in an empty workspace with no
-`[rules.nats_*]` and no fnox entry for that grant, and mounts the decoy
-files into the client. The client reads those files before scenarios 19 and
+run. Scenario 23 is the discovery proof in the `test:nats` integration
+fixture. The client reads its decoy files before scenarios 19 and
 21 overwrite the same directory. `credsAuthenticator` sends `jwt`, `nkey`, and `sig`. A matching `nkey` is
 rewritten to the real public key. The client container does not receive the
-real nkey seed or the real user JWT. `test:ssh` greps the client log for
-those values in `integration/out/nats/nats.env`.
+real nkey seed or the real user JWT. `test:nats` greps the client log for
+those values in `target/integration/nats/nats.env`.
 Scenarios 24–27 use the official `rabbitmq` 4.3.6 Alpine image (pinned
 by its manifest-list digest), `amqplib` 2.2.0, and `rhea` 3.0.5. The
 proxy is the only code we wrote on that path. The broker's one user is
@@ -173,6 +172,15 @@ first attempt.
 
 ## Run
 
+Each protocol has its own client in `client/<protocol>.ts` and its own task,
+which starts only that protocol's servers:
+
+```sh
+mise run test:http      # also: postgres ssh redis smtp ldap nats amqp
+```
+
+The demo runs the HTTP client:
+
 ```sh
 mise run demo
 ```
@@ -190,6 +198,7 @@ cp integration/.env.example integration/.env   # gitignored; adjust freely
 The task builds the release binary, packs it into
 the runtime image via the repo `Dockerfile`, and runs
 `docker compose up --abort-on-container-exit --exit-code-from client`.
+
 Client exit code 0 means every scenario passed.
 
 Recomputing the fake after changing `env` in `arkham.toml`:

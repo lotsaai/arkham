@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+#MISE description="Run the Redis e2e scenarios with eBPF capture"
+#MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "integration/**"]
+#MISE outputs=[]
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+source integration/e2e.sh
+
+e2e_init redis
+e2e_up redis
+e2e_client
+e2e_covered redis rediss

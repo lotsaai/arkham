@@ -1,0 +1,5 @@
+{
+  "issuer": "https://id.example",
+  "token_endpoint": "https://id.example/token",
+  "grant_types_supported": ["client_credentials"]
+}

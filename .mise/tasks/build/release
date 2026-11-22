@@ -3,11 +3,10 @@
 #MISE description="Build the application (Release)"
 #MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**"]
 #MISE outputs=["target/release/arkham"]
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 # `--exclude arkham-ebpf-programs`: it is a workspace member only so `aya-build`
 # can resolve it, and its sources compile for the `bpf` target alone. Every

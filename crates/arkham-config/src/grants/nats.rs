@@ -965,21 +965,32 @@ struct UserJwtClaims {
 /// A NATS user JWT. The header is `alg` `ed25519-nkey` and `typ` `JWT`.
 /// The payload `sub` must be the seed's public key.
 ///
-/// `jwt` 0.16 `Token::parse_unverified` reads the header and claims and does
-/// not check the account signature. This string carries the user seed, not
-/// the account key.
+/// Only the header and claims are inspected. The NATS server verifies the
+/// account signature; the supplied credential carries a user seed, not the account key.
 ///
 /// # Errors
 ///
 /// [`NatsUriError::UserJwt`] when the text is not that JWT.
 /// [`NatsUriError::JwtSeedMismatch`] when `sub` is a different public key.
 pub fn check_user_jwt(jwt: &str, public: &str) -> Result<(), NatsUriError> {
-  let token = jwt::Token::<UserJwtHeader, UserJwtClaims, _>::parse_unverified(jwt).map_err(|_source| NatsUriError::UserJwt)?;
-  let header = token.header();
+  let mut parts = jwt.split('.');
+  let header = parts.next().ok_or(NatsUriError::UserJwt)?;
+  let claims = parts.next().ok_or(NatsUriError::UserJwt)?;
+  if parts.next().is_none() || parts.next().is_some() {
+    return Err(NatsUriError::UserJwt);
+  }
+  let decoder = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::URL_SAFE,
+    base64::engine::GeneralPurposeConfig::new().with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+  );
+  let header = decoder.decode(header).map_err(|_source| NatsUriError::UserJwt)?;
+  let header: UserJwtHeader = serde_json::from_slice(&header).map_err(|_source| NatsUriError::UserJwt)?;
+  let claims = decoder.decode(claims).map_err(|_source| NatsUriError::UserJwt)?;
+  let claims: UserJwtClaims = serde_json::from_slice(&claims).map_err(|_source| NatsUriError::UserJwt)?;
   if header.alg != "ed25519-nkey" || header.typ != "JWT" {
     return Err(NatsUriError::UserJwt);
   }
-  if token.claims().sub != public {
+  if claims.sub != public {
     return Err(NatsUriError::JwtSeedMismatch);
   }
   Ok(())
@@ -1652,13 +1663,9 @@ mod tests {
   }
 
   #[test]
-  fn jwt_crate_parses_an_account_signed_nats_user_jwt() {
+  fn account_signed_nats_user_jwt_and_padded_claims_are_accepted() {
     let (seed, public) = user_material();
     let jwt = account_signed_user_jwt(&public);
-    let token = jwt::Token::<super::UserJwtHeader, super::UserJwtClaims, _>::parse_unverified(&jwt).expect("account-signed user jwt");
-    assert_eq!(token.header().alg, "ed25519-nkey");
-    assert_eq!(token.header().typ, "JWT");
-    assert_eq!(token.claims().sub, public);
     let real_jwt = account_signed_user_jwt(&public);
     let scope = NatsScope::from_strings(
       &format!("nats://creds:{seed}:{jwt}@nats.internal:4222"),
@@ -1673,8 +1680,23 @@ mod tests {
     );
     assert!(padded_payload.contains('='), "the padded fixture needs padding");
     let padded = format!("{header}.{padded_payload}.{}", b64_nopad(b"sig"));
-    let padded_token = jwt::Token::<super::UserJwtHeader, super::UserJwtClaims, _>::parse_unverified(&padded).expect("padded segment");
-    assert_eq!(padded_token.claims().sub, public);
+    super::check_user_jwt(&padded, &public).expect("padded claims");
+  }
+
+  #[test]
+  fn user_jwt_rejects_malformed_segments() {
+    let (_, public) = user_material();
+    let header = b64_nopad(br#"{"typ":"JWT","alg":"ed25519-nkey"}"#);
+    let claims = b64_nopad(format!(r#"{{"sub":"{public}"}}"#).as_bytes());
+    for token in [
+      format!("{header}.{claims}"),
+      format!("{header}.{claims}.sig.extra"),
+      format!("!.{claims}.sig"),
+      format!("{header}.!.sig"),
+      format!("{header}.{}.sig", b64_nopad(b"not json")),
+    ] {
+      assert!(matches!(super::check_user_jwt(&token, &public), Err(NatsUriError::UserJwt)));
+    }
   }
 
   #[test]

@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 
 #MISE description="Run the transparent docker compose integration demo"
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 mise run build
 bash integration/gen-nats.sh
@@ -16,7 +15,7 @@ compose="docker compose -f integration/compose.yaml"
 trap '$compose down --remove-orphans -v --timeout 3' EXIT
 # compose up --abort-on-container-exit hangs after teardown with the
 # netns-sharing client; drive the lifecycle directly instead.
-$compose up -d --build
+ARKHAM_CLIENT=http $compose up -d --build
 
 client=arkham-integration-client-1
 state=running

@@ -69,13 +69,30 @@ unneeded_field_pattern = "warn"
 unused_result_ok = "warn"
 
 [workspace.dependencies]
-arkham-compose = { path = "crates/arkham-compose" }
+arkham-agent = { path = "crates/arkham-agent" }
 arkham-config = { path = "crates/arkham-config" }
 arkham-ebpf = { path = "crates/arkham-ebpf" }
 arkham-fnox = { path = "crates/arkham-fnox" }
+arkham-git-config = { path = "crates/arkham-git-config" }
+arkham-launch-plan = { path = "crates/arkham-launch-plan" }
+arkham-paths = { path = "crates/arkham-paths" }
 arkham-pki = { path = "crates/arkham-pki" }
 arkham-plugin = { path = "crates/arkham-plugin" }
+arkham-profiles = { path = "crates/arkham-profiles" }
+arkham-projection = { path = "crates/arkham-projection" }
 arkham-proxy = { path = "crates/arkham-proxy" }
+arkham-sandbox = { path = "crates/arkham-sandbox" }
+arkham-session = { path = "crates/arkham-session" }
+arkham-session-protocol = { path = "crates/arkham-session-protocol" }
+arkham-test-support = { path = "crates/arkham-test-support" }
+arkham-tool-config = { path = "crates/arkham-tool-config" }
+arkham-tool-git = { path = "crates/arkham-tool-git" }
+arkham-tool-jj = { path = "crates/arkham-tool-jj" }
+arkham-tool-kube = { path = "crates/arkham-tool-kube" }
+arkham-tool-nats = { path = "crates/arkham-tool-nats" }
+arkham-tool-ssh = { path = "crates/arkham-tool-ssh" }
+arkham-tool-talos = { path = "crates/arkham-tool-talos" }
+arkham-workspace = { path = "crates/arkham-workspace" }
 
 # One declaration per external dependency so versions cannot drift between
 # crates. rama tracks main deliberately: its 0.5 line is unpublished.
@@ -94,6 +111,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 code-workspace = "0.1.4"
 confique = { version = "0.4", features = ["toml"] }
+curve25519-dalek = { version = "4.1.3", features = ["precomputed-tables"] }
 dashmap = "6"
 dirs = "7"
 etcetera = "0.11"
@@ -101,10 +119,11 @@ etherparse = "0.19"
 eyre = "0.6"
 fe2o3-amqp = { version = "0.18.3", default-features = false, features = ["acceptor"] }
 fe2o3-amqp-types = "0.18.0"
-fnox-core = "1.39"
+fnox-core = { git = "https://github.com/lotsaai/fnox", branch = "fix/rsa-0.10" }
 futures = "0.3"
 gix-config = { version = "0.62", features = ["sha1"] }
 gix-discover = { version = "0.57", features = ["sha1"] }
+gix-error = "0.5.2"
 h2 = "0.4"
 hex = "0.4"
 httlib-hpack = "0.1.3"
@@ -113,7 +132,6 @@ http-body-util = "0.1"
 httparse = "1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-jwt = "0.16"
 k8s-openapi = { version = "0.27.0", default-features = false, features = ["latest"] }
 kube-client = { version = "3.1.0", default-features = false, features = ["client"] }
 landlock = "0.4.7"
@@ -131,13 +149,13 @@ pgwire = { version = "0.42", default-features = false }
 pretty_assertions = "1"
 proptest = "1"
 rama = { git = "https://github.com/plabayo/rama", branch = "main", default-features = false }
-rand = "0.8"
+rand = "0.10"
 rasn = { version = "0.29.0", default-features = false, features = ["std"] }
 rasn-ldap = "0.29.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 redis = { version = "1.7.1", default-features = false, features = ["tokio-comp"] }
 regex = "1"
-russh = { version = "0.56", default-features = false, features = ["aws-lc-rs"] }
+russh = { version = "0.65.1", default-features = false, features = ["aws-lc-rs"] }
 rustix = { version = "1.1.6", default-features = false, features = ["process"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 rustls-native-certs = "0.8"
@@ -151,6 +169,7 @@ shellexpand = "3"
 smtp-proto = "0.2.5"
 strum = { version = "0.28", features = ["derive"] }
 tempfile = "3"
+test-context = "0.5.8"
 thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "parking_lot", "rt", "rt-multi-thread", "sync", "time"] }
@@ -166,13 +185,19 @@ validator = { version = "0.21", features = ["derive"] }
 wasmtime = { version = "50", default-features = false, features = ["async", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
 wasmtime-wasi = "50"
 xpanda = "0.2"
+zbus = { version = "6", default-features = false, features = ["proxy", "tokio"] }
 
 [dependencies]
-arkham-compose = { workspace = true }
+arkham-agent = { workspace = true }
 arkham-config = { workspace = true }
 arkham-fnox = { workspace = true }
+arkham-launch-plan = { workspace = true }
 arkham-pki = { workspace = true }
 arkham-proxy = { workspace = true }
+arkham-sandbox = { workspace = true }
+arkham-session = { workspace = true }
+arkham-session-protocol = { workspace = true }
+arkham-workspace = { workspace = true }
 clap = { workspace = true }
 confique = { workspace = true }
 dirs = { workspace = true }
@@ -188,8 +213,10 @@ tracing-subscriber = { workspace = true }
 arkham-ebpf = { workspace = true }
 
 [dev-dependencies]
+arkham-test-support = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+test-context = { workspace = true }
 
 [lints]
 workspace = true

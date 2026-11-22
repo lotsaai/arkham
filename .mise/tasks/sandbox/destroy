@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+#MISE description="Delete the warm checkpoint; the next routed task runs sandbox:init again"
+#MISE tags=["sandbox"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+
+rm -f "${ARKHAM_SANDBOX:?set by mise.arch.toml}"

@@ -4,4 +4,3 @@
 mise.local.toml
 target/
 integration/.env
-integration/out/

@@ -6,8 +6,7 @@
 //! else splices through byte-identical.
 
 mod commands;
-#[cfg(target_os = "linux")]
-mod fwd;
+mod daemon;
 #[cfg(target_os = "linux")]
 mod host;
 
@@ -17,8 +16,9 @@ use arkham_config::cli::{Cli, CliCommand, ProxyBackend};
 use arkham_fnox::FnoxSource;
 use clap::{Parser, Subcommand};
 
-use arkham_compose::{AgentArgs, DownArgs, ExposeArgs, InitArgs, LogsArgs, UpArgs};
-use commands::{CaArgs, ConfigArgs, DaemonArgs, FakeArgs, FwdArgs, RegistryArgs, RulesArgs, SchemesArgs, ServeArgs};
+use arkham_agent::AgentArgs;
+use commands::{CaArgs, ConfigArgs, FakeArgs, RegistryArgs, RulesArgs, SchemesArgs, ServeArgs};
+use daemon::DaemonArgs;
 
 #[derive(Parser, Debug)]
 #[command(name = "arkham", about = "grant-scoped MITM proxy", version)]
@@ -58,37 +58,8 @@ enum Command {
   /// document. Reads a local file; prints TOML to stdout. Never touches
   /// the bundled registry or runtime config.
   Registry(RegistryArgs),
-  /// Generate this workspace's stack as an editable file: a stub workspace
-  /// config when it has none (rules derive at serve time), the CA, the agent
-  /// entrypoint, and the compose file. Existing files are left untouched; the
-  /// stack is regenerated when the workspace config changed since it was generated.
-  Init(InitArgs),
-  /// Enter the confined agent environment in one go: generate what is missing,
-  /// start the stack, then run the configured shell (or the command after
-  /// `--`). The stack keeps running when that exits, unless `--rm` stops it.
+  /// Run an agent inside the host confinement environment.
   Agent(AgentArgs),
-  /// Forward agent-owned loopback listeners to the wildcard interface.
-  ///
-  /// A sidecar of the generated compose stack, not a user command: it shares
-  /// the agent's PID namespace and arkham's network namespace, so it sees every
-  /// listener of the shared namespace and can attribute the ones the agent's
-  /// own processes hold. Anything else — arkham's capture and explicit-proxy
-  /// listeners, docker's embedded DNS — is never attributable from here and
-  /// is never forwarded. Raw bytes only: payloads are never inspected.
-  Fwd(FwdArgs),
-  /// Start the layered compose project `arkham init` generated.
-  Up(UpArgs),
-  /// Publish an agent port on the host, claiming the host port across
-  /// workspaces: `arkham expose <port> [--host <host-port>]` appends the
-  /// `[[workspace.expose]]` mapping, regenerates, and `up`s (recreating the
-  /// arkham service, so exec sessions drop). A host port another workspace
-  /// claimed fails naming that workspace. `arkham expose --list` reports
-  /// this workspace's publishings plus every workspace's claims.
-  Expose(ExposeArgs),
-  /// Stop the layered compose project.
-  Down(DownArgs),
-  /// Read the stack's logs.
-  Logs(LogsArgs),
   /// Run the host daemon: one proxy, the project registry, and the control socket.
   Daemon(DaemonArgs),
 }
@@ -115,7 +86,7 @@ fn main() -> eyre::Result<()> {
   if std::env::args().nth(1).as_deref() == Some("--landlock-exec") {
     #[cfg(target_os = "linux")]
     {
-      if let Err(err) = arkham_compose::landlock_exec() {
+      if let Err(err) = run_landlock_exec(&std::env::args_os().collect::<Vec<_>>()) {
         eprintln!("{}", err.registration_detail());
         std::process::exit(1);
       }
@@ -127,6 +98,23 @@ fn main() -> eyre::Result<()> {
     }
   }
   runtime_main()
+}
+
+#[cfg(target_os = "linux")]
+fn run_landlock_exec(args: &[std::ffi::OsString]) -> Result<(), arkham_sandbox::Error> {
+  let mut args = args.iter();
+  let mut plan = None;
+  let mut command = Vec::new();
+  while let Some(arg) = args.next() {
+    if arg == "--landlock-exec" {
+      plan = args.next();
+    } else if arg == "--" {
+      command.extend(args.cloned());
+      break;
+    }
+  }
+  let plan = plan.ok_or(arkham_sandbox::Error::ControlLimit)?;
+  arkham_sandbox::landlock_exec(Path::new(plan), &command)
 }
 
 #[tokio::main]
@@ -149,13 +137,7 @@ async fn runtime_main() -> eyre::Result<()> {
     Command::Rules(args) => args.run(&cli, arkham_version).await?,
     Command::Config(args) => args.run(&cli, arkham_version).await?,
     Command::Registry(args) => args.run(&cli, arkham_version).await?,
-    Command::Init(args) => args.run(&cli, arkham_version).await?,
     Command::Agent(args) => args.run(&cli, arkham_version).await?,
-    Command::Fwd(args) => args.run(&cli, arkham_version).await?,
-    Command::Up(args) => args.run(&cli, arkham_version).await?,
-    Command::Expose(args) => args.run(&cli, arkham_version).await?,
-    Command::Down(args) => args.run(&cli, arkham_version).await?,
-    Command::Logs(args) => args.run(&cli, arkham_version).await?,
     Command::Daemon(args) => args.run(&cli, arkham_version).await?,
   }
   Ok(())
@@ -215,6 +197,7 @@ async fn serve(cli: &Cli, args: ServeArgs) -> eyre::Result<()> {
   let state = std::sync::Arc::new(arkham_proxy::ProxyState::new(resolved, &ca)?);
   // Bind before capture side effects.
   let listener = arkham_proxy::bind_explicit(listen_addr).await?;
+  let listen_addr = listener.local_addr()?;
   let handoff = bind_handoff_listener(&handoff_path, handoff_uid).await?;
   if !listen_addr.ip().is_loopback() {
     tracing::warn!(listen = %listen_addr, "listening on a non-loopback address: anyone reaching this port can trigger real-secret substitution");
@@ -352,6 +335,8 @@ mod serve_handoff_tests {
   use std::time::Duration;
 
   use arkham_config::cli::Cli;
+  use arkham_test_support::IsolatedHome;
+  use test_context::test_context;
   use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
   use tokio::net::{TcpListener, UnixStream};
 
@@ -364,14 +349,11 @@ mod serve_handoff_tests {
     path
   }
 
-  fn isolate_serve_env(home: &Path, handoff: &Path) {
-    // SAFETY: nextest runs this test in its own process. HOME and overlay env
-    // must not touch the operator's real config directory.
+  /// `IsolatedHome` already keeps HOME and the XDG directories off the operator's
+  /// real config; this clears the remaining overlay env and names the socket.
+  fn isolate_serve_env(handoff: &Path) {
+    // SAFETY: test-only mutation, serialized by `IsolatedHome`.
     unsafe {
-      std::env::set_var("HOME", home);
-      std::env::set_var("XDG_CONFIG_HOME", home.join("xdg-config"));
-      std::env::set_var("XDG_STATE_HOME", home.join("xdg-state"));
-      std::env::remove_var("ARKHAM_CONFIG");
       std::env::remove_var("ARKHAM_LISTEN");
       std::env::remove_var("ARKHAM_CA_FILE");
       std::env::set_var("ARKHAM_HANDOFF_SOCKET", handoff);
@@ -401,14 +383,15 @@ mod serve_handoff_tests {
 
   /// `arkham serve` must expose the Unix-socket PROXY handoff the Network
   /// Extension connects to, not only the explicit TCP listener.
+  #[test_context(IsolatedHome)]
   #[tokio::test]
-  async fn serve_binds_the_configured_handoff_socket_and_relays_proxy_v1() {
+  async fn serve_binds_the_configured_handoff_socket_and_relays_proxy_v1(_ctx: &mut IsolatedHome) {
     arkham_pki::ca::install_crypto_provider();
     let work = tempfile::tempdir().unwrap();
     let handoff = work.path().join("handoff.sock");
     let config = write_serve_config(work.path(), "127.0.0.1:0");
 
-    isolate_serve_env(work.path(), &handoff);
+    isolate_serve_env(&handoff);
 
     let cli = Cli { config: Some(config) };
     let serve_task = tokio::spawn(async move { serve(&cli, ServeArgs::default()).await });

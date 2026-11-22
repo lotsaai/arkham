@@ -1,0 +1,17 @@
+net = true
+net_backend = "virtio-net"
+memory = 65536
+cpus = 16
+storage = 200
+overlay = 100
+stop_signal = "SIGRTMIN+3"
+workdir = "/home/eng/github/lotsaai/arkham"
+user = "root"
+
+[dev]
+volumes = [
+    ".:/home/eng/github/lotsaai/arkham",
+    "/home/eng/github/lotsaai/arkham/target",
+    "/var/lib/docker",
+    "/var/lib/containerd",
+]

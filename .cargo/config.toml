@@ -1,7 +1,7 @@
 # `clang-<major>` must resolve to the same LLVM major rustc was built
 # with — rustc 1.99.0 = LLVM 23. Locally: /usr/bin/clang-23. CI: installed by
-# the llvm.sh step in ci.yml. Container: Dockerfile.rustbuilder derives it from
-# `rustc -Vv`. mold comes from mise (`ld.mold` on PATH via shims).
+# the llvm.sh step in ci.yml. Container builds use their image's clang.
+# mold comes from mise (`ld.mold` on PATH via shims).
 [target.x86_64-unknown-linux-gnu]
 linker = "clang-23"
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]

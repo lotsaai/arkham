@@ -1,0 +1,2 @@
+[proxy]
+ca_file = "ca.pem"

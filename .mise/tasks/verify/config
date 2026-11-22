@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+#MISE description="Verify arkham config prints the reference config"
+#MISE depends=["build:debug"]
+#MISE dir="{{config_root}}"
+
+set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
+source integration/verify/lib.sh
+verify_init config
+
+run_cli - config
+expect "config exits 0" test "$CLI_EXIT" = 0
+expect "proxy section" grep -qx '\[proxy\]' "$ARTIFACTS/stdout.txt"
+expect "listen default" grep -q '#listen = "127.0.0.1:8080"' "$ARTIFACTS/stdout.txt"
+verify_pass config

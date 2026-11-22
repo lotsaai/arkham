@@ -14,8 +14,6 @@
 # known, so it is spelled out here.
 
 [settings]
-rust.cargo_home = "/home/runner/work/arkham/arkham/.cache/native/cargo"
-rust.rustup_home = "/home/runner/work/arkham/arkham/.cache/native/rustup"
 # `replacing` (the default) draws a progress spinner and rewrites finished task
 # output in place. Through a CI log that collapses the run into one line per
 # task, which is exactly where you need the failure. Full output per task, all
@@ -23,5 +21,3 @@ rust.rustup_home = "/home/runner/work/arkham/arkham/.cache/native/rustup"
 task.output = "prefix"
 
 [env]
-CARGO_HOME = "/home/runner/work/arkham/arkham/.cache/native/cargo"
-RUSTUP_HOME = "/home/runner/work/arkham/arkham/.cache/native/rustup"

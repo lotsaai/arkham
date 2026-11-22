@@ -7,15 +7,16 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use arkham_compose::{
-  CaPaths, PRIVATE_SESSION_ROOT, RegisterResponse, cgroup_is_confined, decode_request, encode_response, ensure_socket_dir, host_cgroup,
-  peer_uid_allowed, prepare_session, project_root, read_cgroup, read_line, read_starttime, release_session, session_cgroup, write_line,
-};
 use arkham_config::config::ProxyCfg;
 use arkham_config::grants::ResolvedConfig;
 use arkham_config::require_loopback_listen;
+use arkham_launch_plan::{LaunchPlan, PRIVATE_SESSION_ROOT};
 use arkham_pki::ca::{CertAuthority, load_or_generate};
 use arkham_proxy::{ProxyState, bind_explicit, serve};
+use arkham_sandbox::{cgroup_is_confined, host_cgroup, peer_uid_allowed, read_cgroup, read_starttime, release_session, session_cgroup};
+use arkham_session::{CaPaths, prepare_session};
+use arkham_session_protocol::{RegisterResponse, decode_request, encode_response, ensure_socket_dir, read_line, write_line};
+use arkham_workspace::project_root;
 use confique::Config as _;
 use eyre::WrapErr as _;
 use rustix::process::getuid;
@@ -52,7 +53,8 @@ pub async fn run(version: &str) -> eyre::Result<()> {
   )?);
   let registered = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
   let explicit = bind_explicit(proxy.listen).await?;
-  let cgroup = host_cgroup()?;
+  let listen_addr = explicit.local_addr()?;
+  let cgroup = host_cgroup().await?;
   let capture_state = Arc::clone(&state);
   let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
   crate::with_capture(
@@ -61,7 +63,7 @@ pub async fn run(version: &str) -> eyre::Result<()> {
         // The capture task owns startup errors; with_capture reports its result.
         return std::future::pending().await;
       }
-      tracing::info!(listen = %proxy.listen, socket = %socket_path.display(), "host daemon ready");
+      tracing::info!(listen = %listen_addr, socket = %socket_path.display(), "host daemon ready");
       eprintln!("daemon: ready");
       tokio::select! {
         () = serve(explicit, Arc::clone(&state)) => Ok(()),
@@ -131,14 +133,14 @@ async fn one_client(
   let started = match read_starttime(pid) {
     Ok(value) => value,
     Err(err) => {
-      reject_logged(&mut stream, &err, &wrapper_detail(&err)).await?;
+      reject_logged(&mut stream, &err, &err.registration_detail()).await?;
       return Ok(());
     }
   };
   let cgroup = match read_cgroup(pid) {
     Ok(path) => path,
     Err(err) => {
-      reject_logged(&mut stream, &err, &wrapper_detail(&err)).await?;
+      reject_logged(&mut stream, &err, &err.registration_detail()).await?;
       return Ok(());
     }
   };
@@ -176,7 +178,7 @@ async fn one_client(
     Ok(prepared) => prepared,
     Err(err) => {
       let _ = std::fs::remove_dir_all(&scratch);
-      reject_logged(&mut stream, &err, &wrapper_detail(&err)).await?;
+      reject_logged(&mut stream, &err, &err.registration_detail()).await?;
       return Ok(());
     }
   };
@@ -184,7 +186,7 @@ async fn one_client(
     Ok(slot) => slot,
     Err(err) => {
       let _ = std::fs::remove_dir_all(&scratch);
-      reject_logged(&mut stream, &err, &wrapper_detail(&err)).await?;
+      reject_logged(&mut stream, &err, &err.registration_detail()).await?;
       return Ok(());
     }
   };
@@ -204,11 +206,7 @@ async fn one_client(
   Ok(())
 }
 
-async fn activate_session(
-  stream: &mut UnixStream,
-  slot: &arkham_compose::SessionSlot,
-  plan: arkham_compose::LaunchPlan,
-) -> eyre::Result<()> {
+async fn activate_session(stream: &mut UnixStream, slot: &arkham_sandbox::SessionSlot, plan: LaunchPlan) -> eyre::Result<()> {
   let response = RegisterResponse::Join { cgroup: slot.path.clone() };
   let bytes = encode_response(&response)?;
   write_line(stream, &bytes).await?;
@@ -216,7 +214,7 @@ async fn activate_session(
     eyre::bail!("invalid session activation");
   }
   if let Err(err) = slot.confirm() {
-    reject_logged(stream, &err, &wrapper_detail(&err)).await?;
+    reject_logged(stream, &err, &err.registration_detail()).await?;
     return Err(err.into());
   }
   let response = RegisterResponse::Ready { plan };
@@ -250,10 +248,6 @@ async fn drop_registration(
 }
 
 const REGISTRATION_FAILED: &str = "registration failed";
-
-fn wrapper_detail(err: &arkham_compose::Error) -> String {
-  err.registration_detail()
-}
 
 async fn reject_logged(stream: &mut UnixStream, err: &impl std::fmt::Debug, detail: &str) -> eyre::Result<()> {
   tracing::error!(error = ?err, "registration failed");
@@ -319,6 +313,7 @@ mod tests {
 
   #[tokio::test]
   async fn a_failed_register_write_drops_the_session() {
+    host_cgroup().await.unwrap();
     let runtime = tempfile::tempdir().unwrap();
     std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let _env = RestoreEnv::set("XDG_RUNTIME_DIR", runtime.path());
@@ -358,7 +353,7 @@ mod tests {
     let marker = format!("{}-", std::process::id());
     let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap();
     assert!(!cgroup.contains(&marker), "client stayed in the session cgroup: {cgroup}");
-    let parent = host_cgroup().unwrap();
+    let parent = host_cgroup().await.unwrap();
     let leaked = std::fs::read_dir(&parent)
       .unwrap()
       .flatten()

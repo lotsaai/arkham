@@ -1,0 +1,6 @@
+# Decoy-only fixture: one name the bundled registry knows, one it does not.
+[secrets.GITHUB_TOKEN]
+default = "fixture-not-a-secret"
+
+[secrets.UNKNOWN_THING]
+default = "fixture-not-a-secret"

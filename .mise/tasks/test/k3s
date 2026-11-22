@@ -2,16 +2,15 @@
 
 #MISE description="Run the live k3s kubeconfig substitution tests (k3d cluster, bearer, cert, exec)"
 #MISE depends=["build:debug"]
-
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
+#MISE dir="{{config_root}}"
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 cluster="arkham-k3s-test"
-scratch=$proj_dir/target/k3s-e2e
+scratch=$MISE_CONFIG_ROOT/target/k3s-e2e
 plugin_dir=""
-arkham=$proj_dir/target/debug/arkham
+arkham=$MISE_CONFIG_ROOT/target/debug/arkham
 serve_pid=""
 # One budget for /readyz, node Ready, and coredns Ready. Cluster create
 # (image pull included) is outside it. Override when a runner is slower.
@@ -137,10 +136,7 @@ mkdir -p "$scratch" "$scratch/config/arkham"
 # kubeconfig files under $scratch; the user's ~/.kube/config is never
 # read, merged, or written.
 export KUBECONFIG="$scratch/cert-kubeconfig"
-# Stack generation needs `[workspace] home`, which normally arrives via the
-# user's global config; the hermetic XDG_CONFIG_HOME hides that file, so the
-# task seeds the one value generation requires.
-printf '[workspace]\nhome = "%s"\n' "$HOME" >"$scratch/config/arkham/config.toml"
+printf '[workspace]\n' >"$scratch/config/arkham/config.toml"
 
 # Fresh cluster every run: leftover state from a killed run must not leak in.
 # The kubeconfig flags keep k3d from touching ~/.kube/config even if the
@@ -310,12 +306,13 @@ run_leg() {
   # The task exports KUBECONFIG as the cert file for kubectl. Init must see
   # this leg's source, which is already a declared rewrite, so ambient
   # discovery does not add the cert user on the same API server.
-  KUBECONFIG="$source" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend ebpf "$ws"
+  XDG_CONFIG_HOME=$scratch/config "$arkham" ca >/dev/null
+  KUBECONFIG="$source" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox target/debug/examples/prepare-session "$ws" "$statedir" "$scratch/config/arkham/ca.crt"
   shopt -s nullglob
   kubedirs=()
-  for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
+  [ ! -d "$statedir/grants" ] || kubedirs+=("$statedir/grants")
   decoys=()
-  for d in "$statedir"/arkham/ws/*/files/00-*; do decoys+=("$d"); done
+  for d in "$statedir"/files/00-*; do decoys+=("$d"); done
   shopt -u nullglob
   if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
     echo "init generated no kube state under $XDG_STATE_HOME" >&2
@@ -357,11 +354,11 @@ run_discovered() {
   mkdir -p "$ws/.config/arkham"
   printf '%s\n' '[workspace]' >"$ws/.config/arkham/config.toml"
   local statedir=$scratch/state-$name
-  KUBECONFIG="$kubeconfig" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox "$arkham" init --backend ebpf "$ws"
+  KUBECONFIG="$kubeconfig" XDG_STATE_HOME=$statedir XDG_CONFIG_HOME=$scratch/config FNOX_CONFIG_DIR=$scratch/fnox target/debug/examples/prepare-session "$ws" "$statedir" "$scratch/config/arkham/ca.crt"
   shopt -s nullglob
   local kubedirs=() decoys=()
-  for d in "$statedir"/arkham/ws/*/grants; do kubedirs+=("$d"); done
-  for d in "$statedir"/arkham/ws/*/files/kube-config; do decoys+=("$d"); done
+  [ ! -d "$statedir/grants" ] || kubedirs+=("$statedir/grants")
+  [ ! -f "$statedir/files/kube-config" ] || decoys+=("$statedir/files/kube-config")
   shopt -u nullglob
   if [ "${#kubedirs[@]}" -ne 1 ] || [ "${#decoys[@]}" -ne 1 ]; then
     echo "init did not discover a kubeconfig from KUBECONFIG=${kubeconfig}" >&2

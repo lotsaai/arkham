@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 #MISE description="Run the full project test suite"
 #MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**", ".mise/tasks/test/**"]
+#MISE dir="{{config_root}}"
 
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
-
-mise run --force test:rust "$@"
-mise run --force test:ssh "$@"
-mise run --force test:ebpf --use-sudo "$@"
-mise run --force test:k3s "$@"
-mise run --force test:talos "$@"
+mise run test:rust "$@"
+mise run test:http "$@"
+mise run test:postgres "$@"
+mise run test:ssh "$@"
+mise run test:redis "$@"
+mise run test:smtp "$@"
+mise run test:ldap "$@"
+mise run test:nats "$@"
+mise run test:amqp "$@"
+mise run test:ebpf --use-sudo "$@"
+mise run test:k3s "$@"
+mise run test:talos "$@"

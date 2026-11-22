@@ -2,13 +2,13 @@
 
 #MISE description="Run the live eBPF capture tests (build as user, execute as root)"
 #MISE sources=["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "rules/**", ".mise/tasks/test/**"]
+#MISE outputs=[]
+#MISE dir="{{config_root}}"
 #USAGE flag "--use-sudo" help="Skip the gum escalation prompt and go straight to sudo"
 #USAGE arg "[filters]" var=#true help="Test-name filters; default: ebpf_live_"
 
-proj_dir=$(jj root 2>/dev/null || git rev-parse --show-toplevel)
-cd "$proj_dir" || exit 1
-
 set -euo pipefail
+source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 # Build the test binary as the current user so target/ stays user-owned.
 # Building this package is also what runs its `build.rs`, and therefore

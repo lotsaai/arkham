@@ -5,8 +5,6 @@ experimental = true
 lockfile = true
 env_shell_expand = true
 idiomatic_version_file_enable_tools = ["rust"]
-rust.cargo_home = ".cache/native/cargo"
-rust.rustup_home = ".cache/native/rustup"
 
 [tools]
 "aqua:nextest-rs/nextest/cargo-nextest" = "latest"
@@ -30,6 +28,8 @@ mold = { version = "latest", os = ["linux"] }
 k3d = "latest"
 "cargo:cargo-outdated" = "latest"
 kubectl = "latest"
+"cargo:docsrs-mcp" = "latest"
+microsandbox = "latest"
 
 [[tools.rust]]
 version = "stable"
@@ -42,7 +42,7 @@ version = "nightly-2026-09-18"
 components = "llvm-tools,rustfmt,rust-src"
 
 [env]
+# BoringSSL's build script does not read CXXSTDLIB.
+BORING_BSSL_RUST_CPPLIB = "{% if os() == 'linux' %}{{ get_env(name='CXXSTDLIB', default='stdc++') }}{% else %}{{ get_env(name='CXXSTDLIB', default='c++') }}{% endif %}"
 CARGO_TERM_COLOR = "always"
-CARGO_HOME = "{{config_root}}/.cache/native/cargo"
-RUSTUP_HOME = "{{config_root}}/.cache/native/rustup"
 RUSTUP_TOOLCHAIN = "stable"

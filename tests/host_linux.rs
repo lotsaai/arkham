@@ -4,7 +4,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::fs::File;
+use std::fs::{File, Permissions};
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ struct Isolated {
   fnox_dir: tempfile::TempDir,
   ca_file: PathBuf,
   path: std::ffi::OsString,
+  /// The daemon and agent reach the user's systemd manager through this bus.
+  bus: Option<std::ffi::OsString>,
 }
 
 impl Isolated {
@@ -27,7 +29,10 @@ impl Isolated {
     let config_home = tempfile::tempdir().unwrap();
     let fnox_dir = tempfile::tempdir().unwrap();
     let ca_file = runtime.path().join("ca.pem");
+    // tempfile creates directories with the process umask; a login umask of 002 would make it group-writable.
+    std::fs::set_permissions(runtime.path(), Permissions::from_mode(0o700)).unwrap();
     let path = std::env::var_os("PATH").unwrap();
+    let bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
     Self {
       runtime,
       home,
@@ -35,6 +40,7 @@ impl Isolated {
       fnox_dir,
       ca_file,
       path,
+      bus,
     }
   }
 
@@ -45,7 +51,7 @@ impl Isolated {
   }
 
   fn envs(&self) -> Vec<(&str, &std::ffi::OsStr)> {
-    vec![
+    let mut envs = vec![
       ("PATH", self.path.as_os_str()),
       ("HOME", self.home.path().as_os_str()),
       ("USER", "ubuntu".as_ref()),
@@ -58,7 +64,11 @@ impl Isolated {
       ("http_proxy", "http://secret-proxy.invalid".as_ref()),
       ("HTTPS_PROXY", "http://secret-proxy.invalid".as_ref()),
       ("ALL_PROXY", "http://secret-proxy.invalid".as_ref()),
-    ]
+    ];
+    if let Some(bus) = &self.bus {
+      envs.push(("DBUS_SESSION_BUS_ADDRESS", bus.as_os_str()));
+    }
+    envs
   }
 }
 
@@ -72,7 +82,7 @@ impl Daemon {
   }
 
   fn start_with(isolated: &Isolated, extra: &[(&str, &str)]) -> Self {
-    let mut command = isolated.command(&["daemon"]);
+    let mut command = isolated.command(&["daemon", "run"]);
     command
       .env("ARKHAM_LISTEN", "127.0.0.1:0")
       .stdout(Stdio::null())
@@ -151,8 +161,6 @@ fn the_sandbox_env_comes_from_the_agent() {
   let output = isolated
     .command(&[
       "agent",
-      "--isolate",
-      "bwrap",
       "--",
       "sh",
       "-c",
@@ -182,7 +190,7 @@ fn non_unicode_agent_environment_fails_without_exposing_its_value() {
   let _daemon = Daemon::start(&isolated);
   let value = std::ffi::OsString::from_vec(b"PRIVATE_ENV_MARKER\xff".to_vec());
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "echo", "COMMAND_RAN"])
+    .command(&["agent", "--", "echo", "COMMAND_RAN"])
     .env("NON_UNICODE", value)
     .current_dir(workspace.path())
     .output()
@@ -221,7 +229,7 @@ fn custom_ca_bundle_and_key_aliases_are_hidden_in_every_profile() {
   );
   for profile in ["read-only", "workspace-write", "danger-full-access"] {
     let output = isolated
-      .command(&["agent", "--isolate", "bwrap", "--write-profile", profile, "--", "sh", "-c", &script])
+      .command(&["agent", "--write-profile", profile, "--", "sh", "-c", &script])
       .current_dir(&root)
       .output()
       .unwrap();
@@ -272,10 +280,13 @@ fn a_wrapper_never_starts_the_command_without_activation_acknowledgement() {
   let workspace = tempfile::tempdir().unwrap();
   let socket_dir = isolated.runtime.path().join("arkham");
   std::fs::create_dir(&socket_dir).unwrap();
+  std::fs::set_permissions(&socket_dir, Permissions::from_mode(0o700)).unwrap();
   let listener = UnixListener::bind(socket_dir.join("daemon.sock")).unwrap();
   std::fs::set_permissions(socket_dir.join("daemon.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
-  let cgroup = isolated.runtime.path().join("fake-cgroup");
-  std::fs::create_dir(&cgroup).unwrap();
+  let unit = isolated.runtime.path().join("fake-unit");
+  let cgroup = unit.join("arkham-host").join("1-1");
+  std::fs::create_dir_all(&cgroup).unwrap();
+  std::fs::write(unit.join("cgroup.procs"), "").unwrap();
   std::fs::write(cgroup.join("cgroup.procs"), "").unwrap();
   let root = workspace.path().to_path_buf();
   let marker = root.join("command-ran");
@@ -291,7 +302,7 @@ fn a_wrapper_never_starts_the_command_without_activation_acknowledgement() {
     assert_eq!(line, "activate\n");
   });
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "touch", marker.to_str().unwrap()])
+    .command(&["agent", "--", "touch", marker.to_str().unwrap()])
     .current_dir(workspace.path())
     .output()
     .unwrap();
@@ -305,7 +316,7 @@ fn agent_refuses_to_start_without_a_daemon() {
   let isolated = Isolated::new();
   let marker = isolated.runtime.path().join("marker");
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "touch", marker.to_str().unwrap()])
+    .command(&["agent", "--", "touch", marker.to_str().unwrap()])
     .output()
     .unwrap();
   assert!(!output.status.success(), "agent started without a daemon: {output:?}");
@@ -326,7 +337,11 @@ fn a_daemon_does_not_adopt_a_process_that_started_first() {
 #[test]
 fn the_daemon_refuses_a_non_loopback_listen_address() {
   let isolated = Isolated::new();
-  let output = isolated.command(&["daemon"]).env("ARKHAM_LISTEN", "0.0.0.0:8080").output().unwrap();
+  let output = isolated
+    .command(&["daemon", "run"])
+    .env("ARKHAM_LISTEN", "0.0.0.0:8080")
+    .output()
+    .unwrap();
   let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(!output.status.success(), "{stderr}");
   assert!(stderr.contains("non-loopback"), "{stderr}");
@@ -365,7 +380,7 @@ fn bwrap_hides_secret_files_and_proxy_env() {
   let stdout = root.join("stdout.txt");
   let stderr = root.join("stderr.txt");
   let mut child = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "sh", "probe.sh"])
+    .command(&["agent", "--", "sh", "probe.sh"])
     .current_dir(root)
     .env("HTTP_PROXY", "http://wrapper-proxy.invalid")
     .stdout(File::create(&stdout).unwrap())
@@ -442,7 +457,7 @@ fn agent_with_bwrap_unavailable_starts_nothing_and_hides_the_secret() {
   path.push(&isolated.path);
   let _daemon = Daemon::start(&isolated);
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "cat", "fnox.toml"])
+    .command(&["agent", "--", "cat", "fnox.toml"])
     .current_dir(workspace.path())
     .env("PATH", path)
     .output()
@@ -470,7 +485,7 @@ fn no_child_runs_when_neither_probe_accepts() {
   path.push(&isolated.path);
   let _daemon = Daemon::start(&isolated);
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "touch", marker.to_str().unwrap()])
+    .command(&["agent", "--", "touch", marker.to_str().unwrap()])
     .current_dir(workspace.path())
     .env("PATH", path)
     .output()
@@ -499,7 +514,7 @@ fn fnox_projection_names_are_forged() {
   .unwrap();
   let _daemon = Daemon::start(&isolated);
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "sh", "names.sh"])
+    .command(&["agent", "--", "sh", "names.sh"])
     .current_dir(root)
     .output()
     .unwrap();
@@ -537,7 +552,7 @@ fn the_secret_set_does_not_change_after_launch() {
   .unwrap();
   let _daemon = Daemon::start(&isolated);
   let mut child = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "sh", "hold.sh"])
+    .command(&["agent", "--", "sh", "hold.sh"])
     .current_dir(root)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -615,7 +630,7 @@ fn an_unset_runtime_dir_does_not_use_a_tmp_socket_directory() {
   assert!(made.success(), "could not plant {dir}");
   let isolated = Isolated::new();
   let mut child = isolated
-    .command(&["daemon"])
+    .command(&["daemon", "run"])
     .env_remove("XDG_RUNTIME_DIR")
     .env("ARKHAM_LISTEN", "127.0.0.1:0")
     .stdout(Stdio::null())
@@ -675,7 +690,7 @@ fn a_root_owned_cgroup_names_the_denial_and_hides_the_secret() {
   let wrote = migrate.wait_with_output().unwrap();
   assert!(wrote.status.success(), "{}", String::from_utf8_lossy(&wrote.stderr));
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "cat", "fnox.toml"])
+    .command(&["agent", "--", "cat", "fnox.toml"])
     .current_dir(workspace.path())
     .output()
     .unwrap();
@@ -718,7 +733,7 @@ fn the_wrapper_refuses_a_socket_it_does_not_own() {
     .unwrap();
   assert!(chown.success(), "chown failed");
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "cat", "fnox.toml"])
+    .command(&["agent", "--", "cat", "fnox.toml"])
     .current_dir(workspace.path())
     .output()
     .unwrap();
@@ -744,7 +759,7 @@ fn a_nested_fnox_file_stays_forged_after_chdir() {
   std::fs::write(&script, "cd nested\nprintf '%s\\n' \"NEST:$(cat fnox.toml 2>/dev/null)\"\n").unwrap();
   let _daemon = Daemon::start(&isolated);
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "sh", "chdir.sh"])
+    .command(&["agent", "--", "sh", "chdir.sh"])
     .current_dir(root)
     .output()
     .unwrap();
@@ -764,7 +779,7 @@ fn the_daemon_does_not_create_a_tmp_socket_dir() {
   let _ = Command::new("sudo").args(["-n", "rm", "-rf", &dir]).status();
   let isolated = Isolated::new();
   let mut child = isolated
-    .command(&["daemon"])
+    .command(&["daemon", "run"])
     .env_remove("XDG_RUNTIME_DIR")
     .env("ARKHAM_LISTEN", "127.0.0.1:0")
     .stdout(Stdio::null())
@@ -804,7 +819,7 @@ fn the_wrapper_refuses_a_group_writable_socket() {
   let sock = isolated.runtime.path().join("arkham").join("daemon.sock");
   std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o660)).unwrap();
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "cat", "fnox.toml"])
+    .command(&["agent", "--", "cat", "fnox.toml"])
     .current_dir(workspace.path())
     .output()
     .unwrap();
@@ -828,15 +843,7 @@ fn bwrap_registers_the_workspace_argument() {
   std::fs::write(there.path().join("fnox.toml"), "# workspace\n").unwrap();
   let _daemon = Daemon::start(&isolated);
   let output = isolated
-    .command(&[
-      "agent",
-      "--isolate",
-      "bwrap",
-      there.path().to_str().unwrap(),
-      "--",
-      "cat",
-      "marker.txt",
-    ])
+    .command(&["agent", there.path().to_str().unwrap(), "--", "cat", "marker.txt"])
     .current_dir(here.path())
     .output()
     .unwrap();
@@ -866,7 +873,7 @@ fn a_symlinked_fnox_toml_and_its_target_are_forged() {
   .unwrap();
   let _daemon = Daemon::start(&isolated);
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "sh", "links.sh"])
+    .command(&["agent", "--", "sh", "links.sh"])
     .current_dir(root)
     .output()
     .unwrap();
@@ -894,11 +901,7 @@ fn a_prepare_error_does_not_reach_the_wrapper() {
   )
   .unwrap();
   let _daemon = Daemon::start(&isolated);
-  let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "true"])
-    .current_dir(root)
-    .output()
-    .unwrap();
+  let output = isolated.command(&["agent", "--", "true"]).current_dir(root).output().unwrap();
   let stdout = String::from_utf8_lossy(&output.stdout);
   let stderr = String::from_utf8_lossy(&output.stderr);
   assert!(!output.status.success(), "{stdout}{stderr}");
@@ -935,7 +938,7 @@ fn the_sandbox_cannot_read_the_home_credential_or_the_ca_key() {
   .unwrap();
   let _daemon = Daemon::start(&isolated);
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "sh", "home.sh"])
+    .command(&["agent", "--", "sh", "home.sh"])
     .current_dir(root)
     .output()
     .unwrap();
@@ -985,7 +988,7 @@ fn a_symlinked_import_and_age_key_are_forged_at_the_link_and_the_target() {
   .unwrap();
   let _daemon = Daemon::start(&isolated);
   let output = isolated
-    .command(&["agent", "--isolate", "bwrap", "--", "sh", "links.sh"])
+    .command(&["agent", "--", "sh", "links.sh"])
     .current_dir(&root)
     .output()
     .unwrap();
@@ -1115,7 +1118,7 @@ echo sibling > .config/unrelated.toml
 "#;
   for profile in ["workspace-write", "danger-full-access"] {
     let output = isolated
-      .command(&["agent", "--isolate", "bwrap", "--write-profile", profile, "--", "sh", "-c", script])
+      .command(&["agent", "--write-profile", profile, "--", "sh", "-c", script])
       .current_dir(root)
       .output()
       .unwrap();
@@ -1176,7 +1179,7 @@ echo sibling > .config/unrelated.toml
 "#;
   for profile in ["workspace-write", "danger-full-access"] {
     let output = isolated
-      .command(&["agent", "--isolate", "bwrap", "--write-profile", profile, "--", "sh", "-c", script])
+      .command(&["agent", "--write-profile", profile, "--", "sh", "-c", script])
       .current_dir(root)
       .output()
       .unwrap();

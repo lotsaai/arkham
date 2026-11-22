@@ -1,0 +1,23 @@
+[package]
+name = "arkham-tool-jj"
+version = "0.3.37"
+edition = "2024"
+description = "jj configuration adaptation for arkham"
+license = "Apache-2.0"
+repository = "https://github.com/casualjim/arkham"
+publish = false
+
+[dependencies]
+arkham-config = { workspace = true }
+arkham-git-config = { workspace = true }
+arkham-tool-config = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+arkham-test-support = { workspace = true }
+tempfile = { workspace = true }
+test-context = { workspace = true }
+
+[lints]
+workspace = true

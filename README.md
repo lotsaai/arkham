@@ -4,7 +4,7 @@ Give your coding agent fake credentials that work. arkham is a secure agent envi
 
 A leaked prompt, a pasted log, or a dependency that phones home carries the decoy. The upstream rejects it everywhere except the grant. The real value appears on the wire only to a host you named.
 
-One command drops you into that environment. `arkham agent` starts the stack and opens a shell in a container that holds only decoys. Supported traffic is captured transparently without proxy settings, subject to capture exclusions.
+Start `arkham daemon`, then run `arkham agent` to open a confined host shell with decoys. Supported traffic is captured transparently without proxy settings, subject to capture exclusions.
 
 Underneath sits a grant-scoped proxy. A workload can also point its proxy settings at arkham, or on Linux arkham can capture its traffic with `--proxy-backend ebpf`. On a grant match arkham terminates TLS with a per-domain leaf signed by its own CA and swaps the decoy for the real value in headers, basic auth, and bodies, over HTTP/1 and HTTP/2. On the response it swaps real values back to decoys. Every other connection is spliced byte for byte with the real upstream certificate untouched.
 
@@ -58,24 +58,21 @@ The `ebpf` backend additionally needs a nightly toolchain (the BPF target has no
 
 ## Try it in 30 seconds
 
-You need docker and your secrets in fnox. Install arkham, name your source directories once, then step into any workspace as a secure agent.
+You need Linux, bubblewrap, Landlock, eBPF capture privileges, and secrets declared to fnox. Start the daemon in one terminal:
 
 ```sh
-mise use -g github:casualjim/arkham
-mkdir -p ~/.config/arkham
-cat > ~/.config/arkham/config.toml <<'EOF'
-[workspace]
-# source directories you want beside your workspace
-include = ["~/projects"]
-EOF
-
-cd ~/projects/my-awesome-thing
-arkham agent
-# do work, exit the agent
-arkham down
+arkham daemon run
 ```
 
-Container home, shell, listener, and CA all default, so that file is the whole setup. `arkham agent` generates the stack, starts it, and drops you into the agent. The agent holds only decoys. Real values stay in fnox and reach only granted hosts. `arkham down` stops the devenv.
+In another terminal, enter your workspace:
+
+```sh
+cd ~/projects/my-awesome-thing
+arkham rules
+arkham agent
+```
+
+The agent holds decoys. The daemon resolves real values from fnox and substitutes them only for granted hosts. Exit the shell to end the session and stop the daemon separately when it is no longer needed.
 
 To see the raw credential swap from both sides of the wire, follow the [tutorial](docs/user/tutorial.md).
 
@@ -87,7 +84,7 @@ env = "GITHUB_TOKEN"          # decoy seed, registry key, fnox key
 allow = ["https://api.github.com"]
 ```
 
-That file is the whole config. The listener defaults to `127.0.0.1:8080` and the CA to `/certs/ca.pem` when the stack mounted it there, else `<config-dir>/arkham/ca.pem`. Start the proxy, hand your agent its decoy, and the rule is live:
+The listener defaults to `127.0.0.1:8080` and the CA to `<config-dir>/arkham/ca.pem`. Start the proxy, hand your agent its decoy, and the rule is live:
 
 ```sh
 arkham serve
@@ -110,47 +107,44 @@ Everything lives under [docs/user](docs/user/README.md), arranged by what you ne
 
 Two runnable examples ship in the repository:
 
-- [examples/agentic-devenv](examples/agentic-devenv/README.md) — a workspace to secure with `arkham up`: one arkham container, one agent container holding only decoys, transparent capture, and real values that stay in fnox.
-- [integration](integration/README.md) — the compose demo behind `mise run demo`. The scenario table there is what the client asserts.
+- [examples/agentic-devenv](examples/agentic-devenv/README.md) describes a host-confined workspace with decoys and transparent capture.
+- [integration](integration/README.md) describes the container-based proxy integration demo behind `mise run demo`. The [bwrap demo](integration/bwrap/README.md) exercises host capture.
 
-## Linux host mode
+## Linux host confinement
 
-`arkham daemon` and `arkham agent --isolate bwrap` are the Linux host path. The container quickstart above is a different one.
+`arkham daemon` and `arkham agent` run the proxy and confined agent on the Linux host.
 
 ```mermaid
-flowchart TB
-  subgraph HOST["Host kernel, one network namespace, shared"]
-    direction TB
-    subgraph DCG["Daemon cgroup. The daemon process stays in this cgroup"]
-      subgraph DAEMON["arkham daemon, one process, your uid"]
-        SOCK["Unix control socket. Peer uid must be the daemon uid"]
-        PROXY["Proxy in this process. Capture listeners 127.0.0.1 and ::1, TCP :15000 and UDP :15001. Also the explicit loopback listener. Holds the real credentials and substitutes them"]
-        EBPFU["eBPF userspace in this process. Resolves captured destinations and session identity"]
-      end
-      subgraph ATTACH["arkham-host. The eBPF programs are attached here, once, and cover every session under it"]
-        subgraph SCG["pid-starttime, one directory per session"]
-          subgraph BWRAP["bubblewrap. user, pid, uts, ipc, and cgroup namespaces unshared. net shared with the host. tmpfs root. workspace-write and a home session get a private /tmp. The host /sys/fs/cgroup tree is not mounted"]
-            subgraph LL["Landlock, arkham --landlock-exec, then exec. Fully enforced or the command does not start. danger-full-access does not apply Landlock"]
-              AGENT["Agent process. Sees the project bind, forged fnox twins, config twins, the CA certificate, and decoy env"]
-            end
-          end
-        end
-      end
-    end
-    EBPFK["connect4 and connect6, attached at arkham-host. TCP goes to :15000 and connected UDP to :15001 on the matching loopback address. The real destination and cgroup id are stored. Loopback, foreign network namespaces, and bypassed destinations are not rewritten"]
-    REAL["Real secret files and home config. Never mounted into the sandbox"]
-  end
+flowchart LR
+  WRAP["arkham agent"]
   UP["Upstream services"]
-  WRAP["arkham agent --isolate bwrap"] -->|register| SOCK
-  SOCK -->|"registers the session; the wrapper joins its cgroup before the agent starts"| SCG
-  AGENT -->|connect| EBPFK
-  EBPFK -->|redirected| PROXY
-  EBPFU -.->|"the cgroup id selects that session's grants"| PROXY
-  PROXY -->|"real credentials"| UP
-  REAL -.->|"the daemon reads these to build twins"| DAEMON
+  subgraph HOST["Linux host, one shared network namespace"]
+    REAL[("Real secrets and home config")]
+    subgraph DAEMON["arkham daemon, your uid"]
+      SOCK["Control socket"]
+      PROXY["Proxy, holds real credentials"]
+      EBPFU["eBPF userspace"]
+    end
+    subgraph CG["cgroup arkham-host"]
+      KPROG["eBPF connect4 / connect6"]
+      AGENT["Agent in bubblewrap + Landlock"]
+    end
+  end
+  WRAP -->|register| SOCK
+  SOCK -->|session cgroup| AGENT
+  AGENT -->|connect| KPROG
+  KPROG -->|"TCP :15000, UDP :15001"| PROXY
+  EBPFU -.->|"cgroup id selects grants"| PROXY
+  REAL -.->|"read by the daemon"| PROXY
+  PROXY -->|real credentials| UP
 ```
 
-Filesystem isolation is bubblewrap plus Landlock. The network is shared with the host; captured TCP and connected UDP are redirected to the proxy, which alone holds the real credentials, and the cgroup id is how the proxy tells which session's grants apply. Discovery uses project markers, and fnox only decides which files get rewritten.
+- **Control socket.** Accepts only peers with the daemon's uid. The wrapper joins its session cgroup (`arkham-host/<pid>-<starttime>`) before the agent starts.
+- **Sandbox.** bubblewrap unshares the user, pid, uts, ipc, and cgroup namespaces, keeps the host network, and mounts a tmpfs root without the host `/sys/fs/cgroup`. `workspace-write` and home sessions get a private `/tmp`. `arkham --landlock-exec` then enforces Landlock fully or the command does not start; `danger-full-access` skips Landlock.
+- **Agent view.** The project bind, forged fnox twins, config twins, the CA certificate, and decoy env. Real secret files are never mounted.
+- **Capture.** The eBPF programs attach once at `arkham-host`. They redirect TCP and connected UDP to the proxy on the matching loopback address and record the real destination and cgroup id. Loopback, foreign network namespaces, and bypassed destinations are not rewritten.
+
+Discovery uses project markers, and fnox only decides which files get rewritten.
 
 Host sessions hide the configured CA private key and the contents of Arkham config that exists at launch, including discovered hard-link aliases. Unrelated project `.config` files remain usable. Missing config paths are not reserved, and an existing symlink entry can still be replaced even though its original target stays masked.
 

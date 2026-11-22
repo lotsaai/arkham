@@ -1,0 +1,9 @@
+# Tasks that source .mise/sandbox.sh run in a machine restored from this
+# checkpoint, which sandbox:init builds from the image below.
+[env]
+ARKHAM_SANDBOX = "{{config_root}}/.cache/sandbox/arkham-dev.checkpoint"
+ARKHAM_SANDBOX_IMAGE = "ghcr.io/lotsaai/arkham-dev@sha256:7a37eb648af31f4193aac0b5aeddbed0a9adf67def0fb264c5d73b70f94bf06c"
+
+# Dependencies run inside the machine, with the task they belong to.
+[settings]
+task.skip_depends = true
