@@ -79,8 +79,8 @@ local project_steps = new Mapping<String, Step> {
 
   ["betterleaks"] = new Step {
     // Owned trees only, named explicitly: `docs/` and `integration/` carry
-    // credential-shaped fixtures by design, and the derived trees (`.cache/`,
-    // `target/`, `.git/`) hold ~15 GB of vendored bytes nobody wants walked.
+    // credential-shaped fixtures by design, and the derived trees
+    // (`target/`, `.git/`) hold ~15 GB of vendored bytes nobody wants walked.
     // Fixture literals inside the scanned trees carry inline
     // `betterleaks:allow` markers, so a new token-shaped literal in real
     // code still fails the gate. v1.9's global prefilter/filter config keys

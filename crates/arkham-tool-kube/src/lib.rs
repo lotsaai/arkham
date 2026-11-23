@@ -17,9 +17,9 @@ use std::error::Error as StdError;
 use std::path::Path;
 
 use arkham_config::config::{RewriteFormat, fake_for};
-use arkham_config::context::{AmbientProtocol, ContextIdentity, ContextRef, Presented, identities, require_distinct};
 use arkham_config::grants::{EndpointScope, GuestTlsMode, HostPat, Scheme, decoy_for_rule};
 use arkham_pki::ca::CertAuthority;
+use arkham_tool_config::context::{ContextIdentity, ContextRef, Presented, identities, require_distinct};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http::{Request, Uri};
 use kube_client::client::{AuthError, ConfigExt};
@@ -33,15 +33,18 @@ use arkham_tool_config::{GrantFragment, RewriteAdapted, decode, materialize_clie
 /// Prefix of Kubernetes-owned materialized grant blobs.
 pub const BLOB_PREFIX_KUBE: &str = "kube-";
 
+/// Context tag of one kube user: bearer and client certificate.
+pub const USER_TAG: &str = "kube-user";
+
+/// Context tag of one kube cluster: CA blob.
+const CLUSTER_TAG: &str = "kube-cluster";
+
 /// Kubernetes configuration adaptation failure.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
   /// Shared adapter failure.
   #[error(transparent)]
   Shared(#[from] arkham_tool_config::Error),
-  /// Configuration identity failure.
-  #[error(transparent)]
-  Config(Box<arkham_config::Error>),
   /// Kubeconfig loading failure.
   #[error("file rewrite `{}`: kubeconfig: {source}", file.display())]
   Kubeconfig {
@@ -65,19 +68,13 @@ pub enum Error {
 /// Result of Kubernetes configuration adaptation.
 pub type Result<T> = std::result::Result<T, Error>;
 
-impl From<arkham_config::Error> for Error {
-  fn from(source: arkham_config::Error) -> Self {
-    Self::Config(Box::new(source))
-  }
-}
-
 impl Error {
   /// Safe summary for the agent wrapper.
   #[must_use]
   pub fn registration_summary(&self) -> &'static str {
     match self {
       Self::Shared(source) => source.registration_summary(),
-      Self::Config(_) | Self::Kubeconfig { .. } | Self::RewriteYaml { .. } => "configuration could not be read",
+      Self::Kubeconfig { .. } | Self::RewriteYaml { .. } => "configuration could not be read",
     }
   }
 }
@@ -97,16 +94,8 @@ pub async fn adapt(source: &Path, content: &[u8], ca: &CertAuthority) -> Result<
     return Ok(None);
   };
   let opened = open_all(&config, source).await?;
-  let users = identities(&refs(
-    source,
-    AmbientProtocol::KubernetesUser,
-    opened.iter().map(|item| item.user.as_str()),
-  ))?;
-  let clusters = identities(&refs(
-    source,
-    AmbientProtocol::KubernetesCluster,
-    opened.iter().map(|item| item.cluster.as_str()),
-  ))?;
+  let users = identities(&refs(source, USER_TAG, opened.iter().map(|item| item.user.as_str())))?;
+  let clusters = identities(&refs(source, CLUSTER_TAG, opened.iter().map(|item| item.cluster.as_str())))?;
   let decoys = decoys(&opened, &users);
   require_presented(source, &opened, &users, &decoys)?;
   let (fragment, materialized) = render(source, &opened, &users, &clusters)?;
@@ -360,15 +349,11 @@ async fn echo_authorization(
   Ok(http::Response::new(header))
 }
 
-fn refs<'a>(file: &'a Path, protocol: AmbientProtocol, names: impl Iterator<Item = &'a str>) -> Vec<ContextRef<'a>> {
+fn refs<'a>(file: &'a Path, tag: &'static str, names: impl Iterator<Item = &'a str>) -> Vec<ContextRef<'a>> {
   let mut seen = BTreeSet::new();
   names
     .filter(|name| seen.insert(*name))
-    .map(|name| ContextRef {
-      source: file,
-      protocol,
-      name,
-    })
+    .map(|name| ContextRef { source: file, tag, name })
     .collect()
 }
 
@@ -595,7 +580,7 @@ users:
   fn user_id(name: &str) -> ContextIdentity {
     identities(&[ContextRef {
       source: Path::new(SOURCE),
-      protocol: AmbientProtocol::KubernetesUser,
+      tag: USER_TAG,
       name,
     }])
     .unwrap()

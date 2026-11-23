@@ -1,5 +1,7 @@
 //! Shared types and helpers for tool configuration adaptation.
 
+pub mod context;
+
 use arkham_config::config::{HostSshCfg, HostTlsCfg, IfMissing, RewriteFormat};
 use arkham_config::grants::GuestTlsMode;
 use arkham_paths::slug;
@@ -9,6 +11,8 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+use context::{AmbiguousContexts, ContextCollision, NameFault, PathFault};
 
 /// Tool configuration adaptation failure.
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +52,37 @@ pub enum Error {
   /// A byte rewrite position is outside its input.
   #[error("file rewrite position is outside the input")]
   RewriteBounds,
+  /// A source path cannot identify a context.
+  #[error("source path `{}` {fault}", path.display())]
+  ContextPathInvalid {
+    /// Path the adapter passed.
+    path: PathBuf,
+    /// Why the path was rejected.
+    #[source]
+    fault: PathFault,
+  },
+  /// A context name cannot become a label.
+  #[error("context `{name}` in `{}` on {tag} {fault}", path.display())]
+  ContextNameInvalid {
+    /// Path the adapter passed.
+    path: PathBuf,
+    /// Adapter tag of the context.
+    tag: &'static str,
+    /// Original name.
+    name: String,
+    /// Why the name was rejected.
+    #[source]
+    fault: NameFault,
+  },
+  /// Two different contexts share a label.
+  #[error(transparent)]
+  ContextCollision(Box<ContextCollision>),
+  /// Two contexts present the same host, port, and decoy bytes.
+  #[error(transparent)]
+  AmbiguousContexts(Box<AmbiguousContexts>),
+  /// A presented destination host is empty after trimming.
+  #[error("wire host is empty")]
+  WireHostEmpty,
 }
 
 /// Result of tool configuration adaptation.
@@ -59,7 +94,14 @@ impl Error {
   pub fn registration_summary(&self) -> &'static str {
     match self {
       Self::SerializeFragment { .. } | Self::SerializeDecoy { .. } => "session files could not be prepared",
-      Self::RewriteInvalid { .. } | Self::SourceInvalid { .. } | Self::RewriteBounds => "configuration could not be read",
+      Self::RewriteInvalid { .. }
+      | Self::SourceInvalid { .. }
+      | Self::RewriteBounds
+      | Self::ContextPathInvalid { .. }
+      | Self::ContextNameInvalid { .. }
+      | Self::ContextCollision(_)
+      | Self::AmbiguousContexts(_)
+      | Self::WireHostEmpty => "configuration could not be read",
     }
   }
 }

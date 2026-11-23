@@ -7,7 +7,6 @@
 pub mod cli;
 pub mod config;
 pub mod confine;
-pub mod context;
 mod error;
 pub mod grants;
 pub mod import;

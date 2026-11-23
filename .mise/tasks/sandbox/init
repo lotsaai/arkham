@@ -3,7 +3,7 @@
 #MISE tags=["sandbox"]
 #MISE dir="{{config_root}}"
 #MISE sources=["Smolfile", "mise.toml", "mise.lock", "mise.arch.toml", "Cargo.lock", "integration/compose.yaml", ".mise/tasks/sandbox/init", ".mise/sandbox-warm.sh", ".mise/sandbox-build.sh"]
-#MISE outputs=[".cache/sandbox/arkham-dev.checkpoint"]
+#MISE outputs=["target/sandbox/arkham-dev.checkpoint"]
 
 set -euo pipefail
 

@@ -10,8 +10,8 @@ ignored=$(taplo get --file-path .cargo/audit.toml --output-format json advisorie
 audit_status=0
 cargo audit --file Cargo.lock || audit_status=$?
 
-mkdir -p .cache
-audit_dir=$(mktemp -d "$MISE_CONFIG_ROOT/.cache/audit.XXXXXXXX")
+mkdir -p target
+audit_dir=$(mktemp -d "$MISE_CONFIG_ROOT/target/audit.XXXXXXXX")
 trap 'rm -rf -- "$audit_dir"' EXIT
 
 # cargo-audit omits ignored advisories from JSON; shadow its config for the rescan.

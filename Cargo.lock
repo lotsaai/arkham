@@ -726,8 +726,11 @@ dependencies = [
  "arkham-config",
  "arkham-paths",
  "base64 0.23.1",
+ "hex",
+ "pretty_assertions",
  "serde",
  "serde_yaml",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "toml 1.2.2+spec-1.1.0",
 ]

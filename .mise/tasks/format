@@ -7,11 +7,11 @@ source "$MISE_CONFIG_ROOT/.mise/sandbox.sh"
 
 # hk is git-only, and a jj workspace has no `.git` of its own. Bridge to the
 # jj repo's git backend so hk can resolve files, but keep every write out of
-# that shared repo: the scratch index and object store live under `.cache`,
+# that shared repo: the scratch index and object store live under `target`,
 # which both `.gitignore` and `.jjignore` exclude. Without this, hk's staging
 # would land in the repo that owns the git backend, outside this workspace.
 if jj root >/dev/null 2>&1 && [ -n "$(jj git root 2>/dev/null)" ] && ! git rev-parse --git-dir >/dev/null 2>&1; then
-  scratch="$MISE_CONFIG_ROOT/.cache/hk"
+  scratch="$MISE_CONFIG_ROOT/target/hk"
   mkdir -p "$scratch/objects"
   export GIT_DIR
   GIT_DIR=$(jj git root)
