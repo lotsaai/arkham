@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-#MISE description="Delete the warm checkpoint; the next routed task runs sandbox:init again"
+#MISE description="Delete the arkham-dev source machine and the warm checkpoint; the next routed task runs sandbox:init again"
 #MISE tags=["sandbox"]
 #MISE dir="{{config_root}}"
 
 set -euo pipefail
 
+if smolvm machine status --name arkham-dev; then
+  smolvm machine delete --name arkham-dev --force
+fi
 rm -f "${ARKHAM_SANDBOX:?set by mise.arch.toml}"
