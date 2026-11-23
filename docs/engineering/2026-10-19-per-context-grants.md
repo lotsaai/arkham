@@ -1,6 +1,6 @@
 # Per-context grant identity
 
-Several contexts in one kubeconfig, Talos config, NATS directory, or SSH config can share a destination and still be different subjects. This note is the contract for choosing among them. The helper in `arkham_config::context` names each subject and fails when two of them cannot be told apart on one destination. Adapter and proxy changes belong to #62, #63, #64, and #65.
+Several contexts in one kubeconfig, Talos config, NATS directory, or SSH config can share a destination and still be different subjects. This note is the contract for choosing among them. The helper in `arkham_tool_config::context` names each subject and fails when two of them cannot be told apart on one destination. Each adapter owns its tag. Adapter and proxy changes belong to #62, #63, #64, and #65.
 
 The choice uses the destination host and port, the client identity, and the decoy bytes. No new config key is added. The proxy terminates the guest session and opens its own upstream session. Real credentials stay on that upstream leg.
 

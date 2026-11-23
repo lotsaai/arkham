@@ -16,17 +16,20 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::RewriteFormat;
-use arkham_config::context::{AmbientProtocol, ContextRef, Presented, identities, require_distinct};
 use arkham_config::grants::{EndpointScope, HostPat, Scheme};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value, from_str};
 
+use arkham_tool_config::context::{ContextIdentity, ContextRef, Presented, identities, require_distinct};
 use arkham_tool_config::{GrantFragment, RewriteAdapted, decode, materialize_client_tls, render_decoy, render_fragment};
 
 /// Prefix used for Talos client material in the grants state directory.
 pub const BLOB_PREFIX_TALOS: &str = "talos-";
+
+/// Context tag of one Talos context.
+const CONTEXT_TAG: &str = "talos";
 
 /// A fatal Talos adaptation failure.
 #[derive(Debug, thiserror::Error)]
@@ -34,9 +37,6 @@ pub enum Error {
   /// A shared tool configuration failure.
   #[error(transparent)]
   Shared(#[from] arkham_tool_config::Error),
-  /// A configuration failure.
-  #[error(transparent)]
-  Config(Box<arkham_config::Error>),
   /// A certificate authority failure.
   #[error(transparent)]
   Pki(#[from] arkham_pki::Error),
@@ -60,19 +60,13 @@ pub enum Error {
   },
 }
 
-impl From<arkham_config::Error> for Error {
-  fn from(source: arkham_config::Error) -> Self {
-    Self::Config(Box::new(source))
-  }
-}
-
 impl Error {
   /// Return a safe registration failure category without source details.
   #[must_use]
   pub fn registration_summary(&self) -> &'static str {
     match self {
       Self::Shared(source) => source.registration_summary(),
-      Self::Config(_) | Self::Pki(_) | Self::ReadFile { .. } | Self::RewriteYaml { .. } => "configuration could not be read",
+      Self::Pki(_) | Self::ReadFile { .. } | Self::RewriteYaml { .. } => "configuration could not be read",
     }
   }
 }
@@ -250,7 +244,7 @@ pub fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Pat
     .iter()
     .map(|item| ContextRef {
       source,
-      protocol: AmbientProtocol::Talos,
+      tag: CONTEXT_TAG,
       name: item.name.as_str(),
     })
     .collect::<Vec<_>>();
@@ -443,7 +437,7 @@ fn client_key_pem(raw: &[u8]) -> Vec<u8> {
 /// # Errors
 ///
 /// Returns an error when the fragment fails to serialize.
-fn one_grant(source: &Path, item: &Prepared, id: &arkham_config::context::ContextIdentity, decoy: &str) -> Result<RewriteAdapted> {
+fn one_grant(source: &Path, item: &Prepared, id: &ContextIdentity, decoy: &str) -> Result<RewriteAdapted> {
   let label = &id.label;
   let value = String::from_utf8_lossy(&item.crt).into_owned();
   let (tls, materialized) = materialize_client_tls(label, Some((item.crt.clone(), client_key_pem(&item.key))), Some(item.ca.clone()));
@@ -474,7 +468,7 @@ fn one_grant(source: &Path, item: &Prepared, id: &arkham_config::context::Contex
 #[cfg(test)]
 mod tests {
   use super::*;
-  use arkham_tool_config::GRANTS_STATE_DIR;
+  use arkham_tool_config::{Error as SharedError, GRANTS_STATE_DIR};
   use rustls::pki_types::pem::PemObject as _;
   use std::fmt::Write as _;
 
@@ -507,7 +501,7 @@ mod tests {
   fn prod_label() -> String {
     identities(&[ContextRef {
       source: Path::new(SOURCE),
-      protocol: AmbientProtocol::Talos,
+      tag: CONTEXT_TAG,
       name: "prod",
     }])
     .unwrap()
@@ -709,10 +703,10 @@ mod tests {
     );
     let dir = tempfile::tempdir().unwrap();
     let err = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).expect_err("shared endpoint");
-    let Error::Config(source) = err else {
+    let Error::Shared(source) = err else {
       panic!("expected the context collision, got {err}");
     };
-    assert!(matches!(source.as_ref(), arkham_config::Error::AmbiguousContexts(_)), "{source}");
+    assert!(matches!(source, SharedError::AmbiguousContexts(_)), "{source}");
   }
 
   #[test]

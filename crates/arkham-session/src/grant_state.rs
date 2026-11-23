@@ -137,7 +137,8 @@ mod tests {
 
   #[tokio::test]
   async fn state_writes_and_stale_ones_prune() {
-    use arkham_config::context::{AmbientProtocol, ContextRef, identities};
+    use arkham_tool_config::context::{ContextRef, identities};
+    use arkham_tool_kube::USER_TAG;
     let source = Path::new("/home/ivan/.kube/k3s.yaml");
     let doc = crate::test_support::KUBE_DOC
       .replace(
@@ -152,7 +153,7 @@ mod tests {
     let adapted = arkham_tool_kube::adapt(source, doc.as_bytes(), &ca).await.unwrap().unwrap();
     let label = identities(&[ContextRef {
       source,
-      protocol: AmbientProtocol::KubernetesUser,
+      tag: USER_TAG,
       name: "admin",
     }])
     .unwrap()

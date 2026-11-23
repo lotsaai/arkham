@@ -1,44 +1,16 @@
 //! Per-context grant identity.
 //!
-//! [`identities`] names a subject. [`require_distinct`] rejects two subjects that share a destination and a decoy. [`crate::grants::Grant::matches`] stays the host matcher.
+//! [`identities`] names a subject. [`require_distinct`] rejects two subjects that share a destination and a decoy. Each adapter
+//! owns its tag (`kube-user`, `talos`); this module knows none of them.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use arkham_config::config::fake_for;
 use sha2::{Digest as _, Sha256};
-use strum::{Display, IntoStaticStr};
 
-use crate::config::fake_for;
-use crate::error::Error;
-
-/// Protocol tag stored in a context label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, IntoStaticStr)]
-pub enum AmbientProtocol {
-  /// Bearer and client certificate for one kube user. Tag `kube-user`.
-  #[strum(serialize = "kube-user")]
-  KubernetesUser,
-  /// CA blob for one kube cluster. Tag `kube-cluster`.
-  #[strum(serialize = "kube-cluster")]
-  KubernetesCluster,
-  /// One Talos context. Tag `talos`.
-  #[strum(serialize = "talos")]
-  Talos,
-  /// One NATS context. Tag `nats`.
-  #[strum(serialize = "nats")]
-  Nats,
-  /// One SSH host block. Tag `ssh`.
-  #[strum(serialize = "ssh")]
-  Ssh,
-}
-
-impl AmbientProtocol {
-  /// Stable tag stored in the label and in the canonical bytes.
-  #[must_use]
-  pub fn tag(self) -> &'static str {
-    <&'static str>::from(self)
-  }
-}
+use crate::{Error, Result};
 
 /// Why a source path cannot identify a context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -70,8 +42,8 @@ pub enum NameFault {
 pub struct ContextRef<'a> {
   /// File the adapter read.
   pub source: &'a Path,
-  /// Protocol this name belongs to.
-  pub protocol: AmbientProtocol,
+  /// Adapter tag stored in the label and in the canonical bytes.
+  pub tag: &'static str,
   /// Name as it appears in the source file.
   pub name: &'a str,
 }
@@ -79,8 +51,8 @@ pub struct ContextRef<'a> {
 /// Label, env, and decoy for one subject.
 #[derive(Clone)]
 pub struct ContextIdentity {
-  /// Protocol this identity was built with.
-  pub protocol: AmbientProtocol,
+  /// Tag this identity was built with.
+  pub tag: &'static str,
   /// Path passed to [`identities`].
   pub source: PathBuf,
   /// Original name, including case and punctuation.
@@ -93,7 +65,7 @@ pub struct ContextIdentity {
 impl fmt::Debug for ContextIdentity {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("ContextIdentity")
-      .field("protocol", &self.protocol)
+      .field("tag", &self.tag)
       .field("source", &self.source)
       .field("name", &self.name)
       .field("label", &self.label)
@@ -103,13 +75,13 @@ impl fmt::Debug for ContextIdentity {
 }
 
 impl ContextIdentity {
-  /// Env name. [`crate::config::fake_for`] seed for this subject.
+  /// Env name. [`fake_for`] seed for this subject.
   #[must_use]
   pub fn env(&self) -> String {
     self.label.replace('-', "_").to_ascii_uppercase()
   }
 
-  /// Bearer, password, or token. [`crate::config::fake_for`] of [`Self::env`] with no pattern.
+  /// Bearer, password, or token. [`fake_for`] of [`Self::env`] with no pattern.
   #[must_use]
   pub fn secret(&self) -> String {
     fake_for(&self.env(), None)
@@ -138,8 +110,8 @@ pub struct Presented<'a> {
 /// One context named by a collision or an ambiguity error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmbiguousParty {
-  /// Protocol of that context.
-  pub protocol: AmbientProtocol,
+  /// Tag of that context.
+  pub tag: &'static str,
   /// Original name.
   pub name: String,
   /// Source path.
@@ -148,7 +120,7 @@ pub struct AmbiguousParty {
 
 impl fmt::Display for AmbiguousParty {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "`{}` ({}, {})", self.name, self.source.display(), self.protocol)
+    write!(f, "`{}` ({}, {})", self.name, self.source.display(), self.tag)
   }
 }
 
@@ -174,21 +146,21 @@ pub struct AmbiguousContexts {
   pub port: u16,
 }
 
-/// Labels and decoy seeds for `refs`, in input order. A repeated path, protocol, and name keeps the first record.
+/// Labels and decoy seeds for `refs`, in input order. A repeated path, tag, and name keeps the first record.
 ///
 /// # Errors
 ///
 /// Returns [`Error::ContextPathInvalid`], [`Error::ContextNameInvalid`], or [`Error::ContextCollision`].
-pub fn identities(refs: &[ContextRef<'_>]) -> Result<Vec<ContextIdentity>, Error> {
+pub fn identities(refs: &[ContextRef<'_>]) -> Result<Vec<ContextIdentity>> {
   let mut built = Vec::with_capacity(refs.len());
   for reference in refs {
     if built
       .iter()
-      .any(|existing| same_subject(existing, reference.protocol, reference.source, reference.name))
+      .any(|existing| same_subject(existing, reference.tag, reference.source, reference.name))
     {
       continue;
     }
-    built.push(build_identity(reference.source, reference.protocol, reference.name)?);
+    built.push(build_identity(reference.source, reference.tag, reference.name)?);
   }
   ensure_distinct(&built)?;
   Ok(built)
@@ -199,7 +171,7 @@ pub fn identities(refs: &[ContextRef<'_>]) -> Result<Vec<ContextIdentity>, Error
 /// # Errors
 ///
 /// Returns [`Error::WireHostEmpty`] or [`Error::AmbiguousContexts`]. The same identity repeated is success. Ports are not defaulted.
-pub fn require_distinct(presented: &[Presented<'_>]) -> Result<(), Error> {
+pub fn require_distinct(presented: &[Presented<'_>]) -> Result<()> {
   let mut groups: BTreeMap<(String, u16, &[u8]), Vec<&ContextIdentity>> = BTreeMap::new();
   for item in presented {
     let host = item.host.trim().to_ascii_lowercase();
@@ -209,7 +181,7 @@ pub fn require_distinct(presented: &[Presented<'_>]) -> Result<(), Error> {
     let group = groups.entry((host, item.port, item.decoy)).or_default();
     if group
       .iter()
-      .any(|existing| same_subject(existing, item.identity.protocol, &item.identity.source, &item.identity.name))
+      .any(|existing| same_subject(existing, item.identity.tag, &item.identity.source, &item.identity.name))
     {
       continue;
     }
@@ -225,10 +197,10 @@ pub fn require_distinct(presented: &[Presented<'_>]) -> Result<(), Error> {
   Ok(())
 }
 
-fn ensure_distinct(built: &[ContextIdentity]) -> Result<(), Error> {
+fn ensure_distinct(built: &[ContextIdentity]) -> Result<()> {
   for (index, identity) in built.iter().enumerate() {
     for previous in built.iter().take(index) {
-      if same_subject(previous, identity.protocol, &identity.source, &identity.name) || previous.label != identity.label {
+      if same_subject(previous, identity.tag, &identity.source, &identity.name) || previous.label != identity.label {
         continue;
       }
       let parties = parties_from([previous, identity]);
@@ -241,23 +213,23 @@ fn ensure_distinct(built: &[ContextIdentity]) -> Result<(), Error> {
   Ok(())
 }
 
-fn same_subject(existing: &ContextIdentity, protocol: AmbientProtocol, source: &Path, name: &str) -> bool {
-  existing.protocol == protocol && existing.source.as_path() == source && existing.name == name
+fn same_subject(existing: &ContextIdentity, tag: &str, source: &Path, name: &str) -> bool {
+  existing.tag == tag && existing.source.as_path() == source && existing.name == name
 }
 
-fn build_identity(source: &Path, protocol: AmbientProtocol, name: &str) -> Result<ContextIdentity, Error> {
+fn build_identity(source: &Path, tag: &'static str, name: &str) -> Result<ContextIdentity> {
   let path = path_text(source)?;
   if name.is_empty() {
-    return Err(name_error(source, protocol, name, NameFault::Empty));
+    return Err(name_error(source, tag, name, NameFault::Empty));
   }
   if name.contains('\u{001f}') {
-    return Err(name_error(source, protocol, name, NameFault::UnitSeparator));
+    return Err(name_error(source, tag, name, NameFault::UnitSeparator));
   }
-  let canonical = canonical_bytes(protocol.tag(), path, name);
+  let canonical = canonical_bytes(tag, path, name);
   let key_seed: [u8; 32] = Sha256::digest(&canonical).into();
-  let label = format!("{}-{}", protocol.tag(), hex::encode(&key_seed[..16]));
+  let label = format!("{tag}-{}", hex::encode(&key_seed[..16]));
   Ok(ContextIdentity {
-    protocol,
+    tag,
     source: source.to_path_buf(),
     name: name.to_string(),
     label,
@@ -265,7 +237,7 @@ fn build_identity(source: &Path, protocol: AmbientProtocol, name: &str) -> Resul
   })
 }
 
-fn path_text(source: &Path) -> Result<&str, Error> {
+fn path_text(source: &Path) -> Result<&str> {
   if source.as_os_str().is_empty() {
     return Err(Error::ContextPathInvalid {
       path: source.to_path_buf(),
@@ -287,10 +259,10 @@ fn path_text(source: &Path) -> Result<&str, Error> {
   Ok(path)
 }
 
-fn name_error(source: &Path, protocol: AmbientProtocol, name: &str, fault: NameFault) -> Error {
+fn name_error(source: &Path, tag: &'static str, name: &str, fault: NameFault) -> Error {
   Error::ContextNameInvalid {
     path: source.to_path_buf(),
-    protocol,
+    tag,
     name: name.to_string(),
     fault,
   }
@@ -313,14 +285,14 @@ fn parties_from<'a>(identities: impl IntoIterator<Item = &'a ContextIdentity>) -
       .source
       .cmp(&right.source)
       .then_with(|| left.name.cmp(&right.name))
-      .then_with(|| left.protocol.tag().cmp(right.protocol.tag()))
+      .then_with(|| left.tag.cmp(right.tag))
   });
   parties
 }
 
 fn party_from(identity: &ContextIdentity) -> AmbiguousParty {
   AmbiguousParty {
-    protocol: identity.protocol,
+    tag: identity.tag,
     name: identity.name.clone(),
     source: identity.source.clone(),
   }
@@ -336,33 +308,32 @@ mod tests {
   use std::os::unix::ffi::OsStrExt;
   use std::path::{Path, PathBuf};
 
+  use arkham_config::config::fake_for;
   use pretty_assertions::assert_eq;
 
-  use super::{
-    AmbientProtocol, ContextIdentity, ContextRef, NameFault, PathFault, Presented, ensure_distinct, identities, require_distinct,
-  };
+  use super::{ContextIdentity, ContextRef, NameFault, PathFault, Presented, ensure_distinct, identities, require_distinct};
   use crate::Error;
-  use crate::config::fake_for;
+
+  const SSH: &str = "ssh";
+  const KUBE_USER: &str = "kube-user";
+  const KUBE_CLUSTER: &str = "kube-cluster";
+  const TALOS: &str = "talos";
+  const NATS: &str = "nats";
 
   const SSH_SOURCE: &str = "/home/ivan/.ssh/config";
   const SSH_LABEL: &str = "ssh-13786934f8941a5f07bb7b5b084cc9e8";
   const SSH_ENV: &str = "SSH_13786934F8941A5F07BB7B5B084CC9E8";
   const SSH_SEED: &str = "13786934f8941a5f07bb7b5b084cc9e80fb9db120fd9f3cb873d4be2a9c005ee";
 
-  fn one(source: &str, protocol: AmbientProtocol, name: &str) -> ContextIdentity {
+  fn one(source: &str, tag: &'static str, name: &str) -> ContextIdentity {
     let path = PathBuf::from(source);
-    let ids = identities(&[ContextRef {
-      source: &path,
-      protocol,
-      name,
-    }])
-    .unwrap();
+    let ids = identities(&[ContextRef { source: &path, tag, name }]).unwrap();
     ids.into_iter().next().unwrap()
   }
 
-  fn forged(source: &str, protocol: AmbientProtocol, name: &str, label: &str) -> ContextIdentity {
+  fn forged(source: &str, tag: &'static str, name: &str, label: &str) -> ContextIdentity {
     ContextIdentity {
-      protocol,
+      tag,
       source: PathBuf::from(source),
       name: name.to_string(),
       label: label.to_string(),
@@ -372,7 +343,7 @@ mod tests {
 
   #[test]
   fn ssh_git_label_is_the_digest() {
-    let identity = one(SSH_SOURCE, AmbientProtocol::Ssh, "git");
+    let identity = one(SSH_SOURCE, SSH, "git");
     assert_eq!(identity.label, SSH_LABEL);
     assert_eq!(identity.env(), SSH_ENV);
     assert_eq!(hex::encode(identity.key_seed()), SSH_SEED);
@@ -383,8 +354,8 @@ mod tests {
 
   #[test]
   fn identities_are_stable() {
-    let first = one("/home/ivan/.kube/config", AmbientProtocol::KubernetesUser, "ivan");
-    let second = one("/home/ivan/.kube/config", AmbientProtocol::KubernetesUser, "ivan");
+    let first = one("/home/ivan/.kube/config", KUBE_USER, "ivan");
+    let second = one("/home/ivan/.kube/config", KUBE_USER, "ivan");
     assert_eq!(first.label, second.label);
     assert_eq!(first.env(), second.env());
     assert_eq!(first.secret(), second.secret());
@@ -394,9 +365,9 @@ mod tests {
   #[test]
   fn case_and_punctuation_stay_distinct() {
     let path = "/home/ivan/.kube/config";
-    let lower = one(path, AmbientProtocol::KubernetesUser, "prod");
-    let upper = one(path, AmbientProtocol::KubernetesUser, "Prod");
-    let punct = one(path, AmbientProtocol::KubernetesUser, "prod!");
+    let lower = one(path, KUBE_USER, "prod");
+    let upper = one(path, KUBE_USER, "Prod");
+    let punct = one(path, KUBE_USER, "prod!");
     assert_ne!(lower.label, upper.label);
     assert_ne!(lower.label, punct.label);
     assert_eq!(lower.name, "prod");
@@ -405,16 +376,16 @@ mod tests {
 
   #[test]
   fn path_is_part_of_the_digest() {
-    let left = one("/home/a/.kube/config", AmbientProtocol::KubernetesUser, "prod");
-    let right = one("/home/b/.kube/config", AmbientProtocol::KubernetesUser, "prod");
+    let left = one("/home/a/.kube/config", KUBE_USER, "prod");
+    let right = one("/home/b/.kube/config", KUBE_USER, "prod");
     assert_ne!(left.label, right.label);
   }
 
   #[test]
-  fn protocol_is_part_of_the_digest() {
+  fn tag_is_part_of_the_digest() {
     let path = "/home/ivan/.kube/config";
-    let user = one(path, AmbientProtocol::KubernetesUser, "prod");
-    let cluster = one(path, AmbientProtocol::KubernetesCluster, "prod");
+    let user = one(path, KUBE_USER, "prod");
+    let cluster = one(path, KUBE_CLUSTER, "prod");
     assert_ne!(user.label, cluster.label);
     assert!(user.label.starts_with("kube-user-"), "{}", user.label);
     assert!(cluster.label.starts_with("kube-cluster-"), "{}", cluster.label);
@@ -426,12 +397,12 @@ mod tests {
     let ids = identities(&[
       ContextRef {
         source: path.as_path(),
-        protocol: AmbientProtocol::KubernetesUser,
+        tag: KUBE_USER,
         name: "prod",
       },
       ContextRef {
         source: path.as_path(),
-        protocol: AmbientProtocol::KubernetesUser,
+        tag: KUBE_USER,
         name: "prod",
       },
     ])
@@ -443,7 +414,7 @@ mod tests {
   #[test]
   fn eks_arn_name_gets_a_fixed_label() {
     let name = "arn:aws:eks:us-east-1:123456789012:cluster/prod";
-    let identity = one("/home/ivan/.kube/config", AmbientProtocol::KubernetesUser, name);
+    let identity = one("/home/ivan/.kube/config", KUBE_USER, name);
     assert_eq!(identity.name, name);
     assert_eq!(identity.label.len(), 42);
     assert!(identity.label.starts_with("kube-user-"), "{}", identity.label);
@@ -457,19 +428,19 @@ mod tests {
     let path = Path::new("/home/ivan/.talos/config");
     let err = identities(&[ContextRef {
       source: path,
-      protocol: AmbientProtocol::Talos,
+      tag: TALOS,
       name: "",
     }])
     .unwrap_err();
     match err {
       Error::ContextNameInvalid {
         path: got,
-        protocol,
+        tag,
         name,
         fault,
       } => {
         assert_eq!(got.as_path(), path);
-        assert_eq!(protocol, AmbientProtocol::Talos);
+        assert_eq!(tag, TALOS);
         assert_eq!(name, "");
         assert_eq!(fault, NameFault::Empty);
       }
@@ -483,7 +454,7 @@ mod tests {
     let name = "pro\u{001f}d";
     let err = identities(&[ContextRef {
       source: path,
-      protocol: AmbientProtocol::Talos,
+      tag: TALOS,
       name,
     }])
     .unwrap_err();
@@ -507,7 +478,7 @@ mod tests {
     let path = Path::new("");
     let err = identities(&[ContextRef {
       source: path,
-      protocol: AmbientProtocol::Ssh,
+      tag: SSH,
       name: "git",
     }])
     .unwrap_err();
@@ -525,7 +496,7 @@ mod tests {
     let path = Path::new("/tmp/\u{001f}/config");
     let err = identities(&[ContextRef {
       source: path,
-      protocol: AmbientProtocol::Nats,
+      tag: NATS,
       name: "demo",
     }])
     .unwrap_err();
@@ -543,7 +514,7 @@ mod tests {
     let path = Path::new(OsStr::from_bytes(b"/tmp/\xff"));
     let err = identities(&[ContextRef {
       source: path,
-      protocol: AmbientProtocol::Talos,
+      tag: TALOS,
       name: "prod",
     }])
     .unwrap_err();
@@ -559,8 +530,8 @@ mod tests {
   #[test]
   fn shared_label_names_both_contexts() {
     let source = "/home/ivan/.kube/config";
-    let prod = forged(source, AmbientProtocol::KubernetesUser, "prod", "kube-user-shared");
-    let staging = forged(source, AmbientProtocol::KubernetesUser, "staging", "kube-user-shared");
+    let prod = forged(source, KUBE_USER, "prod", "kube-user-shared");
+    let staging = forged(source, KUBE_USER, "staging", "kube-user-shared");
     let forward = ensure_distinct(&[prod.clone(), staging.clone()]).unwrap_err();
     let reverse = ensure_distinct(&[staging, prod]).unwrap_err();
     let expected =
@@ -571,8 +542,8 @@ mod tests {
 
   #[test]
   fn different_decoy_bytes_on_one_destination_are_ok() {
-    let git = one(SSH_SOURCE, AmbientProtocol::Ssh, "git");
-    let other = one(SSH_SOURCE, AmbientProtocol::Ssh, "git.example");
+    let git = one(SSH_SOURCE, SSH, "git");
+    let other = one(SSH_SOURCE, SSH, "git.example");
     require_distinct(&[
       Presented {
         identity: &git,
@@ -592,8 +563,8 @@ mod tests {
 
   #[test]
   fn same_decoy_on_one_destination_names_both() {
-    let git = one(SSH_SOURCE, AmbientProtocol::Ssh, "git");
-    let other = one(SSH_SOURCE, AmbientProtocol::Ssh, "git.example");
+    let git = one(SSH_SOURCE, SSH, "git");
+    let other = one(SSH_SOURCE, SSH, "git.example");
     let err = require_distinct(&[
       Presented {
         identity: &other,
@@ -617,9 +588,9 @@ mod tests {
 
   #[test]
   fn three_contexts_join_with_commas() {
-    let lab = one("/home/ivan/.talos/config", AmbientProtocol::Talos, "lab");
-    let prod = one("/home/ivan/.talos/config", AmbientProtocol::Talos, "prod");
-    let staging = one("/home/ivan/.talos/config", AmbientProtocol::Talos, "staging");
+    let lab = one("/home/ivan/.talos/config", TALOS, "lab");
+    let prod = one("/home/ivan/.talos/config", TALOS, "prod");
+    let staging = one("/home/ivan/.talos/config", TALOS, "staging");
     let err = require_distinct(&[
       Presented {
         identity: &staging,
@@ -649,7 +620,7 @@ mod tests {
 
   #[test]
   fn same_identity_repeated_is_ok() {
-    let git = one(SSH_SOURCE, AmbientProtocol::Ssh, "git");
+    let git = one(SSH_SOURCE, SSH, "git");
     require_distinct(&[
       Presented {
         identity: &git,
@@ -669,7 +640,7 @@ mod tests {
 
   #[test]
   fn same_identity_on_two_destinations_is_ok() {
-    let git = one(SSH_SOURCE, AmbientProtocol::Ssh, "git");
+    let git = one(SSH_SOURCE, SSH, "git");
     require_distinct(&[
       Presented {
         identity: &git,
@@ -689,8 +660,8 @@ mod tests {
 
   #[test]
   fn brackets_stay_on_the_host() {
-    let git = one(SSH_SOURCE, AmbientProtocol::Ssh, "git");
-    let other = one(SSH_SOURCE, AmbientProtocol::Ssh, "git.example");
+    let git = one(SSH_SOURCE, SSH, "git");
+    let other = one(SSH_SOURCE, SSH, "git.example");
     let err = require_distinct(&[
       Presented {
         identity: &git,
@@ -711,7 +682,7 @@ mod tests {
 
   #[test]
   fn empty_host_fails() {
-    let git = one(SSH_SOURCE, AmbientProtocol::Ssh, "git");
+    let git = one(SSH_SOURCE, SSH, "git");
     let err = require_distinct(&[Presented {
       identity: &git,
       host: " \t ",

@@ -10,7 +10,7 @@
 if [[ -n "${ARKHAM_SANDBOX:-}" ]]; then
   sandbox_checkout=/home/eng/github/lotsaai/arkham
   sandbox_source=arkham-dev
-  mkdir -p "$MISE_CONFIG_ROOT/.cache/sandbox"
+  mkdir -p "$MISE_CONFIG_ROOT/target/sandbox"
   # Concurrent tasks wait for one refresh and one source start; the rest find them ready.
   (
     flock 9
@@ -21,7 +21,7 @@ if [[ -n "${ARKHAM_SANDBOX:-}" ]]; then
     if [[ "$(smolvm machine status --name "$sandbox_source" --json | jq -r .state)" != running ]]; then
       smolvm machine start --name "$sandbox_source"
     fi
-  ) 9>"$MISE_CONFIG_ROOT/.cache/sandbox/init.lock"
+  ) 9>"$MISE_CONFIG_ROOT/target/sandbox/init.lock"
   smolvm machine exec --stream --name "$sandbox_source" --user root -- \
     su - eng -c "cd $sandbox_checkout && mise exec -- bash .mise/sandbox-build.sh"
   sandbox_run="arkham-run-$$"
