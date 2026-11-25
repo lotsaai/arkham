@@ -2,7 +2,7 @@
 #MISE description="Create the arkham-dev machine, warm every cache, and checkpoint it as the routed tasks' source"
 #MISE tags=["sandbox"]
 #MISE dir="{{config_root}}"
-#MISE sources=["Smolfile", "mise.toml", "mise.lock", "mise.arch.toml", "Cargo.lock", "integration/compose.yaml", ".mise/tasks/sandbox/init", ".mise/sandbox-warm.sh", ".mise/sandbox-build.sh"]
+#MISE sources=["Smolfile", "mise.toml", "mise.lock", "mise.arch.toml", "mise.arch.lock", "integration/compose.yaml", ".mise/tasks/sandbox/init", ".mise/sandbox-warm.sh"]
 #MISE outputs=["target/sandbox/arkham-dev.checkpoint"]
 
 set -euo pipefail

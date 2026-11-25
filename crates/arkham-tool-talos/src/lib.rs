@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use arkham_config::config::RewriteFormat;
-use arkham_config::grants::{EndpointScope, HostPat, Scheme};
+use arkham_config::grants::{EndpointScope, HostPat};
 use arkham_pki::ca::{CertAuthority, load_or_generate_client_pair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
@@ -74,79 +74,6 @@ impl Error {
 /// A result produced by Talos adaptation.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Why one context did not become a grant. The active context turns a skip
-/// into an invalid-rewrite error. Every other context is warned and omitted.
-#[derive(Debug)]
-pub enum TalosSkip {
-  /// The context lists no endpoints.
-  NoEndpoints {
-    /// Context name.
-    name: String,
-  },
-  /// The context has no client pair to substitute.
-  MissingIdentity {
-    /// Context name.
-    name: String,
-  },
-  /// Omni or another service-account `auth` block. Out of scope.
-  Auth {
-    /// Context name.
-    name: String,
-  },
-  /// An endpoint that is not TLS.
-  NotTls {
-    /// Context name.
-    name: String,
-    /// Endpoint text from the file.
-    endpoint: String,
-  },
-  /// An endpoint that does not parse as an allow entry.
-  BadEndpoint {
-    /// Context name.
-    name: String,
-    /// Endpoint text from the file.
-    endpoint: String,
-    /// Parser detail.
-    detail: String,
-  },
-}
-
-impl std::fmt::Display for TalosSkip {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      Self::NoEndpoints { name } => write!(f, "context `{name}` states no `endpoints`"),
-      Self::MissingIdentity { name } => write!(f, "context `{name}` misses `ca`, `crt`, or `key`: nothing to substitute"),
-      Self::Auth { name } => write!(
-        f,
-        "context `{name}` uses alternative `auth` (Omni/SideroV1): it carries no substitutable client pair"
-      ),
-      Self::NotTls { name, endpoint } => write!(f, "context `{name}` endpoint `{endpoint}` is not TLS: the Talos API is TLS-only"),
-      Self::BadEndpoint { name, endpoint, detail } => write!(f, "context `{name}` endpoint `{endpoint}` is not an allow entry: {detail}"),
-    }
-  }
-}
-
-impl TalosSkip {
-  fn name(&self) -> &str {
-    match self {
-      Self::NoEndpoints { name }
-      | Self::MissingIdentity { name }
-      | Self::Auth { name }
-      | Self::NotTls { name, .. }
-      | Self::BadEndpoint { name, .. } => name,
-    }
-  }
-}
-
-/// Grants derived from one talosconfig, plus the contexts that were skipped.
-#[derive(Debug)]
-pub struct TalosAdapted {
-  /// One grant per context that carried a substitutable client pair.
-  pub grants: Vec<RewriteAdapted>,
-  /// Contexts that were named and left out.
-  pub skipped: Vec<TalosSkip>,
-}
-
 /// A talosconfig document; unknown fields ignored.
 #[derive(Debug, Deserialize, Default)]
 struct TalosDoc {
@@ -173,7 +100,7 @@ struct TalosContext {
   /// Base64 client key.
   #[serde(default)]
   key: String,
-  /// Alternative auth (Omni/SideroV1): detected so it is skipped or rejected.
+  /// Alternative auth (Omni/SideroV1): no client pair to substitute.
   #[serde(default)]
   auth: Option<Mapping>,
 }
@@ -193,20 +120,17 @@ struct Allowed {
   scope: EndpointScope,
 }
 
-/// Classification of one context.
-enum Prep {
-  Grant(Prepared),
-  Skip(TalosSkip),
-}
-
-/// Map a talosconfig onto one grant per context and one decoy document.
+/// Map a talosconfig onto one grant per context and one decoy document. A
+/// context without endpoints or a client pair, or with an `auth` block, gets
+/// no grant and loses its real material in the decoy.
 ///
 /// # Errors
 ///
 /// Returns an error when the document does not parse, the active context is
-/// missing, unknown, or itself skipped, a certificate field is not base64,
-/// or two granted contexts cannot be told apart on one destination.
-pub fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Path) -> Result<TalosAdapted> {
+/// missing, unknown, or has nothing to substitute, an endpoint is not an
+/// allow entry, a certificate field is not base64, or two granted contexts
+/// cannot be told apart on one destination.
+pub fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Path) -> Result<Vec<RewriteAdapted>> {
   let text = String::from_utf8_lossy(content);
   let doc: TalosDoc = from_str(&text).map_err(|err| Error::RewriteYaml {
     file: source.to_path_buf(),
@@ -226,15 +150,19 @@ pub fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Pat
     return Err(invalid(format!("unknown context `{}`", doc.context)));
   }
   let mut prepared = Vec::new();
-  let mut skipped = Vec::new();
+  let mut stripped = Vec::new();
   for (name, context) in &doc.contexts {
     match prepare(source, name, context)? {
-      Prep::Skip(skip) if name == &doc.context => return Err(invalid(skip.to_string())),
-      Prep::Skip(skip) => {
-        tracing::warn!(%skip, "talos context skipped");
-        skipped.push(skip);
+      Some(item) => prepared.push(item),
+      None if name == &doc.context => {
+        return Err(invalid(format!(
+          "context `{name}` has no endpoints, no `ca`/`crt`/`key` pair, or an `auth` block: nothing to substitute"
+        )));
       }
-      Prep::Grant(item) => prepared.push(item),
+      None => {
+        tracing::warn!(context = %name, "talos context has no endpoints or client pair, or uses `auth`: no grant");
+        stripped.push(name.as_str());
+      }
     }
   }
   if prepared.is_empty() {
@@ -274,7 +202,7 @@ pub fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Pat
     }
   }
   require_distinct(&presented)?;
-  let decoy = decoy_doc(&text, source, ca, &prepared, &guest_certs, &guest_keys, &skipped)?;
+  let decoy = decoy_doc(&text, source, ca, &prepared, &guest_certs, &guest_keys, &stripped)?;
   if ids.len() != prepared.len() {
     return Err(invalid("talos context identities did not cover every granted context".to_string()));
   }
@@ -282,64 +210,45 @@ pub fn adapt(source: &Path, content: &[u8], ca: &CertAuthority, guests_dir: &Pat
   for (item, id) in prepared.iter().zip(ids.iter()) {
     grants.push(one_grant(source, item, id, &decoy)?);
   }
-  Ok(TalosAdapted { grants, skipped })
+  Ok(grants)
 }
 
-/// Validate one context. A bad base64 field fails the file. Every other
-/// problem is a skip the caller turns into an error only for the active name.
+/// Validate one context. `None` when it has nothing to substitute. A bad
+/// base64 field or an endpoint that is not an allow entry fails the file.
 ///
 /// # Errors
 ///
-/// Returns an error when `ca`, `crt`, or `key` is present and not base64.
-fn prepare(source: &Path, name: &str, context: &TalosContext) -> Result<Prep> {
-  if context.endpoints.is_empty() {
-    return Ok(Prep::Skip(TalosSkip::NoEndpoints { name: name.to_string() }));
-  }
-  if context.auth.is_some() {
-    return Ok(Prep::Skip(TalosSkip::Auth { name: name.to_string() }));
+/// Returns an error when `ca`, `crt`, or `key` is present and not base64, or
+/// an endpoint does not parse.
+fn prepare(source: &Path, name: &str, context: &TalosContext) -> Result<Option<Prepared>> {
+  if context.endpoints.is_empty() || context.auth.is_some() {
+    return Ok(None);
   }
   let crt = decode(source, RewriteFormat::Talos, Some(context.crt.as_str()), "crt")?;
   let key = decode(source, RewriteFormat::Talos, Some(context.key.as_str()), "key")?;
   let ca_bundle = decode(source, RewriteFormat::Talos, Some(context.ca.as_str()), "ca")?;
   let (Some(crt), Some(key), Some(ca_bundle)) = (crt, key, ca_bundle) else {
-    return Ok(Prep::Skip(TalosSkip::MissingIdentity { name: name.to_string() }));
+    return Ok(None);
   };
-  match allows(name, context) {
-    Ok(parsed) => Ok(Prep::Grant(Prepared {
-      name: name.to_string(),
-      crt,
-      key,
-      ca: ca_bundle,
-      allows: parsed,
-    })),
-    Err(skip) => Ok(Prep::Skip(skip)),
-  }
-}
-
-/// One allow entry per endpoint, `https://`-normalized and validated.
-fn allows(name: &str, context: &TalosContext) -> std::result::Result<Vec<Allowed>, TalosSkip> {
-  let mut parsed = Vec::new();
+  let mut allows = Vec::with_capacity(context.endpoints.len());
   for endpoint in &context.endpoints {
     let entry = normalize_endpoint(endpoint);
-    let scope = match entry.parse::<EndpointScope>() {
-      Ok(scope) => scope,
-      Err(detail) => {
-        return Err(TalosSkip::BadEndpoint {
-          name: name.to_string(),
-          endpoint: endpoint.clone(),
-          detail,
-        });
-      }
-    };
-    if scope.scheme != Scheme::Https {
-      return Err(TalosSkip::NotTls {
-        name: name.to_string(),
-        endpoint: endpoint.clone(),
-      });
-    }
-    parsed.push(Allowed { entry, scope });
+    let scope = entry.parse::<EndpointScope>().map_err(|detail| {
+      Error::Shared(arkham_tool_config::Error::RewriteInvalid {
+        file: source.to_path_buf(),
+        format: RewriteFormat::Talos,
+        detail: format!("context `{name}` endpoint `{endpoint}` is not an allow entry: {detail}"),
+      })
+    })?;
+    allows.push(Allowed { entry, scope });
   }
-  Ok(parsed)
+  Ok(Some(Prepared {
+    name: name.to_string(),
+    crt,
+    key,
+    ca: ca_bundle,
+    allows,
+  }))
 }
 
 /// One endpoint as an allow entry: the grant grammar needs a scheme, and the
@@ -361,8 +270,8 @@ fn normalize_endpoint(endpoint: &str) -> String {
 }
 
 /// The agent's decoy talosconfig. Granted contexts receive arkham's CA and
-/// that context's guest pair. Skipped contexts lose `ca`, `crt`, `key`, and
-/// `auth`, so real material is absent. Every other field round-trips,
+/// that context's guest pair. Contexts in `stripped` lose `ca`, `crt`, `key`,
+/// and `auth`, so real material is absent. Every other field round-trips,
 /// including the active `context` name.
 fn decoy_doc(
   text: &str,
@@ -371,7 +280,7 @@ fn decoy_doc(
   prepared: &[Prepared],
   guest_certs: &[Vec<u8>],
   guest_keys: &[Vec<u8>],
-  skipped: &[TalosSkip],
+  stripped: &[&str],
 ) -> Result<String> {
   let mut root: Value = from_str(text).map_err(|err| Error::RewriteYaml {
     file: source.to_path_buf(),
@@ -393,11 +302,8 @@ fn decoy_doc(
     context.insert(Value::String("crt".to_string()), Value::String(STANDARD.encode(guest_cert)));
     context.insert(Value::String("key".to_string()), Value::String(STANDARD.encode(guest_key)));
   }
-  for skip in skipped {
-    let Some(context) = contexts
-      .get_mut(Value::String(skip.name().to_string()))
-      .and_then(Value::as_mapping_mut)
-    else {
+  for name in stripped {
+    let Some(context) = contexts.get_mut(Value::String((*name).to_string())).and_then(Value::as_mapping_mut) else {
       continue;
     };
     for field in ["ca", "crt", "key", "auth"] {
@@ -470,7 +376,6 @@ mod tests {
   use super::*;
   use arkham_tool_config::{Error as SharedError, GRANTS_STATE_DIR};
   use rustls::pki_types::pem::PemObject as _;
-  use std::fmt::Write as _;
 
   const SOURCE: &str = "/home/ivan/.talos/config";
 
@@ -487,14 +392,9 @@ mod tests {
     )
   }
 
-  fn parts(adapted: &TalosAdapted) -> (String, String) {
-    let fragment = adapted
-      .grants
-      .iter()
-      .map(|grant| grant.fragment.as_str())
-      .collect::<Vec<_>>()
-      .join("\n");
-    let decoy = adapted.grants.first().map_or_default(|grant| grant.decoy.clone());
+  fn parts(adapted: &[RewriteAdapted]) -> (String, String) {
+    let fragment = adapted.iter().map(|grant| grant.fragment.as_str()).collect::<Vec<_>>().join("\n");
+    let decoy = adapted.first().map_or_default(|grant| grant.decoy.clone());
     (fragment, decoy)
   }
 
@@ -535,7 +435,7 @@ mod tests {
     );
     let dir = tempfile::tempdir().unwrap();
     let adapted = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).unwrap();
-    let (_, key) = adapted.grants[0]
+    let (_, key) = adapted[0]
       .materialized
       .iter()
       .find(|(name, _)| name.ends_with(".client.key"))
@@ -567,7 +467,7 @@ mod tests {
     assert!(fragment.contains("guest_tls_mode = \"mtls\""), "{fragment}");
     assert!(decoy.contains("endpoints:\n    - 10.5.0.6"), "{decoy}");
     assert!(decoy.contains("context: prod"), "{decoy}");
-    assert_eq!(adapted.grants[0].materialized.len(), 3);
+    assert_eq!(adapted[0].materialized.len(), 3);
   }
 
   #[test]
@@ -638,10 +538,16 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let no_endpoints = doc("");
     let err = adapt(Path::new(SOURCE), no_endpoints.as_bytes(), &test_ca(), dir.path()).unwrap_err();
-    assert!(err.to_string().contains("states no `endpoints`"), "{err}");
+    assert!(
+      err.to_string().contains("context `prod`") && err.to_string().contains("nothing to substitute"),
+      "{err}"
+    );
     let auth = doc("      - 10.5.0.6\n").replace(&STANDARD.encode(b"CRT"), "");
     let err = adapt(Path::new(SOURCE), auth.as_bytes(), &test_ca(), dir.path()).unwrap_err();
-    assert!(err.to_string().contains("misses `ca`, `crt`, or `key`"), "{err}");
+    assert!(
+      err.to_string().contains("context `prod`") && err.to_string().contains("nothing to substitute"),
+      "{err}"
+    );
     let bad = doc("      - 10.5.0.6\n").replace("Q0E=", "not-base64");
     let err = adapt(Path::new(SOURCE), bad.as_bytes(), &test_ca(), dir.path()).unwrap_err();
     assert!(err.to_string().contains("not valid base64"), "{err}");
@@ -652,7 +558,10 @@ mod tests {
     let dir = tempfile::tempdir().unwrap();
     let omni = "context: omni\ncontexts:\n  omni:\n    endpoints: [omni.example]\n    auth:\n      siderov1:\n        identity: me\n";
     let err = adapt(Path::new(SOURCE), omni.as_bytes(), &test_ca(), dir.path()).unwrap_err();
-    assert!(err.to_string().contains("`auth`"), "{err}");
+    assert!(
+      err.to_string().contains("context `omni`") && err.to_string().contains("`auth` block"),
+      "{err}"
+    );
   }
 
   #[test]
@@ -710,7 +619,7 @@ mod tests {
   }
 
   #[test]
-  fn inactive_auth_context_is_skipped_and_named() {
+  fn inactive_auth_context_gets_no_grant_and_no_real_material() {
     let identity = "real-looking-omni-identity";
     let body = format!(
       "context: prod\ncontexts:\n  prod:\n    endpoints:\n      - 10.5.0.6\n    ca: {}\n    crt: {}\n    key: {}\n  omni:\n    endpoints:\n      - https://omni.example:443\n    auth:\n      siderov1:\n        identity: {identity}\n",
@@ -719,24 +628,26 @@ mod tests {
       STANDARD.encode(b"KEY"),
     );
     let dir = tempfile::tempdir().unwrap();
-    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let adapted = tracing::subscriber::with_default(WarnCapture(std::sync::Arc::clone(&lines)), || {
-      adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).unwrap()
-    });
+    let adapted = adapt(Path::new(SOURCE), body.as_bytes(), &test_ca(), dir.path()).unwrap();
     let (fragment, decoy) = parts(&adapted);
     assert!(fragment.contains("https://10.5.0.6:50000"), "prod is granted: {fragment}");
     assert!(!fragment.contains("omni.example"), "omni is not an allow entry: {fragment}");
     assert!(!decoy.contains(identity), "auth identity survives in the decoy: {decoy}");
-    assert!(
-      adapted
-        .skipped
-        .iter()
-        .any(|skip| matches!(skip, TalosSkip::Auth { name } if name == "omni")),
-      "skip names omni: {:?}",
-      adapted.skipped
-    );
-    let warnings = lines.lock().unwrap();
-    assert!(warnings.iter().any(|line| line.contains("omni")), "skip names omni: {warnings:?}");
+    assert!(decoy.contains("omni.example"), "omni context stays in the decoy: {decoy}");
+  }
+
+  #[test]
+  fn cleartext_endpoint_becomes_a_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapted = adapt(
+      Path::new(SOURCE),
+      doc("      - http://10.5.0.6:50000\n").as_bytes(),
+      &test_ca(),
+      dir.path(),
+    )
+    .unwrap();
+    let (fragment, _) = parts(&adapted);
+    assert!(fragment.contains("allow = [\"http://10.5.0.6:50000\"]"), "{fragment}");
   }
 
   #[test]
@@ -763,39 +674,5 @@ mod tests {
       .values()
       .filter_map(|context| context.get("crt").and_then(serde_yaml::Value::as_str).map(str::to_string))
       .collect()
-  }
-
-  struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
-
-  impl tracing::Subscriber for WarnCapture {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-      *metadata.level() <= tracing::Level::WARN
-    }
-
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-      tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-    fn event(&self, event: &tracing::Event<'_>) {
-      let mut message = String::new();
-      event.record(&mut WarnVisit(&mut message));
-      self.0.lock().unwrap().push(message);
-    }
-
-    fn enter(&self, _span: &tracing::span::Id) {}
-
-    fn exit(&self, _span: &tracing::span::Id) {}
-  }
-
-  struct WarnVisit<'a>(&'a mut String);
-
-  impl tracing::field::Visit for WarnVisit<'_> {
-    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-      let _ = write!(self.0, "{}={value:?};", field.name());
-    }
   }
 }

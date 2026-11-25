@@ -281,11 +281,7 @@ impl ExplicitRewrites<'_> {
       let ca = self.ca()?;
       match format {
         RewriteFormat::Kubeconfig => kube::adapt(host, content, ca).await?.into_iter().collect(),
-        RewriteFormat::Talos => {
-          let found = talos::adapt(host, content, ca, guests_dir)?;
-          tracing::debug!(skipped = found.skipped.len(), "talos contexts left out of the grant set");
-          found.grants
-        }
+        RewriteFormat::Talos => talos::adapt(host, content, ca, guests_dir)?,
       }
     };
     match adapted.first() {

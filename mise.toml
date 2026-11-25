@@ -41,6 +41,8 @@ targets = "aarch64-apple-darwin,wasm32-unknown-unknown,wasm32-wasip2"
 version = "nightly-2026-09-18"
 components = "llvm-tools,rustfmt,rust-src"
 
+[secrets.fnox]
+
 [env]
 # BoringSSL's build script does not read CXXSTDLIB.
 BORING_BSSL_RUST_CPPLIB = "{% if os() == 'linux' %}{{ get_env(name='CXXSTDLIB', default='stdc++') }}{% else %}{{ get_env(name='CXXSTDLIB', default='c++') }}{% endif %}"

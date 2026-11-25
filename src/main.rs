@@ -10,6 +10,7 @@ mod daemon;
 #[cfg(target_os = "linux")]
 mod host;
 
+use std::io::{IsTerminal as _, stderr};
 use std::path::{Path, PathBuf};
 
 use arkham_config::cli::{Cli, CliCommand, ProxyBackend};
@@ -122,6 +123,7 @@ async fn runtime_main() -> eyre::Result<()> {
   arkham_pki::ca::install_crypto_provider();
   tracing_subscriber::fmt()
     .pretty()
+    .with_ansi(stderr().is_terminal())
     .with_line_number(true)
     .with_thread_names(true)
     .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
