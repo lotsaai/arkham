@@ -23,7 +23,7 @@ use arkham_tool_config::context::{ContextIdentity, ContextRef, Presented, identi
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http::{Request, Uri};
 use kube_client::client::{AuthError, ConfigExt};
-use kube_client::config::{AuthInfo, Kubeconfig, KubeconfigError};
+use kube_client::config::{AuthInfo, Kubeconfig};
 use secrecy::ExposeSecret;
 use serde_yaml::{Mapping, Value, from_str};
 use tower::{ServiceBuilder, ServiceExt};
@@ -45,15 +45,6 @@ pub enum Error {
   /// Shared adapter failure.
   #[error(transparent)]
   Shared(#[from] arkham_tool_config::Error),
-  /// Kubeconfig loading failure.
-  #[error("file rewrite `{}`: kubeconfig: {source}", file.display())]
-  Kubeconfig {
-    /// Rewrite source.
-    file: std::path::PathBuf,
-    /// Underlying kubeconfig failure.
-    #[source]
-    source: Box<KubeconfigError>,
-  },
   /// Invalid YAML document.
   #[error("file rewrite `{}`: does not parse as YAML: {source}", file.display())]
   RewriteYaml {
@@ -74,7 +65,7 @@ impl Error {
   pub fn registration_summary(&self) -> &'static str {
     match self {
       Self::Shared(source) => source.registration_summary(),
-      Self::Kubeconfig { .. } | Self::RewriteYaml { .. } => "configuration could not be read",
+      Self::RewriteYaml { .. } => "configuration could not be read",
     }
   }
 }
@@ -124,21 +115,10 @@ struct Opened {
 }
 
 fn read_doc(file: &Path, text: &str) -> Result<Option<Kubeconfig>> {
-  let doc = match Kubeconfig::from_yaml(text) {
-    Ok(doc) => doc,
-    Err(KubeconfigError::Parse(source) | KubeconfigError::InvalidStructure(source)) => {
-      return Err(Error::RewriteYaml {
-        file: file.to_path_buf(),
-        source,
-      });
-    }
-    Err(source) => {
-      return Err(Error::Kubeconfig {
-        file: file.to_path_buf(),
-        source: Box::new(source),
-      });
-    }
-  };
+  let doc: Kubeconfig = from_str(text).map_err(|source| Error::RewriteYaml {
+    file: file.to_path_buf(),
+    source,
+  })?;
   if doc.kind.as_deref() != Some("Config") {
     return Ok(None);
   }
@@ -318,7 +298,7 @@ fn auth_class(err: &(dyn StdError + 'static)) -> Option<String> {
 
 fn classify_auth(err: &AuthError) -> String {
   match err {
-    AuthError::AuthExecRun { status, .. } => match status.code() {
+    AuthError::AuthExecRun { out, .. } => match out.status.code() {
       Some(code) => format!("exited {code}"),
       None => "exited without a status code".to_owned(),
     },

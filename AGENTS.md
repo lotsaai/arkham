@@ -168,12 +168,11 @@ Subcommands are enum variants with args that own a `run` method — never separa
 | `mise run format` (`mise format` gate) | Checks for this codebase (check, clippy `-D warnings`, rustfmt, cargo-sort, toml/whitespace guards). |
 | `mise run test` | All tests (Rust `nextest`). |
 | `mise run --force test` | Force a fresh full test run (bypass cache). |
+| `mise run verify` | Everything: `check`, `test --force`, then every `verify:*` user-path check. |
 
 Live and demo variants: `mise run test:ebpf` (root, serial, `#[ignore]`d live tests), `mise run test:rust` (unit plus plugin e2e via `build:plugins` and `ARKHAM_PLUGIN_FIXTURES`), `mise run demo` (docker compose substitution/splice proof). Start discovery with `mise tasks`; tasks are executable files under `.mise/tasks/`.
 
-**IMPORTANT**: After changes, **ALWAYS** run:
-1. `mise format` (invoke as `mise run format` in this repo)
-2. If Rust code was modified: `mise run --force test`
+**IMPORTANT**: After changes, **ALWAYS** run `mise run verify`. It runs `check`, the full test suite, and the user-path checks in one task.
 
 ## Agent Guidelines
 

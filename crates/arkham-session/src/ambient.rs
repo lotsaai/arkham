@@ -267,10 +267,7 @@ impl AmbientDeriver<'_> {
           false,
         ),
         _ => match talos::adapt(&path, &content, ca, guests_dir) {
-          Ok(found) => {
-            tracing::debug!(source = %path.display(), skipped = found.skipped.len(), "talos contexts left out of the grant set");
-            (found.grants, true)
-          }
+          Ok(grants) => (grants, true),
           Err(err) => {
             tracing::warn!(source = %path.display(), %err, "talosconfig source skipped");
             continue;
