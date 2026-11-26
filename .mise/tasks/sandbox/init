@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
-#MISE description="Create the arkham-dev machine, warm every cache, and checkpoint it as the routed tasks' source"
+#MISE description="Create the arkham-dev machine from the Smolfile, warm every cache, and stop it"
 #MISE tags=["sandbox"]
 #MISE dir="{{config_root}}"
 #MISE sources=["Smolfile", "mise.toml", "mise.lock", "mise.arch.toml", "mise.arch.lock", "integration/compose.yaml", ".mise/tasks/sandbox/init", ".mise/sandbox-warm.sh"]
-#MISE outputs=["target/sandbox/arkham-dev.checkpoint"]
+#MISE outputs=["target/sandbox/arkham-dev.ready"]
 
 set -euo pipefail
 
-name=arkham-dev-init
-checkpoint="${ARKHAM_SANDBOX:?set by mise.arch.toml}"
+name="${ARKHAM_SANDBOX:?set by mise.arch.toml}"
+ready=target/sandbox/arkham-dev.ready
 checkout=/home/eng/github/lotsaai/arkham
 
 in_guest() {
   smolvm machine exec --stream --name "$name" --user root -- "$@"
 }
 
-# The running source belongs to the checkpoint this replaces.
-for machine in "$name" arkham-dev; do
-  if smolvm machine status --name "$machine"; then
-    smolvm machine delete --name "$machine" --force
-  fi
-done
+rm -f "$ready"
+if smolvm machine status --name "$name"; then
+  smolvm machine delete --name "$name" --force
+fi
+# A half-warmed machine is never used: it goes unless the warm step finishes.
 trap 'smolvm machine delete --name "$name" --force' EXIT
 
 smolvm machine create --name "$name" --smolfile ./Smolfile --nested --image "$ARKHAM_SANDBOX_IMAGE"
@@ -33,9 +32,7 @@ in_guest sh -c 'systemctl is-active --quiet docker && systemctl is-active --quie
 
 in_guest su - eng -c "cd $checkout && mise trust --quiet && mise install --quiet && mise exec -- bash .mise/sandbox-warm.sh"
 
-# Page cache from the builds would otherwise be saved as guest RAM.
-in_guest sh -c 'sync && sysctl -q -w vm.drop_caches=3'
-
-mkdir -p "$(dirname "$checkpoint")"
-rm -f "$checkpoint"
-smolvm machine checkpoint --name "$name" --host-mounts -o "$checkpoint"
+trap - EXIT
+smolvm machine stop --name "$name"
+mkdir -p "$(dirname "$ready")"
+touch "$ready"

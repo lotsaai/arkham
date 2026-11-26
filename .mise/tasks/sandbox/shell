@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-#MISE description="Open a login shell as eng in a throwaway machine restored from the warm checkpoint"
+#MISE description="Boot the arkham-dev machine, open a login shell as eng, and stop the machine on exit"
 #MISE tags=["sandbox"]
 #MISE dir="{{config_root}}"
 #MISE interactive=true
 
 set -euo pipefail
 
-mkdir -p target/sandbox
-flock target/sandbox/init.lock mise run sandbox:init
-run="arkham-shell-$$"
-smolvm machine create --name "$run" --from "${ARKHAM_SANDBOX:?set by mise.arch.toml}"
-trap 'smolvm machine delete --name "$run" --force' EXIT
-smolvm machine start --name "$run"
-smolvm machine exec -it --name "$run" --user root -- su - eng
+name="${ARKHAM_SANDBOX:?set by mise.arch.toml}"
+mise run sandbox:init
+if ! smolvm machine status --name "$name"; then
+  mise run --force sandbox:init
+fi
+if [[ "$(smolvm machine status --name "$name" --json | jq -r .state)" != running ]]; then
+  smolvm machine start --name "$name"
+fi
+trap 'smolvm machine stop --name "$name"' EXIT
+smolvm machine exec -it --name "$name" --user root -- su - eng

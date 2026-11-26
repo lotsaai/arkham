@@ -30,12 +30,14 @@ k3d = "latest"
 kubectl = "latest"
 "cargo:docsrs-mcp" = "latest"
 microsandbox = "latest"
+mr-boxington = "latest"
 
 [[tools.rust]]
 version = "stable"
 profile = "default"
 components = "llvm-tools,rust-analyzer,rust-src"
 targets = "aarch64-apple-darwin,wasm32-unknown-unknown,wasm32-wasip2"
+mr_boxington = true
 
 [[tools.rust]]
 version = "nightly-2026-09-18"
