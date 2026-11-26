@@ -152,10 +152,10 @@ jobs:
             echo "Bump the clang pin here, in ci.yml, and the linker in .cargo/config.toml." >&2
             exit 1
           fi
-      - name: "Cache Rust dependencies"
-        uses: "Swatinem/rust-cache@v2"
+      - name: "Configure mr-boxington"
+        uses: "jdx/mr-boxington-action@v1"
         with:
-          "key": "${{ join(matrix.targets, '-') }}"
+          "backend": "local"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

@@ -54,10 +54,9 @@
       exit 1
     fi
 
-# Keyed by target: the matrix builds amd64 and arm64 on different runners, and
-# a shared key would let one architecture's cached artifacts satisfy the other.
-# `matrix.targets` is an array here, unlike the scalar `matrix.target` in ci.yml.
-- name: Cache Rust dependencies
-  uses: Swatinem/rust-cache@v2
+# Release builds restore no compiler outputs (mbx's guidance for production
+# releases): `local` installs nothing extra and never restores or saves.
+- name: Configure mr-boxington
+  uses: jdx/mr-boxington-action@v1
   with:
-    key: ${{ join(matrix.targets, '-') }}
+    backend: local

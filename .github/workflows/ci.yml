@@ -71,10 +71,10 @@ jobs:
             exit 1
           fi
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
+      # Restores target/ and Cargo downloads, and keeps target/ a real
+      # directory: mbx's managed target would be a link out of the checkout.
+      - name: Cache Rust builds
+        uses: jdx/mr-boxington-action@v1
 
       - name: Lint
         run: mise check
@@ -148,10 +148,8 @@ jobs:
           install: true
           cache: true
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: aarch64-apple-darwin
+      - name: Cache Rust builds
+        uses: jdx/mr-boxington-action@v1
 
       - name: Clippy
         run: cargo clippy --locked --workspace --exclude arkham-ebpf-programs --exclude arkham-ebpf --all-targets -- -D warnings
