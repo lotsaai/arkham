@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs as eng inside the machine sandbox:init checkpoints: everything a routed
-# task would otherwise rebuild or pull on each run.
+# Runs as eng inside arkham-dev when sandbox:init creates it: everything a
+# routed task would otherwise rebuild or pull on its first run.
 set -euo pipefail
 
 bash .mise/sandbox-build.sh
