@@ -1,6 +1,6 @@
 [package]
 name = "arkham-projection"
-version = "0.3.40"
+version = "0.3.41"
 edition = "2024"
 description = "Filesystem projection for Arkham sessions"
 license = "Apache-2.0"

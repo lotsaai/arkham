@@ -1,6 +1,6 @@
 [package]
 name = "arkham-tool-talos"
-version = "0.3.40"
+version = "0.3.41"
 edition = "2024"
 description = "Talos configuration adaptation"
 license = "Apache-2.0"

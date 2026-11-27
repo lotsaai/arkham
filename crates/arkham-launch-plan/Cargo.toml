@@ -1,6 +1,6 @@
 [package]
 name = "arkham-launch-plan"
-version = "0.3.40"
+version = "0.3.41"
 edition = "2024"
 description = "Launch plan contracts for Arkham sandbox sessions"
 license = "Apache-2.0"

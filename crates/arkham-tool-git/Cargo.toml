@@ -1,6 +1,6 @@
 [package]
 name = "arkham-tool-git"
-version = "0.3.40"
+version = "0.3.41"
 edition = "2024"
 description = "Git configuration adaptation for arkham"
 license = "Apache-2.0"

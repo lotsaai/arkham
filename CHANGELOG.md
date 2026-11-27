@@ -1,4 +1,24 @@
+## [0.3.41] - 2026-11-27
+
+### 🚜 Refactor
+
+- Move per-context identity out of arkham-config
+- Move per-context identity out of arkham-config, drop TalosSkip
+
+### ⚙️ Miscellaneous Tasks
+
+- Cache Rust builds with mr-boxington-action
+
+### 💼 Other
+
+- Branch routed tasks from a running arkham-dev source
+- Boot one arkham-dev machine per task instead of restoring a checkpoint
 ## [0.3.40] - 2026-11-22
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for v0.3.40 [ci skip]
+- Release
 
 ### 💼 Other
 
